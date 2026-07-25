@@ -6,10 +6,17 @@ import type { BrainEngine } from '../src/core/engine.ts';
 
 const TMP = join(import.meta.dir, '.tmp-import-abort-test');
 
-// Same minimal Proxy engine as import-file.test.ts: tracks calls, transaction
-// just invokes the callback, per-method overrides for abort-mid-flight probes.
+// Same Proxy engine as import-file.test.ts (kept in sync with that file's
+// pageStore-backed mock — see its comment for the override/store merge
+// rationale): tracks calls, simulates a real DB index via an in-memory
+// pageStore so the post-write verifyPageReadable guard in import-file.ts
+// sees the page it just wrote instead of unconditionally missing it.
+// transaction just invokes the callback; per-method overrides remain
+// available for abort-mid-flight probes.
 function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
   const calls: { method: string; args: any[] }[] = [];
+  // In-memory page store: slug → page row (simulates a real DB index).
+  const pageStore = new Map<string, { slug: string; content_hash: string; title: string; type: string; frontmatter: Record<string, unknown> }>();
   const track = (method: string) => (...args: any[]) => {
     calls.push({ method, args });
     if (overrides[method]) return overrides[method](...args);
@@ -19,7 +26,35 @@ function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
     get(_, prop: string) {
       if (prop === '_calls') return calls;
       if (prop === 'getTags') return overrides.getTags || (() => Promise.resolve([]));
-      if (prop === 'getPage') return overrides.getPage || (() => Promise.resolve(null));
+      if (prop === 'getPage') {
+        return async (slug: string, opts?: { sourceId?: string }) => {
+          if (overrides.getPage) {
+            const overrideResult = await overrides.getPage(slug, opts);
+            if (overrideResult) {
+              const stored = pageStore.get(slug);
+              if (stored) {
+                return { ...overrideResult, content_hash: stored.content_hash };
+              }
+              return overrideResult;
+            }
+          }
+          return pageStore.get(slug) ?? null;
+        };
+      }
+      if (prop === 'putPage') {
+        return async (slug: string, page: { content_hash?: string; title?: string; type?: string; frontmatter?: Record<string, unknown> }, _opts?: { sourceId?: string }) => {
+          calls.push({ method: 'putPage', args: [slug, page, _opts] });
+          if (overrides.putPage) overrides.putPage(slug, page, _opts);
+          pageStore.set(slug, {
+            slug,
+            content_hash: page.content_hash ?? '',
+            title: page.title ?? '',
+            type: page.type ?? '',
+            frontmatter: page.frontmatter ?? {},
+          });
+          return Promise.resolve(undefined);
+        };
+      }
       if (prop === 'transaction') return async (fn: (tx: BrainEngine) => Promise<any>) => fn(engine);
       return track(prop);
     },
