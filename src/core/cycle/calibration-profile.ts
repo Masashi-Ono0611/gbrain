@@ -27,7 +27,7 @@
 
 import { BaseCyclePhase, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { resolveOwnerHolder } from '../owner-holder.ts';
-import { chat as gatewayChat } from '../ai/gateway.ts';
+import { chat as gatewayChat, withChatPhase } from '../ai/gateway.ts';
 import { TIER_DEFAULTS } from '../model-config.ts';
 import { gateVoice, type VoiceGateGenerator, type VoiceGateJudge } from '../calibration/voice-gate.ts';
 import { patternStatementTemplate, type PatternStatementSlots } from '../calibration/templates.ts';
@@ -400,7 +400,9 @@ export async function runPhaseCalibrationProfile(
   ctx: OperationContext,
   opts: CalibrationProfileOpts = {},
 ) {
-  return new CalibrationProfilePhase().run(ctx, opts);
+  // gbrain#3392 — tag every gateway.chat() call made during this phase run
+  // (defaultPatternsGenerator + defaultBiasTagsGenerator) for chat_usage_log.
+  return withChatPhase('dream.calibration_profile', () => new CalibrationProfilePhase().run(ctx, opts));
 }
 
 export const __testing = {

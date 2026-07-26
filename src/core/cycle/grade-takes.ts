@@ -36,7 +36,7 @@
 
 import { createHash } from 'node:crypto';
 import { BaseCyclePhase, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
-import { chat as gatewayChat } from '../ai/gateway.ts';
+import { chat as gatewayChat, withChatPhase } from '../ai/gateway.ts';
 import { GBrainError } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine, Take, TakeResolution } from '../engine.ts';
@@ -616,7 +616,9 @@ export async function runPhaseGradeTakes(
   ctx: OperationContext,
   opts: GradeTakesOpts = {},
 ) {
-  return new GradeTakesPhase().run(ctx, opts);
+  // gbrain#3392 — tag every gateway.chat() call made during this phase run
+  // (defaultJudge's per-take grading calls) for chat_usage_log.
+  return withChatPhase('dream.grade_takes', () => new GradeTakesPhase().run(ctx, opts));
 }
 
 export const __testing = {

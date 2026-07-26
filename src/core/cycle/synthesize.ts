@@ -29,7 +29,7 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { chat as gatewayChat, validateModelId, type ChatResult } from '../ai/gateway.ts';
+import { chat as gatewayChat, validateModelId, withChatPhase, type ChatResult } from '../ai/gateway.ts';
 import { AIConfigError } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
@@ -383,6 +383,12 @@ export async function runPhaseSynthesize(
   engine: BrainEngine,
   opts: SynthesizePhaseOpts,
 ): Promise<PhaseResult> {
+  // gbrain#3392 — tag every gateway.chat() call made during this phase run
+  // (judgeSignificance's judge client, chunked-transcript summarization,
+  // etc.) with a phase label for chat_usage_log. Wraps the WHOLE existing
+  // body (unindented, on purpose — see the closing `});` below) rather than
+  // threading a phase string through every nested call site.
+  return withChatPhase('dream.synthesize', async () => {
   const start = Date.now();
   // Normalize brainDir to an absolute path BEFORE any reverse-write. Without
   // this, a relative or empty brainDir flows down to writeReversePages →
@@ -735,6 +741,7 @@ export async function runPhaseSynthesize(
     return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL',
       e instanceof Error ? (e.message || 'synthesize phase threw') : String(e)));
   }
+  });
 }
 
 // ── Config ────────────────────────────────────────────────────────────

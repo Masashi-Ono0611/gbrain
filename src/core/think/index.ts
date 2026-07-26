@@ -25,7 +25,7 @@ import { buildThinkSystemPrompt, buildThinkUserMessage } from './prompt.ts';
 import { resolveCitations, type ParsedCitation } from './cite-render.ts';
 import { resolveOwnerHolder } from '../owner-holder.ts';
 import { resolveModel } from '../model-config.ts';
-import { chat as gatewayChat, probeChatModel, type ChatResult } from '../ai/gateway.ts';
+import { chat as gatewayChat, probeChatModel, withChatPhase, type ChatResult } from '../ai/gateway.ts';
 import { AIConfigError } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
@@ -241,6 +241,12 @@ export async function runThink(
   engine: BrainEngine,
   opts: RunThinkOpts,
 ): Promise<ThinkResult> {
+  // gbrain#3392 — tag every gateway.chat() call made during this run (used
+  // by BOTH auto_think and the `think` CLI — one 'think' phase tag covers
+  // both) for chat_usage_log. Wraps the WHOLE existing body (unindented, on
+  // purpose — see the closing `});` below) rather than threading a phase
+  // string through every nested call site.
+  return withChatPhase('think', async () => {
   const rounds = Math.max(1, opts.rounds ?? 1);
   const warnings: string[] = [];
 
@@ -555,6 +561,7 @@ export async function runThink(
       graphHits: gather.diagnostics.graphHits,
     },
   };
+  });
 }
 
 /**

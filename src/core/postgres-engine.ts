@@ -12,6 +12,7 @@ import type {
   FactRow, FactKind, FactVisibility, FactInsertStatus,
   NewFact, FactListOpts, FactsHealth,
   SourceRow,
+  ChatUsageLogRow,
 } from './engine.ts';
 import { withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay, type BatchAuditSite } from './retry.ts';
 import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatchExhausted } from './audit/batch-retry-audit.ts';
@@ -6119,6 +6120,23 @@ export class PostgresEngine implements BrainEngine {
   async logEvalCaptureFailure(reason: EvalCaptureFailureReason): Promise<void> {
     const sql = this.sql;
     await sql`INSERT INTO eval_capture_failures (reason) VALUES (${reason})`;
+  }
+
+  // ============================================================
+  // gbrain#3392 — universal gateway.chat() usage instrumentation
+  // ============================================================
+
+  async recordChatUsage(row: ChatUsageLogRow): Promise<void> {
+    const sql = this.sql;
+    await sql`
+      INSERT INTO chat_usage_log
+        (job_id, phase, model, tokens_in, tokens_out, tokens_cache_read, tokens_cache_create, succeeded)
+      VALUES (
+        ${row.jobId ?? null}, ${row.phase ?? null}, ${row.model},
+        ${row.tokensIn}, ${row.tokensOut}, ${row.tokensCacheRead}, ${row.tokensCacheCreate},
+        ${row.succeeded}
+      )
+    `;
   }
 
   async listEvalCaptureFailures(filter?: { since?: Date }): Promise<EvalCaptureFailure[]> {

@@ -1,10 +1,17 @@
 /**
- * get_usage op — actual-spend report computed from `subagent_messages` token
+ * get_usage op — actual-spend report computed from `chat_usage_log` token
  * counters against the canonical pricing table (`model-pricing.ts`).
  *
  * Addresses gbrain#3392: ModelPricing had no cache rates and there was no
  * actual-spend report, forcing downstream cost tooling to duplicate (and
- * drift from) the canonical table.
+ * drift from) the canonical table. The report originally read
+ * `subagent_messages`, written from exactly ONE call site in the codebase
+ * (the 'subagent' minion-job handler) — invisible to nearly every other
+ * gateway.chat() caller. `chat_usage_log` (migration v126) is written
+ * directly from gateway.chat() itself, covering essentially all LLM chat
+ * traffic; see `test/ai/gateway-chat-usage.test.ts` for coverage of that
+ * write path itself. This file covers the get_usage aggregation/pricing
+ * logic against the new table's rows.
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -39,40 +46,30 @@ function buildCtx(): OperationContext {
   };
 }
 
-/** Insert a minimal minion_jobs row and return its id (FK target for subagent_messages). */
-async function insertJob(): Promise<number> {
-  const rows = await engine.executeRaw<{ id: number }>(
-    `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
-     VALUES ('subagent', 'completed', '{}'::jsonb, 'default', 0, now())
-     RETURNING id`,
-  );
-  return rows[0]!.id;
-}
-
-async function insertMessage(opts: {
-  jobId: number;
-  messageIdx: number;
-  model: string | null;
+/** Insert a `chat_usage_log` row directly (bypasses gateway.chat() — this file tests get_usage's aggregation/pricing, not the write path). */
+async function insertUsage(opts: {
+  model: string;
+  occurredAt: Date;
   tokensIn?: number;
   tokensOut?: number;
   tokensCacheRead?: number;
   tokensCacheCreate?: number;
-  endedAt: Date;
+  phase?: string | null;
+  succeeded?: boolean;
 }): Promise<void> {
   await engine.executeRaw(
-    `INSERT INTO subagent_messages
-       (job_id, message_idx, role, content_blocks, tokens_in, tokens_out,
-        tokens_cache_read, tokens_cache_create, model, ended_at)
-     VALUES ($1, $2, 'assistant', '[]'::jsonb, $3, $4, $5, $6, $7, $8)`,
+    `INSERT INTO chat_usage_log
+       (job_id, phase, model, tokens_in, tokens_out, tokens_cache_read, tokens_cache_create, succeeded, occurred_at)
+     VALUES (NULL, $1, $2, $3, $4, $5, $6, $7, $8)`,
     [
-      opts.jobId,
-      opts.messageIdx,
-      opts.tokensIn ?? null,
-      opts.tokensOut ?? null,
-      opts.tokensCacheRead ?? null,
-      opts.tokensCacheCreate ?? null,
+      opts.phase ?? null,
       opts.model,
-      opts.endedAt,
+      opts.tokensIn ?? 0,
+      opts.tokensOut ?? 0,
+      opts.tokensCacheRead ?? 0,
+      opts.tokensCacheCreate ?? 0,
+      opts.succeeded ?? true,
+      opts.occurredAt,
     ],
   );
 }
@@ -122,14 +119,13 @@ describe('get_usage op', () => {
   });
 
   test('sums tokens per priced model and computes cost against canonical pricing', async () => {
-    const jobId = await insertJob();
-    // Two messages for the same priced model — sums must combine across rows.
-    await insertMessage({
-      jobId, messageIdx: 0, model: 'anthropic:claude-sonnet-4-6', endedAt: IN_WINDOW,
+    // Two rows for the same priced model — sums must combine across rows.
+    await insertUsage({
+      model: 'anthropic:claude-sonnet-4-6', occurredAt: IN_WINDOW,
       tokensIn: 500_000, tokensOut: 100_000, tokensCacheRead: 250_000, tokensCacheCreate: 50_000,
     });
-    await insertMessage({
-      jobId, messageIdx: 1, model: 'anthropic:claude-sonnet-4-6', endedAt: IN_WINDOW,
+    await insertUsage({
+      model: 'anthropic:claude-sonnet-4-6', occurredAt: IN_WINDOW,
       tokensIn: 500_000, tokensOut: 100_000, tokensCacheRead: 250_000, tokensCacheCreate: 50_000,
     });
 
@@ -165,13 +161,12 @@ describe('get_usage op', () => {
   });
 
   test('unpriced models are reported separately and excluded from total_cost_usd', async () => {
-    const jobId = await insertJob();
-    await insertMessage({
-      jobId, messageIdx: 0, model: 'anthropic:claude-sonnet-4-6', endedAt: IN_WINDOW,
+    await insertUsage({
+      model: 'anthropic:claude-sonnet-4-6', occurredAt: IN_WINDOW,
       tokensIn: 1_000_000, tokensOut: 0, tokensCacheRead: 0, tokensCacheCreate: 0,
     });
-    await insertMessage({
-      jobId, messageIdx: 1, model: 'some-unreleased-model-not-in-canonical', endedAt: IN_WINDOW,
+    await insertUsage({
+      model: 'some-unreleased-model-not-in-canonical', occurredAt: IN_WINDOW,
       tokensIn: 1_000, tokensOut: 500, tokensCacheRead: 0, tokensCacheCreate: 0,
     });
 
@@ -192,18 +187,46 @@ describe('get_usage op', () => {
     expect(result.total_cost_usd).toBeCloseTo(3.0, 6);
   });
 
+  test('excludes succeeded=false rows from by_model and total_cost_usd (pessimistic estimate, not measured spend)', async () => {
+    await insertUsage({
+      model: 'anthropic:claude-sonnet-4-6', occurredAt: IN_WINDOW,
+      tokensIn: 1_000_000, tokensOut: 0, succeeded: true,
+    });
+    // A failed call's tokens are a pessimistic-ceiling ESTIMATE, not
+    // measured usage — large enough that if it leaked into the total, the
+    // assertion below would catch it.
+    await insertUsage({
+      model: 'anthropic:claude-sonnet-4-6', occurredAt: IN_WINDOW,
+      tokensIn: 999_999_999, tokensOut: 999_999_999, succeeded: false,
+    });
+
+    const op = operationsByName.get_usage;
+    const result = (await op.handler(buildCtx(), {
+      since: WINDOW_SINCE.toISOString(),
+      until: WINDOW_UNTIL.toISOString(),
+    })) as {
+      by_model: Array<{ model: string; tokens_input: number; cost_usd: number }>;
+      total_cost_usd: number;
+    };
+
+    expect(result.by_model).toHaveLength(1);
+    // Only the succeeded row's 1_000_000 input tokens, not the failed row's
+    // near-billion — proves the failed row was excluded, not just under-weighted.
+    expect(result.by_model[0]!.tokens_input).toBe(1_000_000);
+    expect(result.total_cost_usd).toBeCloseTo(3.0, 6); // 1.0 * $3.00 input rate only
+  });
+
   test('excludes rows outside the [since, until) window', async () => {
-    const jobId = await insertJob();
-    await insertMessage({
-      jobId, messageIdx: 0, model: 'anthropic:claude-sonnet-4-6', endedAt: BEFORE_WINDOW,
+    await insertUsage({
+      model: 'anthropic:claude-sonnet-4-6', occurredAt: BEFORE_WINDOW,
       tokensIn: 999_999, tokensOut: 0,
     });
-    await insertMessage({
-      jobId, messageIdx: 1, model: 'anthropic:claude-sonnet-4-6', endedAt: AFTER_WINDOW,
+    await insertUsage({
+      model: 'anthropic:claude-sonnet-4-6', occurredAt: AFTER_WINDOW,
       tokensIn: 999_999, tokensOut: 0,
     });
-    await insertMessage({
-      jobId, messageIdx: 2, model: 'anthropic:claude-sonnet-4-6', endedAt: IN_WINDOW,
+    await insertUsage({
+      model: 'anthropic:claude-sonnet-4-6', occurredAt: IN_WINDOW,
       tokensIn: 1_000_000, tokensOut: 0,
     });
 
@@ -218,13 +241,12 @@ describe('get_usage op', () => {
   });
 
   test('boundary: a row exactly at since is included, a row exactly at until is excluded', async () => {
-    const jobId = await insertJob();
-    await insertMessage({
-      jobId, messageIdx: 0, model: 'anthropic:claude-sonnet-4-6', endedAt: WINDOW_SINCE,
+    await insertUsage({
+      model: 'anthropic:claude-sonnet-4-6', occurredAt: WINDOW_SINCE,
       tokensIn: 1, tokensOut: 0,
     });
-    await insertMessage({
-      jobId, messageIdx: 1, model: 'anthropic:claude-sonnet-4-6', endedAt: WINDOW_UNTIL,
+    await insertUsage({
+      model: 'anthropic:claude-sonnet-4-6', occurredAt: WINDOW_UNTIL,
       tokensIn: 999_999, tokensOut: 0,
     });
 
@@ -246,32 +268,15 @@ describe('get_usage op', () => {
     })).rejects.toThrow(/since.*after.*until/i);
   });
 
-  test('rows with model IS NULL are excluded', async () => {
-    const jobId = await insertJob();
-    await insertMessage({ jobId, messageIdx: 0, model: null, endedAt: IN_WINDOW, tokensIn: 1000 });
-    await insertMessage({
-      jobId, messageIdx: 1, model: 'anthropic:claude-sonnet-4-6', endedAt: IN_WINDOW, tokensIn: 500_000,
-    });
-
-    const op = operationsByName.get_usage;
-    const result = (await op.handler(buildCtx(), {
-      since: WINDOW_SINCE.toISOString(),
-      until: WINDOW_UNTIL.toISOString(),
-    })) as { by_model: Array<{ model: string }> };
-
-    expect(result.by_model.map(r => r.model)).toEqual(['anthropic:claude-sonnet-4-6']);
-  });
-
   test('by_model is sorted by cost_usd descending', async () => {
-    const jobId = await insertJob();
     // anthropic:claude-haiku-4-5 ($1/$5) — cheap
-    await insertMessage({
-      jobId, messageIdx: 0, model: 'anthropic:claude-haiku-4-5', endedAt: IN_WINDOW,
+    await insertUsage({
+      model: 'anthropic:claude-haiku-4-5', occurredAt: IN_WINDOW,
       tokensIn: 1_000_000, tokensOut: 0,
     });
     // anthropic:claude-opus-4-8 ($5/$25) — expensive
-    await insertMessage({
-      jobId, messageIdx: 1, model: 'anthropic:claude-opus-4-8', endedAt: IN_WINDOW,
+    await insertUsage({
+      model: 'anthropic:claude-opus-4-8', occurredAt: IN_WINDOW,
       tokensIn: 1_000_000, tokensOut: 0,
     });
 
@@ -288,9 +293,17 @@ describe('get_usage op', () => {
   });
 
   test('defaults since to 7 days ago and until to now when omitted', async () => {
-    const jobId = await insertJob();
-    await insertMessage({
-      jobId, messageIdx: 0, model: 'anthropic:claude-sonnet-4-6', endedAt: new Date(),
+    // 1s in the past, not `new Date()` exactly: the handler computes its own
+    // `until = new Date()` moments later, and the window's upper bound is
+    // exclusive (`occurred_at < until`). A single fast in-process INSERT (no
+    // network latency) can land in the SAME millisecond as the handler's
+    // `new Date()` — a genuine tie, excluded by `<` — causing this to fail
+    // intermittently under low load specifically (flakiness observed and
+    // root-caused during gbrain#3392; reproduced deterministically once,
+    // see PR discussion). A safe margin removes the race without weakening
+    // what the test actually verifies (the row falls inside the window).
+    await insertUsage({
+      model: 'anthropic:claude-sonnet-4-6', occurredAt: new Date(Date.now() - 1000),
       tokensIn: 1_000_000, tokensOut: 0,
     });
 
@@ -310,7 +323,7 @@ describe('get_usage op', () => {
     expect(untilMs).toBeLessThanOrEqual(after);
     // since ~ 7 days before until
     expect(untilMs - sinceMs).toBeCloseTo(7 * 86_400_000, -3);
-    // The just-inserted message (ended_at = now) falls inside the default window.
+    // The just-inserted row falls inside the default window.
     expect(result.by_model.map(r => r.model)).toEqual(['anthropic:claude-sonnet-4-6']);
   });
 });

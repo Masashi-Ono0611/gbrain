@@ -21,7 +21,7 @@
  * gateway-down errors are absorbed into NULL-embedding rows.
  */
 
-import { chat, embedOne, isAvailable } from '../ai/gateway.ts';
+import { chat, embedOne, isAvailable, withChatPhase } from '../ai/gateway.ts';
 import type { ChatResult } from '../ai/gateway.ts';
 import { INJECTION_PATTERNS } from '../think/sanitize.ts';
 import { resolveModel } from '../model-config.ts';
@@ -234,6 +234,12 @@ export type ExtractFactsOutcome =
 export async function extractFactsFromTurnWithOutcome(
   input: ExtractInput,
 ): Promise<ExtractFactsOutcome> {
+  // gbrain#3392 — tag every gateway.chat() call made during this extraction
+  // for chat_usage_log. Wraps the WHOLE existing body (unindented, on
+  // purpose — see the closing `});` below) rather than threading a phase
+  // string through every nested call site. Covers `extractFactsFromTurn`
+  // (the historical best-effort wrapper) too, since it just calls this.
+  return withChatPhase('facts.extract', async () => {
   if (input.isDreamGenerated) return { ok: true, facts: [] };
   if (!input.turnText) return { ok: true, facts: [] };
 
@@ -374,6 +380,7 @@ export async function extractFactsFromTurnWithOutcome(
   }
 
   return { ok: true, facts };
+  });
 }
 
 /** Historical best-effort API retained for interactive callers. */

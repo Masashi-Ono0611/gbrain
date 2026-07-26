@@ -51,7 +51,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult } from '../cycle.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { ProgressReporter } from '../progress.ts';
-import { chat as gatewayChat, withBudgetTracker } from '../ai/gateway.ts';
+import { chat as gatewayChat, withBudgetTracker, withChatPhase } from '../ai/gateway.ts';
 import { BudgetExhausted, BudgetTracker } from '../budget/budget-tracker.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
@@ -417,6 +417,11 @@ export async function runPhaseExtractAtoms(
   engine: BrainEngine,
   opts: ExtractAtomsOpts = {},
 ): Promise<PhaseResult> {
+  // gbrain#3392 — tag every gateway.chat() call made during this phase run
+  // for chat_usage_log. Wraps the WHOLE existing body (unindented, on
+  // purpose — see the closing `});` below) rather than threading a phase
+  // string through every nested call site.
+  return withChatPhase('dream.extract_atoms', async () => {
   const sourceId = opts.sourceId ?? 'default';
   const chat = opts._chat ?? gatewayChat;
 
@@ -754,6 +759,7 @@ export async function runPhaseExtractAtoms(
       dry_run: opts.dryRun ?? false,
     },
   };
+  });
 }
 
 /**

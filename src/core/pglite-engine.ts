@@ -15,6 +15,7 @@ import type {
   FactRow, FactKind, FactVisibility, FactInsertStatus,
   NewFact, FactListOpts, FactsHealth,
   SourceRow,
+  ChatUsageLogRow,
 } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay, type BatchAuditSite } from './retry.ts';
@@ -5839,6 +5840,28 @@ export class PGLiteEngine implements BrainEngine {
     await this.db.query(
       `INSERT INTO eval_capture_failures (reason) VALUES ($1)`,
       [reason]
+    );
+  }
+
+  // ============================================================
+  // gbrain#3392 — universal gateway.chat() usage instrumentation
+  // ============================================================
+
+  async recordChatUsage(row: ChatUsageLogRow): Promise<void> {
+    await this.db.query(
+      `INSERT INTO chat_usage_log
+         (job_id, phase, model, tokens_in, tokens_out, tokens_cache_read, tokens_cache_create, succeeded)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        row.jobId ?? null,
+        row.phase ?? null,
+        row.model,
+        row.tokensIn,
+        row.tokensOut,
+        row.tokensCacheRead,
+        row.tokensCacheCreate,
+        row.succeeded,
+      ]
     );
   }
 
