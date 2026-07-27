@@ -1564,6 +1564,27 @@ export function parseEtimeSeconds(etime: string): number {
 
 const SERVE_ACCUMULATION_WARN_THRESHOLD = 3;
 
+/**
+ * Is this serve process actually running with an ARMED idle timeout?
+ *
+ * Deliberately mirrors `parseStdioIdleTimeout` in `serve.ts` rather than just
+ * looking for the flag name, because two spellings look enabled and are not:
+ *   - `--stdio-idle-timeout=900` — serve.ts does `args.indexOf('--stdio-idle-timeout')`
+ *     and reads the NEXT argv slot, so the equals form is not the flag at all.
+ *   - `--stdio-idle-timeout 0` — parses fine but the timer is only installed
+ *     when the value is > 0, i.e. zero is the documented off switch.
+ * Claiming "the timer was armed and still survived" for either case would send
+ * the operator chasing a client that was never being timed.
+ *
+ * Heuristic by construction: `ps` gives us a flattened command string, so argv
+ * boundaries cannot be recovered exactly. The leading `(?:^|\s)` keeps a
+ * superstring like `--not-really--stdio-idle-timeout 900` from matching.
+ */
+function hasArmedIdleTimeout(command: string): boolean {
+  const m = /(?:^|\s)--stdio-idle-timeout\s+(\d+)(?:\s|$)/.exec(command);
+  return m ? Number(m[1]) > 0 : false;
+}
+
 /** Threshold + message logic, split from the ps scan for direct testing (pure). */
 export function computeServeAccumulationCheck(rows: ServeProcessRow[]): Check {
   if (rows.length < SERVE_ACCUMULATION_WARN_THRESHOLD) {
@@ -1578,6 +1599,34 @@ export function computeServeAccumulationCheck(rows: ServeProcessRow[]): Check {
   );
   const oldest = sorted[0]!;
   const pidList = sorted.map((r) => `${r.pid} (up ${r.etime})`).join(', ');
+
+  // Tailor the remediation to what the flagged processes are ALREADY doing.
+  // The first version of this check always said "launch with
+  // --stdio-idle-timeout", which is useless advice for an operator whose
+  // launcher already sets it — and that is exactly the case that produces a
+  // long-lived process worth looking at, because the idle timer is re-armed on
+  // every stdin chunk (see `serve.ts`), so a process that outlives its timeout
+  // is one that kept RECEIVING traffic, not one that ignored the flag.
+  const unarmed = sorted.filter((r) => !hasArmedIdleTimeout(r.command));
+  const addFlagHint =
+    `launch with \`gbrain serve --stdio-idle-timeout <seconds>\` so abandoned servers ` +
+    `exit on their own, and \`kill\` the stale PIDs above (oldest: ${oldest.pid})`;
+
+  let fix: string;
+  if (unarmed.length === 0) {
+    fix =
+      `each already has an armed \`--stdio-idle-timeout\` and the timer resets on every ` +
+      `stdin data chunk, so each received data within its window — inspect the clients ` +
+      `holding them open, and \`kill\` the ones you know are stale (oldest: ${oldest.pid})`;
+  } else if (unarmed.length === sorted.length) {
+    fix = addFlagHint;
+  } else {
+    const missing = unarmed.map((r) => String(r.pid)).join(', ');
+    fix =
+      `${missing} ${unarmed.length === 1 ? 'has' : 'have'} no armed idle timeout — ` +
+      `${addFlagHint}`;
+  }
+
   return {
     name: 'serve_process_accumulation',
     status: 'warn',
@@ -1585,8 +1634,7 @@ export function computeServeAccumulationCheck(rows: ServeProcessRow[]): Check {
       `${rows.length} concurrent gbrain serve stdio processes: ${pidList}. ` +
       `Clients that die without closing stdin (SSH half-open, slept laptop) leak servers ` +
       `that each hold a DB connection; if these are all live editor sessions, ignore. ` +
-      `Fix: launch with \`gbrain serve --stdio-idle-timeout <seconds>\` so abandoned ` +
-      `servers exit on their own, and \`kill\` the stale PIDs above (oldest: ${oldest.pid}).`,
+      `Fix: ${fix}.`,
   };
 }
 

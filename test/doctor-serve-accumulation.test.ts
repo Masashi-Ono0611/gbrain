@@ -85,6 +85,77 @@ describe('computeServeAccumulationCheck', () => {
     expect(c.message).toContain('oldest: 20');
     expect(c.message).toContain('--stdio-idle-timeout');
   });
+
+  // The remediation has to react to what the flagged processes are already
+  // doing. Telling an operator to add a flag their launcher already sets is
+  // the case that actually shows up in the field — and it is the case where
+  // the accumulation is most worth investigating, because the idle timer
+  // re-arms on every stdin frame, so surviving the timeout means the process
+  // kept receiving traffic.
+  const rowWith = (pid: number, etime: string, cmd: string): ServeProcessRow => ({
+    pid,
+    uid: 501,
+    etime,
+    command: cmd,
+  });
+
+  test('every process has an armed timeout → do not tell the operator to add it', () => {
+    const c = computeServeAccumulationCheck([
+      rowWith(10, '00:10', 'bun gbrain serve --stdio-idle-timeout 14400'),
+      rowWith(20, '01-09:28:54', 'bun gbrain serve --stdio-idle-timeout 900'),
+      rowWith(30, '09:51:44', 'bun gbrain serve --stdio-idle-timeout 14400'),
+    ]);
+    expect(c.status).toBe('warn');
+    expect(c.message).toContain('already has an armed');
+    expect(c.message).toContain('stdin data chunk');
+    expect(c.message).toContain('oldest: 20');
+    // The stale advice must be GONE, not merely accompanied by the new text.
+    expect(c.message).not.toContain('launch with `gbrain serve --stdio-idle-timeout <seconds>`');
+  });
+
+  test('mixed → name only the PIDs whose timeout is not armed', () => {
+    const c = computeServeAccumulationCheck([
+      rowWith(10, '00:10', 'bun gbrain serve --stdio-idle-timeout 14400'),
+      rowWith(20, '01-09:28:54', 'bun gbrain serve'),
+      rowWith(30, '09:51:44', 'bun gbrain serve'),
+    ]);
+    expect(c.status).toBe('warn');
+    expect(c.message).toContain('20, 30 have no armed idle timeout');
+    expect(c.message).toContain('launch with');
+  });
+
+  // The three spellings that LOOK enabled and are not. serve.ts does
+  // `args.indexOf('--stdio-idle-timeout')` and reads the next argv slot, and
+  // only installs the timer when the value is > 0.
+  test('the equals form is not the flag serve.ts parses', () => {
+    const c = computeServeAccumulationCheck([
+      rowWith(10, '00:10', 'bun gbrain serve --stdio-idle-timeout=900'),
+      rowWith(20, '01:00', 'bun gbrain serve --stdio-idle-timeout=900'),
+      rowWith(30, '02:00', 'bun gbrain serve --stdio-idle-timeout=900'),
+    ]);
+    expect(c.message).toContain('launch with');
+    expect(c.message).not.toContain('already has an armed');
+  });
+
+  test('an explicit 0 is the documented off switch, not an armed timer', () => {
+    const c = computeServeAccumulationCheck([
+      rowWith(10, '00:10', 'bun gbrain serve --stdio-idle-timeout 0'),
+      rowWith(20, '01:00', 'bun gbrain serve --stdio-idle-timeout 0'),
+      rowWith(30, '02:00', 'bun gbrain serve --stdio-idle-timeout 0'),
+    ]);
+    expect(c.message).toContain('launch with');
+    expect(c.message).not.toContain('already has an armed');
+  });
+
+  test('neither a longer flag name nor a leading superstring counts', () => {
+    const c = computeServeAccumulationCheck([
+      rowWith(10, '00:10', 'bun gbrain serve --stdio-idle-timeout-foo 5'),
+      rowWith(20, '01:00', 'bun gbrain serve --not-really--stdio-idle-timeout 900'),
+      rowWith(30, '02:00', 'bun gbrain serve --stdio-idle-timeout-foo 5'),
+    ]);
+    expect(c.message).toContain('launch with');
+    expect(c.message).not.toContain('already has an armed');
+  });
 });
 
 describe('checkServeProcessAccumulation (PsRunner seam)', () => {
