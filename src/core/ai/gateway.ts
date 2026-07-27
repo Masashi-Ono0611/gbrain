@@ -189,6 +189,10 @@ type EmbedManyFn = typeof embedMany;
 let _embedTransport: EmbedManyFn = embedMany;
 type GenerateTextFn = typeof generateText;
 let _generateTextTransport: GenerateTextFn = generateText;
+// Same seam as _generateTextTransport, for expand()'s generateObject() call
+// (gbrain#3392 follow-up chat_usage_log instrumentation below).
+type GenerateObjectFn = typeof generateObject;
+let _generateObjectTransport: GenerateObjectFn = generateObject;
 // v0.41.6.0 D1: tests that install a transport stub also pass the
 // embedding-creds preflight, matching the chat-transport fast-path
 // pattern. Set when __setEmbedTransportForTests is called with a
@@ -663,6 +667,7 @@ export function resetGateway(): void {
   _shrinkState.clear();
   _embedTransport = embedMany;
   _generateTextTransport = generateText;
+  _generateObjectTransport = generateObject;
   _embedTransportInstalled = false;
   _chatTransport = null;
   _warnedRecipes.clear();
@@ -708,6 +713,17 @@ export function __setEmbedTransportForTests(fn: EmbedManyFn | null): void {
  */
 export function __setGenerateTextTransportForTests(fn: GenerateTextFn | null): void {
   _generateTextTransport = fn ?? generateText;
+}
+
+/**
+ * Test-only seam for expand()'s generateObject() call. Same shape as
+ * __setGenerateTextTransportForTests: keeps provider resolution live,
+ * replaces only the final SDK call.
+ *
+ * @internal exported for tests; not part of the public gateway API.
+ */
+export function __setGenerateObjectTransportForTests(fn: GenerateObjectFn | null): void {
+  _generateObjectTransport = fn ?? generateObject;
 }
 
 /**
@@ -2488,9 +2504,17 @@ export async function expand(query: string): Promise<string[]> {
     metadata: { query_chars: query.length },
   });
 
+  // gbrain#3392 follow-up — expand() calls generateObject() directly and
+  // never went through chat(), so query-expansion spend was invisible to
+  // chat_usage_log / `gbrain usage` even after the #3399 instrumentation
+  // pass. Estimate here so a failure still logs a pessimistic ceiling,
+  // same convention chat() uses (see extractUsageFromError's doc comment).
+  const estimatedInputTokens = Math.ceil(query.length / 4) + 80; // +prompt scaffold
+  const ESTIMATED_OUTPUT_TOKENS = 200; // expand() sets no explicit output cap
+
   try {
     const { model, recipe, modelId } = await resolveExpansionProvider(getExpansionModel());
-    const result = await generateObject({
+    const result = await _generateObjectTransport({
       model,
       schema: ExpansionSchema,
       // v0.42.20.0 (codex P0) — expansion had NO abortSignal; same stalled-socket
@@ -2505,6 +2529,18 @@ export async function expand(query: string): Promise<string[]> {
       ].join('\n'),
     });
 
+    const usage = (result as any).usage ?? {};
+    const providerMetadata = (result as any).providerMetadata as Record<string, any> | undefined;
+    const anthropicCache = providerMetadata?.anthropic ?? {};
+    _recordChatUsageBestEffort({
+      model: `${recipe.id}:${modelId}`,
+      tokensIn: Number(usage.inputTokens ?? usage.promptTokens ?? 0),
+      tokensOut: Number(usage.outputTokens ?? usage.completionTokens ?? 0),
+      tokensCacheRead: Number(anthropicCache.cacheReadInputTokens ?? anthropicCache.cache_read_input_tokens ?? usage.cachedInputTokens ?? 0),
+      tokensCacheCreate: Number(anthropicCache.cacheCreationInputTokens ?? anthropicCache.cache_creation_input_tokens ?? 0),
+      succeeded: true,
+    });
+
     const expansions = result.object?.queries ?? [];
     // Deduplicate + include the original query
     const seen = new Set<string>();
@@ -2516,6 +2552,22 @@ export async function expand(query: string): Promise<string[]> {
     });
     return all;
   } catch (err) {
+    // Best-effort usage log even on failure — mirrors chat()'s catch-path
+    // convention (pessimistic ceiling; better to overcount than go dark).
+    // resolveExpansionProvider's own model id isn't in scope here on early
+    // failure, so fall back to the configured expansion model string.
+    const usageForLog = _extractUsageFromError(err, {
+      inputTokens: estimatedInputTokens,
+      outputTokens: ESTIMATED_OUTPUT_TOKENS,
+    });
+    _recordChatUsageBestEffort({
+      model: getExpansionModel(),
+      tokensIn: usageForLog.inputTokens,
+      tokensOut: usageForLog.outputTokens,
+      tokensCacheRead: 0,
+      tokensCacheCreate: 0,
+      succeeded: false,
+    });
     // Expansion is best-effort: on failure, fall back to the original query alone.
     const normalized = normalizeAIError(err, 'expand');
     if (normalized instanceof AIConfigError) {
@@ -2542,7 +2594,7 @@ export async function expand(query: string): Promise<string[]> {
  */
 export async function generateOcrText(imageBytes: Buffer, mime: string): Promise<string> {
   if (!isAvailable('expansion')) return '';
-  const { model } = await resolveExpansionProvider(getExpansionModel());
+  const { model, recipe, modelId } = await resolveExpansionProvider(getExpansionModel());
   const base64 = imageBytes.toString('base64');
   const result = await generateText({
     model,
@@ -2569,6 +2621,23 @@ export async function generateOcrText(imageBytes: Buffer, mime: string): Promise
         ] as any,
       },
     ],
+  });
+  // gbrain#3392 follow-up — same blind spot as expand() above: generateText()
+  // called directly, never through chat(), so OCR spend was invisible to
+  // chat_usage_log. Only the success path is logged; errors intentionally
+  // propagate un-recorded here (unlike expand()/chat()'s catch-and-record)
+  // because importImageFile's ocr_failed_other routing depends on this
+  // function throwing on failure — swallowing to log usage would break that.
+  const usage = (result as any).usage ?? {};
+  const providerMetadata = (result as any).providerMetadata as Record<string, any> | undefined;
+  const anthropicCache = providerMetadata?.anthropic ?? {};
+  _recordChatUsageBestEffort({
+    model: `${recipe.id}:${modelId}`,
+    tokensIn: Number(usage.inputTokens ?? usage.promptTokens ?? 0),
+    tokensOut: Number(usage.outputTokens ?? usage.completionTokens ?? 0),
+    tokensCacheRead: Number(anthropicCache.cacheReadInputTokens ?? anthropicCache.cache_read_input_tokens ?? usage.cachedInputTokens ?? 0),
+    tokensCacheCreate: Number(anthropicCache.cacheCreationInputTokens ?? anthropicCache.cache_creation_input_tokens ?? 0),
+    succeeded: true,
   });
   return (result.text ?? '').trim();
 }
