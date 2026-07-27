@@ -2,6 +2,15 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.67.0] - 2026-07-28
+
+### Fixed
+- **`gbrain agent` help no longer claims Anthropic-only.** `--model` is documented as `provider:model`, the Anthropic-direct default is described as reading either `ANTHROPIC_API_KEY` or the configured `anthropic_api_key`, and the gateway-loop requirement for non-Anthropic providers is spelled out with the exact enable command. (#2753)
+- **The doctor and the subagent worker now share one truthiness parser** (`isConfigTruthy` in `src/core/config.ts`). The doctor accepted `true`/`1`/`yes`/`on` while the worker accepted only `true`/`1`, so `gbrain config set agent.use_gateway_loop yes` produced a healthy doctor report *and* a runtime refusal of the job the setting was meant to enable. (#2753)
+
+### Added
+- Regression test that extracts the literal command out of the doctor's own recommendation and feeds it through `runConfig`, so the check and the config validator cannot silently drift apart again. (#2753)
+
 ## [0.42.66.0] - 2026-07-24
 
 **54 verified fixes from the community backlog: background enrichment stops wasting money on dead pages, autopilot stops killing its own healthy runs, and search respects your settings.**
