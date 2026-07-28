@@ -17,6 +17,8 @@ import {
   beginChatUsageAttempt,
   buildRateSnapshot,
   computeCostUsd,
+  sanitizeTokenCount,
+  isAbortError,
   chatUsageRecorderFailures,
   flushChatUsage,
   setChatUsageEngine,
@@ -56,6 +58,19 @@ describe('buildRateSnapshot', () => {
     expect(snap!.cache_read_per_mtok).not.toBeNull();
   });
 
+  test('invalid TTL string: fail closed to null, never a silent 5m rate', () => {
+    const snap = buildRateSnapshot('anthropic:claude-sonnet-5', '30m');
+    expect(snap!.cache_write_per_mtok).toBeNull();
+    expect(snap!.cache_write_ttl).toBeNull();
+  });
+
+  test('bare model id prices via canonicalLookup (anthropic default)', () => {
+    const snap = buildRateSnapshot('claude-sonnet-5', '5m');
+    expect(snap).not.toBeNull();
+    expect(snap!.input_per_mtok).toBe(CANONICAL_PRICING['anthropic:claude-sonnet-5']!.input);
+    expect(snap!.cache_write_per_mtok).not.toBeNull();
+  });
+
   test('non-anthropic model: cache rates null (semantics unverified)', () => {
     const nonAnthropic = Object.keys(CANONICAL_PRICING).find(k => !k.startsWith('anthropic:'));
     expect(nonAnthropic).toBeDefined();
@@ -93,6 +108,38 @@ describe('computeCostUsd', () => {
     expect(computeCostUsd({ input_tokens: 100, output_tokens: 100, cache_read_tokens: 0, cache_creation_tokens: 5 }, noCache)).toBeNull();
     // zero cache tokens: the unverified cache rate is irrelevant — priced.
     expect(computeCostUsd({ input_tokens: 100, output_tokens: 100, cache_read_tokens: 0, cache_creation_tokens: 0 }, noCache)).not.toBeNull();
+  });
+
+  test('null fields contribute nothing (lower bound), not zero-as-fact', () => {
+    const base = CANONICAL_PRICING['anthropic:claude-sonnet-5']!;
+    const cost = computeCostUsd(
+      { input_tokens: 1_000_000, output_tokens: null, cache_read_tokens: null, cache_creation_tokens: null },
+      sonnet,
+    );
+    expect(cost).toBeCloseTo(base.input, 10);
+  });
+});
+
+describe('sanitizeTokenCount', () => {
+  test('finite non-negative passes; NaN/Infinity/negative/non-number become null', () => {
+    expect(sanitizeTokenCount(0)).toBe(0);
+    expect(sanitizeTokenCount(42)).toBe(42);
+    expect(sanitizeTokenCount(NaN)).toBeNull();
+    expect(sanitizeTokenCount(Infinity)).toBeNull();
+    expect(sanitizeTokenCount(-1)).toBeNull();
+    expect(sanitizeTokenCount('10')).toBeNull();
+    expect(sanitizeTokenCount(undefined)).toBeNull();
+  });
+});
+
+describe('isAbortError', () => {
+  test('AbortError / APIUserAbortError variants classify; plain errors do not', () => {
+    const a = new Error('x'); a.name = 'AbortError';
+    const b = new Error('x'); b.name = 'APIUserAbortError';
+    expect(isAbortError(a)).toBe(true);
+    expect(isAbortError(b)).toBe(true);
+    expect(isAbortError(new Error('x'))).toBe(false);
+    expect(isAbortError(null)).toBe(false);
   });
 });
 
@@ -230,6 +277,104 @@ describe('lifecycle ledger', () => {
     });
     const [r] = await rows();
     expect(r.phase).toBe('dream.synthesize');
+  });
+
+  test('final claim with a missing field is downgraded to partial', async () => {
+    const attempt = beginChatUsageAttempt({ boundary: 'gateway.chat', modelRaw: 'anthropic:claude-haiku-4-5', model: 'anthropic:claude-haiku-4-5' });
+    await attempt.finish({
+      requestStatus: 'succeeded',
+      usageStatus: 'final',
+      usage: { input_tokens: 100, output_tokens: null, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    });
+    const [r] = await rows();
+    expect(r.usage_status).toBe('partial');
+    expect(Number(r.input_tokens)).toBe(100);
+    expect(r.output_tokens).toBeNull();
+  });
+
+  test('all-null usage collapses to unknown with no usage row data', async () => {
+    const attempt = beginChatUsageAttempt({ boundary: 'gateway.chat', modelRaw: 'anthropic:claude-haiku-4-5', model: 'anthropic:claude-haiku-4-5' });
+    await attempt.finish({
+      requestStatus: 'succeeded',
+      usageStatus: 'final',
+      usage: { input_tokens: null, output_tokens: null, cache_read_tokens: null, cache_creation_tokens: null },
+    });
+    const [r] = await rows();
+    expect(r.usage_status).toBe('unknown');
+    expect(r.input_tokens).toBeNull();
+    expect(r.cost_usd).toBeNull();
+  });
+
+  test('NaN token counts are sanitized to null, never written', async () => {
+    const attempt = beginChatUsageAttempt({ boundary: 'gateway.chat', modelRaw: 'anthropic:claude-haiku-4-5', model: 'anthropic:claude-haiku-4-5' });
+    await attempt.finish({
+      requestStatus: 'succeeded',
+      usageStatus: 'final',
+      usage: { input_tokens: NaN, output_tokens: 5, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    });
+    const [r] = await rows();
+    expect(r.input_tokens).toBeNull();
+    expect(r.usage_status).toBe('partial');
+  });
+
+  test('rate_snapshot round-trips as a jsonb OBJECT, not a double-encoded string', async () => {
+    const attempt = beginChatUsageAttempt({
+      boundary: 'gateway.chat',
+      modelRaw: 'anthropic:claude-sonnet-5',
+      model: 'anthropic:claude-sonnet-5',
+      cacheWriteTtl: '5m',
+    });
+    await attempt.finish({
+      requestStatus: 'succeeded',
+      usageStatus: 'final',
+      usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    });
+    await flushChatUsage();
+    const [probe] = await engine.executeRaw<{ t: string; in_rate: string | null }>(
+      `SELECT jsonb_typeof(rate_snapshot) AS t, rate_snapshot ->> 'input_per_mtok' AS in_rate FROM chat_usage_log`,
+    );
+    // The #2339 double-encode failure mode stores a jsonb STRING scalar:
+    // typeof 'string' and ->> returning NULL. Assert the healthy shape.
+    expect(probe.t).toBe('object');
+    expect(parseFloat(String(probe.in_rate))).toBe(CANONICAL_PRICING['anthropic:claude-sonnet-5']!.input);
+  });
+
+  test('started-INSERT failure: finish lands a single self-contained terminal row', async () => {
+    // Engine proxy: fail exactly the FIRST executeRaw (the started INSERT),
+    // let everything after through. sqlQueryForEngine funnels every write
+    // through engine.executeRaw, so this exercises the recovery INSERT path.
+    let failures = 0;
+    const flaky = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'executeRaw') {
+          return (...args: unknown[]) => {
+            if (failures === 0) {
+              failures++;
+              return Promise.reject(new Error('transient DB error'));
+            }
+            return (target as any).executeRaw(...args);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    setChatUsageEngine(flaky as any);
+    const attempt = beginChatUsageAttempt({ boundary: 'gateway.chat', modelRaw: 'anthropic:claude-haiku-4-5', model: 'anthropic:claude-haiku-4-5' });
+    await attempt.finish({
+      requestStatus: 'succeeded',
+      usageStatus: 'final',
+      usage: { input_tokens: 7, output_tokens: 3, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    });
+    setChatUsageEngine(engine);
+    expect(failures).toBe(1);
+    const all = await rows();
+    expect(all.length).toBe(1);
+    expect(all[0].request_status).toBe('succeeded');
+    expect(Number(all[0].input_tokens)).toBe(7);
+    expect(all[0].completed_at).toBeTruthy();
+    // The failed started-INSERT counted as one recorder failure — the gap is
+    // visible even though recovery succeeded.
+    expect(chatUsageRecorderFailures()).toBe(1);
   });
 
   test('no engine: no throw, recorder failure counted, nothing written', async () => {

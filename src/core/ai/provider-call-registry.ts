@@ -35,11 +35,16 @@ export type SpendOperation =
 export interface ProviderCallSite {
   /** Repo-relative file path. */
   file: string;
-  /** Why this file trips the scanner (import or endpoint literal). */
+  /** Why this file trips the scanner (import, endpoint literal, or subprocess). */
   trigger: string;
   operation: SpendOperation;
-  /** metered = writes to chat_usage_log; unmetered = declared out of scope. */
-  status: 'metered' | 'unmetered';
+  /**
+   * metered            = this file calls beginChatUsageAttempt itself
+   * metered_via_gateway = dispatches BELOW gateway.chat(); covered by the
+   *                       gateway boundary row (no second attempt row)
+   * unmetered          = declared out of measurement scope, with a reason
+   */
+  status: 'metered' | 'metered_via_gateway' | 'unmetered';
   /** Required for unmetered entries: why it is acceptable not to meter. */
   reason?: string;
 }
@@ -62,12 +67,41 @@ export const PROVIDER_CALL_REGISTRY: ProviderCallSite[] = [
     file: 'src/core/ai/providers/claude-cli-language-model.ts',
     trigger: 'claude CLI subprocess spawn (LanguageModelV2 adapter for the claude-cli recipe)',
     operation: 'chat',
-    status: 'metered',
+    status: 'metered_via_gateway',
     reason:
       'Dispatches BELOW gateway.chat() as an ai-sdk model, so its calls are '
       + 'already covered by the gateway.chat boundary row. claude-cli:* has '
       + 'no CANONICAL_PRICING entry, so those rows are correctly unpriced — '
       + 'subscription spend must not be costed at API list rates.',
+  },
+
+  // ── Custom fetch transports living BELOW gateway.chat() ────────────────
+  // These recipes install header/response-munging fetch wrappers into the
+  // AI SDK client; the dispatch they wrap is the gateway.chat boundary, so
+  // they carry no attempt row of their own (a second one would double-count).
+  {
+    file: 'src/core/ai/recipes/azure-openai.ts',
+    trigger: 'custom fetch transport under gateway dispatch',
+    operation: 'chat',
+    status: 'metered_via_gateway',
+  },
+  {
+    file: 'src/core/ai/recipes/deepseek.ts',
+    trigger: 'custom fetch transport under gateway dispatch (+ base URL literal)',
+    operation: 'chat',
+    status: 'metered_via_gateway',
+  },
+  {
+    file: 'src/core/ai/recipes/minimax.ts',
+    trigger: 'custom fetch transport under gateway dispatch',
+    operation: 'chat',
+    status: 'metered_via_gateway',
+  },
+  {
+    file: 'src/core/ai/recipes/openrouter.ts',
+    trigger: 'custom fetch transport under gateway dispatch (+ base URL literal)',
+    operation: 'chat',
+    status: 'metered_via_gateway',
   },
 
   // ── Declared unmetered paths (visible in get_usage coverage) ───────────

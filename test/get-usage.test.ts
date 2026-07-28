@@ -126,7 +126,7 @@ describe('get_usage', () => {
     const c1 = await insertFinal('anthropic:claude-sonnet-5', { in: 1_000_000, out: 500_000, cr: 200_000, cc: 100_000 });
     const c2 = await insertFinal('anthropic:claude-haiku-4-5', { in: 50_000, out: 10_000 });
     const res = await runOp();
-    expect(res.coverage.status).toBe('complete');
+    expect(res.coverage.status).toBe('complete_observed');
     expect(res.coverage.gaps).toEqual([]);
     expect(res.known_cost_lower_bound_usd).toBeCloseTo(c1 + c2, 10);
     expect(res.complete_calculated_cost_usd).toBeCloseTo(c1 + c2, 10);

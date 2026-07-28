@@ -36,7 +36,7 @@ import {
   extractUsageFromError as _extractUsageFromError,
   type BudgetKind,
 } from '../budget/budget-tracker.ts';
-import { beginChatUsageAttempt, setChatUsageEngine } from '../chat-usage.ts';
+import { beginChatUsageAttempt, setChatUsageEngine, sanitizeTokenCount, isAbortError } from '../chat-usage.ts';
 
 import type {
   AIGatewayConfig,
@@ -3418,6 +3418,37 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       ...(requestHeaders ? { headers: requestHeaders } : {}),
     });
 
+    // Ledger finish runs IMMEDIATELY after the provider returns — before
+    // block normalization — so a post-response parsing throw can't turn a
+    // billed, provider-confirmed call into a 'failed/unknown' row. Field
+    // presence is honored per-field: an SDK route that omits usage entirely
+    // lands as 'unknown' with NULL tokens (finish() enforces this), never as
+    // "final, 0 tokens, $0". Cache fields are absent-means-zero ONLY when
+    // the base usage was reported at all — Anthropic/OpenAI-compat routes
+    // omit cache counters when no caching occurred.
+    {
+      const u = (result as any).usage ?? {};
+      const pm = (result as any).providerMetadata as Record<string, any> | undefined;
+      const ac = pm?.anthropic ?? {};
+      const inObs = sanitizeTokenCount(u.inputTokens ?? u.promptTokens);
+      const outObs = sanitizeTokenCount(u.outputTokens ?? u.completionTokens);
+      const baseReported = inObs !== null || outObs !== null;
+      void usageAttempt.finish({
+        requestStatus: 'succeeded',
+        usageStatus: 'final',
+        usage: {
+          input_tokens: inObs,
+          output_tokens: outObs,
+          cache_read_tokens: baseReported
+            ? sanitizeTokenCount(ac.cacheReadInputTokens ?? ac.cache_read_input_tokens ?? u.cachedInputTokens) ?? 0
+            : null,
+          cache_creation_tokens: baseReported
+            ? sanitizeTokenCount(ac.cacheCreationInputTokens ?? ac.cache_creation_input_tokens) ?? 0
+            : null,
+        },
+      });
+    }
+
     // Normalize blocks. Vercel SDK gives us `result.content` (an array of typed
     // parts) for v6+; fall back to text + toolCalls for older shapes.
     const blocks: ChatBlock[] = [];
@@ -3458,16 +3489,6 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     const cacheReadTok = Number(anthropicCache.cacheReadInputTokens ?? anthropicCache.cache_read_input_tokens ?? usage.cachedInputTokens ?? 0);
     const cacheCreateTok = Number(anthropicCache.cacheCreationInputTokens ?? anthropicCache.cache_creation_input_tokens ?? 0);
     _recordBudget(`${recipe.id}:${modelId}`, inTok, outTok);
-    void usageAttempt.finish({
-      requestStatus: 'succeeded',
-      usageStatus: 'final',
-      usage: {
-        input_tokens: inTok,
-        output_tokens: outTok,
-        cache_read_tokens: cacheReadTok,
-        cache_creation_tokens: cacheCreateTok,
-      },
-    });
 
     return {
       text: blocks.filter(b => b.type === 'text').map(b => (b as { type: 'text'; text: string }).text).join(''),
@@ -3502,23 +3523,31 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     // timed-out call may or may not have been billed, and 0 would be
     // fabricated data.
     const probed = _extractUsageFromError(err, { inputTokens: -1, outputTokens: -1 });
-    const hasRealUsage = probed.inputTokens !== -1 || probed.outputTokens !== -1;
     void usageAttempt.finish({
-      requestStatus: (err as { name?: string } | null)?.name === 'AbortError' ? 'aborted' : 'failed',
-      usageStatus: hasRealUsage ? 'partial' : 'unknown',
-      ...(hasRealUsage
-        ? {
-            usage: {
-              input_tokens: Math.max(0, probed.inputTokens === -1 ? 0 : probed.inputTokens),
-              output_tokens: Math.max(0, probed.outputTokens === -1 ? 0 : probed.outputTokens),
-              cache_read_tokens: 0,
-              cache_creation_tokens: 0,
-            },
-          }
-        : {}),
+      requestStatus: isAbortError(err) ? 'aborted' : 'failed',
+      usageStatus: 'partial',
+      // Per-field: only what the error actually carried. Fields the probe
+      // did not find stay null (unobserved ≠ free) — cache counters are
+      // never surfaced on errors, so they stay null too. finish() downgrades
+      // an all-null observation to 'unknown' with no usage.
+      usage: {
+        input_tokens: probed.inputTokens === -1 ? null : sanitizeTokenCount(probed.inputTokens),
+        output_tokens: probed.outputTokens === -1 ? null : sanitizeTokenCount(probed.outputTokens),
+        cache_read_tokens: null,
+        cache_creation_tokens: null,
+      },
       errorClass: err instanceof Error ? err.name : typeof err,
     });
     throw normalizeAIError(err, `chat(${recipe.id}:${modelId})`);
+  } finally {
+    // Backstop: if any path above escaped without finalizing (finish is
+    // idempotent — this is a no-op on the normal paths), never leave the
+    // row as a permanent 'started' orphan when the process survived.
+    void usageAttempt.finish({
+      requestStatus: 'failed',
+      usageStatus: 'unknown',
+      errorClass: 'unfinalized_attempt',
+    });
   }
 }
 

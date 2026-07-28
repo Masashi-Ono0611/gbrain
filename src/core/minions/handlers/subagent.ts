@@ -27,7 +27,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { MinionJobContext, MinionJob } from '../types.ts';
 import { UnrecoverableError } from '../types.ts';
-import { beginChatUsageAttempt, type ChatUsageAttempt } from '../../chat-usage.ts';
+import { beginChatUsageAttempt, isAbortError, type ChatUsageAttempt } from '../../chat-usage.ts';
 import { extractUsageFromError } from '../../budget/budget-tracker.ts';
 import type {
   ContentBlock,
@@ -610,28 +610,41 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           jobId: ctx.id,
         });
         assistantMsg = await client.create(params, { signal: combinedSignal });
+        // Ledger finish IMMEDIATELY after the provider returns — nothing may
+        // sit between a billed response and its ledger row (a throw in the
+        // bookkeeping below must not relabel real spend as failed/unknown).
+        // Anthropic Message.usage carries input/output always; cache fields
+        // are absent-means-zero on this SDK shape.
+        if (usageAttempt) {
+          void usageAttempt.finish({
+            requestStatus: 'succeeded',
+            usageStatus: 'final',
+            usage: {
+              input_tokens: assistantMsg.usage?.input_tokens ?? null,
+              output_tokens: assistantMsg.usage?.output_tokens ?? null,
+              cache_read_tokens: (assistantMsg.usage as any)?.cache_read_input_tokens ?? 0,
+              cache_creation_tokens: (assistantMsg.usage as any)?.cache_creation_input_tokens ?? 0,
+            },
+          });
+          usageAttempt = null;
+        }
       } catch (err) {
         // Release lease eagerly on error so we don't starve capacity.
         await releaseLease(engine, lease.leaseId!).catch(() => {});
-        // Ledger: tokens stay NULL unless the error itself carried real
-        // provider-reported usage (then it's a billed lower bound). Never 0,
-        // never an estimate — see chat-usage.ts.
+        // Ledger: per-field — only what the error actually carried; fields
+        // the probe did not find stay NULL (unobserved, not free). See
+        // chat-usage.ts for the finish() invariants.
         if (usageAttempt) {
           const probed = extractUsageFromError(err, { inputTokens: -1, outputTokens: -1 });
-          const hasRealUsage = probed.inputTokens !== -1 || probed.outputTokens !== -1;
           void usageAttempt.finish({
-            requestStatus: (err as { name?: string } | null)?.name?.includes('Abort') ? 'aborted' : 'failed',
-            usageStatus: hasRealUsage ? 'partial' : 'unknown',
-            ...(hasRealUsage
-              ? {
-                  usage: {
-                    input_tokens: Math.max(0, probed.inputTokens === -1 ? 0 : probed.inputTokens),
-                    output_tokens: Math.max(0, probed.outputTokens === -1 ? 0 : probed.outputTokens),
-                    cache_read_tokens: 0,
-                    cache_creation_tokens: 0,
-                  },
-                }
-              : {}),
+            requestStatus: isAbortError(err) ? 'aborted' : 'failed',
+            usageStatus: 'partial',
+            usage: {
+              input_tokens: probed.inputTokens === -1 ? null : probed.inputTokens,
+              output_tokens: probed.outputTokens === -1 ? null : probed.outputTokens,
+              cache_read_tokens: null,
+              cache_creation_tokens: null,
+            },
             errorClass: err instanceof Error ? err.name : typeof err,
           });
           usageAttempt = null;
@@ -657,20 +670,6 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       const outTokens = assistantMsg.usage?.output_tokens ?? 0;
       const cacheRead = (assistantMsg.usage as any)?.cache_read_input_tokens ?? 0;
       const cacheCreate = (assistantMsg.usage as any)?.cache_creation_input_tokens ?? 0;
-
-      if (usageAttempt) {
-        void usageAttempt.finish({
-          requestStatus: 'succeeded',
-          usageStatus: 'final',
-          usage: {
-            input_tokens: inTokens,
-            output_tokens: outTokens,
-            cache_read_tokens: cacheRead,
-            cache_creation_tokens: cacheCreate,
-          },
-        });
-        usageAttempt = null;
-      }
 
       tokenTotals.in += inTokens;
       tokenTotals.out += outTokens;

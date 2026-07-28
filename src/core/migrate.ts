@@ -5751,9 +5751,11 @@ export const MIGRATIONS: Migration[] = [
         model_raw TEXT,
         model TEXT,
         provider_id TEXT,
-        request_status TEXT NOT NULL DEFAULT 'started',
-        usage_status TEXT NOT NULL DEFAULT 'pending',
-        cache_write_ttl TEXT,
+        request_status TEXT NOT NULL DEFAULT 'started'
+          CHECK (request_status IN ('started','succeeded','failed','aborted')),
+        usage_status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (usage_status IN ('pending','final','partial','unknown')),
+        cache_write_ttl TEXT CHECK (cache_write_ttl IN ('5m','1h')),
         input_tokens BIGINT,
         output_tokens BIGINT,
         cache_read_tokens BIGINT,
@@ -5783,9 +5785,11 @@ export const MIGRATIONS: Migration[] = [
           model_raw TEXT,
           model TEXT,
           provider_id TEXT,
-          request_status TEXT NOT NULL DEFAULT 'started',
-          usage_status TEXT NOT NULL DEFAULT 'pending',
-          cache_write_ttl TEXT,
+          request_status TEXT NOT NULL DEFAULT 'started'
+          CHECK (request_status IN ('started','succeeded','failed','aborted')),
+          usage_status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (usage_status IN ('pending','final','partial','unknown')),
+          cache_write_ttl TEXT CHECK (cache_write_ttl IN ('5m','1h')),
           input_tokens BIGINT,
           output_tokens BIGINT,
           cache_read_tokens BIGINT,

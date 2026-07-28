@@ -54,7 +54,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from './engine.ts';
 import { sqlQueryForEngine } from './sql-query.ts';
-import { CANONICAL_PRICING } from './model-pricing.ts';
+import { canonicalLookup } from './model-pricing.ts';
 import { registerBackgroundWorkDrainer } from './background-work.ts';
 import { VERSION } from '../version.ts';
 
@@ -124,59 +124,90 @@ export interface RateSnapshot {
 }
 
 /**
- * Build the applied-rate snapshot for a normalized `provider:model` id.
- * Returns null when the model has no entry in CANONICAL_PRICING — the row
- * is then stored unpriced (cost_usd NULL) instead of guessed.
+ * Build the applied-rate snapshot for a model id. Lookup goes through
+ * `canonicalLookup`, which accepts colon (`anthropic:claude-…`), bare and
+ * slash spellings — so a boundary that passes a bare id still prices instead
+ * of silently landing every row in `pricing_missing`. Returns null when the
+ * model has no pricing entry — the row is then stored unpriced (cost_usd
+ * NULL) instead of guessed.
+ *
+ * The TTL is validated against the two billable values; anything else
+ * (config injecting an unexpected string through cacheControl deep-merge)
+ * yields cache_write_per_mtok null — fail closed, never a silent 5m default.
  */
 export function buildRateSnapshot(
   model: string | null | undefined,
-  cacheWriteTtl: CacheWriteTtl | null,
+  cacheWriteTtl: string | null | undefined,
 ): RateSnapshot | null {
   if (!model) return null;
-  const pricing = CANONICAL_PRICING[model];
+  const pricing = canonicalLookup(model);
   if (!pricing) return null;
-  const isAnthropic = model.startsWith('anthropic:');
+  const isAnthropic = model.startsWith('anthropic:') || !model.includes(':');
+  const ttl: CacheWriteTtl | null =
+    cacheWriteTtl === '5m' || cacheWriteTtl === '1h' ? cacheWriteTtl : null;
   return {
     input_per_mtok: pricing.input,
     output_per_mtok: pricing.output,
     cache_read_per_mtok: isAnthropic
       ? pricing.input * ANTHROPIC_CACHE_MULTIPLIERS.read
       : null,
-    cache_write_per_mtok: isAnthropic && cacheWriteTtl
-      ? pricing.input * (cacheWriteTtl === '1h'
+    cache_write_per_mtok: isAnthropic && ttl
+      ? pricing.input * (ttl === '1h'
           ? ANTHROPIC_CACHE_MULTIPLIERS.write_1h
           : ANTHROPIC_CACHE_MULTIPLIERS.write_5m)
       : null,
-    cache_write_ttl: isAnthropic ? cacheWriteTtl : null,
+    cache_write_ttl: isAnthropic ? ttl : null,
   };
 }
 
+/**
+ * Per-attempt token observation. `null` means "the provider did not report
+ * this field" — never coerce it to 0: absent is not the same as free, and
+ * the first cut of this feature got exactly that wrong.
+ */
 export interface UsageCounts {
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  cache_creation_tokens: number;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
+}
+
+/** Finite non-negative number, else null. NaN/Infinity never reach the DB. */
+export function sanitizeTokenCount(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
 }
 
 /**
- * Price a final usage observation against a snapshot. Returns null (unpriced)
- * whenever a nonzero token class has no verified rate — fail closed, never
- * silently drop a cost component.
+ * Price a usage observation against a snapshot, as a LOWER BOUND: null
+ * fields contribute nothing (they are unobserved, not free), and any
+ * observed nonzero token class without a verified rate makes the whole
+ * result null — fail closed, never silently drop a cost component.
  */
 export function computeCostUsd(usage: UsageCounts, rate: RateSnapshot | null): number | null {
   if (!rate) return null;
   const M = 1_000_000;
-  let cost = (usage.input_tokens / M) * rate.input_per_mtok
-           + (usage.output_tokens / M) * rate.output_per_mtok;
-  if (usage.cache_read_tokens > 0) {
+  let cost = 0;
+  if (usage.input_tokens !== null) cost += (usage.input_tokens / M) * rate.input_per_mtok;
+  if (usage.output_tokens !== null) cost += (usage.output_tokens / M) * rate.output_per_mtok;
+  if (usage.cache_read_tokens !== null && usage.cache_read_tokens > 0) {
     if (rate.cache_read_per_mtok === null) return null;
     cost += (usage.cache_read_tokens / M) * rate.cache_read_per_mtok;
   }
-  if (usage.cache_creation_tokens > 0) {
+  if (usage.cache_creation_tokens !== null && usage.cache_creation_tokens > 0) {
     if (rate.cache_write_per_mtok === null) return null;
     cost += (usage.cache_creation_tokens / M) * rate.cache_write_per_mtok;
   }
-  return cost;
+  return Number.isFinite(cost) ? cost : null;
+}
+
+/**
+ * Abort classification shared by both boundaries so the same user action
+ * lands with the same request_status everywhere. Covers fetch/AI-SDK
+ * 'AbortError', Anthropic SDK 'APIUserAbortError' and DOMException variants.
+ */
+export function isAbortError(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return typeof name === 'string' && name.includes('Abort');
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +242,12 @@ export interface AttemptStart {
 export interface AttemptFinish {
   requestStatus: Exclude<RequestStatus, 'started'>;
   usageStatus: Exclude<UsageStatus, 'pending'>;
-  /** Required when usageStatus is 'final' or 'partial'; must be omitted for 'unknown'. */
+  /**
+   * Per-field observation; null = provider did not report that field.
+   * finish() enforces the invariants: all-null (or absent) usage forces
+   * usageStatus 'unknown'; a 'final' claim with any null field is
+   * downgraded to 'partial'. NaN/Infinity are sanitized to null.
+   */
   usage?: UsageCounts;
   /** Normalized model/provider learned during the call (post-resolution). */
   model?: string;
@@ -307,18 +343,46 @@ export function beginChatUsageAttempt(start: AttemptStart): ChatUsageAttempt {
         const inserted = await insertPromise;
         const model = outcome.model ?? start.model ?? null;
         const providerId = outcome.providerId ?? start.providerId ?? null;
-        const usage = outcome.usage ?? null;
-        const rate = usage ? buildRateSnapshot(model, cacheWriteTtl) : null;
-        const cost = usage && outcome.usageStatus !== 'unknown'
-          ? computeCostUsd(usage, rate)
+
+        // Sanitize and enforce the status/usage invariants HERE, not at the
+        // call sites: 'final' requires a complete, finite observation. A
+        // provider that returned HTTP 200 with missing usage fields must not
+        // produce "final, 0 tokens, $0" — that window would then claim
+        // completeness at a fabricated total.
+        let usage: UsageCounts | null = outcome.usage
+          ? {
+              input_tokens: sanitizeTokenCount(outcome.usage.input_tokens),
+              output_tokens: sanitizeTokenCount(outcome.usage.output_tokens),
+              cache_read_tokens: sanitizeTokenCount(outcome.usage.cache_read_tokens),
+              cache_creation_tokens: sanitizeTokenCount(outcome.usage.cache_creation_tokens),
+            }
           : null;
+        let usageStatus: Exclude<UsageStatus, 'pending'> = outcome.usageStatus;
+        const fields = usage
+          ? [usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_creation_tokens]
+          : [];
+        const allNull = fields.every(f => f === null);
+        if (!usage || allNull) {
+          usage = null;
+          usageStatus = 'unknown';
+        } else if (usageStatus === 'final' && fields.some(f => f === null)) {
+          usageStatus = 'partial';
+        }
+
+        const rate = usage ? buildRateSnapshot(model, cacheWriteTtl) : null;
+        const cost = usage ? computeCostUsd(usage, rate) : null;
         const completedAt = new Date().toISOString();
         const sql = sqlQueryForEngine(engine);
+        // rate_snapshot binds as text and parses through an explicit
+        // ::text::jsonb cast — the sanctioned form from docs/ENGINES.md
+        // (#2339: a bare jsonb bind double-encodes under postgres.js and
+        // PGLite hides it).
+        const rateJson = rate ? JSON.stringify(rate) : null;
         if (inserted) {
           await sql`
             UPDATE chat_usage_log SET
               request_status = ${outcome.requestStatus},
-              usage_status = ${outcome.usageStatus},
+              usage_status = ${usageStatus},
               model = ${model},
               provider_id = ${providerId},
               input_tokens = ${usage ? usage.input_tokens : null},
@@ -327,7 +391,7 @@ export function beginChatUsageAttempt(start: AttemptStart): ChatUsageAttempt {
               cache_creation_tokens = ${usage ? usage.cache_creation_tokens : null},
               rate_source = ${rate ? 'model-pricing.ts:CANONICAL_PRICING' : null},
               rate_version = ${rate ? VERSION : null},
-              rate_snapshot = ${rate ? JSON.stringify(rate) : null},
+              rate_snapshot = ${rateJson}::text::jsonb,
               cost_usd = ${cost},
               error_class = ${outcome.errorClass ?? null},
               completed_at = ${completedAt}
@@ -346,12 +410,12 @@ export function beginChatUsageAttempt(start: AttemptStart): ChatUsageAttempt {
             ) VALUES (
               ${attemptId}, ${start.boundary}, ${phase}, ${start.jobId ?? null},
               ${start.modelRaw}, ${model}, ${providerId},
-              ${outcome.requestStatus}, ${outcome.usageStatus}, ${cacheWriteTtl},
+              ${outcome.requestStatus}, ${usageStatus}, ${cacheWriteTtl},
               ${usage ? usage.input_tokens : null}, ${usage ? usage.output_tokens : null},
               ${usage ? usage.cache_read_tokens : null}, ${usage ? usage.cache_creation_tokens : null},
               ${rate ? 'model-pricing.ts:CANONICAL_PRICING' : null},
               ${rate ? VERSION : null},
-              ${rate ? JSON.stringify(rate) : null},
+              ${rateJson}::text::jsonb,
               ${cost}, ${outcome.errorClass ?? null},
               ${startedAt}, ${completedAt}
             )

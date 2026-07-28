@@ -2586,7 +2586,13 @@ const get_usage: Operation = {
     if (totals.unpriced_calls > 0) gaps.push({ type: 'pricing_missing', calls: totals.unpriced_calls, note: 'tokens recorded but no verified rate; excluded from cost sums' });
     if (recorderFailures > 0) gaps.push({ type: 'recorder_failures_this_process', count: recorderFailures, note: 'ledger writes that failed in THIS process; cross-process write failures are not observable' });
 
+    // 'complete_observed', not 'complete': completeness is judged over the
+    // rows this ledger observed. A process that failed BOTH ledger writes for
+    // an attempt leaves nothing behind for any later reader to count — an
+    // unobservable gap by construction, so the status name must not claim
+    // more than the ledger can know.
     const complete = gaps.length === 0;
+    const totalObserved = totals.final_calls + totals.partial_calls;
 
     return {
       window: { since: since.toISOString(), until: until.toISOString() },
@@ -2605,7 +2611,7 @@ const get_usage: Operation = {
       complete_calculated_cost_usd: complete ? totals.known_cost_lower_bound_usd : null,
       in_flight_calls: inFlightCalls,
       coverage: {
-        status: complete ? 'complete' : 'partial',
+        status: complete ? 'complete_observed' : 'partial',
         scope: {
           operation: 'chat',
           boundaries: ['gateway.chat', 'subagent.legacy_anthropic'],
@@ -2618,6 +2624,14 @@ const get_usage: Operation = {
           + 'model-pricing.ts published list rates. Promotional, negotiated '
           + 'and invoice-level pricing (credits, tax, tiers) are NOT modeled: '
           + 'token counts are the ground truth, costs are labeled estimates.',
+          'complete_observed means gap-free over OBSERVED rows: an attempt '
+          + 'whose ledger writes all failed in a crashed process leaves no '
+          + 'row and cannot be counted by any reader.',
+          ...(totalObserved === 0
+            ? ['window contains no recorded attempts — an empty window is '
+               + 'trivially gap-free, not evidence of zero spend outside the '
+               + 'ledger\'s scope.']
+            : []),
         ],
       },
     };

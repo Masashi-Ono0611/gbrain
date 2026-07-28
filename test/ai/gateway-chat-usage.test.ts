@@ -151,17 +151,52 @@ describe('gateway.chat boundary', () => {
     expect(Number(r.output_tokens)).toBe(3);
   });
 
-  test('abort: request_status aborted', async () => {
+  test('abort: request_status aborted (both AbortError and APIUserAbortError spellings)', async () => {
+    for (const name of ['AbortError', 'APIUserAbortError']) {
+      await engine.executeRaw('DELETE FROM chat_usage_log');
+      __setGenerateTextTransportForTests(async () => {
+        const err = new Error('aborted');
+        err.name = name;
+        throw err;
+      });
+      await expect(
+        chat({ model: 'anthropic:claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] }),
+      ).rejects.toThrow();
+      const [r] = await rows();
+      expect(r.request_status).toBe('aborted');
+      expect(r.usage_status).toBe('unknown');
+    }
+  });
+
+  test('success with NO usage fields: unknown + NULL tokens, never final zeros', async () => {
+    __setGenerateTextTransportForTests(async () => ({
+      content: [{ type: 'text', text: 'ok' }],
+      finishReason: 'stop',
+      // no usage at all — an SDK route that dropped the counters
+    }) as any);
+    await chat({ model: 'anthropic:claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] });
+    const [r] = await rows();
+    expect(r.request_status).toBe('succeeded');
+    expect(r.usage_status).toBe('unknown');
+    expect(r.input_tokens).toBeNull();
+    expect(r.output_tokens).toBeNull();
+    expect(r.cache_read_tokens).toBeNull();
+    expect(r.cost_usd).toBeNull();
+  });
+
+  test('error carrying only input tokens: output stays NULL (unobserved is not free)', async () => {
     __setGenerateTextTransportForTests(async () => {
-      const err = new Error('aborted');
-      err.name = 'AbortError';
+      const err = new Error('half-reported');
+      (err as any).usage = { input_tokens: 555 };
       throw err;
     });
     await expect(
       chat({ model: 'anthropic:claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] }),
     ).rejects.toThrow();
     const [r] = await rows();
-    expect(r.request_status).toBe('aborted');
-    expect(r.usage_status).toBe('unknown');
+    expect(r.usage_status).toBe('partial');
+    expect(Number(r.input_tokens)).toBe(555);
+    expect(r.output_tokens).toBeNull();
+    expect(r.cache_read_tokens).toBeNull();
   });
 });

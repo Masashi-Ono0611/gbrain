@@ -30,6 +30,8 @@ const SCAN_INFRA_ALLOWLIST: Record<string, string> = {
   'src/core/ai/provider-call-registry.ts': 'the registry itself (doc strings)',
   'src/core/ai/recipes/voyage.ts': 'base_url_default config string; dispatch happens in gateway.ts',
   'src/core/ai/recipes/zeroentropyai.ts': 'base_url_default config string; dispatch happens in gateway.ts',
+  'src/core/ai/recipes/groq.ts': 'base_url_default config string; dispatch happens in gateway.ts',
+  'src/core/ai/recipes/together.ts': 'base_url_default config string; dispatch happens in gateway.ts',
   'src/core/retrieval-upgrade-prompt.ts': 'user-facing prompt text mentions the endpoint; no dispatch',
 };
 
@@ -42,6 +44,12 @@ const ENDPOINT_LITERALS = [
   'api.openai.com',
   'api.voyageai.com',
   'api.zeroentropy.dev',
+  'api.deepseek.com',
+  'api.groq.com',
+  'api.together.xyz',
+  'openrouter.ai',
+  'api.minimax',
+  'cognitiveservices.azure.com',
   'audio/transcriptions',
   '/multimodalembeddings',
 ];
@@ -135,6 +143,20 @@ describe('provider-call registry tripwire', () => {
   test('infra allowlist entries are not stale', () => {
     const stale = Object.keys(SCAN_INFRA_ALLOWLIST).filter(f => !hits.has(f));
     expect(stale).toEqual([]);
+  });
+
+  test('metered files actually contain the recorder call (not just a claim)', () => {
+    // A registry row saying 'metered' is a claim; this checks the file
+    // really invokes the ledger. metered_via_gateway files are excluded —
+    // their coverage comes from gateway.ts, which this loop does include.
+    for (const e of PROVIDER_CALL_REGISTRY) {
+      if (e.status !== 'metered') continue;
+      const content = readFileSync(join(SRC_ROOT, '..', e.file), 'utf-8');
+      expect(
+        content.includes('beginChatUsageAttempt'),
+        `${e.file} is registered as metered but never calls beginChatUsageAttempt`,
+      ).toBe(true);
+    }
   });
 
   test('unmetered entries always carry a reason', () => {

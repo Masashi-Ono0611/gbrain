@@ -756,6 +756,13 @@ describe('chat-usage ledger at the subagent boundary', () => {
     expect(Number(r.input_tokens)).toBe(10);
     expect(Number(r.output_tokens)).toBe(5);
     expect(r.cache_write_ttl).toBe('5m');
+    // Pricing must actually land on this path (the model id spelling the
+    // handler carries — qualified or bare — must resolve via canonicalLookup;
+    // a spelling mismatch would silently leave every legacy row unpriced).
+    expect(r.model).toBeTruthy();
+    expect(r.cost_usd).not.toBeNull();
+    expect(Number(r.cost_usd)).toBeGreaterThan(0);
+    expect(r.rate_snapshot).toBeTruthy();
   });
 
   test('two-turn tool run writes one row per provider call', async () => {
