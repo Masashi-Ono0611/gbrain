@@ -5724,6 +5724,87 @@ export const MIGRATIONS: Migration[] = [
         ON take_proposals (source_id, page_slug, content_hash, prompt_version, md5(claim_text));
     `,
   },
+  {
+    version: 126,
+    name: 'chat_usage_log',
+    // gbrain#3392/#3425: provider-boundary lifecycle ledger for chat LLM
+    // spend (see src/core/chat-usage.ts for the full design contract).
+    // One row per provider attempt, opened before the call ('started' /
+    // 'pending') and finalized in finally. Token columns are NULL when the
+    // provider never reported usage — never 0, never an estimate: a
+    // timed-out call may still have been billed, and 0 would be fabricated
+    // data. cost_usd is NULL for unpriced rows (no pricing entry, or cache
+    // tokens on a provider whose cache billing semantics are unverified).
+    //
+    // Volume: one row per LLM call — hundreds/day on an active brain, so
+    // growth is modest; the started_at index covers the get_usage window
+    // scan. Same shape on both engines.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS chat_usage_log (
+        id SERIAL PRIMARY KEY,
+        attempt_id TEXT NOT NULL UNIQUE,
+        boundary TEXT NOT NULL,
+        operation TEXT NOT NULL DEFAULT 'chat',
+        phase TEXT,
+        job_id BIGINT,
+        model_raw TEXT,
+        model TEXT,
+        provider_id TEXT,
+        request_status TEXT NOT NULL DEFAULT 'started',
+        usage_status TEXT NOT NULL DEFAULT 'pending',
+        cache_write_ttl TEXT,
+        input_tokens BIGINT,
+        output_tokens BIGINT,
+        cache_read_tokens BIGINT,
+        cache_creation_tokens BIGINT,
+        rate_source TEXT,
+        rate_version TEXT,
+        rate_snapshot JSONB,
+        cost_usd DOUBLE PRECISION,
+        error_class TEXT,
+        started_at TIMESTAMPTZ NOT NULL,
+        completed_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS idx_chat_usage_log_started
+        ON chat_usage_log (started_at);
+      CREATE INDEX IF NOT EXISTS idx_chat_usage_log_phase_started
+        ON chat_usage_log (phase, started_at);
+    `,
+    sqlFor: {
+      pglite: `
+        CREATE TABLE IF NOT EXISTS chat_usage_log (
+          id SERIAL PRIMARY KEY,
+          attempt_id TEXT NOT NULL UNIQUE,
+          boundary TEXT NOT NULL,
+          operation TEXT NOT NULL DEFAULT 'chat',
+          phase TEXT,
+          job_id BIGINT,
+          model_raw TEXT,
+          model TEXT,
+          provider_id TEXT,
+          request_status TEXT NOT NULL DEFAULT 'started',
+          usage_status TEXT NOT NULL DEFAULT 'pending',
+          cache_write_ttl TEXT,
+          input_tokens BIGINT,
+          output_tokens BIGINT,
+          cache_read_tokens BIGINT,
+          cache_creation_tokens BIGINT,
+          rate_source TEXT,
+          rate_version TEXT,
+          rate_snapshot JSONB,
+          cost_usd DOUBLE PRECISION,
+          error_class TEXT,
+          started_at TIMESTAMPTZ NOT NULL,
+          completed_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_usage_log_started
+          ON chat_usage_log (started_at);
+        CREATE INDEX IF NOT EXISTS idx_chat_usage_log_phase_started
+          ON chat_usage_log (phase, started_at);
+      `,
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

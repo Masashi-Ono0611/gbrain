@@ -36,6 +36,7 @@ import {
   extractUsageFromError as _extractUsageFromError,
   type BudgetKind,
 } from '../budget/budget-tracker.ts';
+import { beginChatUsageAttempt, setChatUsageEngine } from '../chat-usage.ts';
 
 import type {
   AIGatewayConfig,
@@ -581,6 +582,11 @@ export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise
   ]) {
     if (m) registerExtendedModel(m);
   }
+  // Wire the chat-usage ledger (gbrain#3392) to this engine. Every
+  // DB-connected process passes through here, so both chat boundaries
+  // (gateway.chat and the legacy subagent loop) get a write path without
+  // threading the engine through call signatures.
+  setChatUsageEngine(engine);
   return _config;
 }
 
@@ -3387,6 +3393,17 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       }
     : opts.system;
 
+  // Lifecycle ledger (gbrain#3392): open the attempt row BEFORE the provider
+  // call so failures/aborts land in the ledger too. The request-level cache
+  // TTL is captured here because a single request carries one TTL for all
+  // its breakpoints (cacheControlValue is derived once and reused above).
+  const usageAttempt = beginChatUsageAttempt({
+    boundary: 'gateway.chat',
+    modelRaw: modelStr,
+    model: `${recipe.id}:${modelId}`,
+    providerId: recipe.id,
+    cacheWriteTtl: cacheControlValue ? (cacheControlValue.ttl ?? '5m') : null,
+  });
   try {
     const result = await _generateTextTransport({
       model,
@@ -3438,7 +3455,19 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
 
     const inTok = Number(usage.inputTokens ?? usage.promptTokens ?? 0);
     const outTok = Number(usage.outputTokens ?? usage.completionTokens ?? 0);
+    const cacheReadTok = Number(anthropicCache.cacheReadInputTokens ?? anthropicCache.cache_read_input_tokens ?? usage.cachedInputTokens ?? 0);
+    const cacheCreateTok = Number(anthropicCache.cacheCreationInputTokens ?? anthropicCache.cache_creation_input_tokens ?? 0);
     _recordBudget(`${recipe.id}:${modelId}`, inTok, outTok);
+    void usageAttempt.finish({
+      requestStatus: 'succeeded',
+      usageStatus: 'final',
+      usage: {
+        input_tokens: inTok,
+        output_tokens: outTok,
+        cache_read_tokens: cacheReadTok,
+        cache_creation_tokens: cacheCreateTok,
+      },
+    });
 
     return {
       text: blocks.filter(b => b.type === 'text').map(b => (b as { type: 'text'; text: string }).text).join(''),
@@ -3450,8 +3479,8 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
         // `usage.cachedInputTokens` is the AI SDK's provider-neutral cache-read
         // count — it's how OpenAI-compatible routes (OpenRouter's
         // prompt_tokens_details.cached_tokens) surface cache hits.
-        cache_read_tokens: Number(anthropicCache.cacheReadInputTokens ?? anthropicCache.cache_read_input_tokens ?? usage.cachedInputTokens ?? 0),
-        cache_creation_tokens: Number(anthropicCache.cacheCreationInputTokens ?? anthropicCache.cache_creation_input_tokens ?? 0),
+        cache_read_tokens: cacheReadTok,
+        cache_creation_tokens: cacheCreateTok,
       },
       model: `${recipe.id}:${modelId}`,
       providerId: recipe.id,
@@ -3465,6 +3494,30 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       outputTokens: maxOutputTokens,
     });
     _recordBudget(`${recipe.id}:${modelId}`, fallback.inputTokens, fallback.outputTokens);
+    // Ledger (gbrain#3392): the budget tracker above deliberately charges a
+    // worst-case CEILING (its job is enforcement), but the ledger must not
+    // present ceilings as observations. Probe the error with a sentinel: if
+    // it carried real provider-reported usage, record it as a billed lower
+    // bound ('partial'); otherwise tokens stay NULL ('unknown') — a
+    // timed-out call may or may not have been billed, and 0 would be
+    // fabricated data.
+    const probed = _extractUsageFromError(err, { inputTokens: -1, outputTokens: -1 });
+    const hasRealUsage = probed.inputTokens !== -1 || probed.outputTokens !== -1;
+    void usageAttempt.finish({
+      requestStatus: (err as { name?: string } | null)?.name === 'AbortError' ? 'aborted' : 'failed',
+      usageStatus: hasRealUsage ? 'partial' : 'unknown',
+      ...(hasRealUsage
+        ? {
+            usage: {
+              input_tokens: Math.max(0, probed.inputTokens === -1 ? 0 : probed.inputTokens),
+              output_tokens: Math.max(0, probed.outputTokens === -1 ? 0 : probed.outputTokens),
+              cache_read_tokens: 0,
+              cache_creation_tokens: 0,
+            },
+          }
+        : {}),
+      errorClass: err instanceof Error ? err.name : typeof err,
+    });
     throw normalizeAIError(err, `chat(${recipe.id}:${modelId})`);
   }
 }

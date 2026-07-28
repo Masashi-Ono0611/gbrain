@@ -709,3 +709,95 @@ describe('subagent handler output-token cap (#2778)', () => {
     expect(texts.some(t => t.includes('truncated') && t.includes('DROPPED'))).toBe(true);
   });
 });
+
+// ── Chat-usage ledger boundary (gbrain#3392) ─────────────────
+//
+// The legacy Anthropic-direct loop is a provider boundary of its own — the
+// exact path the first cut of the usage ledger missed. These tests run the
+// REAL handler against the fake client and assert the ledger row, so
+// removing the beginChatUsageAttempt wiring in subagent.ts fails here.
+
+import {
+  setChatUsageEngine,
+  flushChatUsage,
+  __resetChatUsageForTests,
+} from '../src/core/chat-usage.ts';
+
+describe('chat-usage ledger at the subagent boundary', () => {
+  beforeEach(async () => {
+    __resetChatUsageForTests();
+    setChatUsageEngine(engine);
+    await engine.executeRaw('DELETE FROM chat_usage_log');
+  });
+
+  afterAll(() => {
+    setChatUsageEngine(null);
+  });
+
+  test('happy path writes one final row per LLM turn with the 5m cache TTL', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'hello world' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi' });
+    await handler(ctx);
+
+    await flushChatUsage();
+    const rows = await engine.executeRaw<any>(
+      'SELECT * FROM chat_usage_log ORDER BY id',
+    );
+    expect(rows.length).toBe(1);
+    const r = rows[0];
+    expect(r.boundary).toBe('subagent.legacy_anthropic');
+    expect(Number(r.job_id)).toBe(ctx.id);
+    expect(r.provider_id).toBe('anthropic');
+    expect(r.request_status).toBe('succeeded');
+    expect(r.usage_status).toBe('final');
+    expect(Number(r.input_tokens)).toBe(10);
+    expect(Number(r.output_tokens)).toBe(5);
+    expect(r.cache_write_ttl).toBe('5m');
+  });
+
+  test('two-turn tool run writes one row per provider call', async () => {
+    const tool = makeEchoTool();
+    const client = new FakeMessagesClient([
+      {
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'echo', input: { value: 'v1' } } as any],
+        stop_reason: 'tool_use' as any,
+      },
+      { content: [{ type: 'text', text: 'done' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [tool] });
+    const ctx = await makeCtx({ prompt: 'run the tool' });
+    await handler(ctx);
+
+    await flushChatUsage();
+    const rows = await engine.executeRaw<any>(
+      `SELECT request_status, usage_status FROM chat_usage_log ORDER BY id`,
+    );
+    expect(rows.length).toBe(2);
+    for (const r of rows) {
+      expect(r.request_status).toBe('succeeded');
+      expect(r.usage_status).toBe('final');
+    }
+  });
+
+  test('client failure: row failed with NULL tokens, never 0', async () => {
+    const failing: MessagesClient = {
+      async create() {
+        throw new Error('provider exploded');
+      },
+    };
+    const handler = makeSubagentHandler({ engine, client: failing, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi' });
+    await expect(handler(ctx)).rejects.toThrow('provider exploded');
+
+    await flushChatUsage();
+    const rows = await engine.executeRaw<any>('SELECT * FROM chat_usage_log');
+    expect(rows.length).toBe(1);
+    expect(rows[0].request_status).toBe('failed');
+    expect(rows[0].usage_status).toBe('unknown');
+    expect(rows[0].input_tokens).toBeNull();
+    expect(rows[0].error_class).toBe('Error');
+  });
+});

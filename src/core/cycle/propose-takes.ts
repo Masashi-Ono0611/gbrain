@@ -47,6 +47,7 @@ import { GBrainError } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseStatus, CyclePhase } from '../cycle.ts';
+import { withChatPhase } from '../chat-usage.ts';
 
 /**
  * Bump when the extractor prompt or the JSON output shape changes. Old
@@ -669,7 +670,9 @@ export async function runPhaseProposeTakes(
   ctx: OperationContext,
   opts: ProposeTakesOpts = {},
 ) {
-  return new ProposeTakesPhase().run(ctx, opts);
+  // gbrain#3392 — tag every gateway.chat() call made during this phase run
+  // (defaultExtractor's per-page extraction calls) for chat_usage_log.
+  return withChatPhase('dream.propose_takes', () => new ProposeTakesPhase().run(ctx, opts));
 }
 
 /** Test-only access to the class for subclassing in tests. */

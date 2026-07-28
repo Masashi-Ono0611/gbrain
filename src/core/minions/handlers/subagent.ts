@@ -27,6 +27,8 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { MinionJobContext, MinionJob } from '../types.ts';
 import { UnrecoverableError } from '../types.ts';
+import { beginChatUsageAttempt, type ChatUsageAttempt } from '../../chat-usage.ts';
+import { extractUsageFromError } from '../../budget/budget-tracker.ts';
 import type {
   ContentBlock,
   SubagentHandlerData,
@@ -502,6 +504,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       }
 
       let assistantMsg: Anthropic.Message;
+      let usageAttempt: ChatUsageAttempt | null = null;
       const turnIdx = assistantTurns;
       const t0 = Date.now();
       logSubagentHeartbeat({ job_id: ctx.id, event: 'llm_call_started', turn_idx: turnIdx });
@@ -593,10 +596,46 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         };
 
         const combinedSignal = mergeSignals(ctx.signal, ctx.shutdownSignal);
+        // Lifecycle ledger (gbrain#3392): this direct-SDK call is a provider
+        // boundary of its own — the default subagent path never reaches
+        // gateway.chat(), which is exactly how the first cut of the usage
+        // ledger missed half of real spend. Cache TTL is the 5m ephemeral
+        // default (every cache_control in this file is `{type:'ephemeral'}`).
+        usageAttempt = beginChatUsageAttempt({
+          boundary: 'subagent.legacy_anthropic',
+          modelRaw: model,
+          model,
+          providerId: 'anthropic',
+          cacheWriteTtl: '5m',
+          jobId: ctx.id,
+        });
         assistantMsg = await client.create(params, { signal: combinedSignal });
       } catch (err) {
         // Release lease eagerly on error so we don't starve capacity.
         await releaseLease(engine, lease.leaseId!).catch(() => {});
+        // Ledger: tokens stay NULL unless the error itself carried real
+        // provider-reported usage (then it's a billed lower bound). Never 0,
+        // never an estimate — see chat-usage.ts.
+        if (usageAttempt) {
+          const probed = extractUsageFromError(err, { inputTokens: -1, outputTokens: -1 });
+          const hasRealUsage = probed.inputTokens !== -1 || probed.outputTokens !== -1;
+          void usageAttempt.finish({
+            requestStatus: (err as { name?: string } | null)?.name?.includes('Abort') ? 'aborted' : 'failed',
+            usageStatus: hasRealUsage ? 'partial' : 'unknown',
+            ...(hasRealUsage
+              ? {
+                  usage: {
+                    input_tokens: Math.max(0, probed.inputTokens === -1 ? 0 : probed.inputTokens),
+                    output_tokens: Math.max(0, probed.outputTokens === -1 ? 0 : probed.outputTokens),
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                  },
+                }
+              : {}),
+            errorClass: err instanceof Error ? err.name : typeof err,
+          });
+          usageAttempt = null;
+        }
         // Terminal classification: a 400 "prompt is too long" from Anthropic
         // is unrecoverable — retrying with the same prompt will always fail.
         // Convert to UnrecoverableError so the worker routes the job
@@ -618,6 +657,20 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       const outTokens = assistantMsg.usage?.output_tokens ?? 0;
       const cacheRead = (assistantMsg.usage as any)?.cache_read_input_tokens ?? 0;
       const cacheCreate = (assistantMsg.usage as any)?.cache_creation_input_tokens ?? 0;
+
+      if (usageAttempt) {
+        void usageAttempt.finish({
+          requestStatus: 'succeeded',
+          usageStatus: 'final',
+          usage: {
+            input_tokens: inTokens,
+            output_tokens: outTokens,
+            cache_read_tokens: cacheRead,
+            cache_creation_tokens: cacheCreate,
+          },
+        });
+        usageAttempt = null;
+      }
 
       tokenTotals.in += inTokens;
       tokenTotals.out += outTokens;

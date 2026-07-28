@@ -26,6 +26,7 @@ import type { BrainEngine } from '../engine.ts';
 import { BudgetMeter } from './budget-meter.ts';
 import { resolveModel } from '../model-config.ts';
 import type { DreamPhaseResult } from './auto-think.ts';
+import { withChatPhase } from '../chat-usage.ts';
 
 export interface DriftPhaseOpts {
   brainDir?: string;
@@ -270,6 +271,15 @@ function skipped(_reason: string, detail: string): DreamPhaseResult {
 }
 
 export async function runPhaseDrift(
+  engine: BrainEngine,
+  opts: DriftPhaseOpts,
+): Promise<DreamPhaseResult> {
+  // gbrain#3392 — tag every gateway.chat() call under this run with a
+  // phase label for chat_usage_log (covers the drift judge calls).
+  return withChatPhase('dream.drift', () => _runPhaseDriftInner(engine, opts));
+}
+
+async function _runPhaseDriftInner(
   engine: BrainEngine,
   opts: DriftPhaseOpts,
 ): Promise<DreamPhaseResult> {

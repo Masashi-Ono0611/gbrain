@@ -57,6 +57,7 @@ import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { createHash } from 'crypto';
 import { slugifySegment } from '../sync.ts';
+import { withChatPhase } from '../chat-usage.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 const DEFAULT_EXTRACT_ATOMS_MODEL = 'anthropic:claude-haiku-4-5';
@@ -414,6 +415,15 @@ export async function atomsExistingForHashes(
  * to avoid circular module loads and to keep PGLite-only tests fast).
  */
 export async function runPhaseExtractAtoms(
+  engine: BrainEngine,
+  opts: ExtractAtomsOpts = {},
+): Promise<PhaseResult> {
+  // gbrain#3392 — tag every gateway.chat() call under this run with a
+  // phase label for chat_usage_log (covers per-transcript atom extraction calls).
+  return withChatPhase('dream.extract_atoms', () => _runPhaseExtractAtomsInner(engine, opts));
+}
+
+async function _runPhaseExtractAtomsInner(
   engine: BrainEngine,
   opts: ExtractAtomsOpts = {},
 ): Promise<PhaseResult> {

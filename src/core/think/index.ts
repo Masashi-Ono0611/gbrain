@@ -29,6 +29,7 @@ import { chat as gatewayChat, probeChatModel, type ChatResult } from '../ai/gate
 import { AIConfigError } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
+import { withChatPhase } from '../chat-usage.ts';
 
 /** Anthropic Messages client interface — same shape used by subagent.ts so test stubs can be shared. */
 export interface ThinkLLMClient {
@@ -249,6 +250,15 @@ async function persistCitations(
  * to print, persist as synthesis page, or surface as MCP response.
  */
 export async function runThink(
+  engine: BrainEngine,
+  opts: RunThinkOpts,
+): Promise<ThinkResult> {
+  // gbrain#3392 — tag every gateway.chat() call under this run with a
+  // phase label for chat_usage_log (covers the model-resolve + N-round gateway.chat loop).
+  return withChatPhase('think', () => _runThinkInner(engine, opts));
+}
+
+async function _runThinkInner(
   engine: BrainEngine,
   opts: RunThinkOpts,
 ): Promise<ThinkResult> {
