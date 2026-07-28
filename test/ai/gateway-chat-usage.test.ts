@@ -14,6 +14,7 @@ import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import {
   configureGateway,
   resetGateway,
+  reconfigureGatewayWithEngine,
   chat,
   __setGenerateTextTransportForTests,
 } from '../../src/core/ai/gateway.ts';
@@ -182,6 +183,21 @@ describe('gateway.chat boundary', () => {
     expect(r.output_tokens).toBeNull();
     expect(r.cache_read_tokens).toBeNull();
     expect(r.cost_usd).toBeNull();
+  });
+
+  test('production wiring: reconfigureGatewayWithEngine alone installs the ledger', async () => {
+    // Every other test calls setChatUsageEngine() by hand — this one proves
+    // the REAL wiring: removing the setChatUsageEngine call from
+    // reconfigureGatewayWithEngine() must fail here, or production would
+    // silently record nothing while the whole suite stays green.
+    __resetChatUsageForTests(); // wipe the manual wiring from beforeEach
+    fakeSuccess({ inputTokens: 3, outputTokens: 4 });
+    await reconfigureGatewayWithEngine(engine);
+    await chat({ model: 'anthropic:claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] });
+    const all = await rows();
+    expect(all.length).toBe(1);
+    expect(all[0].boundary).toBe('gateway.chat');
+    expect(Number(all[0].input_tokens)).toBe(3);
   });
 
   test('error carrying only input tokens: output stays NULL (unobserved is not free)', async () => {

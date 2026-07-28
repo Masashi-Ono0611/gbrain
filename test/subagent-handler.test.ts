@@ -722,6 +722,11 @@ import {
   flushChatUsage,
   __resetChatUsageForTests,
 } from '../src/core/chat-usage.ts';
+import {
+  configureGateway,
+  resetGateway,
+  __setGenerateTextTransportForTests,
+} from '../src/core/ai/gateway.ts';
 
 describe('chat-usage ledger at the subagent boundary', () => {
   beforeEach(async () => {
@@ -787,6 +792,50 @@ describe('chat-usage ledger at the subagent boundary', () => {
       expect(r.request_status).toBe('succeeded');
       expect(r.usage_status).toBe('final');
     }
+  });
+
+  test('success WITHOUT a usage object: unknown + all-NULL, never a fabricated $0 partial', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'ok' }] as any, stop_reason: 'end_turn', usage: undefined } as any,
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi' });
+    await handler(ctx);
+
+    await flushChatUsage();
+    const rows = await engine.executeRaw<any>('SELECT * FROM chat_usage_log');
+    expect(rows.length).toBe(1);
+    expect(rows[0].usage_status).toBe('unknown');
+    expect(rows[0].input_tokens).toBeNull();
+    expect(rows[0].cache_read_tokens).toBeNull();
+    expect(rows[0].cost_usd).toBeNull();
+  });
+
+  test('gateway-loop mode: exactly one gateway.chat row, ZERO legacy rows (no double count)', async () => {
+    // The two subagent modes are mutually exclusive provider boundaries: a
+    // refactor that let a gateway-loop run ALSO enter the legacy
+    // instrumentation would double-count every call and still pass the
+    // legacy-path tests. This pins the exclusivity.
+    await engine.setConfig('agent.use_gateway_loop', 'true');
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'fake' } });
+    __setGenerateTextTransportForTests(async () => ({
+      content: [{ type: 'text', text: 'done' }],
+      finishReason: 'stop',
+      usage: { inputTokens: 5, outputTokens: 5 },
+    }) as any);
+    try {
+      const handler = makeSubagentHandler({ engine, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      await handler(ctx);
+    } finally {
+      __setGenerateTextTransportForTests(null);
+      resetGateway();
+      await engine.unsetConfig('agent.use_gateway_loop');
+    }
+    await flushChatUsage();
+    const rows = await engine.executeRaw<any>('SELECT boundary FROM chat_usage_log ORDER BY id');
+    expect(rows.length).toBe(1);
+    expect(rows[0].boundary).toBe('gateway.chat');
   });
 
   test('client failure: row failed with NULL tokens, never 0', async () => {

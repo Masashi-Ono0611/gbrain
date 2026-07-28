@@ -616,24 +616,32 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         // Anthropic Message.usage carries input/output always; cache fields
         // are absent-means-zero on this SDK shape.
         if (usageAttempt) {
+          // Cache counters are absent-means-zero ONLY when the base usage was
+          // reported at all — a response with no usage object must land as
+          // 'unknown' with all NULLs, not as a fabricated $0 'partial'.
+          const baseReported = assistantMsg.usage?.input_tokens !== undefined
+            || assistantMsg.usage?.output_tokens !== undefined;
           void usageAttempt.finish({
             requestStatus: 'succeeded',
             usageStatus: 'final',
             usage: {
               input_tokens: assistantMsg.usage?.input_tokens ?? null,
               output_tokens: assistantMsg.usage?.output_tokens ?? null,
-              cache_read_tokens: (assistantMsg.usage as any)?.cache_read_input_tokens ?? 0,
-              cache_creation_tokens: (assistantMsg.usage as any)?.cache_creation_input_tokens ?? 0,
+              cache_read_tokens: baseReported
+                ? (assistantMsg.usage as any)?.cache_read_input_tokens ?? 0
+                : null,
+              cache_creation_tokens: baseReported
+                ? (assistantMsg.usage as any)?.cache_creation_input_tokens ?? 0
+                : null,
             },
           });
           usageAttempt = null;
         }
       } catch (err) {
-        // Release lease eagerly on error so we don't starve capacity.
-        await releaseLease(engine, lease.leaseId!).catch(() => {});
-        // Ledger: per-field — only what the error actually carried; fields
-        // the probe did not find stay NULL (unobserved, not free). See
-        // chat-usage.ts for the finish() invariants.
+        // Ledger FIRST — before any cleanup I/O: a hung lease release or a
+        // mid-cleanup crash must not leave a known-failed attempt 'started'.
+        // Per-field: only what the error actually carried; fields the probe
+        // did not find stay NULL (unobserved, not free).
         if (usageAttempt) {
           const probed = extractUsageFromError(err, { inputTokens: -1, outputTokens: -1 });
           void usageAttempt.finish({
@@ -649,6 +657,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           });
           usageAttempt = null;
         }
+        // Release lease eagerly on error so we don't starve capacity.
+        await releaseLease(engine, lease.leaseId!).catch(() => {});
         // Terminal classification: a 400 "prompt is too long" from Anthropic
         // is unrecoverable — retrying with the same prompt will always fail.
         // Convert to UnrecoverableError so the worker routes the job

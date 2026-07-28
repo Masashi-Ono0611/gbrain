@@ -71,6 +71,17 @@ describe('buildRateSnapshot', () => {
     expect(snap!.cache_write_per_mtok).not.toBeNull();
   });
 
+  test('slash-spelled non-anthropic id: priced, but NEVER given anthropic cache rates', () => {
+    // canonicalLookup resolves 'openai/gpt-4o' → openai:gpt-4o; classifying
+    // it as anthropic (the old punctuation heuristic) would price unverified
+    // cache semantics — the wrong fail-open direction.
+    const snap = buildRateSnapshot('openai/gpt-4o', '5m');
+    expect(snap).not.toBeNull();
+    expect(snap!.input_per_mtok).toBe(CANONICAL_PRICING['openai:gpt-4o']!.input);
+    expect(snap!.cache_read_per_mtok).toBeNull();
+    expect(snap!.cache_write_per_mtok).toBeNull();
+  });
+
   test('non-anthropic model: cache rates null (semantics unverified)', () => {
     const nonAnthropic = Object.keys(CANONICAL_PRICING).find(k => !k.startsWith('anthropic:'));
     expect(nonAnthropic).toBeDefined();
@@ -375,6 +386,63 @@ describe('lifecycle ledger', () => {
     // The failed started-INSERT counted as one recorder failure — the gap is
     // visible even though recovery succeeded.
     expect(chatUsageRecorderFailures()).toBe(1);
+  });
+
+  test('terminal-UPDATE failure: bounded retry lands the terminal state', async () => {
+    // Call #1 (started INSERT) succeeds, call #2 (terminal UPDATE) fails
+    // once, the built-in retry (call #3) succeeds. The row must end terminal
+    // — Codex P2: without the retry, a transient UPDATE failure left the row
+    // 'started' forever with the finished latch already set.
+    let calls = 0;
+    const flaky = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'executeRaw') {
+          return (...args: unknown[]) => {
+            calls++;
+            if (calls === 2) return Promise.reject(new Error('transient UPDATE failure'));
+            return (target as any).executeRaw(...args);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    setChatUsageEngine(flaky as any);
+    const attempt = beginChatUsageAttempt({ boundary: 'gateway.chat', modelRaw: 'anthropic:claude-haiku-4-5', model: 'anthropic:claude-haiku-4-5' });
+    await attempt.finish({
+      requestStatus: 'succeeded',
+      usageStatus: 'final',
+      usage: { input_tokens: 11, output_tokens: 2, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    });
+    setChatUsageEngine(engine);
+    const all = await rows();
+    expect(all.length).toBe(1);
+    expect(all[0].request_status).toBe('succeeded');
+    expect(Number(all[0].input_tokens)).toBe(11);
+    expect(all[0].completed_at).toBeTruthy();
+  });
+
+  test('backpressure: past the pending-writes cap, attempts are dropped and counted', async () => {
+    // Wedge the DB: executeRaw never resolves. Every attempt leaves its
+    // started-INSERT pending, so the cap fills; past it, beginChatUsageAttempt
+    // returns the no-op handle and counts a recorder failure instead of
+    // queueing unbounded promises against a dead database.
+    const never = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'executeRaw') {
+          return () => new Promise(() => {});
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    setChatUsageEngine(never as any);
+    const before = chatUsageRecorderFailures();
+    for (let i = 0; i < 300; i++) {
+      beginChatUsageAttempt({ boundary: 'gateway.chat', modelRaw: 'x' });
+    }
+    expect(chatUsageRecorderFailures()).toBeGreaterThan(before);
+    setChatUsageEngine(engine);
+    __resetChatUsageForTests();
+    setChatUsageEngine(engine);
   });
 
   test('no engine: no throw, recorder failure counted, nothing written', async () => {

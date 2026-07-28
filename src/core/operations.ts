@@ -2633,6 +2633,10 @@ const get_usage: Operation = {
           'complete_observed means gap-free over OBSERVED rows: an attempt '
           + 'whose ledger writes all failed in a crashed process leaves no '
           + 'row and cannot be counted by any reader.',
+          'SDK-internal retries are not separately metered: the boundaries '
+          + 'wrap the SDK call, so a transient failure that was billed and '
+          + 'then retried appears as one attempt carrying only the final '
+          + 'try\'s usage. Sums remain valid lower bounds.',
           ...(totalObserved === 0
             ? ['window contains no recorded attempts — an empty window is '
                + 'trivially gap-free, not evidence of zero spend outside the '

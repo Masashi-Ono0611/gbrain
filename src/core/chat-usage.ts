@@ -55,6 +55,7 @@ import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from './engine.ts';
 import { sqlQueryForEngine } from './sql-query.ts';
 import { canonicalLookup } from './model-pricing.ts';
+import { splitProviderModelId } from './model-id.ts';
 import { registerBackgroundWorkDrainer } from './background-work.ts';
 import { VERSION } from '../version.ts';
 
@@ -142,7 +143,14 @@ export function buildRateSnapshot(
   if (!model) return null;
   const pricing = canonicalLookup(model);
   if (!pricing) return null;
-  const isAnthropic = model.startsWith('anthropic:') || !model.includes(':');
+  // Provider comes from the shared splitter, NOT punctuation: canonicalLookup
+  // accepts bare and slash spellings, and treating "anything without a colon"
+  // as Anthropic would hand Anthropic cache multipliers to e.g. a resolvable
+  // `openai/...` id — pricing an unverified cache cost is the wrong
+  // fail-open direction. Bare ids default to anthropic, matching the
+  // canonicalLookup key they resolve through.
+  const { provider } = splitProviderModelId(model);
+  const isAnthropic = (provider ?? 'anthropic') === 'anthropic';
   const ttl: CacheWriteTtl | null =
     cacheWriteTtl === '5m' || cacheWriteTtl === '1h' ? cacheWriteTtl : null;
   return {
@@ -269,6 +277,13 @@ export function chatUsageRecorderFailures(): number {
 
 /** Pending write chains — awaited by tests and drained before CLI exit. */
 const _pending = new Set<Promise<unknown>>();
+/**
+ * Backpressure cap on in-flight ledger writes. A wedged/slow DB must not let
+ * telemetry accumulate unbounded promises and destabilize the user's work
+ * (the house contract) — past the cap, new attempts are dropped and counted
+ * as recorder failures so the gap stays visible instead of silent.
+ */
+const MAX_PENDING_WRITES = 256;
 export function flushChatUsage(): Promise<void> {
   return Promise.allSettled([..._pending]).then(() => undefined);
 }
@@ -314,6 +329,10 @@ export function beginChatUsageAttempt(start: AttemptStart): ChatUsageAttempt {
     _recorderFailures++;
     return NOOP_ATTEMPT;
   }
+  if (_pending.size >= MAX_PENDING_WRITES) {
+    _recorderFailures++;
+    return NOOP_ATTEMPT;
+  }
   const attemptId = randomUUID();
   const startedAt = new Date().toISOString();
   const phase = start.phase !== undefined ? start.phase : (currentChatPhase() ?? null);
@@ -338,8 +357,12 @@ export function beginChatUsageAttempt(start: AttemptStart): ChatUsageAttempt {
     attemptId,
     finish(outcome: AttemptFinish): Promise<void> {
       if (finished) return Promise.resolve();
+      // Optimistically latched, but RESET on write failure (in the .catch
+      // below) so a later finish call — e.g. the gateway's finally backstop —
+      // can retry the terminal write instead of leaving the row 'started'
+      // forever when only the UPDATE lost a transient race.
       finished = true;
-      return track((async () => {
+      const writeTerminal = async () => {
         const inserted = await insertPromise;
         const model = outcome.model ?? start.model ?? null;
         const providerId = outcome.providerId ?? start.providerId ?? null;
@@ -421,7 +444,19 @@ export function beginChatUsageAttempt(start: AttemptStart): ChatUsageAttempt {
             )
           `;
         }
-      })().catch(() => { _recorderFailures++; }));
+      };
+      return track(writeTerminal().catch(async () => {
+        // One bounded retry: a transient DB hiccup on the terminal write must
+        // not leave the row 'started' forever while the process lives on.
+        await new Promise<void>(resolve => {
+          const t = setTimeout(resolve, 500);
+          (t as { unref?: () => void }).unref?.();
+        });
+        return writeTerminal();
+      }).catch(() => {
+        _recorderFailures++;
+        finished = false; // let a later finish call (finally backstop) try again
+      }));
     },
   };
 }
