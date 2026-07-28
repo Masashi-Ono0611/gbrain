@@ -199,6 +199,16 @@ export interface SyncResult {
   pagesAffected: string[];
   failedFiles?: number; // count of parse failures (Bug 9)
   /**
+   * #3056: renames whose cheap path (updateSlug) did not move a row — either
+   * the UPDATE matched nothing (old slug absent in the scoped source) or it
+   * threw (destination slug occupied, invalid slug). Each one fell back to
+   * add semantics, same as before this counter existed; the difference is
+   * it's now surfaced (counted here + a per-file warn naming both slugs)
+   * instead of silently swallowed. 0 / absent = every rename took the cheap
+   * page_id-preserving path.
+   */
+  renameFallbacks?: number;
+  /**
    * v0.41.13.0 partial-sync fields (only set when status === 'partial').
    *
    * D-V3-1 (honest scope): --timeout aborts ONLY in pre-bookmark phases
@@ -1794,6 +1804,8 @@ function buildPartialResult(opts: {
   renamed: number;
   reason: 'timeout' | 'pull_timeout' | 'pull_failed' | 'stall_timeout' | 'checkpoint_unavailable';
   bankedFiles?: number;
+  /** #3056: renames that fell back to add semantics before this abort. */
+  renameFallbacks?: number;
 }): SyncResult {
   return {
     status: 'partial',
@@ -1809,6 +1821,7 @@ function buildPartialResult(opts: {
     filesImported: opts.filesImported,
     reason: opts.reason,
     bankedFiles: opts.bankedFiles,
+    ...(opts.renameFallbacks ? { renameFallbacks: opts.renameFallbacks } : {}),
   };
 }
 
@@ -2605,6 +2618,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // on success (consecutive-failure semantics for the auto-skip valve).
   const succeededPaths: string[] = [];
   let chunksCreated = 0;
+  // #3056: renames that fell off the cheap updateSlug path (zero-row match or
+  // throw). Hoisted above partial() (below) so an abort mid-run still
+  // reports whatever fallbacks were counted before the abort, instead of a
+  // TDZ error or a silently dropped count.
+  let renameFallbacks = 0;
   // v0.41.13.0 (T2): tracks add+modify files actually persisted so far.
   // Only bumped from inside importOnePath's success path. partial() reports
   // this as `filesImported` so cron operators can see how much work the
@@ -2642,6 +2660,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       renamed: filtered.renamed.length,
       reason: checkpointDead ? 'checkpoint_unavailable' : reason,
       bankedFiles,
+      renameFallbacks,
     });
   };
 
@@ -2874,11 +2893,30 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         : await resolveSlugByPathOrSourcePath(engine, from, undefined);
       // The new path doesn't yet have a row, so resolve from path only.
       const newSlug = resolveSlugForPath(to);
+      // #3056: the cheap rename is OBSERVED, not assumed. A zero-row UPDATE
+      // doesn't throw, and a thrown collision used to be swallowed by an
+      // empty catch — both fell through to importFile, which created/updated
+      // the row at the new path while the old row stayed behind live
+      // (invisible to every existing signal). Both shapes are now warned
+      // with enough context to self-diagnose and counted in renameFallbacks;
+      // behavior otherwise stays "treat as add" (unchanged).
+      let renameApplied = false;
       try {
-        await engine.updateSlug(oldSlug, newSlug, renameOpts);
-      } catch {
-        // Slug doesn't exist or collision, treat as add
+        renameApplied = (await engine.updateSlug(oldSlug, newSlug, renameOpts)) > 0;
+        if (!renameApplied) {
+          serr(
+            `  [sync] rename fallback: updateSlug matched no row for ` +
+            `${oldSlug} -> ${newSlug} (${from} -> ${to}); treating as add.`,
+          );
+        }
+      } catch (err) {
+        serr(
+          `  [sync] rename fallback: updateSlug failed for ${oldSlug} -> ${newSlug} ` +
+          `(${from} -> ${to}): ${err instanceof Error ? err.message : String(err)}; ` +
+          `treating as add.`,
+        );
       }
+      if (!renameApplied) renameFallbacks++;
       // Reimport at new path (picks up content changes). Wrapped to match the
       // deletes/adds loops: a malformed renamed file is recorded to failedFiles
       // and skipped, NOT thrown uncaught. importFile still throws on content
@@ -3404,6 +3442,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       pagesAffected,
       failedFiles: failedFiles.length,
       bankedFiles,
+      ...(renameFallbacks > 0 ? { renameFallbacks } : {}),
     };
   }
 
@@ -3566,6 +3605,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     chunksCreated,
     embedded,
     pagesAffected,
+    ...(renameFallbacks > 0 ? { renameFallbacks } : {}),
   };
 }
 
