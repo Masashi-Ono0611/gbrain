@@ -273,15 +273,6 @@ export async function runPhaseDrift(
   engine: BrainEngine,
   opts: DriftPhaseOpts,
 ): Promise<DreamPhaseResult> {
-  // gbrain#3392 — tag every gateway.chat() call made during this phase run
-  // (defaultDriftJudge's per-candidate calls) for chat_usage_log. Dynamic
-  // import matches this file's existing pattern (defaultDriftJudge already
-  // lazy-imports gateway.ts) instead of adding a new static import. Wraps
-  // the WHOLE existing body (unindented, on purpose — see the closing
-  // `});` below) rather than threading a phase string through every nested
-  // call site.
-  const { withChatPhase } = await import('../ai/gateway.ts');
-  return withChatPhase('dream.drift', async () => {
   const start = Date.now();
   const config = await loadDriftConfig(engine);
   if (!config.enabled && !opts.forceEnabled) {
@@ -386,7 +377,6 @@ export async function runPhaseDrift(
     },
     duration_ms: Date.now() - start,
   };
-  });
 }
 
 /** Test helper: expose findDriftCandidates without running the full phase. */

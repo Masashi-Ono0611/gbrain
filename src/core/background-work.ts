@@ -3,19 +3,18 @@
  * registry. Single source of truth for "drain every fire-and-forget sink before
  * the CLI exits / disconnects."
  *
- * WHY THIS EXISTS (rule-of-four, now five): independent fire-and-forget sinks
- * each write to the DB after an op returns its response —
+ * WHY THIS EXISTS (rule-of-four): four independent fire-and-forget sinks each
+ * write to the DB after an op returns its response —
  *   - `last-retrieved.ts`     UPDATE pages.last_retrieved_at   (#1247/#1269/#1290)
  *   - `facts/queue.ts`        facts:absorb Haiku job + logIngest (#1762)
  *   - `search/hybrid.ts`      query_cache write
  *   - `eval-capture.ts`       eval_candidates INSERT
- *   - `ai/gateway.ts`         chat_usage_log INSERT (gbrain#3392)
  * On PGLite, if `engine.disconnect()` nulls `_db` while one of these is in
  * flight, the sink's "not connected" error path re-pumps via queueMicrotask and
  * spins `db.close()` into a 100%-CPU busy-loop that pins the single-writer lock
  * (the #1762 incident). The fix is to DRAIN every sink before disconnect. A
  * registry (not a hand-written N-call helper) makes that structural: a future
- * 6th sink that registers is auto-drained, and the drain is invoked from THREE
+ * 5th sink that registers is auto-drained, and the drain is invoked from THREE
  * exit points (op-dispatch success finally, op-dispatch error catch, CLI_ONLY
  * finally) without repeating the sink list at each.
  *
@@ -23,8 +22,7 @@
  *     last-retrieved (order 1)   │
  *     facts          (order 0)   ├─► Map<name, drainer>
  *     search-cache   (order 2)   │
- *     eval-capture   (order 3)   │
- *     chat-usage-log (order 4)   ┘
+ *     eval-capture   (order 3)   ┘
  *                                      │  CLI exit
  *                                      ▼
  *   drainAllBackgroundWorkForCliExit ──► sort by (order, name)

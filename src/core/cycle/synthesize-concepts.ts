@@ -23,7 +23,7 @@ import type { PhaseResult } from '../cycle.ts';
 import type { ProgressReporter } from '../progress.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
-import { chat as gatewayChat, isAvailable, withChatPhase } from '../ai/gateway.ts';
+import { chat as gatewayChat, isAvailable } from '../ai/gateway.ts';
 // #2163: concept pages route through importFromContent (the same
 // parse→chunk→embed pipeline put_page uses) instead of a bare engine.putPage,
 // so they land in the retrieval surface (content_chunks + embeddings) where
@@ -71,11 +71,6 @@ export async function runPhaseSynthesizeConcepts(
   engine: BrainEngine,
   opts: SynthesizeConceptsOpts = {},
 ): Promise<PhaseResult> {
-  // gbrain#3392 — tag every gateway.chat() call made during this phase run
-  // for chat_usage_log. Wraps the WHOLE existing body (unindented, on
-  // purpose — see the closing `});` below) rather than threading a phase
-  // string through every nested call site.
-  return withChatPhase('dream.synthesize_concepts', async () => {
   const chat = opts._chat ?? gatewayChat;
 
   // 1. Get atom pages (test seam OR DB query)
@@ -309,7 +304,6 @@ export async function runPhaseSynthesizeConcepts(
       dry_run: opts.dryRun ?? false,
     },
   };
-  });
 }
 
 /**

@@ -282,25 +282,12 @@ describe('shell-audit: computeAuditFilename', () => {
 
 describe('shell-audit: write', () => {
   let tmpDir: string;
-  // #2823: capture whatever the shared test bootstrap (test/helpers/
-  // audit-dir-preload.ts) had already set BEFORE this describe block
-  // overrides it, so afterAll can restore that value instead of deleting
-  // the var outright — an unconditional delete leaks into every test file
-  // that runs after this one in the same shard process (bun test runs all
-  // files in a shard in one process), making them fall through to the
-  // real ~/.gbrain/audit. See test/gbrain-home-isolation.test.ts for the
-  // same restore pattern applied to GBRAIN_HOME.
-  const ORIG_GBRAIN_AUDIT_DIR = process.env.GBRAIN_AUDIT_DIR;
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shell-audit-test-'));
     process.env.GBRAIN_AUDIT_DIR = tmpDir;
   });
   afterAll(() => {
-    if (ORIG_GBRAIN_AUDIT_DIR === undefined) {
-      delete process.env.GBRAIN_AUDIT_DIR;
-    } else {
-      process.env.GBRAIN_AUDIT_DIR = ORIG_GBRAIN_AUDIT_DIR;
-    }
+    delete process.env.GBRAIN_AUDIT_DIR;
   });
 
   test('GBRAIN_AUDIT_DIR env override resolves to the custom dir', () => {

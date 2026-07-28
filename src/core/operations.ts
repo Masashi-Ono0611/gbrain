@@ -28,7 +28,6 @@ import type { SearchResult } from './types.ts';
 import { CJK_SLUG_CHARS, PAGE_SLUG_SEG } from './cjk.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
-import { canonicalLookup } from './model-pricing.ts';
 import {
   GET_RECENT_SALIENCE_DESCRIPTION,
   FIND_ANOMALIES_DESCRIPTION,
@@ -2388,158 +2387,6 @@ const get_stats: Operation = {
   },
   scope: 'admin',
   cliHints: { name: 'stats' },
-};
-
-/**
- * Actual-spend report, computed from `chat_usage_log` (migration v126)
- * against the canonical pricing table (`model-pricing.ts`). Complements
- * (does not duplicate) the opt-in BudgetTracker audit JSONL: this op reads
- * unconditional DB-recorded counters, not just runs that opted into budget
- * auditing.
- *
- * Scope (gbrain#3392, corrected framing — this op originally read
- * `subagent_messages`, which is written from exactly ONE call site in the
- * whole codebase, the 'subagent' minion-job handler, so nearly every
- * gateway.chat() caller — dream cycle phases, think/auto_think,
- * brainstorm/lsd, facts extraction, ... — was invisible to it):
- * `chat_usage_log` is written directly from BOTH the success and error
- * paths inside `gateway.chat()` itself (see `src/core/ai/gateway.ts`), so
- * this now covers essentially all LLM chat traffic in the process,
- * regardless of which layer above the gateway made the call. The one
- * documented gap: calls dispatched off the minion job queue (the 'patterns'
- * cycle phase via `queue.add('subagent', ...)`, and ad-hoc `gbrain agent
- * run` / `submit_agent`) run in a different async context than whoever
- * submitted them, so they lose their `phase` attribution (surfaced as
- * `phase: null` on the row) — but they do NOT lose cost accuracy; the row
- * is still written and still counted in `total_cost_usd`.
- *
- * Unpriced models (no canonical pricing entry) are surfaced in
- * `unpriced_models` and EXCLUDED from `total_cost_usd` rather than silently
- * priced at zero — a missing price must never look like a free model.
- *
- * `succeeded=false` rows (chat() calls that errored) are EXCLUDED from this
- * report entirely — same "never let an approximation masquerade as a real
- * number" posture as unpriced-model exclusion. A failed call's token counts
- * are a pessimistic fallback ESTIMATE (`_extractUsageFromError`'s worst-
- * case ceiling, the same value BudgetTracker charges for cap-enforcement
- * purposes), not measured usage — some failures (network error before the
- * request reached the provider) cost $0, others (a timeout after the
- * provider started processing) cost something close to the ceiling, and
- * chat_usage_log has no way to distinguish which. Reporting the ceiling as
- * "actual spend" would let a 401/429/network blip appear as a fully billed
- * completion. The rows still land in `chat_usage_log` (queryable directly)
- * for anyone who wants worst-case exposure visibility; they just don't
- * enter this op's cost total.
- *
- * Known approximation: `tokens_cache_create` combines both 5-minute and
- * 1-hour TTL cache writes (the schema tracks one counter, not two) but is
- * priced entirely at the 5-minute rate (`cacheWrite5m`). 1-hour writes are
- * therefore understated (Anthropic prices 1h writes at 2x input vs 1.25x for
- * 5m). Splitting the counter is a schema change, out of scope here.
- */
-const get_usage: Operation = {
-  name: 'get_usage',
-  description: 'Actual API spend by model over a date range, computed from successful chat_usage_log rows (every gateway.chat() call that completed) against canonical pricing (see handler doc for the phase-attribution gap and the succeeded-only exclusion).',
-  params: {
-    since: { type: 'string', description: 'ISO 8601 start date (inclusive). Defaults to 7 days ago.' },
-    until: { type: 'string', description: 'ISO 8601 end date (exclusive). Defaults to now.' },
-  },
-  handler: async (ctx, p) => {
-    const now = new Date();
-    const since = typeof p.since === 'string' && p.since
-      ? new Date(p.since)
-      : new Date(now.getTime() - 7 * 86_400_000);
-    const until = typeof p.until === 'string' && p.until ? new Date(p.until) : now;
-    if (Number.isNaN(since.getTime())) {
-      throw new Error(`get_usage: invalid 'since' date: ${String(p.since)}`);
-    }
-    if (Number.isNaN(until.getTime())) {
-      throw new Error(`get_usage: invalid 'until' date: ${String(p.until)}`);
-    }
-    if (since.getTime() > until.getTime()) {
-      throw new Error(`get_usage: 'since' (${since.toISOString()}) is after 'until' (${until.toISOString()})`);
-    }
-
-    const rows = await ctx.engine.executeRaw<{
-      model: string;
-      tokens_in: string;
-      tokens_out: string;
-      tokens_cache_read: string;
-      tokens_cache_create: string;
-    }>(
-      `SELECT
-         model,
-         COALESCE(SUM(tokens_in), 0)::text AS tokens_in,
-         COALESCE(SUM(tokens_out), 0)::text AS tokens_out,
-         COALESCE(SUM(tokens_cache_read), 0)::text AS tokens_cache_read,
-         COALESCE(SUM(tokens_cache_create), 0)::text AS tokens_cache_create
-       FROM chat_usage_log
-       WHERE occurred_at >= $1 AND occurred_at < $2 AND succeeded
-       GROUP BY model`,
-      [since.toISOString(), until.toISOString()],
-    );
-
-    const unpriced_models: string[] = [];
-    const by_model: Array<{
-      model: string;
-      tokens_input: number;
-      tokens_output: number;
-      tokens_cache_read: number;
-      tokens_cache_create: number;
-      cost_usd: number;
-    }> = [];
-
-    for (const r of rows) {
-      const tokens_input = parseInt(r.tokens_in, 10);
-      const tokens_output = parseInt(r.tokens_out, 10);
-      const tokens_cache_read = parseInt(r.tokens_cache_read, 10);
-      const tokens_cache_create = parseInt(r.tokens_cache_create, 10);
-
-      // r.model may be bare ("claude-sonnet-4-6") or provider-prefixed
-      // ("anthropic:claude-sonnet-4-6") — canonicalLookup normalizes both
-      // (plus the slash form) and defaults bare ids to the anthropic
-      // provider. chat_usage_log.model is provider-prefixed on the two
-      // normal chat() exit points (`${recipe.id}:${modelId}`), but the
-      // test-transport instrumentation path can fall back to whatever
-      // `opts.model` the caller passed (or the configured default), which
-      // may be bare — canonicalLookup's normalization covers that case too.
-      const pricing = canonicalLookup(r.model);
-      if (!pricing) {
-        unpriced_models.push(r.model);
-        continue; // omit from by_model/total — never silently price at $0.
-      }
-
-      const cost_usd =
-        (tokens_input / 1_000_000) * pricing.input +
-        (tokens_output / 1_000_000) * pricing.output +
-        (tokens_cache_read / 1_000_000) * (pricing.cacheRead ?? 0) +
-        (tokens_cache_create / 1_000_000) * (pricing.cacheWrite5m ?? 0);
-
-      by_model.push({
-        model: r.model,
-        tokens_input,
-        tokens_output,
-        tokens_cache_read,
-        tokens_cache_create,
-        cost_usd,
-      });
-    }
-
-    by_model.sort((a, b) => b.cost_usd - a.cost_usd);
-    unpriced_models.sort();
-    const total_cost_usd = by_model.reduce((sum, m) => sum + m.cost_usd, 0);
-
-    return {
-      schema_version: 1 as const,
-      since: since.toISOString(),
-      until: until.toISOString(),
-      by_model,
-      total_cost_usd,
-      unpriced_models,
-    };
-  },
-  scope: 'admin',
-  cliHints: { name: 'usage' },
 };
 
 const get_health: Operation = {
@@ -5756,7 +5603,7 @@ export const operations: Operation[] = [
   // Timeline
   add_timeline_entry, get_timeline,
   // Admin
-  get_stats, get_usage, get_health, run_doctor, get_versions, revert_version,
+  get_stats, get_health, run_doctor, get_versions, revert_version,
   // v0.31.1 (Issue #734): thin-client banner identity packet (read-scope, banner-only)
   get_brain_identity,
   // PR1: skill catalog over MCP — discover + fetch host-repo skills (read-scope)

@@ -646,30 +646,6 @@ export interface TrajectoryPoint {
   embedding: Float32Array | null;
 }
 
-/**
- * gbrain#3392 — a row for `chat_usage_log` (migration v126), written from
- * BOTH the success and error paths of `gateway.chat()` so every LLM call
- * gets recorded regardless of which layer above the gateway made it (not
- * just job-tracked callers, which is all `subagent_messages` ever saw).
- * `jobId`/`phase` are best-effort attribution, not required for the row to
- * be counted. Current state: `phase` IS populated (via `withChatPhase`'s
- * AsyncLocalStorage scope, best-effort — `null` outside any scope or across
- * a job-queue boundary). `jobId` is RESERVED but always `null` today —
- * `gateway.chat()` has no job-id-carrying context to populate it from; the
- * field exists so a future caller that has one on hand can populate it
- * without a schema/type change.
- */
-export interface ChatUsageLogRow {
-  jobId?: number | null;
-  phase?: string | null;
-  model: string;
-  tokensIn: number;
-  tokensOut: number;
-  tokensCacheRead: number;
-  tokensCacheCreate: number;
-  succeeded: boolean;
-}
-
 /** Maximum results returned by search operations. Internal bulk operations (listPages) are not clamped. */
 export const MAX_SEARCH_LIMIT = 100;
 
@@ -2266,20 +2242,4 @@ export interface BrainEngine {
    * not a misleading mean of 1.
    */
   findAnomalies(opts: AnomaliesOpts): Promise<AnomalyResult[]>;
-
-  // ============================================================
-  // gbrain#3392 — universal gateway.chat() usage instrumentation
-  // ============================================================
-
-  /**
-   * Plain single-row INSERT into `chat_usage_log` (migration v126). Called
-   * from BOTH the success and error paths inside `gateway.chat()` itself —
-   * see `src/core/ai/gateway.ts` — so it captures spend for every caller,
-   * not just job-tracked ones. Callers (the gateway) are expected to treat
-   * this as fire-and-forget and swallow any rejection; this method itself
-   * does not swallow errors (matches `logEvalCaptureFailure`'s posture —
-   * the caller owns the best-effort wrapping, same as `appendAuditLine` in
-   * `budget-tracker.ts`).
-   */
-  recordChatUsage(row: ChatUsageLogRow): Promise<void>;
 }

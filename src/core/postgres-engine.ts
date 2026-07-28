@@ -12,7 +12,6 @@ import type {
   FactRow, FactKind, FactVisibility, FactInsertStatus,
   NewFact, FactListOpts, FactsHealth,
   SourceRow,
-  ChatUsageLogRow,
 } from './engine.ts';
 import { withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay, type BatchAuditSite } from './retry.ts';
 import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatchExhausted } from './audit/batch-retry-audit.ts';
@@ -68,6 +67,7 @@ import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery } from './search/sql-ranking.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
+import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
 
@@ -1408,9 +1408,10 @@ export class PostgresEngine implements BrainEngine {
     // paths, so the merge must happen inside the UPDATE (parity with
     // pglite-engine.updateSourceConfig, which already uses JSONB `||`).
     //
-    // The CASE normalizes historical bad shapes inline (so `config` is re-read
-    // against the row-locked latest version — a CTE/subquery snapshot would
-    // reintroduce the lost-update race under READ COMMITTED): older code paths
+    // The shared SQL coercion normalizes historical bad shapes inline (so
+    // `config` is re-read against the row-locked latest version — a detached
+    // read/normalize/write cycle would reintroduce the lost-update race under
+    // READ COMMITTED): older code paths
     // could store config as a JSONB string (double-encoded) or as a JSONB array
     // of patch objects. We coerce those to a flat object before the `||` merge
     // so doctor and source routing keep getting flat keys.
@@ -1436,24 +1437,7 @@ export class PostgresEngine implements BrainEngine {
     const sql = this.sql;
     const result = await sql`
       UPDATE sources
-         SET config =
-           CASE
-             WHEN jsonb_typeof(config) = 'object' THEN config
-             WHEN jsonb_typeof(config) = 'string'
-               THEN CASE
-                 WHEN (config #>> '{}') IS JSON
-                   THEN COALESCE(NULLIF((config #>> '{}'), '')::jsonb, '{}'::jsonb)
-                 ELSE '{}'::jsonb
-               END
-             WHEN jsonb_typeof(config) = 'array'
-               THEN COALESCE(
-                 (SELECT jsonb_object_agg(kv.key, kv.value)
-                    FROM jsonb_array_elements(config) elem,
-                         jsonb_each(elem) kv),
-                 '{}'::jsonb
-               )
-             ELSE '{}'::jsonb
-           END
+         SET config = ${sql.unsafe(SOURCE_CONFIG_OBJECT_SQL)}
            || ${sql.json(patch as Parameters<typeof sql.json>[0])}
        WHERE id = ${sourceId}
     `;
@@ -6120,23 +6104,6 @@ export class PostgresEngine implements BrainEngine {
   async logEvalCaptureFailure(reason: EvalCaptureFailureReason): Promise<void> {
     const sql = this.sql;
     await sql`INSERT INTO eval_capture_failures (reason) VALUES (${reason})`;
-  }
-
-  // ============================================================
-  // gbrain#3392 — universal gateway.chat() usage instrumentation
-  // ============================================================
-
-  async recordChatUsage(row: ChatUsageLogRow): Promise<void> {
-    const sql = this.sql;
-    await sql`
-      INSERT INTO chat_usage_log
-        (job_id, phase, model, tokens_in, tokens_out, tokens_cache_read, tokens_cache_create, succeeded)
-      VALUES (
-        ${row.jobId ?? null}, ${row.phase ?? null}, ${row.model},
-        ${row.tokensIn}, ${row.tokensOut}, ${row.tokensCacheRead}, ${row.tokensCacheCreate},
-        ${row.succeeded}
-      )
-    `;
   }
 
   async listEvalCaptureFailures(filter?: { since?: Date }): Promise<EvalCaptureFailure[]> {

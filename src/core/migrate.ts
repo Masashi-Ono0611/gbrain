@@ -5724,54 +5724,6 @@ export const MIGRATIONS: Migration[] = [
         ON take_proposals (source_id, page_slug, content_hash, prompt_version, md5(claim_text));
     `,
   },
-  {
-    version: 126,
-    name: 'chat_usage_log',
-    // gbrain#3392 (corrected framing): get_usage originally read
-    // subagent_messages, but that table is written from exactly ONE call
-    // site (the 'subagent' minion-job handler) — every other gateway.chat()
-    // caller (dream cycle phases, think/auto_think, brainstorm/lsd, facts
-    // extraction, ...) was invisible to it. chat_usage_log is a NEW,
-    // separate audit table written directly from gateway.chat() itself (both
-    // the success and error paths), so it captures spend regardless of which
-    // layer above the gateway made the call — total-cost coverage without
-    // requiring every caller to opt into a job or a tracker.
-    //
-    // This is a SEPARATE concern from subagent_messages (billing/usage audit
-    // vs. conversation-transcript replay) — the two coexist, same as
-    // minion_budget_log coexists with minion_jobs. subagent_messages is
-    // untouched by this migration.
-    //
-    // Structural pattern mirrors minion_budget_log (v93, minions_v0_41_audit_
-    // and_budget): nullable FK to minion_jobs with ON DELETE SET NULL, model
-    // denormalized onto the row (not just via job_id) so the row stays
-    // forensically useful after the job is pruned. job_id is RESERVED and
-    // currently always NULL — gateway.ts's chat() has no job-id-carrying
-    // context to populate it from (see ChatUsageLogRow in engine.ts); the
-    // column exists so a future caller that DOES have a job id on hand
-    // (e.g. handlers/subagent.ts, if job-queue phase attribution is ever
-    // wired through) can populate it without a schema change. No RLS
-    // statement needed —
-    // the v35 auto_enable_rls event trigger covers every new public.* table
-    // on Postgres; PGLite has no RLS. No `transaction: false` — plain CREATE
-    // TABLE / CREATE INDEX IF NOT EXISTS, not CREATE INDEX CONCURRENTLY.
-    sql: `
-      CREATE TABLE IF NOT EXISTS chat_usage_log (
-        id                  BIGSERIAL PRIMARY KEY,
-        job_id              BIGINT NULL REFERENCES minion_jobs(id) ON DELETE SET NULL,
-        phase               TEXT NULL,
-        model               TEXT NOT NULL,
-        tokens_in           INTEGER NOT NULL DEFAULT 0,
-        tokens_out          INTEGER NOT NULL DEFAULT 0,
-        tokens_cache_read   INTEGER NOT NULL DEFAULT 0,
-        tokens_cache_create INTEGER NOT NULL DEFAULT 0,
-        succeeded           BOOLEAN NOT NULL DEFAULT true,
-        occurred_at         TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-      CREATE INDEX IF NOT EXISTS chat_usage_log_recent_idx ON chat_usage_log (occurred_at DESC);
-      CREATE INDEX IF NOT EXISTS chat_usage_log_model_idx ON chat_usage_log (model);
-    `,
-  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

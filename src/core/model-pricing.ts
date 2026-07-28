@@ -21,7 +21,7 @@
  * regression trip-wire if anyone later re-hardcodes a view back into a duplicate)
  * and that the cross-modal panel models are all present in canonical.
  *
- * Prices verified 2026-06-03 against published provider pricing:
+ * Prices verified 2026-07-26 against published provider pricing:
  *   - Anthropic: https://platform.claude.com/docs/en/about-claude/models/overview
  *   - OpenAI:    https://openai.com/api/pricing
  *   - Google:    https://ai.google.dev/gemini-api/docs/pricing
@@ -32,29 +32,6 @@
  * zero-cost rerankers) are intentionally absent — callers treat those as
  * zero-cost elsewhere. Embeddings live in embedding-pricing.ts (different unit:
  * per-MTok, char-based).
- *
- * Cache pricing: `cacheRead`/`cacheWrite5m` are Anthropic-only (0.1x / 1.25x
- * the input rate — Anthropic's standard prompt-caching ratios). Non-Anthropic
- * entries omit them; consumers treat a missing field as "no cache billing
- * modeled for this provider", not as zero-cost.
- *
- * IMPORTANT for future cache-rate additions: this ratio math assumes
- * input/cache token counters are DISJOINT (Anthropic's `input_tokens`
- * excludes cache-read/create tokens — true today). That does NOT hold for
- * every provider (e.g. OpenAI's `input` usage includes cached tokens). If a
- * future entry adds cache rates for a provider where input already includes
- * cached tokens, a consumer summing `input*tokens_in + cacheRead*tokens_cache_read`
- * would double-count. Normalize token counters (or the formula) before adding
- * a second provider's cache rates — do not copy the Anthropic-shaped formula
- * blind.
- *
- * A model that IS priced (`input`/`output` present) but omits `cacheRead`/
- * `cacheWrite5m` while a caller has nonzero cache token counts for it is
- * currently a non-issue: every entry with cache fields at all (the full
- * Anthropic set) has BOTH fields, always. If a future entry breaks that
- * (priced but only partially cache-priced), callers treating a missing cache
- * field as `?? 0` will silently undercount that portion — worth revisiting
- * if/when such an entry is added.
  */
 
 import { splitProviderModelId } from './model-id.ts';
@@ -64,18 +41,6 @@ export interface ModelPricing {
   input: number;
   /** USD per 1M output tokens. */
   output: number;
-  /**
-   * USD per 1M cache-read tokens (Anthropic prompt caching — cache hit).
-   * Anthropic-only: 0.1x the input rate. Absent for providers without a
-   * modeled cache-billing tier in this table.
-   */
-  cacheRead?: number;
-  /**
-   * USD per 1M cache-write tokens, 5-minute TTL (Anthropic prompt caching —
-   * cache miss / write). Anthropic-only: 1.25x the input rate. Absent for
-   * providers without a modeled cache-billing tier in this table.
-   */
-  cacheWrite5m?: number;
 }
 
 /**
@@ -87,26 +52,25 @@ export interface ModelPricing {
  */
 export const CANONICAL_PRICING: Record<string, ModelPricing> = {
   // ── Anthropic ──────────────────────────────────────────────────────────
-  // cacheRead = 0.1x input, cacheWrite5m = 1.25x input (Anthropic's standard
-  // prompt-caching ratios — https://platform.claude.com/docs/en/about-claude/pricing).
   // Fable 5: Anthropic's top tier, above Opus. $10 in / $50 out.
-  'anthropic:claude-fable-5':             { input: 10.00, output: 50.00, cacheRead: 1.00, cacheWrite5m: 12.50 },
-  // Opus 4.x: $5 in / $25 out. 4.8 (released 2026-05-28) shares 4.7's
-  // per-token rate — closes gbrain#1819.
-  'anthropic:claude-opus-4-8':            { input:  5.00, output: 25.00, cacheRead: 0.50, cacheWrite5m:  6.25 },
-  'anthropic:claude-opus-4-7':            { input:  5.00, output: 25.00, cacheRead: 0.50, cacheWrite5m:  6.25 },
-  'anthropic:claude-opus-4-6':            { input:  5.00, output: 25.00, cacheRead: 0.50, cacheWrite5m:  6.25 },
+  'anthropic:claude-fable-5':             { input: 10.00, output: 50.00 },
+  // Opus 4.x/5: $5 in / $25 out. Opus 5 (new generation) shares the same
+  // per-token rate as 4.8 (released 2026-05-28) — closes gbrain#1819.
+  'anthropic:claude-opus-5':              { input:  5.00, output: 25.00 },
+  'anthropic:claude-opus-4-8':            { input:  5.00, output: 25.00 },
+  'anthropic:claude-opus-4-7':            { input:  5.00, output: 25.00 },
+  'anthropic:claude-opus-4-6':            { input:  5.00, output: 25.00 },
   // Sonnet 5 (released 2026-06-29): same $3/$15 sticker as 4.6. The launch
   // intro discount ($2/$10 through 2026-08-31) is deliberately NOT modeled —
   // the table carries standard rates so estimates stay conservative and
   // don't need a time-bombed edit when the promo lapses.
-  'anthropic:claude-sonnet-5':            { input:  3.00, output: 15.00, cacheRead: 0.30, cacheWrite5m:  3.75 },
-  'anthropic:claude-sonnet-4-6':          { input:  3.00, output: 15.00, cacheRead: 0.30, cacheWrite5m:  3.75 },
+  'anthropic:claude-sonnet-5':            { input:  3.00, output: 15.00 },
+  'anthropic:claude-sonnet-4-6':          { input:  3.00, output: 15.00 },
   // Haiku 4.5 — both the dateless canonical id and the dated snapshot.
-  'anthropic:claude-haiku-4-5':           { input:  1.00, output:  5.00, cacheRead: 0.10, cacheWrite5m:  1.25 },
-  'anthropic:claude-haiku-4-5-20251001':  { input:  1.00, output:  5.00, cacheRead: 0.10, cacheWrite5m:  1.25 },
-  'anthropic:claude-3-5-sonnet-20241022': { input:  3.00, output: 15.00, cacheRead: 0.30, cacheWrite5m:  3.75 },
-  'anthropic:claude-3-5-haiku-20241022':  { input:  0.80, output:  4.00, cacheRead: 0.08, cacheWrite5m:  1.00 },
+  'anthropic:claude-haiku-4-5':           { input:  1.00, output:  5.00 },
+  'anthropic:claude-haiku-4-5-20251001':  { input:  1.00, output:  5.00 },
+  'anthropic:claude-3-5-sonnet-20241022': { input:  3.00, output: 15.00 },
+  'anthropic:claude-3-5-haiku-20241022':  { input:  0.80, output:  4.00 },
 
   // ── OpenAI ─────────────────────────────────────────────────────────────
   'openai:gpt-4o':                        { input:  2.50, output: 10.00 },
@@ -129,7 +93,12 @@ export const CANONICAL_PRICING: Record<string, ModelPricing> = {
 
   // ── Together / DeepSeek (cross-modal-eval panel) ───────────────────────
   'together:meta-llama/Llama-3.3-70B-Instruct-Turbo': { input: 0.88, output: 0.88 },
+  // `deepseek-chat` was retired by DeepSeek 2026-07-24 (#1255); kept so
+  // historical usage/audit rows still price. New calls use the v4 names.
   'deepseek:deepseek-chat':               { input:  0.14, output:  0.28 },
+  // DeepSeek v4 (verified 2026-07-27 at api-docs.deepseek.com): cache-miss rates.
+  'deepseek:deepseek-v4-flash':           { input:  0.14, output:  0.28 },
+  'deepseek:deepseek-v4-pro':             { input:  0.435, output: 0.87 },
 };
 
 /**

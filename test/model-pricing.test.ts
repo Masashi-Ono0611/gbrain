@@ -35,20 +35,24 @@ describe('CANONICAL_PRICING — table integrity', () => {
     }
   });
 
+  test('Opus 5 present at $5/$25 (same tier as Opus 4.8)', () => {
+    expect(CANONICAL_PRICING['anthropic:claude-opus-5']).toEqual({ input: 5.0, output: 25.0 });
+  });
+
   test('Opus 4.8 present at $5/$25 (closes gbrain#1819)', () => {
-    expect(CANONICAL_PRICING['anthropic:claude-opus-4-8']).toMatchObject({ input: 5.0, output: 25.0 });
+    expect(CANONICAL_PRICING['anthropic:claude-opus-4-8']).toEqual({ input: 5.0, output: 25.0 });
   });
 
   test('Opus 4.7 at $5/$25 (not the stale $15/$75)', () => {
-    expect(CANONICAL_PRICING['anthropic:claude-opus-4-7']).toMatchObject({ input: 5.0, output: 25.0 });
+    expect(CANONICAL_PRICING['anthropic:claude-opus-4-7']).toEqual({ input: 5.0, output: 25.0 });
   });
 
   test('Sonnet 5 present at $3/$15 (standard rate, intro discount not modeled)', () => {
-    expect(CANONICAL_PRICING['anthropic:claude-sonnet-5']).toMatchObject({ input: 3.0, output: 15.0 });
+    expect(CANONICAL_PRICING['anthropic:claude-sonnet-5']).toEqual({ input: 3.0, output: 15.0 });
   });
 
   test('Fable 5 present at $10/$50', () => {
-    expect(CANONICAL_PRICING['anthropic:claude-fable-5']).toMatchObject({ input: 10.0, output: 50.0 });
+    expect(CANONICAL_PRICING['anthropic:claude-fable-5']).toEqual({ input: 10.0, output: 50.0 });
   });
 
   test('Gemini 2.0 Flash reconciled to $0.10/$0.40; legacy alias agrees', () => {
@@ -57,52 +61,19 @@ describe('CANONICAL_PRICING — table integrity', () => {
       CANONICAL_PRICING['google:gemini-2.0-flash'],
     );
   });
-
-  test('cacheRead / cacheWrite5m, when present, are finite positive numbers', () => {
-    // Not every entry carries cache rates (only anthropic: does today) — only
-    // validate the shape when the field is actually present.
-    for (const [key, p] of Object.entries(CANONICAL_PRICING)) {
-      if (p.cacheRead !== undefined) {
-        expect(Number.isFinite(p.cacheRead)).toBe(true);
-        expect(p.cacheRead).toBeGreaterThan(0);
-      }
-      if (p.cacheWrite5m !== undefined) {
-        expect(Number.isFinite(p.cacheWrite5m)).toBe(true);
-        expect(p.cacheWrite5m).toBeGreaterThan(0);
-      }
-      // Both-or-neither: no entry should carry one cache field without the other.
-      expect(p.cacheRead !== undefined).toBe(p.cacheWrite5m !== undefined);
-      if (!key.startsWith('anthropic:')) {
-        expect(p.cacheRead).toBeUndefined();
-        expect(p.cacheWrite5m).toBeUndefined();
-      }
-    }
-  });
-
-  test('Opus 4.8 cache rates: cacheRead $0.50 (0.1x input), cacheWrite5m $6.25 (1.25x input)', () => {
-    expect(CANONICAL_PRICING['anthropic:claude-opus-4-8']).toEqual({
-      input: 5.0, output: 25.0, cacheRead: 0.5, cacheWrite5m: 6.25,
-    });
-  });
-
-  test('Sonnet 5 cache rates: cacheRead $0.30 (0.1x input), cacheWrite5m $3.75 (1.25x input)', () => {
-    expect(CANONICAL_PRICING['anthropic:claude-sonnet-5']).toEqual({
-      input: 3.0, output: 15.0, cacheRead: 0.3, cacheWrite5m: 3.75,
-    });
-  });
 });
 
 describe('canonicalLookup — id normalization', () => {
   test('bare anthropic id → hit (defaults to anthropic provider)', () => {
-    expect(canonicalLookup('claude-opus-4-8')).toMatchObject({ input: 5.0, output: 25.0 });
+    expect(canonicalLookup('claude-opus-4-8')).toEqual({ input: 5.0, output: 25.0 });
   });
 
   test('colon form → hit', () => {
-    expect(canonicalLookup('anthropic:claude-opus-4-8')).toMatchObject({ input: 5.0, output: 25.0 });
+    expect(canonicalLookup('anthropic:claude-opus-4-8')).toEqual({ input: 5.0, output: 25.0 });
   });
 
   test('slash form → hit', () => {
-    expect(canonicalLookup('anthropic/claude-opus-4-8')).toMatchObject({ input: 5.0, output: 25.0 });
+    expect(canonicalLookup('anthropic/claude-opus-4-8')).toEqual({ input: 5.0, output: 25.0 });
   });
 
   test('non-anthropic bare id → miss (preserves prior null contract)', () => {

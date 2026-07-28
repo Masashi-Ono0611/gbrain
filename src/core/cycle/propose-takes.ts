@@ -39,7 +39,7 @@
 
 import { randomUUID, createHash } from 'node:crypto';
 import { BaseCyclePhase, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
-import { chat as gatewayChat, getChatModel, probeChatModel, withChatPhase } from '../ai/gateway.ts';
+import { chat as gatewayChat, getChatModel, probeChatModel } from '../ai/gateway.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
@@ -669,9 +669,7 @@ export async function runPhaseProposeTakes(
   ctx: OperationContext,
   opts: ProposeTakesOpts = {},
 ) {
-  // gbrain#3392 — tag every gateway.chat() call made during this phase run
-  // (defaultExtractor's per-page extraction calls) for chat_usage_log.
-  return withChatPhase('dream.propose_takes', () => new ProposeTakesPhase().run(ctx, opts));
+  return new ProposeTakesPhase().run(ctx, opts);
 }
 
 /** Test-only access to the class for subclassing in tests. */

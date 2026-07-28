@@ -58,7 +58,7 @@ import { ensureWellFormed } from '../text-safe.ts';
 // ---------------------------------------------------------------------------
 
 import { BudgetExhausted, BudgetTracker } from '../budget/budget-tracker.ts';
-import { withBudgetTracker, withChatPhase } from '../ai/gateway.ts';
+import { withBudgetTracker } from '../ai/gateway.ts';
 import {
   computeRunId,
   loadCheckpoint,
@@ -560,13 +560,7 @@ async function runBrainstormImpl(
     label: `brainstorm.${opts.profile?.label ?? 'brainstorm'}`,
     maxCostUsd: opts.maxCostUsd ?? 5,
   });
-  // gbrain#3392 — tag every gateway.chat() call made during this run for
-  // chat_usage_log, alongside (not replacing) the existing BudgetTracker
-  // scope. Same mode distinction the tracker label above already uses.
-  const chatPhase = opts.profile?.label === 'lsd' ? 'lsd' : 'brainstorm';
-  return withBudgetTracker(_runTracker, () =>
-    withChatPhase(chatPhase, () => _runBrainstormInner(engine, config, opts)),
-  );
+  return withBudgetTracker(_runTracker, () => _runBrainstormInner(engine, config, opts));
 }
 
 async function _runBrainstormInner(
