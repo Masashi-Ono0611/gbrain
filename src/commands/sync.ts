@@ -19,6 +19,11 @@ import {
   isSkippablePath,
   resolveAutoSkipThreshold,
   DEFAULT_SOURCE_ID,
+  RENAME_SENTINEL_PREFIX,
+  renameSentinelPath,
+  renameReconcileErrorMessage,
+  parseRenameReconcileFrom,
+  clearFailures,
 } from '../core/sync.ts';
 import {
   computeSyncDelta,
@@ -1812,6 +1817,98 @@ function buildPartialResult(opts: {
   };
 }
 
+/**
+ * Source-scoped ACTIVE slugs for the given source_paths, considering EVERY
+ * matching row. `source_path` has only a non-unique index and
+ * `resolveSlugsByPaths` collapses to one arbitrary row per path — through
+ * that collapse a soft-deleted row could mask a live duplicate sharing the
+ * same path (#3479 review), so the rename-reconcile paths query all rows
+ * with an explicit `deleted_at IS NULL` instead.
+ */
+async function activeSlugsBySourcePath(
+  engine: BrainEngine,
+  paths: string[],
+  sourceId: string,
+): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  for (let i = 0; i < paths.length; i += DELETE_BATCH_SIZE) {
+    const batch = paths.slice(i, i + DELETE_BATCH_SIZE);
+    const rows = await engine.executeRaw<{ slug: string; source_path: string }>(
+      `SELECT slug, source_path FROM pages
+        WHERE source_path = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL`,
+      [batch, sourceId],
+    );
+    for (const r of rows) {
+      const arr = out.get(r.source_path);
+      if (arr) arr.push(r.slug);
+      else out.set(r.source_path, [r.slug]);
+    }
+  }
+  return out;
+}
+
+/**
+ * #3479 blocker 2 — find open `<rename:…>` sentinels with nothing left to
+ * reconcile. A sentinel is orphaned when NO active row carries the rename's
+ * OLD source_path (read back out of the sentinel's own error text) anymore:
+ * the duplicate it guarded against is gone — hard-deleted, or soft-deleted
+ * by the operator's `gbrain delete` — so keeping the row open only ages
+ * doctor toward a permanent FAIL.
+ *
+ * Fail-closed on every uncertain branch: a sentinel that failed again THIS
+ * run (in `excludePaths`), one whose error text doesn't parse, or a probe
+ * that throws leaves the row open — only a positive "no active row has the
+ * old path" clears. ANY surviving active row keeps its sentinel: the
+ * duplicate is real, and the operator remedy (`gbrain delete <stale-slug>`)
+ * or a converging retry is the way out, not silent bookkeeping cleanup.
+ */
+async function orphanedRenameSentinels(
+  engine: BrainEngine,
+  sourceId: string,
+  excludePaths: ReadonlySet<string>,
+): Promise<string[]> {
+  const candidates: Array<{ path: string; from: string }> = [];
+  for (const row of loadSyncFailures()) {
+    if (row.source_id !== sourceId || row.state !== 'open') continue;
+    if (!row.path.startsWith(RENAME_SENTINEL_PREFIX)) continue;
+    if (excludePaths.has(row.path)) continue;
+    const from = parseRenameReconcileFrom(row.error);
+    if (from === undefined) continue;
+    candidates.push({ path: row.path, from });
+  }
+  if (candidates.length === 0) return [];
+  try {
+    const active = await activeSlugsBySourcePath(
+      engine, [...new Set(candidates.map(c => c.from))], sourceId,
+    );
+    return candidates.filter(c => !active.has(c.from)).map(c => c.path);
+  } catch {
+    // Probe unavailable — leave every row open rather than guess.
+    return [];
+  }
+}
+
+/**
+ * The quiet-run half of the #3479 blocker-2 fix: the up_to_date early
+ * returns never reach the failure gate, and the reviewer's exact probe was
+ * a `synced` then `up_to_date` run pair that left the orphaned sentinel
+ * open forever. Clears directly through the ledger; a no-op (including the
+ * no-ledger-file case) costs one small file read.
+ */
+async function sweepOrphanedRenameSentinels(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<void> {
+  const orphaned = await orphanedRenameSentinels(engine, sourceId, new Set());
+  if (orphaned.length > 0) {
+    clearFailures(sourceId, orphaned);
+    serr(
+      `  [sync] cleared ${orphaned.length} orphaned rename sentinel(s) — ` +
+      `the stale row(s) they guarded no longer resolve.`,
+    );
+  }
+}
+
 async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
   // v0.41.8.0 (D9 / #1342): phase breadcrumbs. The #1342 reporter saw
   // ZERO stderr output before their sync hang, which made the bug
@@ -2292,6 +2389,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         [opts.sourceId],
       );
     }
+    // #3479 blocker 2: quiet runs bypass the failure gate below, and an
+    // orphaned `<rename:…>` sentinel would otherwise sit open forever.
+    await sweepOrphanedRenameSentinels(engine, opts.sourceId ?? DEFAULT_SOURCE_ID);
     return {
       status: 'up_to_date',
       fromCommit: lastCommit,
@@ -2494,6 +2594,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     await writeChunkerVersion(engine, opts.sourceId, String(CHUNKER_VERSION));
     await clearOpCheckpoint(engine, ckpt.paths);
     await clearOpCheckpoint(engine, ckpt.target);
+    // #3479 blocker 2: this early return also bypasses the failure gate —
+    // sweep orphaned `<rename:…>` sentinels here too.
+    await sweepOrphanedRenameSentinels(engine, opts.sourceId ?? DEFAULT_SOURCE_ID);
     return {
       status: 'up_to_date',
       fromCommit: lastCommit,
@@ -2938,22 +3041,45 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         const destMaterialized = importResult.status === 'imported' ||
           (importResult.status === 'skipped' && !importResult.error && importResult.slug === newSlug);
         if (destMaterialized) {
+          // Hoisted above the try so the failure record can name the exact
+          // row `gbrain delete` should remove when the DELETE itself failed
+          // (still unknown — recorded as `?` — when the probe threw first).
+          //
+          // ACTIVE rows only, considering EVERY row with the old path:
+          // source_path is non-unique, and a one-row resolve could hand back
+          // a soft-deleted row while a live duplicate sharing the path hides
+          // behind it (#3479 review). Skipping already-soft-deleted rows is
+          // also what makes `gbrain delete` (a soft delete) the documented
+          // operator exit from a permanent delete-failure wedge (blocker 1):
+          // retrying the hard delete against a row the operator already
+          // removed would just re-fail and keep the sync blocked.
+          let staleSlug: string | undefined;
           try {
-            const staleMap = await engine.resolveSlugsByPaths([from], { sourceId: opts.sourceId ?? DEFAULT_SOURCE_ID });
-            const staleSlug = staleMap.get(from);
-            if (staleSlug !== undefined && staleSlug !== newSlug) {
-              await engine.deletePage(staleSlug, renameOpts);
-              deletedSlugs.add(staleSlug); // never hand a deleted slug to auto-embed
-              serr(`  [sync] rename reconciled: removed stale row ${staleSlug} (${from} -> ${to} fell back to add).`);
-            } else if (staleSlug === undefined) {
-              serr(`  [sync] rename fallback: no row has source_path ${from}; stale row (if any) left in place.`);
+            const active = await activeSlugsBySourcePath(
+              engine, [from], opts.sourceId ?? DEFAULT_SOURCE_ID,
+            );
+            const staleSlugs = (active.get(from) ?? []).filter(s => s !== newSlug);
+            if (staleSlugs.length > 0) {
+              // Delete every active row still carrying the old path — with a
+              // non-unique source_path there can be more than one, and the
+              // rename is checkpointed after this loop, so a survivor would
+              // never be retried (#3479 review, the ORDER BY finding).
+              for (const s of staleSlugs) {
+                staleSlug = s;
+                await engine.deletePage(s, renameOpts);
+                deletedSlugs.add(s); // never hand a deleted slug to auto-embed
+                serr(`  [sync] rename reconciled: removed stale row ${s} (${from} -> ${to} fell back to add).`);
+              }
+            } else {
+              serr(`  [sync] rename fallback: no active row has source_path ${from}; nothing left to reconcile.`);
             }
           } catch (e: unknown) {
             reconcileFailed = true;
             failedFiles.push({
-              path: `<rename:${to}>`,
-              error: `rename reconcile failed (stale row for ${from} not removed): ` +
-                `${e instanceof Error ? e.message : String(e)}`,
+              path: renameSentinelPath(to),
+              error: renameReconcileErrorMessage(
+                from, staleSlug, e instanceof Error ? e.message : String(e),
+              ),
             });
           }
         } else {
@@ -2965,7 +3091,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       }
       // Converged (cheap rename, clean reconcile, or nothing to reconcile):
       // clear any `<rename:…>` sentinel a previous failing run recorded.
-      if (!reconcileFailed) succeededPaths.push(`<rename:${to}>`);
+      if (!reconcileFailed) succeededPaths.push(renameSentinelPath(to));
       pagesAffected.push(newSlug);
       deletedSlugs.delete(newSlug); // #1284: rename landed on a previously-deleted slug → embeddable again
       // A failed reconcile must NOT checkpoint: banking `to` would make the
@@ -3417,6 +3543,16 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // operators cannot acknowledge manually. Once pin ancestry is verified on
     // a later run, clear that stale sentinel through the ordinary success path.
     ...(headVerificationSucceeded ? ['<head>'] : []),
+    // #3479 blocker 2 — same self-heal for `<rename:…>` sentinels: a force-push
+    // that invalidates the pinned target means the rename never re-enters the
+    // diff, so the ordinary convergence path above can never clear the row and
+    // doctor ages it to a permanent FAIL no CLI can fix. An open sentinel whose
+    // stale source_path row no longer resolves has nothing left to reconcile
+    // (the duplicate is gone — deleted by the operator, a full-sync purge, or
+    // any other path), so it clears here, mirroring the `<head>` clear above.
+    ...(await orphanedRenameSentinels(
+      engine, opts.sourceId ?? DEFAULT_SOURCE_ID, new Set(failedFiles.map(f => f.path)),
+    )),
   ];
 
   const gate = await applySyncFailureGate({
@@ -3432,20 +3568,44 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     const codeBreakdown = formatCodeBreakdown(failedFiles);
     // Two sentinel classes block here: `<head>` (pin ancestry broken) and
     // `<rename:…>` (#3056 — a rename-reconcile delete failed and advancing
-    // would permanently bank the duplicate). Pick the message by which fired.
+    // would permanently bank the duplicate). Pick the message by which fired —
+    // and when BOTH fired, the rename detail is appended to the head message
+    // rather than silently losing to it (#3479 review).
+    const renameRows = failedFiles.filter(f => f.path.startsWith(RENAME_SENTINEL_PREFIX));
+    // The failing rows verbatim (path + error): the error names the stale
+    // slug and the old path, which the operator remedy below points at —
+    // a code-count breakdown alone can't tell them which row to delete.
+    const renameDetail = renameRows.map(f => `  ${f.path}: ${f.error}`).join('\n');
+    // #3479 blocker 1 — the sentinel hard-blocks even --skip-failed by
+    // design, so an environment where the DELETE can never succeed (RLS
+    // denying DELETE, an FK RESTRICT) needs a documented exit or a cosmetic
+    // duplicate becomes a total sync outage. The remedy is deliberately NOT
+    // pitched at a fully read-only database: 'gbrain delete' soft-deletes
+    // via UPDATE, so it unwedges exactly the environments where writes work
+    // but this DELETE does not.
+    const renameRemedy =
+      `The next 'gbrain sync' retries the reconcile from the same diff. If the delete ` +
+      `keeps failing in your environment (RLS denying DELETE, an FK RESTRICT — anywhere ` +
+      `UPDATE still works), remove the stale row yourself: 'gbrain delete <stale-slug>' ` +
+      `with the stale slug named above — the reconcile then finds nothing left to delete ` +
+      `and the sentinel clears on the next run.`;
     if (gate.sentinelBlocked && failedFiles.some(f => f.path === '<head>')) {
       serr(
         `\nSync blocked: repository history changed during sync (force-push / reset).\n` +
         `${codeBreakdown}\n\n` +
         `The pinned target is no longer an ancestor of HEAD; advancing would record ` +
         `a commit that doesn't match the indexed tree. Re-run sync to re-pin against ` +
-        `current HEAD.`,
+        `current HEAD.` +
+        (renameRows.length > 0
+          ? `\n\nA rename also left a stale duplicate that could not be removed:\n` +
+            `${renameDetail}\n\n${renameRemedy}`
+          : ''),
       );
     } else if (gate.sentinelBlocked) {
       serr(
         `\nSync blocked: a rename left a stale duplicate that could not be removed:\n` +
-        `${codeBreakdown}\n\n` +
-        `The next 'gbrain sync' retries the reconcile from the same diff.`,
+        `${renameDetail || codeBreakdown}\n\n` +
+        renameRemedy,
       );
     } else {
       const fileFailCount = failedFiles.filter(f => isSkippablePath(f.path)).length;
@@ -3742,9 +3902,16 @@ async function performFullSync(
   // failures still climb their attempts.
   const fullSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
   const fullFailureSet = new Set(result.failures.map(f => f.path));
-  const fullSucceeded = loadSyncFailures()
-    .filter(e => e.source_id === fullSourceId && isSkippablePath(e.path) && !fullFailureSet.has(e.path))
-    .map(e => e.path);
+  const fullSucceeded = [
+    ...loadSyncFailures()
+      .filter(e => e.source_id === fullSourceId && isSkippablePath(e.path) && !fullFailureSet.has(e.path))
+      .map(e => e.path),
+    // #3479 blocker 2 — the same orphaned-`<rename:…>`-sentinel self-heal the
+    // incremental gate applies: an open sentinel whose stale source_path row
+    // no longer resolves has nothing left to reconcile, and a full sync is
+    // often exactly the operator's reset move after a wedge.
+    ...(await orphanedRenameSentinels(engine, fullSourceId, fullFailureSet)),
+  ];
   const advanceFull = async (): Promise<void> => {
     // Persist sync state so the next sync is incremental. Routed through
     // writeSyncAnchor so --source pins the right sources row.
@@ -3766,7 +3933,21 @@ async function performFullSync(
   if (!fullGate.advanced) {
     const codeBreakdown = formatCodeBreakdown(result.failures);
     if (fullGate.sentinelBlocked) {
-      serr(`\nFull sync blocked: repository history changed during sync.\n${codeBreakdown}`);
+      // #3479 review — say WHICH sentinel fired: a `<rename:…>` block here
+      // used to print the history-changed message, pointing the operator at
+      // a force-push that never happened.
+      const fullRenameRows = result.failures.filter(f => f.path.startsWith(RENAME_SENTINEL_PREFIX));
+      if (fullRenameRows.length > 0) {
+        serr(
+          `\nFull sync blocked: a rename left a stale duplicate that could not be removed:\n` +
+          `${fullRenameRows.map(f => `  ${f.path}: ${f.error}`).join('\n')}\n\n` +
+          `If the delete keeps failing in your environment, remove the stale row ` +
+          `yourself: 'gbrain delete <stale-slug>' with the stale slug named above — ` +
+          `the sentinel then clears on the next sync.`,
+        );
+      } else {
+        serr(`\nFull sync blocked: repository history changed during sync.\n${codeBreakdown}`);
+      }
     } else {
       const fileFailCount = result.failures.filter(f => isSkippablePath(f.path)).length;
       serr(
@@ -3928,6 +4109,11 @@ async function performFullSync(
         slog(`  Reconciled ${reconciledDeletes} stale page(s) whose source file was removed.`);
       }
     }
+    // #3479 blocker 2 — the pre-gate orphan probe above ran BEFORE this purge,
+    // so a `<rename:…>` sentinel whose stale row the purge just removed would
+    // stay open until the NEXT run. Sweep again post-purge: a full sync is the
+    // operator's usual reset move, and it should converge in one run.
+    await sweepOrphanedRenameSentinels(engine, fullSourceId);
   }
 
   // Full sync doesn't track pagesAffected, so fall back to embed --stale.
