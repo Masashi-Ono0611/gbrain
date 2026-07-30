@@ -1848,6 +1848,33 @@ async function activeSlugsBySourcePath(
 }
 
 /**
+ * #3583 review (data-loss blocker): every tracked working-tree file, indexed
+ * by the slug it derives to. `updateSlug` never rewrites `source_path` and an
+ * unchanged-content re-import is a no-write skip, so after an ordinary cheap
+ * rename the LIVE row still carries its OLD path — `source_path = from`
+ * therefore matches live pages, not just stale ones. A reconcile candidate is
+ * only genuinely stale when NO working-tree file derives to its CURRENT slug.
+ * Derivation goes through resolveSlugForPath — the exact mapping the import
+ * path uses — so a slugified path (case folding, spaces) can never be
+ * misclassified the way a naive `slug + '.md'` inversion would. Built at most
+ * once per sync run, and only when a fallback rename actually has reconcile
+ * candidates. Throws on git failure: the caller's catch records the
+ * `<rename:…>` sentinel (fail-closed) instead of guessing.
+ */
+function trackedSlugIndex(gitContextRoot: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  const listing = git(gitContextRoot, ['ls-files', '-z']);
+  for (const rel of listing.split('\u0000')) {
+    if (!rel) continue;
+    const slug = resolveSlugForPath(rel);
+    const arr = out.get(slug);
+    if (arr) arr.push(rel);
+    else out.set(slug, [rel]);
+  }
+  return out;
+}
+
+/**
  * #3479 blocker 2 — find open `<rename:…>` sentinels with nothing left to
  * reconcile. A sentinel is orphaned when NO active row carries the rename's
  * OLD source_path (read back out of the sentinel's own error text) anymore:
@@ -2391,7 +2418,15 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     }
     // #3479 blocker 2: quiet runs bypass the failure gate below, and an
     // orphaned `<rename:…>` sentinel would otherwise sit open forever.
-    await sweepOrphanedRenameSentinels(engine, opts.sourceId ?? DEFAULT_SOURCE_ID);
+    // #3583 review: NOT under --dry-run — the sweep rewrites the failure
+    // ledger, and this early return sits ABOVE the dry-run gate, so an
+    // unguarded sweep here made a preview clear the operator's only wedge
+    // signal. (The sibling site below already sits after the dry-run
+    // return, and performFullSync's dry-run return precedes both of its
+    // sweep sites.)
+    if (!opts.dryRun) {
+      await sweepOrphanedRenameSentinels(engine, opts.sourceId ?? DEFAULT_SOURCE_ID);
+    }
     return {
       status: 'up_to_date',
       fromCommit: lastCommit,
@@ -2964,6 +2999,21 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       }
     }
 
+    // #3583 review: lazily-built (at most once per run) tracked-file slug
+    // index for the live-row filter in the reconcile below. A throw from the
+    // index build surfaces inside the reconcile's own try/catch, where it
+    // records the `<rename:…>` sentinel — fail-closed, never a guessed delete.
+    // Liveness = tracked in the git index, deliberately NOT "present on
+    // disk": sync's ground truth is git, and in a sparse/partial checkout a
+    // tracked file is intentionally absent from the working tree — an
+    // on-disk check would misclassify its live page as stale and delete it,
+    // the same failure shape this filter exists to prevent.
+    let treeSlugIndex: Map<string, string[]> | undefined;
+    const isLiveSlug = (s: string): boolean => {
+      treeSlugIndex ??= trackedSlugIndex(gitContextRoot);
+      return treeSlugIndex.has(s);
+    };
+
     for (const { from, to } of renamesToDo) {
       // v0.41.13.0 (T2 / D-V4-2): per-iteration abort check. Renames call
       // importFile() at line 1173-style sites which can be slow on big files;
@@ -3053,23 +3103,47 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           // operator exit from a permanent delete-failure wedge (blocker 1):
           // retrying the hard delete against a row the operator already
           // removed would just re-fail and keep the sync blocked.
+          // Rows whose CURRENT slug a working-tree file still derives to are
+          // LIVE, not stale, and are filtered out before any delete (#3583
+          // review) — so `staleSlug` below (and the sentinel/remedy text it
+          // feeds) can only ever name a genuinely-stale row.
           let staleSlug: string | undefined;
           try {
             const active = await activeSlugsBySourcePath(
               engine, [from], opts.sourceId ?? DEFAULT_SOURCE_ID,
             );
-            const staleSlugs = (active.get(from) ?? []).filter(s => s !== newSlug);
+            // #3583 review (data-loss blocker): `source_path = from` also
+            // matches LIVE pages — after an ordinary cheap rename the
+            // surviving row keeps the OLD path (updateSlug never rewrites
+            // source_path; an unchanged-content re-import writes nothing).
+            // Delete only rows whose CURRENT slug no working-tree file
+            // derives to; skip the rest as live.
+            const candidates = (active.get(from) ?? []).filter(s => s !== newSlug);
+            const staleSlugs: string[] = [];
+            for (const s of candidates) {
+              if (isLiveSlug(s)) {
+                serr(
+                  `  [sync] rename reconcile: skipping live row ${s} — a working-tree ` +
+                  `file still derives to it (source_path ${from} is stale bookkeeping).`,
+                );
+              } else {
+                staleSlugs.push(s);
+              }
+            }
             if (staleSlugs.length > 0) {
-              // Delete every active row still carrying the old path — with a
-              // non-unique source_path there can be more than one, and the
-              // rename is checkpointed after this loop, so a survivor would
-              // never be retried (#3479 review, the ORDER BY finding).
+              // Delete every genuinely-stale active row still carrying the
+              // old path — with a non-unique source_path there can be more
+              // than one, and the rename is checkpointed after this loop, so
+              // a survivor would never be retried (#3479 review, the ORDER BY
+              // finding).
               for (const s of staleSlugs) {
                 staleSlug = s;
                 await engine.deletePage(s, renameOpts);
                 deletedSlugs.add(s); // never hand a deleted slug to auto-embed
                 serr(`  [sync] rename reconciled: removed stale row ${s} (${from} -> ${to} fell back to add).`);
               }
+            } else if (candidates.length > 0) {
+              serr(`  [sync] rename fallback: every active row with source_path ${from} is live; nothing stale to reconcile.`);
             } else {
               serr(`  [sync] rename fallback: no active row has source_path ${from}; nothing left to reconcile.`);
             }
@@ -3587,8 +3661,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `The next 'gbrain sync' retries the reconcile from the same diff. If the delete ` +
       `keeps failing in your environment (RLS denying DELETE, an FK RESTRICT — anywhere ` +
       `UPDATE still works), remove the stale row yourself: 'gbrain delete <stale-slug>' ` +
-      `with the stale slug named above — the reconcile then finds nothing left to delete ` +
-      `and the sentinel clears on the next run.`;
+      `with the stale slug named above (the reconcile only names rows whose backing file ` +
+      `is gone from the working tree — never a live page) — the reconcile then finds ` +
+      `nothing left to delete and the sentinel clears on the next run.`;
     if (gate.sentinelBlocked && failedFiles.some(f => f.path === '<head>')) {
       serr(
         `\nSync blocked: repository history changed during sync (force-push / reset).\n` +
@@ -3942,7 +4017,8 @@ async function performFullSync(
           `\nFull sync blocked: a rename left a stale duplicate that could not be removed:\n` +
           `${fullRenameRows.map(f => `  ${f.path}: ${f.error}`).join('\n')}\n\n` +
           `If the delete keeps failing in your environment, remove the stale row ` +
-          `yourself: 'gbrain delete <stale-slug>' with the stale slug named above — ` +
+          `yourself: 'gbrain delete <stale-slug>' with the stale slug named above ` +
+          `(only rows whose backing file is gone are ever named — never a live page) — ` +
           `the sentinel then clears on the next sync.`,
         );
       } else {

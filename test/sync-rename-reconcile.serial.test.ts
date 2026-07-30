@@ -476,13 +476,16 @@ describe('#3479: rename sentinel error format round-trips', () => {
 });
 
 describe('#3479: non-unique source_path — a soft-deleted row must not mask a live duplicate', () => {
-  test('sentinel survives while ANY active row still carries the old path; reconcile removes every active one', async () => {
+  test('sentinel survives while ANY active row still carries the old path; reconcile removes every stale active one and spares the live row', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     const { loadSyncFailures } = await import('../src/core/sync-failure-ledger.ts');
     const openRenameRows = () => loadSyncFailures().filter(
       f => f.path === '<rename:people/dana.md>' && f.state === 'open',
     );
-    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    const repo = mkRepo({
+      'people/carol.md': personMd('Carol', 'Carol is a person.'),
+      'people/erin.md': personMd('Erin', 'Erin is a person.'),
+    });
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
 
     // A SECOND row sharing source_path=people/carol.md (non-unique index):
@@ -494,6 +497,14 @@ describe('#3479: non-unique source_path — a soft-deleted row must not mask a l
     await engine.executeRaw(
       `UPDATE pages SET source_path = 'people/carol.md'
        WHERE source_id = 'default' AND slug = 'people/carol-duplicate'`,
+    );
+    // A LIVE row also sharing the old path — the bookkeeping a prior cheap
+    // rename leaves behind (updateSlug never rewrites source_path). Its
+    // backing file people/erin.md is in the working tree, so the widened
+    // delete must NOT touch it (#3583 review, the data-loss blocker).
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/carol.md'
+       WHERE source_id = 'default' AND slug = 'people/erin'`,
     );
     await engine.putPage('people/carol-decoy', {
       type: 'person', title: 'Carol (decoy)', compiled_truth: 'soft-deleted decoy sharing the path',
@@ -520,16 +531,157 @@ describe('#3479: non-unique source_path — a soft-deleted row must not mask a l
     }
     expect(openRenameRows()).toHaveLength(1);
 
-    // Convergence must remove BOTH active rows carrying the old path — a
-    // single-row reconcile would leave one behind with the rename already
-    // checkpointed, never to be retried.
+    // Convergence must remove BOTH genuinely-stale active rows carrying the
+    // old path — a single-row reconcile would leave one behind with the
+    // rename already checkpointed, never to be retried. The LIVE erin row
+    // (backed by people/erin.md in the working tree) must survive.
     const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(result.status).toBe('synced');
     expect(await engine.getPage('people/carol')).toBeNull();
     expect(await engine.getPage('people/carol-duplicate')).toBeNull();
+    const erin = await engine.getPage('people/erin');
+    expect(erin).not.toBeNull();
+    expect(erin!.compiled_truth).toContain('Erin is a person.');
     expect(openRenameRows()).toHaveLength(0);
     const dana = await engine.getPage('people/dana');
     expect(dana).not.toBeNull();
     expect(dana!.compiled_truth).toContain('Carol is a person.');
+  });
+});
+
+describe('#3583 review: a live page sharing the stale source_path survives the reconcile', () => {
+  test('cheap rename leaves the old source_path on the live row; a later occupied-destination rename must not delete it', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/alpha.md': personMd('Alpha', 'Alpha original body.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('people/alpha')).not.toBeNull();
+
+    // Ordinary cheap rename alpha -> beta. updateSlug moves the slug but
+    // never rewrites source_path, and the follow-up import is an
+    // unchanged-content no-write skip — so the LIVE beta row keeps the OLD
+    // path. Pinned here because it is the precondition that made the
+    // widened source_path delete a data-loss bug (#3583 review).
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "cheap rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    const betaRows = await engine.executeRaw<{ source_path: string | null }>(
+      `SELECT source_path FROM pages
+        WHERE source_id = 'default' AND slug = 'people/beta' AND deleted_at IS NULL`,
+    );
+    expect(betaRows).toHaveLength(1);
+    expect(betaRows[0].source_path).toBe('people/alpha.md');
+
+    // An unrelated NEW file appears at the old path — two active rows now
+    // share source_path=people/alpha.md.
+    writeFileSync(join(repo, 'people/alpha.md'), personMd('Alpha II', 'A fresh, unrelated alpha.'));
+    execSync('git add -A && git commit -m "new unrelated alpha"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('people/alpha')).not.toBeNull();
+    expect(await engine.getPage('people/beta')).not.toBeNull();
+
+    // Rename the recreated alpha into an OCCUPIED destination (the #3056
+    // fallback this reconcile exists for). Only the recreated-alpha row is
+    // genuinely stale; beta is a live page whose backing file is present in
+    // the working tree.
+    await engine.putPage('people/gamma', {
+      type: 'person', title: 'Gamma occupier', compiled_truth: 'occupies the destination slug',
+    }, { sourceId: 'default' });
+    execSync('git mv people/alpha.md people/gamma.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha into occupied gamma"', { cwd: repo, stdio: 'pipe' });
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+
+    // The destination carries the recreated file's content...
+    const gamma = await engine.getPage('people/gamma');
+    expect(gamma).not.toBeNull();
+    expect(gamma!.compiled_truth).toContain('A fresh, unrelated alpha.');
+    // ...the genuinely-stale row (recreated alpha, file gone) is removed...
+    expect(await engine.getPage('people/alpha')).toBeNull();
+    // ...and the LIVE beta page survives with its content intact.
+    const beta = await engine.getPage('people/beta');
+    expect(beta).not.toBeNull();
+    expect(beta!.compiled_truth).toContain('Alpha original body.');
+
+    // The very next sync is quiet and beta is still alive — the review's
+    // loss was permanent precisely because no incremental sync healed it.
+    const quiet = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(quiet.status).toBe('up_to_date');
+    expect(await engine.getPage('people/beta')).not.toBeNull();
+  });
+});
+
+describe('#3583 review: --dry-run must not rewrite the failure ledger', () => {
+  const openDanaRows = async () => {
+    const { loadSyncFailures } = await import('../src/core/sync-failure-ledger.ts');
+    return loadSyncFailures().filter(
+      f => f.path === '<rename:people/dana.md>' && f.state === 'open',
+    );
+  };
+
+  /** Plant one open, ORPHANED `<rename:…>` sentinel (its old path has no
+   * active row) — exactly what the self-heal sweep would clear, which is
+   * why a preview must not run the sweep. */
+  async function plantOrphanedSentinel(): Promise<void> {
+    const { recordFailures, renameSentinelPath, renameReconcileErrorMessage } =
+      await import('../src/core/sync-failure-ledger.ts');
+    recordFailures('default', [{
+      path: renameSentinelPath('people/dana.md'),
+      error: renameReconcileErrorMessage('people/dana-old.md', 'people/dana-old', 'injected wedge'),
+    }], 'deadbeef');
+  }
+
+  test('quiet-repo dry run reports up_to_date and leaves the open sentinel untouched; the real run still self-heals it', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    await plantOrphanedSentinel();
+    expect(await openDanaRows()).toHaveLength(1);
+
+    const dry = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, dryRun: true });
+    expect(dry.status).toBe('up_to_date');
+    // The operator's only wedge signal survives the preview.
+    expect(await openDanaRows()).toHaveLength(1);
+
+    // Control: the same quiet run WITHOUT --dry-run self-heals the orphan.
+    const real = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(real.status).toBe('up_to_date');
+    expect(await openDanaRows()).toHaveLength(0);
+  });
+
+  test('totalChanges==0 sweep site: git advanced with no syncable changes — dry run preserves the row, the real run clears it', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    await plantOrphanedSentinel();
+    expect(await openDanaRows()).toHaveLength(1);
+
+    // Advance git HEAD with a change the markdown strategy filters out, so
+    // the run reaches the totalChanges==0 early return (not the
+    // HEAD-equality one).
+    writeFileSync(join(repo, 'notes.txt'), 'not syncable under the markdown strategy');
+    execSync('git add -A && git commit -m "non-syncable change"', { cwd: repo, stdio: 'pipe' });
+
+    const dry = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, dryRun: true });
+    expect(dry.status).toBe('dry_run');
+    expect(await openDanaRows()).toHaveLength(1);
+
+    const real = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(real.status).toBe('up_to_date');
+    expect(await openDanaRows()).toHaveLength(0);
+  });
+
+  test('performFullSync pre-gate probe: a full sync self-heals an orphaned sentinel', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+
+    await plantOrphanedSentinel();
+    expect(await openDanaRows()).toHaveLength(1);
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(result.status).toBe('first_sync');
+    expect(await engine.getPage('people/carol')).not.toBeNull();
+    expect(await openDanaRows()).toHaveLength(0);
   });
 });
