@@ -1,12 +1,12 @@
 ---
 id: x-to-brain
 name: X-to-Brain
-version: 0.8.2
+version: 0.8.3
 description: Twitter timeline, mentions, and keyword monitoring flow into brain pages. Tracks deletions, engagement velocity, OCR on images, and real-time alerts.
 category: sense
 requires: []
 secrets:
-  - name: X_BEARER_TOKEN
+  - name: X_API_BEARER_TOKEN
     description: X API v2 Bearer token (Basic tier minimum, $200/mo for full archive search)
     where: https://developer.x.com/en/portal/dashboard — create a project + app, copy the Bearer Token from "Keys and tokens"
   - name: X_HANDLE
@@ -16,7 +16,7 @@ health_checks:
   - type: http
     url: "https://api.x.com/2/users/by/username/$X_HANDLE"
     auth: bearer
-    auth_token: "$X_BEARER_TOKEN"
+    auth_token: "$X_API_BEARER_TOKEN"
     label: "X API"
 setup_time: 15 min
 cost_estimate: "$0-200/mo (Free tier: 1 app, read-only. Basic: $200/mo for search + higher limits)"
@@ -118,11 +118,11 @@ Tell the user:
 Note: Free tier gives read-only access with low limits. Basic tier ($200/mo)
 gives search/recent endpoint and higher limits. Pro tier gets full archive search."
 
-Set both `X_BEARER_TOKEN` and `X_HANDLE` in the environment. Validate immediately
+Set both `X_API_BEARER_TOKEN` and `X_HANDLE` in the environment. Validate immediately
 (app-only bearer tokens cannot call `/users/me` — that endpoint requires
 user-context OAuth — so validation uses the by-username lookup):
 ```bash
-curl -sf -H "Authorization: Bearer $X_BEARER_TOKEN" \
+curl -sf -H "Authorization: Bearer $X_API_BEARER_TOKEN" \
   "https://api.x.com/2/users/by/username/$X_HANDLE" \
   && echo "PASS: X API connected" \
   || echo "FAIL: X API token invalid"
@@ -138,7 +138,7 @@ starting with 'AAA...', (3) if you just created the app, the token is valid imme
 
 ```bash
 # Look up the user's X user ID from their handle
-curl -sf -H "Authorization: Bearer $X_BEARER_TOKEN" \
+curl -sf -H "Authorization: Bearer $X_API_BEARER_TOKEN" \
   "https://api.x.com/2/users/by/username/$X_HANDLE" | grep -o '"id":"[^"]*"'
 ```
 
@@ -210,7 +210,7 @@ The agent should review collected data 2-3x daily and run enrichment.
 
 ```bash
 mkdir -p ~/.gbrain/integrations/x-to-brain
-echo '{"ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","event":"setup_complete","source_version":"0.8.2","status":"ok","details":{"user_id":"X_USER_ID"}}' >> ~/.gbrain/integrations/x-to-brain/heartbeat.jsonl
+echo '{"ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","event":"setup_complete","source_version":"0.8.3","status":"ok","details":{"user_id":"X_USER_ID"}}' >> ~/.gbrain/integrations/x-to-brain/heartbeat.jsonl
 ```
 
 ## Production Patterns (v0.8.1)

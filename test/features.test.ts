@@ -23,6 +23,36 @@ describe('recipe metadata', () => {
   });
 });
 
+// #2789: the x-to-brain secret name must be the one the resolver actually
+// reads. The recipe + RECIPE_META used to pin X_BEARER_TOKEN while the
+// x_handle_to_tweet resolver reads only config x_api_bearer_token / env
+// X_API_BEARER_TOKEN — so no single name worked end-to-end. All three
+// surfaces must agree on the resolver's canonical name.
+describe('x-to-brain secret name alignment (#2789)', () => {
+  const read = (p: string) => {
+    const { readFileSync } = require('fs');
+    return readFileSync(new URL(p, import.meta.url), 'utf-8') as string;
+  };
+
+  it('features registry pins the resolver-canonical name', () => {
+    const src = read('../src/commands/features.ts');
+    expect(src).toContain("{ id: 'x-to-brain', name: 'X/Twitter to Brain', secrets: ['X_API_BEARER_TOKEN'] }");
+  });
+
+  it('the x-to-brain recipe declares and uses only the canonical name', () => {
+    const recipe = read('../recipes/x-to-brain.md');
+    expect(recipe).toContain('X_API_BEARER_TOKEN');
+    // No occurrence of the legacy name. (Safe as a substring check: the
+    // canonical X_API_BEARER_TOKEN does not contain X_BEARER_TOKEN.)
+    expect(recipe).not.toContain('X_BEARER_TOKEN');
+  });
+
+  it('the resolver reads the same env var the recipe documents', () => {
+    const resolver = read('../src/core/resolvers/builtin/x-api/handle-to-tweet.ts');
+    expect(resolver).toContain('process.env.X_API_BEARER_TOKEN');
+  });
+});
+
 // Test brain_score in BrainHealth type
 describe('BrainHealth type', () => {
   it('includes brain_score field', async () => {
