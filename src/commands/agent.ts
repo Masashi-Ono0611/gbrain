@@ -19,6 +19,7 @@ import { MinionQueue } from '../core/minions/queue.ts';
 import { waitForCompletion, TimeoutError } from '../core/minions/wait-for-completion.ts';
 import type { MinionJobInput, SubagentHandlerData, AggregatorHandlerData } from '../core/minions/types.ts';
 import { resolveSourceId, ALL_SOURCES } from '../core/source-resolver.ts';
+import { fetchSource } from '../core/sources-load.ts';
 import { runAgentLogs } from './agent-logs.ts';
 
 // ── arg parsing helpers ────────────────────────────────────
@@ -237,6 +238,13 @@ function isResolverUserError(e: unknown): boolean {
  * would reject it anyway — better to fail at submit than at claim).
  */
 async function resolveAgentSource(engine: BrainEngine, explicit: string | undefined): Promise<string> {
+  // An empty `--source ""` must fail loudly, not silently degrade to the
+  // env/dotfile/default tiers (resolveSourceId's `if (explicit)` treats a
+  // falsy value as omitted — explicit-but-empty would slip through).
+  if (explicit !== undefined && explicit.trim() === '') {
+    console.error('gbrain agent run: --source requires a non-empty value. Run `gbrain agent run --help`.');
+    process.exit(2);
+  }
   let resolved: string;
   try {
     resolved = await resolveSourceId(engine, explicit ?? null);
@@ -253,6 +261,16 @@ async function resolveAgentSource(engine: BrainEngine, explicit: string | undefi
       `subagent writes must target exactly one source. Pass a concrete --source <id>.`,
     );
     process.exit(2);
+  }
+  // Archived-source guard, mirroring dream.ts: writing subagent pages into
+  // an archived (normally invisible) source would mask them until restore.
+  const src = await fetchSource(engine, resolved);
+  if (src?.archived === true) {
+    console.error(
+      `gbrain agent run: source ${resolved} is archived; restore with ` +
+      `\`gbrain sources restore ${resolved}\` before submitting agent jobs`,
+    );
+    process.exit(1);
   }
   return resolved;
 }
