@@ -14,7 +14,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
-import { __testing as agentTesting } from '../src/commands/agent.ts';
+import { __testing as agentTesting, runAgentRun } from '../src/commands/agent.ts';
 import { parseSince } from '../src/commands/agent-logs.ts';
 import { isProtectedJobName, PROTECTED_JOB_NAMES } from '../src/core/minions/protected-names.ts';
 
@@ -136,6 +136,17 @@ describe('parseRunFlags', () => {
   test('--fanout-manifest parsed', () => {
     const { flags } = agentTesting.parseRunFlags(['--fanout-manifest', '/tmp/m.json']);
     expect(flags.fanoutManifest).toBe('/tmp/m.json');
+  });
+
+  test('#2922: --source parsed as a leading value-flag', () => {
+    const { flags, rest } = agentTesting.parseRunFlags(['--source', 'corporate', 'do', 'x']);
+    expect(flags.source).toBe('corporate');
+    expect(rest).toEqual(['do', 'x']);
+  });
+
+  test('#2922: --source missing its value throws a usage error', () => {
+    expect(() => agentTesting.parseRunFlags(['--source'])).toThrow(/requires a value/);
+    expect(() => agentTesting.parseRunFlags(['--source', '--detach', 'x'])).toThrow(/requires a value/);
   });
 });
 
@@ -263,6 +274,98 @@ describe('queue.add trusted-submit gate for subagent', () => {
     await expect(
       queue.add('subagent', { prompt: 'hi', model: 'voyage:voyage-3-large' }, {}, { allowProtectedSubmit: true }),
     ).rejects.toThrow(/unknown provider/i);
+  });
+});
+
+describe('#2922: submit-time source resolution', () => {
+  let savedEnvSource: string | undefined;
+
+  beforeEach(async () => {
+    savedEnvSource = process.env.GBRAIN_SOURCE;
+    delete process.env.GBRAIN_SOURCE;
+    await engine.executeRaw(`DELETE FROM sources WHERE id != 'default'`);
+    await engine.unsetConfig('sources.default');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('corporate', 'Corporate') ON CONFLICT (id) DO NOTHING`,
+    );
+  });
+
+  const restoreEnv = () => {
+    if (savedEnvSource === undefined) delete process.env.GBRAIN_SOURCE;
+    else process.env.GBRAIN_SOURCE = savedEnvSource;
+  };
+
+  async function jobData(jobId: number): Promise<Record<string, unknown>> {
+    const rows = await engine.executeRaw<{ data: unknown }>(
+      `SELECT data FROM minion_jobs WHERE id = $1`, [jobId],
+    );
+    return typeof rows[0]!.data === 'string'
+      ? JSON.parse(rows[0]!.data as string)
+      : rows[0]!.data as Record<string, unknown>;
+  }
+
+  async function onlyJobData(): Promise<Record<string, unknown>> {
+    const rows = await engine.executeRaw<{ id: number }>(
+      `SELECT id FROM minion_jobs WHERE name = 'subagent' ORDER BY id`,
+    );
+    expect(rows.length).toBe(1);
+    return jobData(rows[0]!.id);
+  }
+
+  test('explicit --source lands on SubagentHandlerData.source_id', async () => {
+    try {
+      await runAgentRun(engine, ['--detach', '--source', 'corporate', 'write', 'a', 'page']);
+      const data = await onlyJobData();
+      expect(data.source_id).toBe('corporate');
+      expect(data.prompt).toBe('write a page');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('no --source: sources.default (tier 5) is honored instead of the seed default', async () => {
+    try {
+      await engine.setConfig('sources.default', 'corporate');
+      await runAgentRun(engine, ['--detach', 'write', 'a', 'page']);
+      const data = await onlyJobData();
+      expect(data.source_id).toBe('corporate');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('no signal at all: resolves to the seed default (legacy behavior preserved)', async () => {
+    try {
+      await runAgentRun(engine, ['--detach', 'write', 'a', 'page']);
+      const data = await onlyJobData();
+      expect(data.source_id).toBe('default');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('fan-out children all carry the resolved source_id', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fanout-source-'));
+    try {
+      const manifestPath = path.join(tmp, 'm.json');
+      fs.writeFileSync(manifestPath, JSON.stringify([
+        { prompt: 'chunk 1' }, { prompt: 'chunk 2' },
+      ]));
+      await runAgentRun(engine, [
+        '--source', 'corporate', '--fanout-manifest', manifestPath, '--detach',
+      ]);
+      const rows = await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM minion_jobs WHERE name = 'subagent' ORDER BY id`,
+      );
+      expect(rows.length).toBe(2);
+      for (const r of rows) {
+        const data = await jobData(r.id);
+        expect(data.source_id).toBe('corporate');
+      }
+    } finally {
+      restoreEnv();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 
