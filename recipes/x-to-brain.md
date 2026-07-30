@@ -438,6 +438,14 @@ Free tier works for personal monitoring. Basic tier needed for keyword search.
 
 ## Troubleshooting
 
+**Upgrading from recipe v0.8.2 or earlier (token shows [missing] after upgrade):**
+- Older versions of this recipe named the token `X_BEARER_TOKEN`. The canonical
+  name is `X_API_BEARER_TOKEN` — the name the built-in `x_handle_to_tweet`
+  resolver reads. Rename the variable wherever you set it (shell profile, cron
+  environment, `.env`) — same value, new name. A collector installed under the
+  old name keeps running either way; the rename is what makes the integrations
+  dashboard and the resolver see the token.
+
 **API returns 403:**
 - Check your app has the right access level (Read or Read+Write)
 - Free tier apps can only use basic endpoints

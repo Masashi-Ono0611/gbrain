@@ -39,15 +39,31 @@ describe('x-to-brain secret name alignment (#2789)', () => {
     expect(src).toContain("{ id: 'x-to-brain', name: 'X/Twitter to Brain', secrets: ['X_API_BEARER_TOKEN'] }");
   });
 
-  it('the x-to-brain recipe declares and uses only the canonical name', () => {
-    const recipe = read('../recipes/x-to-brain.md');
-    expect(recipe).toContain('X_API_BEARER_TOKEN');
-    // No occurrence of the legacy name. (Safe as a substring check: the
-    // canonical X_API_BEARER_TOKEN does not contain X_BEARER_TOKEN.)
-    expect(recipe).not.toContain('X_BEARER_TOKEN');
+  it('the x-to-brain recipe declares and uses only the canonical name', async () => {
+    const { parseRecipe } = await import('../src/commands/integrations.ts');
+    const raw = read('../recipes/x-to-brain.md');
+    const recipe = parseRecipe(raw, 'x-to-brain.md');
+    expect(recipe).not.toBeNull();
+    // Frontmatter: the declared secret is the canonical name.
+    const secretNames = recipe!.frontmatter.secrets.map(s => s.name);
+    expect(secretNames).toContain('X_API_BEARER_TOKEN');
+    expect(secretNames).not.toContain('X_BEARER_TOKEN');
+    // Health check: the bearer interpolation uses the canonical name.
+    const hc = recipe!.frontmatter.health_checks[0] as { auth_token?: string };
+    expect(hc.auth_token).toBe('$X_API_BEARER_TOKEN');
+    // Body: every $-interpolated token reference (curl examples etc.) is the
+    // canonical name — catches a third misspelled variant, not just the exact
+    // legacy string. (The legacy name may still appear as PROSE in the
+    // upgrade/migration note; only $VAR references are load-bearing.)
+    const tokenRefs = raw.match(/\$X_[A-Z_]*TOKEN\b/g) ?? [];
+    expect(tokenRefs.length).toBeGreaterThan(0);
+    for (const ref of tokenRefs) expect(ref).toBe('$X_API_BEARER_TOKEN');
   });
 
   it('the resolver reads the same env var the recipe documents', () => {
+    // Alignment guard (not a behavior test — resolver behavior is pinned in
+    // test/resolvers.test.ts): if the resolver's env name ever changes, this
+    // forces the recipe + registry to move with it.
     const resolver = read('../src/core/resolvers/builtin/x-api/handle-to-tweet.ts');
     expect(resolver).toContain('process.env.X_API_BEARER_TOKEN');
   });
