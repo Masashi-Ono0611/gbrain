@@ -27,6 +27,7 @@ import {
   renameReconcileErrorMessage,
   parseRenameReconcileFrom,
   clearFailures,
+  recordFailures,
 } from '../core/sync.ts';
 import {
   computeSyncDelta,
@@ -2085,18 +2086,59 @@ async function orphanedRenameSentinels(
  * a `synced` then `up_to_date` run pair that left the orphaned sentinel
  * open forever. Clears directly through the ledger; a no-op (including the
  * no-ledger-file case) costs one small file read.
+ *
+ * Clear-then-verify: after the clear, the probe runs once more, and any
+ * sentinel whose old path re-acquired an active row in the window (a
+ * writer outside the sync lock — a raw import, restore_page) is RESTORED
+ * from the row data captured before the clear. That converts the
+ * probe/clear race from "silently lost" to "detected and repaired". A
+ * writer landing after the verify probe is indistinguishable from one
+ * landing a second after a legitimate clear — out of any sentinel's reach
+ * by design (the sentinel is a one-shot failure record, not a
+ * continuously re-derived invariant), and the file ledger and the DB
+ * share no transaction that could close it.
  */
 async function sweepOrphanedRenameSentinels(
   engine: BrainEngine,
   sourceId: string,
 ): Promise<void> {
   const orphaned = await orphanedRenameSentinels(engine, sourceId, new Set());
-  if (orphaned.length > 0) {
-    clearFailures(sourceId, orphaned);
-    serr(
-      `  [sync] cleared ${orphaned.length} orphaned rename sentinel(s) — ` +
-      `the stale row(s) they guarded no longer resolve.`,
+  if (orphaned.length === 0) return;
+  const orphanSet = new Set(orphaned);
+  // Captured BEFORE the clear so a restore can reproduce the exact row.
+  const clearedRows = loadSyncFailures().filter(
+    r => r.source_id === sourceId && orphanSet.has(r.path),
+  );
+  clearFailures(sourceId, orphaned);
+  serr(
+    `  [sync] cleared ${orphaned.length} orphaned rename sentinel(s) — ` +
+    `the stale row(s) they guarded no longer resolve.`,
+  );
+  try {
+    const froms = new Map<string, string>();
+    for (const row of clearedRows) {
+      const from = parseRenameReconcileFrom(row.error);
+      if (from !== undefined) froms.set(row.path, from);
+    }
+    const active = await activeSlugsBySourcePath(
+      engine, [...new Set(froms.values())], sourceId,
     );
+    const revived = clearedRows.filter(r => {
+      const from = froms.get(r.path);
+      return from !== undefined && active.has(from);
+    });
+    for (const r of revived) {
+      recordFailures(sourceId, [{ path: r.path, error: r.error }], r.commit);
+    }
+    if (revived.length > 0) {
+      serr(
+        `  [sync] restored ${revived.length} rename sentinel(s) — an active row ` +
+        `re-acquired the old path between the probe and the clear.`,
+      );
+    }
+  } catch {
+    // Verify probe unavailable — the clear already happened on two
+    // consecutive positive verdicts; nothing safe to add here.
   }
 }
 

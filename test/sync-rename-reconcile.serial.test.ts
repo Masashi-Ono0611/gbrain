@@ -1114,3 +1114,51 @@ describe('#3583 review: both content states prove liveness — working tree AND 
     expect(await loadOpCheckpoint(engine, targetKey)).toEqual([]);
   });
 });
+
+describe('#3583 review: a writer landing AFTER the second probe gets its sentinel restored', () => {
+  test('clear-then-verify detects the post-probe row and re-records the sentinel', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    await plantOrphanedSentinel();
+    expect(await openDanaRows()).toHaveLength(1);
+
+    // Both orphan probes see "no active row" — the writer lands only AFTER
+    // the second probe returned, i.e. after the double-probe verdict is
+    // final and the clear is committed. The post-clear verify probe must
+    // detect the row and RESTORE the sentinel.
+    const origExecuteRaw = engine.executeRaw.bind(engine);
+    let probeCalls = 0;
+    (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw =
+      (async (sql: string, params?: unknown[]) => {
+        const res = await origExecuteRaw(sql, params);
+        if (sql.includes('source_path = ANY')) {
+          probeCalls++;
+          if (probeCalls === 2) {
+            await engine.putPage('people/dana-old-late-writer', {
+              type: 'person', title: 'Dana (late writer)',
+              compiled_truth: 'materialized after the second probe',
+            }, { sourceId: 'default' });
+            await origExecuteRaw(
+              `UPDATE pages SET source_path = 'people/dana-old.md'
+               WHERE source_id = 'default' AND slug = 'people/dana-old-late-writer'`,
+            );
+          }
+        }
+        return res;
+      }) as typeof engine.executeRaw;
+    try {
+      const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      expect(result.status).toBe('up_to_date');
+    } finally {
+      (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw = origExecuteRaw;
+    }
+
+    // Probe #1 and #2 (orphan verdict) + probe #3 (post-clear verify).
+    expect(probeCalls).toBe(3);
+    expect(await engine.getPage('people/dana-old-late-writer')).not.toBeNull();
+    // The duplicate is real again — the verify probe restored its sentinel.
+    expect(await openDanaRows()).toHaveLength(1);
+  });
+});
