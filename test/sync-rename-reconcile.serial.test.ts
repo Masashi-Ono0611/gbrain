@@ -2322,3 +2322,49 @@ describe('#3583 review: GATE14 — the purge liveness proof is repo-wide and sou
     }
   });
 });
+
+describe('#3583 review: FUGU — the carried-rename spare survives a decoy row displacing the DB resolve', () => {
+  test('a decoy row sharing the carrying rename\'s from-path cannot strip the path-derived slug from the spare set', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // The GATE6 sequence — a row carried by ANOTHER rename to a slugless
+    // exotic path — plus one DECOY: an unrelated row whose stale
+    // bookkeeping names the carrying rename's from-path. A single-slug
+    // DB resolve for notes/party.md returns the DECOY's slug and
+    // displaces the path-derived notes/party from the spare set; the
+    // carried row then loses its protection and is hard-deleted.
+    const repo = mkRepo({
+      'notes/party.md': personMd('Party', 'Party content lives here.'),
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('notes/party')).not.toBeNull();
+
+    // Stale bookkeeping: the carried row names alpha's path (its
+    // candidate-admission ticket for the colliding rename)...
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'notes/party'`,
+    );
+    // ...and the DECOY names the carrying rename's from-path.
+    await engine.putPage('people/decoy', {
+      type: 'person', title: 'Decoy', compiled_truth: 'stale bookkeeping pointing at party',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'notes/party.md'
+       WHERE source_id = 'default' AND slug = 'people/decoy'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta occupier', compiled_truth: 'occupies the destination slug',
+    }, { sourceId: 'default' });
+
+    execSync('git mv notes/party.md "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "carry party to an exotic path; rename alpha"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('blocked_by_failures');
+    // The carried row survives — the spare set holds the path-derived
+    // slug REGARDLESS of what the DB resolve returned for the path.
+    expect(await engine.getPage('notes/party')).not.toBeNull();
+  });
+});

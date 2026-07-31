@@ -912,8 +912,8 @@ export async function resolveSlugByPathOrSourcePath(
       // fallback import corrupted under a cross-source dedup. Resolve and
       // mutate must agree on the scope.
       const rows = await engine.executeRaw<{ slug: string }>(
-        `SELECT slug FROM pages WHERE source_path = $1 AND source_id = 'default' LIMIT 1`,
-        [path],
+        `SELECT slug FROM pages WHERE source_path = $1 AND source_id = $2 LIMIT 1`,
+        [path, DEFAULT_SOURCE_ID],
       );
       if (rows.length > 0 && rows[0].slug) return rows[0].slug;
     }
@@ -3514,12 +3514,29 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // even when its own rename was filtered out of processing (an
     // --exclude'd or out-of-scope destination still proves the content is
     // tracked; registration is purely spare-side).
-    const renameOldSlugs = new Map<string, string>();
-    for (const r of manifest.renamed) {
-      const s = opts.sourceId
-        ? (fromSlugByPath.get(r.from) ?? resolveSlugForPath(r.from))
-        : await resolveSlugByPathOrSourcePath(engine, r.from, undefined);
-      renameOldSlugs.set(r.from, s);
+    // Each from-path maps to a SET of slugs, never one: source_path is
+    // non-unique, so a DB resolve can return an UNRELATED row's slug
+    // (stale bookkeeping naming the same path) and silently displace the
+    // path-derived slug the carried-spare depends on — the carried row
+    // then lost its protection and the GATE6 delete came back. The set
+    // always holds the path-derived slug (when the path derives one)
+    // PLUS every active row's slug under that source_path; registration
+    // is purely spare-side, so over-inclusion only delays a cleanup.
+    const renameOldSlugs = new Map<string, Set<string>>();
+    {
+      let dbSlugsByFrom = new Map<string, string[]>();
+      try {
+        dbSlugsByFrom = await activeSlugsBySourcePath(
+          engine, manifest.renamed.map(r => r.from), opts.sourceId ?? DEFAULT_SOURCE_ID,
+        );
+      } catch { /* spare-side registration only — path-derived slugs still protect */ }
+      for (const r of manifest.renamed) {
+        const shapes = new Set<string>();
+        const derived = resolveSlugForPath(r.from);
+        if (derived !== '') shapes.add(derived);
+        for (const s of dbSlugsByFrom.get(r.from) ?? []) shapes.add(s);
+        renameOldSlugs.set(r.from, shapes);
+      }
     }
 
     for (const { from, to } of renamesToDo) {
@@ -3530,7 +3547,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         progress.finish();
         return await partial('timeout');
       }
-      const oldSlug = renameOldSlugs.get(from) ?? resolveSlugForPath(from);
+      // Single-slug resolution for the CHEAP RENAME target (which row
+      // updateSlug moves) — distinct from the set-valued carried-spare map
+      // above, which answers a different question (every slug the rename
+      // pair can prove tracked).
+      const oldSlug = opts.sourceId
+        ? (fromSlugByPath.get(from) ?? resolveSlugForPath(from))
+        : await resolveSlugByPathOrSourcePath(engine, from, undefined);
       // The new path doesn't yet have a row, so resolve from path only.
       const newSlug = resolveSlugForPath(to);
       // #3056: the cheap rename is OBSERVED, not assumed. A zero-row UPDATE
@@ -3562,7 +3585,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           // its rename sentinel (gate 14).
           await engine.executeRaw(
             `UPDATE pages SET source_path = $1 WHERE source_id = $2 AND slug = $3 AND source_path = $4`,
-            [to, opts.sourceId ?? 'default', newSlug, from],
+            [to, opts.sourceId ?? DEFAULT_SOURCE_ID, newSlug, from],
           );
         } catch { /* bookkeeping only — never fail the rename over it */ }
       }
@@ -3653,8 +3676,8 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
               // its content is still tracked even when no slug state names
               // it anymore — never a reconcile target of THIS rename.
               let carriedByOtherRename = false;
-              for (const [rFrom, rOldSlug] of renameOldSlugs) {
-                if (rFrom !== from && rOldSlug === s) { carriedByOtherRename = true; break; }
+              for (const [rFrom, rOldSlugs] of renameOldSlugs) {
+                if (rFrom !== from && rOldSlugs.has(s)) { carriedByOtherRename = true; break; }
               }
               if (carriedByOtherRename) {
                 serr(
