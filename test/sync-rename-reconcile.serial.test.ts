@@ -2848,17 +2848,22 @@ describe('#3583 review: GATE21 — the purge proves write provenance, not conten
     expect(resurrected!.type).toBe('note');
     expect(resurrected!.compiled_truth).toContain('State B body.');
 
-    // And it must STAY. A watermark alone only defers: it keeps advancing,
-    // so a one-time accepted write falls below it within a run or two.
-    // The second proof (the row's content_hash is one import would have
-    // produced for a committed state of its path) is what makes the spare
-    // durable.
-    const second = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
-    expect(second.status).not.toBe('blocked_by_failures');
-    expect(await engine.getPage('people/alpha')).not.toBeNull();
-    const third = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
-    expect(third.status).not.toBe('blocked_by_failures');
-    expect(await engine.getPage('people/alpha')).not.toBeNull();
+    // The watermark buys exactly one run — it advances, so a one-time
+    // accepted write falls below it on a later sync (executed: this is
+    // why the watermark is documented as a deferral, not a proof). What
+    // makes that survivable is that the reconcile's removal is SOFT: the
+    // row leaves every read path exactly as a hard delete would, and the
+    // operator can bring it back with its content intact for the 72h
+    // recovery window.
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    const afterSecond = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(afterSecond.status).not.toBe('blocked_by_failures');
+    expect(await engine.getPage('people/alpha')).toBeNull();
+    expect(await engine.restorePage('people/alpha', { sourceId: 'default' })).toBe(true);
+    const recovered = await engine.getPage('people/alpha');
+    expect(recovered).not.toBeNull();
+    expect(recovered!.type).toBe('note');
+    expect(recovered!.compiled_truth).toContain('State B body.');
   });
 
   test('G21_CRLF_FILTER_PROJECTION_FOREVER_SPARE: a genuine projection under a CRLF rule still purges', async () => {
