@@ -2172,3 +2172,153 @@ describe('#3583 review: GATE13 — chunker_version is acknowledged only by a com
     expect(await engine.getPage('people/alpha')).not.toBeNull();
   });
 });
+
+describe('#3583 review: GATE14 — the purge liveness proof is repo-wide and source-exact', () => {
+  test('a scoped full sync spares a legacy row whose live carrier sits OUTSIDE the scope', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      'scope/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+      'scope/keeper.md': personMd('Keeper', 'Keeper stays in scope.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    // The carrier moves OUT of the scope; the cheap rename repairs the
+    // bookkeeping, so re-plant the LEGACY shape a pre-fix brain carries.
+    mkdirSync(join(repo, 'outside'), { recursive: true });
+    execSync('git mv scope/alpha.md outside/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "move alpha outside the scope"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('outside/beta')).not.toBeNull();
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'scope/alpha.md'
+       WHERE source_id = 'default' AND slug = 'outside/beta'`,
+    );
+
+    // The scoped full sync admits the row as a candidate through its stale
+    // IN-SCOPE source_path — but its live carrier is outside the walk.
+    const full = await performSync(engine, {
+      repoPath: repo, ...SYNC_OPTS, full: true, srcSubpath: 'scope',
+    });
+    expect(full.status).not.toBe('blocked_by_failures');
+    expect(await engine.getPage('outside/beta')).not.toBeNull();
+  });
+
+  test('the bookkeeping repair never crosses sources: an unscoped sync leaves an identical (slug, source_path) row in another source alone', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const bare = { noPull: true, noEmbed: true, noExtract: true } as const;
+    // Source "other" naturally carries the SAME legacy pair the default
+    // source is about to repair: slug people/beta, source_path
+    // people/alpha.md.
+    const repoOther = mkRepo({ 'people/beta.md': personMd('Beta Other', 'Beta in the other source.') });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config, created_at)
+       VALUES ('other', 'other', '{}'::jsonb, now()) ON CONFLICT (id) DO NOTHING`,
+    );
+    const otherSync = await performSync(engine, { repoPath: repoOther, ...bare, sourceId: 'other' });
+    expect(otherSync.status).not.toBe('blocked_by_failures');
+    const otherSeed = await engine.executeRaw<{ n: number | string }>(
+      `SELECT count(*)::int AS n FROM pages WHERE source_id = 'other' AND slug = 'people/beta'`,
+    );
+    expect(Number(otherSeed[0]?.n)).toBe(1);
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'other' AND slug = 'people/beta'`,
+    );
+
+    // The default-source rename runs WITHOUT a sourceId (the bare path).
+    // Pin the bare path's dynamic source resolution to the DEFAULT source
+    // (tier 5, sources.default — otherwise the sole-non-default-source
+    // convenience tier routes the run into 'other'), so the run coheres
+    // with updateSlug's own no-opts scope ('default') — the pair the
+    // repair UPDATE must match.
+    const repoDefault = mkRepo({ 'people/alpha.md': personMd('Alpha', 'Alpha is a person.') });
+    await engine.setConfig('sources.default', 'default');
+    await performSync(engine, { repoPath: repoDefault, ...bare });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repoDefault, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repoDefault, stdio: 'pipe' });
+    const renameRun = await performSync(engine, { repoPath: repoDefault, ...bare });
+    expect(renameRun.status).toBe('synced');
+
+    // The default row is repaired...
+    const defaultRow = await engine.executeRaw<{ source_path: string | null }>(
+      `SELECT source_path FROM pages WHERE source_id = 'default' AND slug = 'people/beta'`,
+    );
+    expect(defaultRow[0]?.source_path).toBe('people/beta.md');
+    // ...and the OTHER source's bookkeeping is untouched: rewriting it made
+    // that source's later fallback reconcile probe the wrong path, find
+    // nothing, and advance without its rename sentinel (gate 14).
+    const otherRow = await engine.executeRaw<{ source_path: string | null }>(
+      `SELECT source_path FROM pages WHERE source_id = 'other' AND slug = 'people/beta'`,
+    );
+    expect(otherRow[0]?.source_path).toBe('people/alpha.md');
+  });
+
+  test('an untracked fallback-regime file proves its slug from the working tree without degrading the whole purge', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+      'people/gamma.md': personMd('Gamma', 'Gamma is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    execSync('git rm -q people/gamma.md && git commit -m "delete gamma"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.putPage('people/gamma', {
+      type: 'person', title: 'Gamma (stale)', compiled_truth: 'file deleted from disk and history',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/gamma.md'
+       WHERE source_id = 'default' AND slug = 'people/gamma'`,
+    );
+    // An UNTRACKED exotic file: it has no staging or HEAD state at all —
+    // the working tree is its complete evidence, not a proof failure.
+    writeFileSync(join(repo, '\u{1F389}.md'), exoticMd);
+
+    const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    // The genuinely-stale row is still purged (no blanket spare)...
+    expect(await engine.getPage('people/gamma')).toBeNull();
+    // ...while live pages are untouched.
+    expect(await engine.getPage('people/alpha')).not.toBeNull();
+  });
+
+  test('the mass-delete valve judges the POST-liveness candidate list', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const files: Record<string, string> = {
+      'people/gamma.md': personMd('Gamma', 'Gamma is a person.'),
+    };
+    for (let i = 1; i <= 20; i++) {
+      const n = String(i).padStart(2, '0');
+      files[`people/p${n}.md`] = personMd(`Person ${n}`, `Body of person ${n}.`);
+    }
+    const repo = mkRepo(files);
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    execSync('git rm -q people/gamma.md && git commit -m "delete gamma"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.putPage('people/gamma', {
+      type: 'person', title: 'Gamma (stale)', compiled_truth: 'file deleted from disk and history',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/gamma.md'
+       WHERE source_id = 'default' AND slug = 'people/gamma'`,
+    );
+    // Ten LIVE rows carry legacy bookkeeping naming paths that are gone —
+    // pre-filter that is 11 candidates over 21 file-backed rows (> 50%),
+    // post-filter it is exactly ONE genuinely-stale row.
+    for (let i = 1; i <= 10; i++) {
+      const n = String(i).padStart(2, '0');
+      await engine.executeRaw(
+        `UPDATE pages SET source_path = 'people/old-p${n}.md'
+         WHERE source_id = 'default' AND slug = 'people/p${n}'`,
+      );
+    }
+
+    const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    // The valve no longer refuses the single real stale row...
+    expect(await engine.getPage('people/gamma')).toBeNull();
+    // ...and every live row survives.
+    for (let i = 1; i <= 20; i++) {
+      const n = String(i).padStart(2, '0');
+      expect(await engine.getPage(`people/p${n}`)).not.toBeNull();
+    }
+  });
+});

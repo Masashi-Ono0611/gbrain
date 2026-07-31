@@ -903,8 +903,16 @@ export async function resolveSlugByPathOrSourcePath(
       const slug = m.get(path);
       if (slug) return slug;
     } else {
+      // #3583 gate14: scoped to 'default', matching every WRITE the bare
+      // no-sourceId path performs (updateSlug, deletePage, the rename
+      // bookkeeping repair — all default-scoped). The historical unscoped
+      // form could hand back a row from ANOTHER source that happened to
+      // share the source_path: renameOldSlugs then fed that foreign slug
+      // to updateSlug, the cheap rename silently no-opped, and the
+      // fallback import corrupted under a cross-source dedup. Resolve and
+      // mutate must agree on the scope.
       const rows = await engine.executeRaw<{ slug: string }>(
-        `SELECT slug FROM pages WHERE source_path = $1 LIMIT 1`,
+        `SELECT slug FROM pages WHERE source_path = $1 AND source_id = 'default' LIMIT 1`,
         [path],
       );
       if (rows.length > 0 && rows[0].slug) return rows[0].slug;
@@ -3546,17 +3554,16 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         // the moment the rename lands (best-effort: the purge's own
         // liveness spare is the backstop for rows this misses).
         try {
-          if (opts.sourceId) {
-            await engine.executeRaw(
-              `UPDATE pages SET source_path = $1 WHERE source_id = $2 AND slug = $3 AND source_path = $4`,
-              [to, opts.sourceId, newSlug, from],
-            );
-          } else {
-            await engine.executeRaw(
-              `UPDATE pages SET source_path = $1 WHERE slug = $2 AND source_path = $3`,
-              [to, newSlug, from],
-            );
-          }
+          // Scope EXACTLY the way updateSlug scoped the move it repairs:
+          // no sourceId means the DEFAULT source, never every source — an
+          // unqualified UPDATE rewrote a matching (slug, source_path) row
+          // in ANOTHER source, and that source's later fallback reconcile
+          // probed the rewritten path, found nothing, and advanced without
+          // its rename sentinel (gate 14).
+          await engine.executeRaw(
+            `UPDATE pages SET source_path = $1 WHERE source_id = $2 AND slug = $3 AND source_path = $4`,
+            [to, opts.sourceId ?? 'default', newSlug, from],
+          );
         } catch { /* bookkeeping only — never fail the rename over it */ }
       }
       // Reimport at new path (picks up content changes). Wrapped to match the
@@ -4665,15 +4672,47 @@ async function performFullSync(
     // (no delete without proof — the incremental reconcile's posture).
     const liveSlugs = new Set<string>();
     let livenessProofIntact = true;
+    // Basis A — repo-wide TRACKED files (the incremental reconcile's own
+    // basis): a scoped walk must not scope the PROOF. A legacy row admitted
+    // as a candidate through its stale in-scope source_path can be carried
+    // by a live file OUTSIDE the scope, and a liveness set built only from
+    // the scoped walk hard-deleted it (gate 14).
+    let trackedSet: Set<string> | null = null;
+    try {
+      const trackedListing = gitRawOutput(gitContextRoot, ['ls-files', '-z']);
+      trackedSet = new Set(trackedListing.split('\u0000').filter(Boolean));
+      for (const rel of trackedSet) {
+        const derived = resolveSlugForPath(rel);
+        if (derived !== '') { liveSlugs.add(derived); continue; }
+        if (isCodeFilePath(rel)) continue;
+        try {
+          const fb = fallbackSlugsForFile(gitContextRoot, rel);
+          for (const shape of fb.slugs) liveSlugs.add(shape);
+          if (!fb.proofIntact) livenessProofIntact = false;
+        } catch {
+          livenessProofIntact = false;
+        }
+      }
+    } catch {
+      livenessProofIntact = false;
+    }
+    // Basis B — walked files the tracked listing does not know (untracked):
+    // they have no git states to consult, so the working tree IS the whole
+    // evidence. Read it directly instead of degrading the proof over git
+    // states an untracked file cannot have (gate 14 — the degraded proof
+    // blanket-spared a genuinely-stale row over one untracked exotic file).
     for (const f of currentFiles) {
       const rel = f.replace(/\\/g, '/');
+      if (trackedSet?.has(rel)) continue;
       const derived = resolveSlugForPath(rel);
       if (derived !== '') { liveSlugs.add(derived); continue; }
       if (isCodeFilePath(rel)) continue;
       try {
-        const fb = fallbackSlugsForFile(gitContextRoot, rel);
-        for (const fs of fb.slugs) liveSlugs.add(fs);
-        if (!fb.proofIntact) livenessProofIntact = false;
+        const st = lstatSync(join(gitContextRoot, rel));
+        if (st.isSymbolicLink()) continue;
+        if (st.size > MAX_FILE_SIZE) { livenessProofIntact = false; continue; }
+        const content = readFileSync(join(gitContextRoot, rel), 'utf-8');
+        for (const shape of frontmatterSlugShapes(content, rel)) liveSlugs.add(shape);
       } catch {
         livenessProofIntact = false;
       }
@@ -4697,7 +4736,14 @@ async function performFullSync(
         `content).`,
       );
     }
-    if (staleCandidates.length > 0 && plan.massDelete && !massReconcileAllowed()) {
+    // #3583 gate14: the valve judges what would actually be DELETED — the
+    // post-liveness candidate list, by planReconcileDeletes' own formula. The
+    // pre-filter flag once refused a single genuinely-stale row because ten
+    // live legacy rows had inflated the pre-filter count past the ratio.
+    const massDelete =
+      plan.reconcilableCount > MASS_RECONCILE_MIN_PAGES &&
+      staleCandidates.length > plan.reconcilableCount * MASS_RECONCILE_RATIO;
+    if (staleCandidates.length > 0 && massDelete && !massReconcileAllowed()) {
       // #2828 mass-delete safety valve: a reconcile that would sweep more than
       // half of the pages this strategy manages, on a source with a non-trivial
       // number of them, is almost always a path-comparison bug or the wrong repo
