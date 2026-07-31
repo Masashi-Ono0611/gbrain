@@ -2510,8 +2510,9 @@ describe('#3583 review: GATE17 — legacy-slug rows survive the derived-authorit
     expect(manual).not.toBeNull();
     expect(manual!.compiled_truth).toContain('MANUAL BODY');
     // The rename converged through add + reconcile: the destination holds
-    // the file's content and the legacy old row (this file's row, proven
-    // by its source_path claim) was reconciled away.
+    // the file's content and the legacy old row (a stale claimant at a
+    // NON-derived slug — the established #3056 bookkeeping cleanup, not
+    // the gate-18 co-spoof shape) was reconciled away.
     const beta = await engine.getPage('people/beta');
     expect(beta).not.toBeNull();
     expect(beta!.compiled_truth).toContain('Alpha file body');
@@ -2595,5 +2596,113 @@ describe('#3583 review: GATE17 — legacy-slug rows survive the derived-authorit
     const party = await engine.getPage('notes/party');
     expect(party).not.toBeNull();
     expect(party!.compiled_truth).toContain('Party content lives here.');
+  });
+});
+
+describe('#3583 review: GATE18 — content-level rail on the cheap move + purge deferral on failed imports', () => {
+  test('G18_TWO_SIDED_INTERSECTION_DECOY_LOSS: a decoy at the derived slug that also claims the from-path is not moved, overwritten, or reconciled away', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // Both bookkeeping signals co-spoofed: the real row's bookkeeping
+    // drifted elsewhere while an unrelated decoy occupies the derived slug
+    // AND claims the from-path. The two-sided intersection alone selects
+    // the decoy; only the content rail (its body does not match the anchor
+    // state of the renamed file) tells them apart.
+    const repo = mkRepo({ 'people/alpha.md': personMd('Alpha', 'Alpha file body.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.executeRaw(
+      `UPDATE pages SET slug = 'people/real-elsewhere', source_path = 'old/alpha-home.md'
+       WHERE source_id = 'default' AND slug = 'people/alpha'`,
+    );
+    await engine.putPage('people/alpha', {
+      type: 'person', title: 'Decoy', compiled_truth: 'UNRELATED DECOY BODY',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/alpha'`,
+    );
+
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    // The decoy survives at its own slug with its own body (it was moved
+    // to people/beta and overwritten with the file body).
+    const decoy = await engine.getPage('people/alpha');
+    expect(decoy).not.toBeNull();
+    expect(decoy!.compiled_truth).toContain('UNRELATED DECOY BODY');
+    // The destination materialized with the file's content, and the real
+    // drifted row survives (deferred duplicate, not loss).
+    const beta = await engine.getPage('people/beta');
+    expect(beta).not.toBeNull();
+    expect(beta!.compiled_truth).toContain('Alpha file body');
+    expect(await engine.getPage('people/real-elsewhere')).not.toBeNull();
+  });
+
+  test('G18_ERROR_SKIP_ADVANCING_PURGE_LOSS: a full sync advanced with --skip-failed does not purge', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // The last-good legacy row's only living counterpart is exactly the
+    // file that FAILED to import (an errorful SLUG_MISMATCH skip): no
+    // import write, no dedup-skip record, no liveness registration beyond
+    // the path-derived slug. Advancing past the failure with --skip-failed
+    // must not let the purge treat that absence of evidence as staleness.
+    const repo = mkRepo({ 'old/alpha-home.md': personMd('Alpha', 'Alpha legacy body.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.executeRaw(
+      `UPDATE pages SET slug = 'people/legacy-alpha'
+       WHERE source_id = 'default' AND slug = 'old/alpha-home'`,
+    );
+    execSync('git rm -q old/alpha-home.md', { cwd: repo, stdio: 'pipe' });
+    // The current file errors: frontmatter slug conflicts with the
+    // path-derived slug (anti-spoof rejection).
+    mkdirSync(join(repo, 'people'), { recursive: true });
+    writeFileSync(join(repo, 'people/alpha.md'),
+      ['---', 'type: person', 'title: Alpha', 'slug: somewhere/else', '---', '', 'Alpha current body.'].join('\n'));
+    execSync('git add people/alpha.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "move alpha home, add a misconfigured alpha"', { cwd: repo, stdio: 'pipe' });
+
+    const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true, skipFailed: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    const legacy = await engine.getPage('people/legacy-alpha');
+    expect(legacy).not.toBeNull();
+    expect(legacy!.compiled_truth).toContain('Alpha legacy body.');
+  });
+
+  test('G18_ERROR_AUTOSKIP_PURGE_LOSS: the chronic-failure auto-skip advance does not purge either', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // Same root without explicit acknowledgement: the failure valve
+    // auto-skips the chronically-failing file and advances on its own.
+    const prevThreshold = process.env.GBRAIN_SYNC_AUTOSKIP_AFTER;
+    process.env.GBRAIN_SYNC_AUTOSKIP_AFTER = '2';
+    try {
+      const repo = mkRepo({ 'old/alpha-home.md': personMd('Alpha', 'Alpha legacy body.') });
+      await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      await engine.executeRaw(
+        `UPDATE pages SET slug = 'people/legacy-alpha'
+         WHERE source_id = 'default' AND slug = 'old/alpha-home'`,
+      );
+      execSync('git rm -q old/alpha-home.md', { cwd: repo, stdio: 'pipe' });
+      mkdirSync(join(repo, 'people'), { recursive: true });
+      writeFileSync(join(repo, 'people/alpha.md'),
+        ['---', 'type: person', 'title: Alpha', 'slug: somewhere/else', '---', '', 'Alpha current body.'].join('\n'));
+      execSync('git add people/alpha.md', { cwd: repo, stdio: 'pipe' });
+      execSync('git commit -m "move alpha home, add a misconfigured alpha"', { cwd: repo, stdio: 'pipe' });
+
+      let lastStatus = '';
+      for (let i = 0; i < 4; i++) {
+        const run = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+        lastStatus = run.status;
+        if (lastStatus !== 'blocked_by_failures') break;
+      }
+      // The valve eventually advances past the chronic failure...
+      expect(lastStatus).not.toBe('blocked_by_failures');
+      // ...and the advancing run still must not purge the legacy row.
+      const legacy = await engine.getPage('people/legacy-alpha');
+      expect(legacy).not.toBeNull();
+      expect(legacy!.compiled_truth).toContain('Alpha legacy body.');
+    } finally {
+      if (prevThreshold === undefined) delete process.env.GBRAIN_SYNC_AUTOSKIP_AFTER;
+      else process.env.GBRAIN_SYNC_AUTOSKIP_AFTER = prevThreshold;
+    }
   });
 });

@@ -2026,6 +2026,31 @@ function frontmatterSlugShapes(content: string, rel: string): string[] {
 }
 
 /**
+ * #3583 gate18: the compiled_truth the ANCHOR state of a path parses to —
+ * the content-level signal for "is this row genuinely the file's own row".
+ * Bookkeeping alone is spoofable from both sides (gate 16: a decoy claiming
+ * the path; gate 18: a decoy claiming the path AND occupying the derived
+ * slug), but the brain reflects `anchorCommit`, so the row imported from
+ * this file MUST hold the compiled_truth its anchor blob parses to — a
+ * rename+edit changes the file at HEAD, never the anchor blob. Returns
+ * null when the blob is unreadable or unparsable; callers treat null as
+ * "no proof" and defer, never as a match. A clean/smudge filter or CRLF
+ * conversion makes the clean blob differ from what import read in the
+ * working tree; that mismatch also defers — the safe direction (the
+ * filter family is exactly where content proofs go blind).
+ */
+function anchorCompiledTruth(
+  gitContextRoot: string, anchorCommit: string, rel: string,
+): string | null {
+  try {
+    const content = gitRawOutput(gitContextRoot, ['show', `${anchorCommit}:${rel}`]);
+    return parseMarkdown(content, rel).compiled_truth;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Size-gated read + slug extraction of one anchor-tree blob. When a
  * content filter is in effect for the path under TODAY's attributes, or
  * ANY reachable attribute epoch assigns a filter to ANYTHING
@@ -3556,10 +3581,36 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // old row alive when the destination doesn't materialize — and the
       // full-sync purge now spares dedup-matched rows, so deferral is
       // never loss.
+      //
+      // And even BOTH bookkeeping signals can be co-spoofed (gate 18): a
+      // decoy sitting at the derived slug AND claiming the from-path is
+      // indistinguishable from the healthy row by bookkeeping alone, while
+      // the real row's own bookkeeping drifted elsewhere. The third rail is
+      // content-level: the target must hold the compiled_truth the ANCHOR
+      // blob of `from` parses to (see anchorCompiledTruth) — the state the
+      // brain reflects, which a rename+edit at HEAD cannot change. Any
+      // mismatch or unprovable read skips the move (deferral, never loss).
       const derivedFrom = resolveSlugForPath(from);
       const fromRows = dbSlugsByFrom.get(from) ?? [];
-      const oldSlug =
+      let oldSlug =
         derivedFrom !== '' && fromRows.includes(derivedFrom) ? derivedFrom : '';
+      if (oldSlug !== '') {
+        try {
+          const targetRows = await engine.executeRaw<{ compiled_truth: string | null }>(
+            `SELECT compiled_truth FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
+            [opts.sourceId ?? DEFAULT_SOURCE_ID, oldSlug],
+          );
+          const anchorTruth = anchorCompiledTruth(gitContextRoot, lastCommit, from);
+          if (
+            anchorTruth === null || targetRows.length === 0 ||
+            (targetRows[0].compiled_truth ?? '') !== anchorTruth
+          ) {
+            oldSlug = '';
+          }
+        } catch {
+          oldSlug = ''; // unprovable → defer, never move a guessed row
+        }
+      }
       // The new path doesn't yet have a row, so resolve from path only.
       const newSlug = resolveSlugForPath(to);
       // #3056: the cheap rename is OBSERVED, not assumed. A zero-row UPDATE
@@ -3680,6 +3731,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             // to the slug, 'unknown' when staleness could not be proven.
             const candidates = (active.get(from) ?? []).filter(s => s !== newSlug);
             const staleSlugs: string[] = [];
+            // gate 18: memoized per rename — the content-level signal for
+            // the delete side (see anchorCompiledTruth and the cheap-move
+            // rail above). `undefined` = not yet computed; `null` = no proof.
+            let anchorTruthForFrom: string | null | undefined;
             for (const s of candidates) {
               // Carried by ANOTHER rename in this diff (see renameOldSlugs):
               // its content is still tracked even when no slug state names
@@ -3707,8 +3762,47 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
                   `is unprovable this run (an unreadable tracked file could own this ` +
                   `slug), so it is spared rather than deleted.`,
                 );
-              } else {
+              } else if (s !== derivedFrom || derivedFrom === '') {
+                // Established bookkeeping cleanup (#3056 → gate 6): a stale
+                // claimant at any OTHER slug is exactly the duplicate the
+                // reconcile exists to remove once the destination
+                // materialized.
                 staleSlugs.push(s);
+              } else {
+                // gate 18: the candidate sits at the DERIVED slug of `from`
+                // — the co-spoof shape the cheap-move rail just refused to
+                // move (an unrelated row can occupy the derived slug AND
+                // claim the path while the real row's bookkeeping drifted
+                // elsewhere). The same doubt must block the delete, or the
+                // move-rail fix would merely convert move-destruction into
+                // delete-destruction. Delete only when the row provably IS
+                // the file's own imported row: its compiled_truth matches
+                // what the anchor blob of `from` parses to. Mismatch or an
+                // unprovable read spares (deferral, never loss).
+                let ownRow = false;
+                try {
+                  if (anchorTruthForFrom === undefined) {
+                    anchorTruthForFrom = anchorCompiledTruth(gitContextRoot, lastCommit, from);
+                  }
+                  if (anchorTruthForFrom !== null) {
+                    const rowRows = await engine.executeRaw<{ compiled_truth: string | null }>(
+                      `SELECT compiled_truth FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
+                      [opts.sourceId ?? DEFAULT_SOURCE_ID, s],
+                    );
+                    ownRow = rowRows.length > 0 &&
+                      (rowRows[0].compiled_truth ?? '') === anchorTruthForFrom;
+                  }
+                } catch { ownRow = false; }
+                if (ownRow) {
+                  staleSlugs.push(s);
+                } else {
+                  serr(
+                    `  [sync] rename reconcile: leaving row ${s} in place — it sits ` +
+                    `at the derived slug of ${from} but its content does not match ` +
+                    `that path's anchor state, so it is not provably this rename's ` +
+                    `own stale row.`,
+                  );
+                }
               }
             }
             if (staleSlugs.length > 0) {
@@ -4658,8 +4752,28 @@ async function performFullSync(
   //      used, so paths are in the identical relative form as source_path).
   // Skipped on the legacy no-sourceId path (the batch delete primitives require
   // a sourceId; matches every other source-scoped feature).
+  // #3583 gate18: the purge below proves staleness against the files the
+  // import WALKED — but a file that exists and FAILED to import (an
+  // errorful skip: SLUG_MISMATCH, malformed YAML, …) produced no row
+  // evidence at all: no import write, no dedup-skip record, no liveness
+  // registration beyond its path-derived slug. When `--skip-failed` (or the
+  // chronic-failure auto-skip valve) advances such a run, the purge would
+  // hard-delete a legacy row whose only living counterpart is exactly the
+  // file that errored. There is no narrow mapping from the failed file to
+  // the at-risk row (the error fires before the identity is computed), so
+  // the only sound rule is broad: purge ONLY on a run where every walked
+  // file imported or dedup-skipped cleanly. Deferral, never loss.
+  const fullFileFailures = result.failures.filter(f => isSkippablePath(f.path)).length;
+  const fullImportClean = fullFileFailures === 0 && fullGate.autoSkipped.length === 0;
   let reconciledDeletes = 0;
-  if (opts.sourceId) {
+  if (opts.sourceId && !fullImportClean) {
+    serr(
+      `  [sync] full-sync reconcile: skipped — ${fullFileFailures || fullGate.autoSkipped.length} ` +
+      `file(s) failed to import (or were auto-skipped) this run; staleness cannot be ` +
+      `proven against a partially-imported tree. The purge resumes on a clean run.`,
+    );
+  }
+  if (opts.sourceId && fullImportClean) {
     const sid = opts.sourceId;
     const reconcileSyncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
     // collectSyncableFiles returns ABSOLUTE paths; source_path is stored
