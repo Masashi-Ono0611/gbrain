@@ -3453,33 +3453,6 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // either sweep them all OR violate (source_id, slug) UNIQUE).
     const renameOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
 
-    // T4: pre-resolve ALL `from` slugs in batches before iterating. Falls
-    // back to per-path resolveSlugByPathOrSourcePath when sourceId is
-    // unset (matches the delete loop's legacy posture). For large rename
-    // commits (rare but possible: prefix sweep, reorganization), this drops
-    // the slug-resolve round-trips from O(renames) to O(renames/500).
-    const fromSlugByPath = new Map<string, string>();
-    if (opts.sourceId) {
-      const sid = opts.sourceId;
-      const fromPaths = renamesToDo.map(r => r.from);
-      for (let i = 0; i < fromPaths.length; i += DELETE_BATCH_SIZE) {
-        if (opts.signal?.aborted) {
-          progress.finish();
-          return await partial('timeout');
-        }
-        const batch = fromPaths.slice(i, i + DELETE_BATCH_SIZE);
-        let m: Map<string, string>;
-        try {
-          m = await engine.resolveSlugsByPaths(batch, { sourceId: sid });
-        } catch {
-          m = new Map();
-        }
-        for (const p of batch) {
-          fromSlugByPath.set(p, m.get(p) ?? resolveSlugForPath(p));
-        }
-      }
-    }
-
     // #3583 review: lazily-built (at most once per run) tracked-file slug
     // index for the live-row filter in the reconcile below. A throw from the
     // index build surfaces inside the reconcile's own try/catch, where it
@@ -3522,21 +3495,25 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // always holds the path-derived slug (when the path derives one)
     // PLUS every active row's slug under that source_path; registration
     // is purely spare-side, so over-inclusion only delays a cleanup.
+    // The same batch also feeds the cheap-rename TARGET disambiguation in
+    // the loop below (gate 16). The two consumers fail in opposite safe
+    // directions: for the spare map a resolve failure only shrinks the DB
+    // side (path-derived entries still protect); for the target it leaves
+    // fallback-regime paths with no provable row, which skips the cheap
+    // rename — toward add + reconcile, never toward moving a guessed row.
+    let dbSlugsByFrom = new Map<string, string[]>();
+    try {
+      dbSlugsByFrom = await activeSlugsBySourcePath(
+        engine, manifest.renamed.map(r => r.from), opts.sourceId ?? DEFAULT_SOURCE_ID,
+      );
+    } catch { /* see above — both consumers degrade safely */ }
     const renameOldSlugs = new Map<string, Set<string>>();
-    {
-      let dbSlugsByFrom = new Map<string, string[]>();
-      try {
-        dbSlugsByFrom = await activeSlugsBySourcePath(
-          engine, manifest.renamed.map(r => r.from), opts.sourceId ?? DEFAULT_SOURCE_ID,
-        );
-      } catch { /* spare-side registration only — path-derived slugs still protect */ }
-      for (const r of manifest.renamed) {
-        const shapes = new Set<string>();
-        const derived = resolveSlugForPath(r.from);
-        if (derived !== '') shapes.add(derived);
-        for (const s of dbSlugsByFrom.get(r.from) ?? []) shapes.add(s);
-        renameOldSlugs.set(r.from, shapes);
-      }
+    for (const r of manifest.renamed) {
+      const shapes = new Set<string>();
+      const derived = resolveSlugForPath(r.from);
+      if (derived !== '') shapes.add(derived);
+      for (const s of dbSlugsByFrom.get(r.from) ?? []) shapes.add(s);
+      renameOldSlugs.set(r.from, shapes);
     }
 
     for (const { from, to } of renamesToDo) {
@@ -3550,10 +3527,26 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // Single-slug resolution for the CHEAP RENAME target (which row
       // updateSlug moves) — distinct from the set-valued carried-spare map
       // above, which answers a different question (every slug the rename
-      // pair can prove tracked).
-      const oldSlug = opts.sourceId
-        ? (fromSlugByPath.get(from) ?? resolveSlugForPath(from))
-        : await resolveSlugByPathOrSourcePath(engine, from, undefined);
+      // pair can prove tracked). The target must never come from a DB
+      // resolve by source_path (gate 16): the column is non-unique, so the
+      // resolve could hand back an UNRELATED row whose stale bookkeeping
+      // names this from-path — updateSlug then MOVED that row, the
+      // re-import overwrote its body at the destination, and the real old
+      // row stayed behind as a permanent duplicate (renameApplied skips
+      // the reconcile). When the path derives a slug, that slug is the
+      // sole authority — import's anti-spoof pins an ordinary path's row
+      // to exactly it, so a same-path row under any OTHER slug is
+      // bookkeeping, never the content row; if no row sits at the derived
+      // slug the zero-row move falls through to add + reconcile. A
+      // fallback-regime path (derives nothing) moves a row only when
+      // exactly ONE active row claims the path; zero, several, or a failed
+      // batch resolve skip the cheap rename and let the reconcile's
+      // liveness proof decide row by row.
+      const derivedFrom = resolveSlugForPath(from);
+      const fromRows = dbSlugsByFrom.get(from) ?? [];
+      const oldSlug = derivedFrom !== ''
+        ? derivedFrom
+        : (fromRows.length === 1 ? fromRows[0] : '');
       // The new path doesn't yet have a row, so resolve from path only.
       const newSlug = resolveSlugForPath(to);
       // #3056: the cheap rename is OBSERVED, not assumed. A zero-row UPDATE
@@ -3562,11 +3555,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // the row at the new path while the old row stayed behind live. Both
       // shapes now fall through to the reconcile below.
       let renameApplied = false;
-      try {
-        renameApplied = (await engine.updateSlug(oldSlug, newSlug, renameOpts)) > 0;
-      } catch {
-        // Destination slug occupied or invalid — treat as add; the reconcile
-        // below removes the stale old row once the destination materialized.
+      if (oldSlug !== '') {
+        try {
+          renameApplied = (await engine.updateSlug(oldSlug, newSlug, renameOpts)) > 0;
+        } catch {
+          // Destination slug occupied or invalid — treat as add; the
+          // reconcile below removes the stale old row once the destination
+          // materialized.
+        }
       }
       if (renameApplied) {
         // #3583 gate13: the cheap rename moves the ROW but updateSlug never

@@ -2401,3 +2401,79 @@ describe('#3583 review: FUGU — the carried-rename spare survives a decoy row d
     expect(await engine.getPage('notes/party')).not.toBeNull();
   });
 });
+
+describe('#3583 review: GATE16 — the cheap-rename target never comes from a non-unique source_path resolve', () => {
+  test('G16_SET_TARGET_DIVERGENCE: a decoy sharing the from-path is not moved and overwritten', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // An ordinary rename with one DECOY: an unrelated active row whose
+    // stale bookkeeping names the renamed file's from-path. A DB resolve
+    // by source_path (non-unique) can collapse the path to the DECOY's
+    // slug; updateSlug then moves the decoy to people/beta, the re-import
+    // overwrites its body with Alpha's content, and the real people/alpha
+    // row stays behind as a permanent duplicate (renameApplied skips the
+    // reconcile). The path-derived slug is the authority for an ordinary
+    // path — the decoy must not move.
+    const repo = mkRepo({
+      'people/alpha.md': personMd('Alpha', 'Alpha file body.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.putPage('people/decoy', {
+      type: 'person', title: 'Decoy', compiled_truth: 'UNRELATED DECOY BODY',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/decoy'`,
+    );
+
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    // The REAL row moved: people/beta carries Alpha's content and
+    // people/alpha is gone (no duplicate left behind).
+    const beta = await engine.getPage('people/beta');
+    expect(beta).not.toBeNull();
+    expect(beta!.compiled_truth).toContain('Alpha file body');
+    expect(await engine.getPage('people/alpha')).toBeNull();
+    // The decoy row was NOT moved and its body survives untouched.
+    const decoy = await engine.getPage('people/decoy');
+    expect(decoy).not.toBeNull();
+    expect(decoy!.compiled_truth).toContain('UNRELATED DECOY BODY');
+  });
+
+  test('a fallback-regime rename with AMBIGUOUS active rows skips the cheap move (no arbitrary row moved)', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // The from-path derives no slug (exotic filename), so the DB is the
+    // only signal for which row to move — and TWO active rows claim the
+    // path (the genuine fallback-regime row plus one stale-bookkeeping
+    // decoy). Moving either would be a guess; the cheap rename must skip
+    // and neither row's body may be destroyed.
+    const repo = mkRepo({
+      '\u{1F389}.md': ['---', 'type: person', 'title: Party', 'slug: notes/party', '---', '', 'Party content lives here.'].join('\n'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('notes/party')).not.toBeNull();
+    await engine.putPage('people/decoy', {
+      type: 'person', title: 'Decoy', compiled_truth: 'UNRELATED DECOY BODY',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = '\u{1F389}.md'
+       WHERE source_id = 'default' AND slug = 'people/decoy'`,
+    );
+
+    execSync('git mv "\u{1F389}.md" "\u{1F38A}.md"', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename the exotic file"', { cwd: repo, stdio: 'pipe' });
+
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    // Whatever bookkeeping shape the run settles on, no body is lost: the
+    // genuine fallback row still holds its content and the decoy is
+    // untouched (an arbitrary single-row move destroyed one of them).
+    const party = await engine.getPage('notes/party');
+    expect(party).not.toBeNull();
+    expect(party!.compiled_truth).toContain('Party content lives here.');
+    const decoy = await engine.getPage('people/decoy');
+    expect(decoy).not.toBeNull();
+    expect(decoy!.compiled_truth).toContain('UNRELATED DECOY BODY');
+  });
+});
