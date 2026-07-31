@@ -1755,4 +1755,72 @@ describe('#3583 review: GATE9 — attribute mutations after the import cannot er
     // every miss spared, the ghost included (documented cost).
     expect(await engine.getPage('people/ghost')).not.toBeNull();
   });
+
+  test('a filter active only for a PAST interval (attr removal already absorbed by an earlier sync) still downgrades the proof', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // Same historical-smudge construction, but the attribute reset is
+    // absorbed by an INTERMEDIATE sync: by the time the rename reconcile
+    // runs, BOTH endpoints (today's attributes and the current anchor's)
+    // are clean — only an interior epoch of the history names the filter
+    // the imported row's content came through.
+    const rawExotic = [
+      '---', 'type: person', 'title: Party Notes', '---',
+      '', 'Party notes live here.',
+    ].join('\n');
+    const repo = mkRepo({
+      '\u{1F389}.md': rawExotic,
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+      '.gitattributes': '*.md filter=probe\n',
+    });
+    execSync(`git config filter.probe.clean "sed '/^slug: Party-Notes$/d'"`, { cwd: repo, stdio: 'pipe' });
+    execSync(`git config filter.probe.smudge "awk 'NR==2{print \\"slug: Party-Notes\\"}1'"`, { cwd: repo, stdio: 'pipe' });
+    rmSync(join(repo, '\u{1F389}.md'));
+    execSync('git checkout -- "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    writeFileSync(join(repo, '.gitattributes'), '*.md !filter\n');
+    // An ordinary edit rides along so the intermediate sync has syncable
+    // work and ADVANCES the anchor past the reset commit. The adds are
+    // TARGETED: `git add -A` here would sweep the still-smudged working
+    // copy of the exotic file into the commit as a slug-carrying blob
+    // (the clean filter no longer strips it), collapsing the scenario.
+    writeFileSync(join(repo, 'people/alpha.md'), personMd('Alpha', 'Alpha is a person. Edited.'));
+    execSync('git add .gitattributes people/alpha.md && git commit -m "reset filter attribute; edit alpha"', { cwd: repo, stdio: 'pipe' });
+    const resetCommit = execSync('git rev-parse HEAD', { cwd: repo, stdio: 'pipe' }).toString().trim();
+    rmSync(join(repo, '\u{1F389}.md'));
+    execSync('git checkout -- "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+    expect(readFileSync(join(repo, '\u{1F389}.md'), 'utf8')).not.toContain('slug: Party-Notes');
+    const mid = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(mid.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // Scenario precondition: the anchor now sits AT the reset commit, so
+    // both endpoint attribute states (today + anchor) are clean.
+    const anchorRows = await engine.executeRaw<{ last_commit: string }>(
+      `SELECT last_commit FROM sources WHERE id = 'default'`,
+    );
+    expect(anchorRows[0]?.last_commit).toBe(resetCommit);
+
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta occupier', compiled_truth: 'occupies destination',
+    }, { sourceId: 'default' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    expect(await engine.getPage('people/ghost')).not.toBeNull();
+  });
 });

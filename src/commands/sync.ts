@@ -1964,11 +1964,12 @@ function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): Tracke
   // for fallback-regime paths.
   if (anchorCommit && anchorCommit !== 'HEAD') {
     try {
+      const epochs = attributeEpochCommits(gitContextRoot, anchorCommit);
       const anchorListing = gitRawOutput(gitContextRoot, ['ls-tree', '-r', '-z', '--name-only', anchorCommit]);
       for (const rel of anchorListing.split('\u0000')) {
         if (!rel) continue;
         if (resolveSlugForPath(rel) !== '' || isCodeFilePath(rel)) continue;
-        const res = anchorBlobSlugs(gitContextRoot, anchorCommit, rel);
+        const res = anchorBlobSlugs(gitContextRoot, anchorCommit, rel, epochs);
         for (const s of res.slugs) addSlug(s, rel);
         if (!res.proofIntact) {
           complete = false;
@@ -2010,27 +2011,32 @@ function frontmatterSlugShapes(content: string, rel: string): string[] {
 
 /**
  * Size-gated read + slug extraction of one anchor-tree blob. When a
- * content filter is in effect for the path — under TODAY's attributes OR
- * under the ANCHOR commit's attributes (--source) — the read still
- * registers what it can (spare-side) but the proof is NOT intact:
- * `cat-file --filters` reconstructs the historical blob with TODAY's
- * filter definitions, and content imported at the anchor was converted by
- * the filter active THEN, so either side's filter makes a successful read
- * not evidence of absence. Consulting both sides also covers attribute
- * MUTATIONS between anchor and now (`!filter` resets, entries deleted
- * outright). The remaining residual is an UNVERSIONED attribute source
- * (info/attributes, core.attributesFile) whose filter entry was removed
- * since the import — invisible to every git surface.
+ * content filter is in effect for the path — under TODAY's attributes, or
+ * under ANY attribute epoch in the reachable history (--source per epoch
+ * commit) — the read still registers what it can (spare-side) but the
+ * proof is NOT intact: `cat-file --filters` reconstructs the historical
+ * blob with TODAY's filter definitions, and the row's content was
+ * imported under whatever filter was active at ITS import-time anchor —
+ * which can be any past epoch, not just the current endpoints (`!filter`
+ * resets, entries deleted outright, filters active only for an interval
+ * all land here). A null epoch set means the history enumeration itself
+ * failed: every anchor proof is downgraded. The remaining residual is an
+ * UNVERSIONED attribute source (info/attributes, core.attributesFile)
+ * whose filter entry was removed since the import, or an import-time
+ * state force-pushed out of the reachable history — invisible to every
+ * git surface.
  */
 function anchorBlobSlugs(
   gitContextRoot: string,
   anchorCommit: string,
   rel: string,
+  epochs: string[] | null,
 ): { slugs: string[]; proofIntact: boolean } {
   try {
     const filtered =
+      epochs === null ||
       pathHasContentFilter(gitContextRoot, rel) ||
-      pathHasContentFilter(gitContextRoot, rel, anchorCommit);
+      epochs.some((epoch) => pathHasContentFilter(gitContextRoot, rel, epoch));
     const size = Number(git(gitContextRoot, ['cat-file', '-s', `${anchorCommit}:${rel}`]));
     if (Number.isFinite(size) && size > MAX_FILE_SIZE) return { slugs: [], proofIntact: false };
     // BOTH the raw blob and the filter-converted view register (union,
@@ -2065,10 +2071,37 @@ function anchorBlobSlugs(
  * Any failure counts as filtered (fail toward unprovable, never a delete).
  *
  * With `source` set, attributes are read from that tree-ish
- * (`check-attr --source`, git >= 2.40) — the anchor-time view. On an
- * older git the flag fails and the catch answers filtered/unprovable,
- * which only widens sparing, never deleting.
+ * (`check-attr --source`, git >= 2.40) — a historical view. On an older
+ * git the flag fails and the catch answers filtered/unprovable, which
+ * only widens sparing, never deleting.
  */
+/**
+ * Every reachable commit that CHANGED an attributes file (root or nested
+ * .gitattributes), walked from BOTH the current HEAD and the anchor (a
+ * blocked past sync can have imported at a commit ahead of the anchor;
+ * multiple start points cover both ancestries even after a force-push
+ * moved one aside). The attribute state at any past import-time anchor is
+ * the state at its nearest attribute-epoch ancestor, so checking the
+ * filter attribute at every epoch covers every historical state a live
+ * row can have been imported under. The anchor itself is appended so the
+ * check never depends on the epoch enumeration being exhaustive for it.
+ * Returns null when the enumeration fails — the caller downgrades every
+ * anchor proof (spare-side).
+ */
+function attributeEpochCommits(gitContextRoot: string, anchorCommit: string): string[] | null {
+  try {
+    const out = git(gitContextRoot, [
+      'log', '--format=%H', 'HEAD', anchorCommit, '--',
+      '.gitattributes', ':(glob)**/.gitattributes',
+    ]);
+    const epochs = out.split('\n').filter(Boolean);
+    if (!epochs.includes(anchorCommit)) epochs.push(anchorCommit);
+    return epochs;
+  } catch {
+    return null;
+  }
+}
+
 function pathHasContentFilter(gitContextRoot: string, rel: string, source?: string): boolean {
   try {
     const out = gitRawOutput(gitContextRoot, [
