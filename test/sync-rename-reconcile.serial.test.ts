@@ -2477,3 +2477,123 @@ describe('#3583 review: GATE16 — the cheap-rename target never comes from a no
     expect(decoy!.compiled_truth).toContain('UNRELATED DECOY BODY');
   });
 });
+
+describe('#3583 review: GATE17 — legacy-slug rows survive the derived-authority move and the full-sync purge', () => {
+  test('G17_DERIVED_DRIFT_MANUAL_COLLISION_LOSS: a manual page occupying the derived slug is not moved and overwritten', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // A row imported under an OLDER slug algorithm legitimately sits at a
+    // slug the current algorithm does not derive (#3417 changed what
+    // non-Latin ordinary paths derive to). Simulated by re-slugging the
+    // imported row and fabricating a drifted content hash. A legitimate
+    // MANUAL page occupies the current derived slug. The derived-authority
+    // target moved the manual page to the destination and the re-import
+    // overwrote its body.
+    const repo = mkRepo({ 'people/alpha.md': personMd('Alpha', 'Alpha file body.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.executeRaw(
+      `UPDATE pages SET slug = 'people-legacy', compiled_truth = 'OLD LEGACY BODY',
+              content_hash = 'fabricated-legacy-drift'
+       WHERE source_id = 'default' AND slug = 'people/alpha'`,
+    );
+    await engine.putPage('people/alpha', {
+      type: 'person', title: 'Manual Alpha', compiled_truth: 'MANUAL BODY, not from any file',
+    }, { sourceId: 'default' });
+
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    // The manual page was NOT moved — it still sits at its own slug with
+    // its own body (the derived-authority move destroyed it).
+    const manual = await engine.getPage('people/alpha');
+    expect(manual).not.toBeNull();
+    expect(manual!.compiled_truth).toContain('MANUAL BODY');
+    // The rename converged through add + reconcile: the destination holds
+    // the file's content and the legacy old row (this file's row, proven
+    // by its source_path claim) was reconciled away.
+    const beta = await engine.getPage('people/beta');
+    expect(beta).not.toBeNull();
+    expect(beta!.compiled_truth).toContain('Alpha file body');
+    expect(await engine.getPage('people-legacy')).toBeNull();
+  });
+
+  test('G17_DERIVED_DRIFT_DEDUP_PURGE_LOSS: a legacy-slug row the import dedup-matches survives the full-sync purge', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // The legacy row is the ONLY copy: nothing sits at the current derived
+    // slug, and the file carries an external frontmatter id, so every
+    // import of the renamed file dedup-skips against the legacy row — the
+    // destination never materializes. The purge then read the row's dead
+    // source_path as "file removed", could not derive its legacy slug from
+    // any current path, and hard-deleted the only copy.
+    const repo = mkRepo({
+      'people/alpha.md': ['---', 'type: person', 'title: Alpha', 'id: alpha-ext-001', '---', '', 'Alpha file body.'].join('\n'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.executeRaw(
+      `UPDATE pages SET slug = 'people-legacy'
+       WHERE source_id = 'default' AND slug = 'people/alpha'`,
+    );
+
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    const inc = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(inc.status).toBe('synced');
+    expect(await engine.getPage('people-legacy')).not.toBeNull();
+
+    const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    const legacy = await engine.getPage('people-legacy');
+    expect(legacy).not.toBeNull();
+    expect(legacy!.compiled_truth).toContain('Alpha file body');
+  });
+
+  test('G17_FALLBACK_ZERO_DEDUP_PURGE_LOSS: a fallback row with drifted bookkeeping survives a fallback-to-ordinary rename plus full sync', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // A fallback-regime row (frontmatter slug) whose source_path drifted to
+    // a DIFFERENT, historically committed path: the from-path active-row
+    // lookup finds nothing, the renamed file's import dedup-skips against
+    // the row by external id, and the purge — seeing a dead source_path
+    // and a slug no current file derives — hard-deleted the only copy.
+    const partyBody = [
+      'Party content lives here.', '',
+      'Enough body lines that removing the frontmatter slug line',
+      'still leaves the rename similarity detector convinced', 'this is the same file.',
+    ].join('\n');
+    const repo = mkRepo({
+      '\u{1F389}.md': ['---', 'type: person', 'title: Party', 'slug: notes/party', 'id: party-ext-001', '---', '', partyBody].join('\n'),
+      'old/party-home.md': personMd('Party home', 'The historically committed drift target.'),
+    });
+    // The drift target must have EXISTED in git history (the db-only
+    // partition keeps never-committed paths); remove it before the first
+    // sync so it never imports.
+    execSync('git rm -q old/party-home.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "remove the old party home"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('notes/party')).not.toBeNull();
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'old/party-home.md'
+       WHERE source_id = 'default' AND slug = 'notes/party'`,
+    );
+
+    // Fallback-to-ordinary rename; the frontmatter slug line goes away in
+    // the same commit (an ordinary destination rejects a conflicting
+    // frontmatter slug — anti-spoof).
+    execSync('git mv "\u{1F389}.md" party.md', { cwd: repo, stdio: 'pipe' });
+    writeFileSync(join(repo, 'party.md'),
+      ['---', 'type: person', 'title: Party', 'id: party-ext-001', '---', '', partyBody].join('\n'));
+    execSync('git add party.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "party moves to an ordinary path"', { cwd: repo, stdio: 'pipe' });
+
+    const inc = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(inc.status).toBe('synced');
+    expect(await engine.getPage('notes/party')).not.toBeNull();
+
+    const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    const party = await engine.getPage('notes/party');
+    expect(party).not.toBeNull();
+    expect(party!.compiled_truth).toContain('Party content lives here.');
+  });
+});

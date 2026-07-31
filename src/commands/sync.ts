@@ -1856,9 +1856,16 @@ async function activeSlugsBySourcePath(
   engine: BrainEngine,
   paths: string[],
   sourceId: string,
+  signal?: AbortSignal,
 ): Promise<Map<string, string[]>> {
   const out = new Map<string, string[]>();
   for (let i = 0; i < paths.length; i += DELETE_BATCH_SIZE) {
+    // gate 17 (timeout responsiveness): a large rename manifest runs many
+    // batches; stop between them once aborted. The partial map is safe for
+    // both consumers — the rename loop's own per-iteration check returns
+    // `partial` before consuming it, and a smaller map only ever degrades
+    // toward skipping cheap renames, never toward moving a guessed row.
+    if (signal?.aborted) break;
     const batch = paths.slice(i, i + DELETE_BATCH_SIZE);
     const rows = await engine.executeRaw<{ slug: string; source_path: string }>(
       `SELECT slug, source_path FROM pages
@@ -3505,6 +3512,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     try {
       dbSlugsByFrom = await activeSlugsBySourcePath(
         engine, manifest.renamed.map(r => r.from), opts.sourceId ?? DEFAULT_SOURCE_ID,
+        opts.signal,
       );
     } catch { /* see above — both consumers degrade safely */ }
     const renameOldSlugs = new Map<string, Set<string>>();
@@ -3527,26 +3535,31 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // Single-slug resolution for the CHEAP RENAME target (which row
       // updateSlug moves) — distinct from the set-valued carried-spare map
       // above, which answers a different question (every slug the rename
-      // pair can prove tracked). The target must never come from a DB
-      // resolve by source_path (gate 16): the column is non-unique, so the
-      // resolve could hand back an UNRELATED row whose stale bookkeeping
-      // names this from-path — updateSlug then MOVED that row, the
-      // re-import overwrote its body at the destination, and the real old
-      // row stayed behind as a permanent duplicate (renameApplied skips
-      // the reconcile). When the path derives a slug, that slug is the
-      // sole authority — import's anti-spoof pins an ordinary path's row
-      // to exactly it, so a same-path row under any OTHER slug is
-      // bookkeeping, never the content row; if no row sits at the derived
-      // slug the zero-row move falls through to add + reconcile. A
-      // fallback-regime path (derives nothing) moves a row only when
-      // exactly ONE active row claims the path; zero, several, or a failed
-      // batch resolve skip the cheap rename and let the reconcile's
-      // liveness proof decide row by row.
+      // pair can prove tracked). The move destroys the target's body (the
+      // re-import overwrites it at the destination), so the target needs
+      // TWO-SIDED positive proof — each single signal was refuted with an
+      // executed data-loss repro:
+      //   - A DB resolve by source_path alone (gate 16): non-unique, so an
+      //     unrelated decoy's stale bookkeeping could be picked and its
+      //     body destroyed while the real row stayed as a duplicate.
+      //   - The path-derived slug alone (gate 17): a row imported under an
+      //     OLDER slug algorithm legitimately sits at a non-derived slug,
+      //     and a manually curated page can occupy the derived one — the
+      //     derived authority moved and overwrote the manual page.
+      //   - The sole same-path claimant alone: the same decoy gamble as
+      //     gate 16 whenever the real row's bookkeeping drifted elsewhere.
+      // So the cheap move fires ONLY on the intersection: the path derives
+      // a slug AND an active row at exactly that slug claims this path.
+      // Every other shape (legacy-slug rows, drifted or absent bookkeeping,
+      // fallback-regime paths, a failed batch resolve) skips the move and
+      // falls through to add + reconcile, whose dedup-skip rail keeps the
+      // old row alive when the destination doesn't materialize — and the
+      // full-sync purge now spares dedup-matched rows, so deferral is
+      // never loss.
       const derivedFrom = resolveSlugForPath(from);
       const fromRows = dbSlugsByFrom.get(from) ?? [];
-      const oldSlug = derivedFrom !== ''
-        ? derivedFrom
-        : (fromRows.length === 1 ? fromRows[0] : '');
+      const oldSlug =
+        derivedFrom !== '' && fromRows.includes(derivedFrom) ? derivedFrom : '';
       // The new path doesn't yet have a row, so resolve from path only.
       const newSlug = resolveSlugForPath(to);
       // #3056: the cheap rename is OBSERVED, not assumed. A zero-row UPDATE
@@ -4764,6 +4777,26 @@ async function performFullSync(
         `a tracked file still derives to (stale source_path bookkeeping, live ` +
         `content).`,
       );
+    }
+    // #3583 gate17: rows THIS run's import dedup-skipped against are live by
+    // that very evidence — identity dedup matched a walked file to the row.
+    // Both derivation bases above are blind to them when the row's slug
+    // predates a slug-algorithm change (#3417 changed what ordinary
+    // non-Latin paths derive to) or its fallback bookkeeping drifted: the
+    // destination row never materializes precisely BECAUSE the dedup keeps
+    // skipping against the legacy row, so the purge was deleting the only
+    // copy. Spare-side only — a spared row defers duplicate cleanup to a
+    // later converging sync, never loses content.
+    {
+      const dedupSpared = new Set(result.dedupSkippedSlugs);
+      const dedupSparedCount = staleCandidates.filter(s => dedupSpared.has(s)).length;
+      if (dedupSparedCount > 0) {
+        staleCandidates = staleCandidates.filter(s => !dedupSpared.has(s));
+        serr(
+          `  [sync] full-sync reconcile: spared ${dedupSparedCount} page(s) this ` +
+          `import dedup-matched to a current file (legacy slug, live content).`,
+        );
+      }
     }
     // #3583 gate14: the valve judges what would actually be DELETED — the
     // post-liveness candidate list, by planReconcileDeletes' own formula. The

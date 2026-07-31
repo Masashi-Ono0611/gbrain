@@ -43,6 +43,17 @@ export interface RunImportResult {
   errors: number;
   chunksCreated: number;
   failures: Array<{ path: string; error: string }>;
+  /**
+   * #3583 gate17: the slug of every row an errorless skip dedup-matched.
+   * A skip means identity dedup (content hash / unchanged) matched a walked
+   * file to an EXISTING row — positive evidence that row is the live
+   * representative of a current file, even when its slug is not derivable
+   * from any current path (legacy slug-algorithm rows, drifted fallback
+   * bookkeeping). performFullSync's purge spares these rows: deleting one
+   * removed the only copy, because the destination never materializes
+   * precisely while the dedup keeps skipping against it.
+   */
+  dedupSkippedSlugs: string[];
 }
 
 export async function runImport(
@@ -270,6 +281,7 @@ export async function runImport(
   let processed = 0;
   let chunksCreated = 0;
   const importedSlugs: string[] = [];
+  const dedupSkippedSlugs: string[] = [];
   const errorCounts: Record<string, number> = {};
   const failures: Array<{ path: string; error: string }> = []; // Bug 9
   const startTime = Date.now();
@@ -323,6 +335,9 @@ export async function runImport(
           // 'unchanged' or no-error skip: content_hash matched a prior
           // successful import, so this file IS done for checkpoint purposes.
           completed.add(relativePath);
+          // #3583 gate17: record WHICH row the dedup matched (see
+          // RunImportResult.dedupSkippedSlugs).
+          if (result.slug) dedupSkippedSlugs.push(result.slug);
         }
       }
     } catch (e: unknown) {
@@ -530,7 +545,7 @@ export async function runImport(
     await engine.setConfig('sync.repo_path', dir);
   }
 
-  return { imported, skipped, errors, chunksCreated, failures };
+  return { imported, skipped, errors, chunksCreated, failures, dedupSkippedSlugs };
 }
 
 /**
