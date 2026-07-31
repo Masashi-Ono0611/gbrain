@@ -1869,7 +1869,7 @@ async function activeSlugsBySourcePath(
  *     content (working tree first, git index blob when the working-tree
  *     copy is absent, e.g. a sparse checkout), then the same validateSlug
  *     chokepoint importFromContent runs (which lowercases). Only markdown
- *     files reach this regime; see fallbackSlugForFile.
+ *     files reach this regime; see fallbackSlugsForFile.
  *
  * `complete` goes false when some fallback-regime file's content could not
  * be read at all: its true slug is then unknowable, so absence from the
@@ -1915,14 +1915,16 @@ function trackedSlugIndex(gitContextRoot: string): TrackedSlugIndex {
     // '' too, but can never own a row, so it is never opened.
     if (slug === '' && /\.mdx?$/i.test(rel)) {
       try {
-        const fmSlug = fallbackSlugForFile(gitContextRoot, rel);
-        if (fmSlug !== undefined) addSlug(fmSlug, rel);
+        for (const fmSlug of fallbackSlugsForFile(gitContextRoot, rel)) {
+          addSlug(fmSlug, rel);
+        }
       } catch {
         complete = false;
         serr(
-          `  [sync] rename reconcile: could not read tracked file ${rel} to ` +
-          `resolve its slug; staleness is unprovable this run, so reconcile ` +
-          `will not delete any row missing from the index.`,
+          `  [sync] rename reconcile: could not resolve the slug of tracked ` +
+          `file ${rel} (unreadable, or over the import size gate); staleness ` +
+          `is unprovable this run, so reconcile will not delete any row ` +
+          `missing from the index.`,
         );
       }
     }
@@ -1931,41 +1933,62 @@ function trackedSlugIndex(gitContextRoot: string): TrackedSlugIndex {
 }
 
 /**
- * The true slug of a fallback-regime file (path derives no slug), resolved
- * the way import resolves it — parseMarkdown for the frontmatter `slug:`,
- * then the SAME validateSlug chokepoint importFromContent runs, which
- * lowercases (a `slug: Party-Notes` row is stored as `party-notes`; an
- * index carrying the raw casing would miss it and misclassify the live row
- * as stale). Returns undefined when the file can never own a row — import's
- * own refusal conditions, mirrored: over the MAX_FILE_SIZE gate, no usable
- * frontmatter slug, or a slug validateSlug rejects. Throws only when the
- * content cannot be read at all; the caller turns that into an incomplete
- * index (spare, never delete).
+ * The slugs a fallback-regime file (path derives no slug) can own a row
+ * under, resolved the way import resolves them — parseMarkdown for the
+ * frontmatter `slug:`, then the SAME validateSlug chokepoint
+ * importFromContent runs, which lowercases (a `slug: Party-Notes` row is
+ * stored as `party-notes`; an index carrying the raw casing would miss it
+ * and misclassify the live row as stale). A slug the current chokepoint
+ * REJECTS still registers in both casings: a legacy row imported under
+ * older validation rules may carry it, and extra entries are purely
+ * spare-side. Returns [] only when the current content derives nothing (no
+ * usable frontmatter slug — the current import path refuses the file).
+ * Throws when the content cannot be read, AND when the file sits over the
+ * import size gate: an over-gate file is never read (the unbounded-read
+ * hole), but a row imported while it was under the gate stays live, so
+ * "unprovable" (the caller marks the index incomplete; misses spare) is
+ * the only verdict that cannot delete a live page.
  */
-function fallbackSlugForFile(gitContextRoot: string, rel: string): string | undefined {
+function fallbackSlugsForFile(gitContextRoot: string, rel: string): string[] {
   let content: string;
   try {
     const abs = join(gitContextRoot, rel);
-    if (statSync(abs).size > MAX_FILE_SIZE) return undefined;
+    // Over the import size gate: DON'T read it (that is the unbounded-read
+    // hole), but DON'T conclude "no row" either — a row imported while the
+    // file was still under the gate stays live after the file grows past
+    // it. Throw instead: the caller marks the index incomplete and every
+    // index miss is spared as unknown. Never a delete on an unread file.
+    if (statSync(abs).size > MAX_FILE_SIZE) {
+      throw new Error(`tracked fallback-regime file over the import size gate`);
+    }
     content = readFileSync(abs, 'utf-8');
-  } catch {
+  } catch (e) {
+    if (e instanceof Error && e.message.includes('size gate')) throw e;
     // Tracked but absent from the working tree (sparse/partial checkout):
     // the index blob is the next-best source. git()'s trim() can only ADD
     // a frontmatter parse (leading whitespace stripped), so any divergence
     // from import's untrimmed read lands on the spare side, never the
     // delete side. Size-gate the blob the same way before reading it.
     const blobSize = Number(git(gitContextRoot, ['cat-file', '-s', `:${rel}`]));
-    if (Number.isFinite(blobSize) && blobSize > MAX_FILE_SIZE) return undefined;
+    if (Number.isFinite(blobSize) && blobSize > MAX_FILE_SIZE) {
+      throw new Error(`tracked fallback-regime file over the import size gate`);
+    }
     content = git(gitContextRoot, ['cat-file', '--filters', `:${rel}`]);
   }
   const fmSlug = parseMarkdown(content, rel).slug;
-  if (!fmSlug) return undefined;
+  // No frontmatter slug in the CURRENT content → the current import path
+  // refuses the file, and any row a PAST content revision created carries a
+  // slug this pass cannot recover (accepted residual: it would also need
+  // drifted source_path bookkeeping to ever become a reconcile candidate).
+  if (!fmSlug) return [];
   try {
-    return validateSlug(fmSlug);
+    return [validateSlug(fmSlug)];
   } catch {
-    // validateSlug would throw identically inside importFromContent, so a
-    // row with this slug can never have been created from this file.
-    return undefined;
+    // The CURRENT import chokepoint rejects this slug — but a legacy row
+    // imported under older validation rules may still carry it, in either
+    // casing. Registering both shapes is purely spare-side: it can only
+    // widen liveness, never name a delete.
+    return [fmSlug, fmSlug.toLowerCase()];
   }
 }
 

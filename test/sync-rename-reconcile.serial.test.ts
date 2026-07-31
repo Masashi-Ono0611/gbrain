@@ -895,3 +895,58 @@ describe('#3583 review: orphan-sentinel self-heal probe/clear race', () => {
     expect(probeCalls).toBe(2);
   });
 });
+
+describe('#3583 review: an over-size-gate fallback-regime file suspends deletes instead of losing the row', () => {
+  test('a live row whose emoji file grew past the import size gate is spared as unknown (and so is everything else)', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // Import while the file is comfortably under the 5MB gate...
+    const repo = mkRepo({
+      '\u{1F389}.md': [
+        '---', 'type: person', 'title: Party Notes', 'slug: Party-Notes', '---',
+        '', 'Party notes live here.',
+      ].join('\n'),
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    // ...then the file grows past the gate. Uncommitted on purpose: the
+    // growth never enters the commit diff (no import attempt, no ledger
+    // noise), but the liveness index reads the WORKING TREE — where the
+    // file now sits over the gate. Concluding "no row possible" from the
+    // current size would delete the row imported before the growth.
+    const bigBody = 'x'.repeat(5_100_000);
+    writeFileSync(join(repo, '\u{1F389}.md'), [
+      '---', 'type: person', 'title: Party Notes', 'slug: Party-Notes', '---',
+      '', bigBody,
+    ].join('\n'));
+
+    // Same stale-bookkeeping + ghost construction as the main exotic test.
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta (stale)', compiled_truth: 'occupies the destination slug',
+    }, { sourceId: 'default' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+
+    // The live row survives — its slug could not be read, so staleness is
+    // unprovable and the miss is spared, never deleted.
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // Deliberate, documented cost of the incomplete index: the genuinely
+    // stale ghost is ALSO spared this run (no delete without proof).
+    expect(await engine.getPage('people/ghost')).not.toBeNull();
+  });
+});
