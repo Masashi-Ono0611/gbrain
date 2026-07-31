@@ -1824,3 +1824,101 @@ describe('#3583 review: GATE9 — attribute mutations after the import cannot er
     expect(await engine.getPage('people/ghost')).not.toBeNull();
   });
 });
+
+describe('#3583 review: GATE10 — historical path-specific attributes survive a rename of the file', () => {
+  test('a reachable filter epoch on the pre-rename path must downgrade proof for the anchor-time path', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const rawExotic = [
+      '---', 'type: person', 'title: Party Notes', '---',
+      '', 'Party notes live here.',
+    ].join('\n');
+    const repo = mkRepo({
+      '🎉.md': rawExotic,
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+      '.gitattributes': '🎉.md filter=probe\n',
+    });
+    execSync(`git config filter.probe.clean "sed '/^slug: Party-Notes$/d'"`, { cwd: repo, stdio: 'pipe' });
+    execSync(`git config filter.probe.smudge "awk 'NR==2{print \\"slug: Party-Notes\\"}1'"`, { cwd: repo, stdio: 'pipe' });
+    rmSync(join(repo, '🎉.md'));
+    execSync('git checkout -- "🎉.md"', { cwd: repo, stdio: 'pipe' });
+    expect(readFileSync(join(repo, '🎉.md'), 'utf8')).toContain('slug: Party-Notes');
+    const importCommit = execSync('git rev-parse HEAD', { cwd: repo, stdio: 'pipe' })
+      .toString().trim();
+
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    // Remove the filter and materialize the raw, slugless blob before the
+    // file moves. The old-path filter epoch remains reachable from HEAD.
+    writeFileSync(join(repo, '.gitattributes'), '*.md !filter\n');
+    rmSync(join(repo, '🎉.md'));
+    execSync('git checkout -- "🎉.md"', { cwd: repo, stdio: 'pipe' });
+    expect(readFileSync(join(repo, '🎉.md'), 'utf8')).not.toContain('slug: Party-Notes');
+    execSync('git mv "🎉.md" "✨.md"', { cwd: repo, stdio: 'pipe' });
+    execSync('git add .gitattributes && git commit -m "reset filter and move exotic file"', {
+      cwd: repo, stdio: 'pipe',
+    });
+    const movedCommit = execSync('git rev-parse HEAD', { cwd: repo, stdio: 'pipe' })
+      .toString().trim();
+
+    // Absorb the move while excluding its destination. This advances the
+    // sync anchor without re-importing the now-slugless fallback file.
+    await performSync(engine, {
+      repoPath: repo,
+      ...SYNC_OPTS,
+      exclude: ['✨.md'],
+    });
+    const anchorRows = await engine.executeRaw<{ last_commit: string }>(
+      `SELECT last_commit FROM sources WHERE id = 'default'`,
+    );
+    expect(anchorRows[0]?.last_commit).toBe(movedCommit);
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta occupier', compiled_truth: 'occupies destination',
+    }, { sourceId: 'default' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    // Pin the defect mechanism: the epoch enumeration finds both
+    // attribute-changing commits, but a PER-PATH check keyed to the
+    // anchor path (✨.md) is empty at every epoch, while the same import
+    // epoch proves a filter immediately under the HISTORICAL path
+    // (🎉.md). Only a repo-wide epoch check can see it.
+    const epochOutput = execSync(
+      `git log --format=%H HEAD ${movedCommit} -- .gitattributes ':(glob)**/.gitattributes'`,
+      { cwd: repo, stdio: 'pipe' },
+    ).toString().trim();
+    const epochs = epochOutput.split('\n').filter(Boolean);
+    expect(epochs).toContain(importCommit);
+    expect(epochs).toContain(movedCommit);
+    for (const epoch of epochs) {
+      expect(execSync(`git check-attr --source=${epoch} --all -- "✨.md"`, {
+        cwd: repo, stdio: 'pipe',
+      }).toString()).toBe('');
+    }
+    const oldPathAtImport = execSync(
+      `git check-attr --source=${importCommit} --all -- "🎉.md"`,
+      { cwd: repo, stdio: 'pipe' },
+    ).toString();
+    expect(oldPathAtImport).toContain('filter: probe');
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // The repo-wide historical downgrade spares every miss, the true
+    // ghost included (documented conservative cost).
+    expect(await engine.getPage('people/ghost')).not.toBeNull();
+  });
+});
