@@ -4694,14 +4694,24 @@ async function performFullSync(
   // failures still climb their attempts.
   const fullSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
   // #3583 gate21: the purge's write-provenance watermark, read BEFORE the
-  // gate's advance overwrites it. `pages.updated_at` moves only on real
-  // content writes (putPage, updateSlug, revertVersion) — link extraction,
-  // embedding and retrieval bookkeeping all write their own columns — so a
-  // candidate whose updated_at postdates the previous sync was written by
-  // something other than that sync's import, and is not the removed file's
-  // projection. NULL (never synced, or a pre-anchor brain) is not a licence
-  // to delete: the purge simply defers, and THIS run's own advance stamps
-  // the watermark, so the next full sync converges.
+  // gate's advance overwrites it. A candidate whose `updated_at` postdates
+  // the previous sync was written by something other than that sync's
+  // import, so it is not the removed file's projection and must not be
+  // purged.
+  //
+  // What actually moves `updated_at` (audited across BOTH engines, since
+  // they move in lockstep): putPage, updateSlug, revertVersion,
+  // refreshPageBody — and updatePageContextualRetrievalState, which bumps
+  // it deliberately as a side effect of stamping the embedding tier. That
+  // last one is NOT a content write and it runs in the embed phase, i.e.
+  // AFTER the gate stamped this watermark. So a page embedded by sync N
+  // carries updated_at > last_sync_at(N) and is spared once if its file
+  // disappears before sync N+1 — then sync N+1's own advance moves the
+  // watermark past it and sync N+2 purges it. Every extra writer can only
+  // ever make a row look NEWER, so every mistake this makes is a deferral
+  // of a backstop, never a delete. NULL (never synced, or a pre-anchor
+  // brain) is likewise not a licence to delete: the purge defers, and THIS
+  // run's advance stamps the watermark, so the next full sync converges.
   let purgeWatermark: string | null = null;
   try {
     const wm = await engine.executeRaw<{ last_sync_at: string | Date | null }>(

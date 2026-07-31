@@ -2872,3 +2872,33 @@ describe('#3583 review: GATE21 — the purge proves write provenance, not conten
     expect(await engine.getPage('people/keeper')).not.toBeNull();
   });
 });
+
+describe('#3583 review: GATE21 — non-content writers only ever defer the purge, never block it', () => {
+  test('a stale row bumped by the embedding-tier stamp is spared once, then purged by the next full sync', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // updatePageContextualRetrievalState bumps updated_at deliberately (so
+    // the autopilot sweep sees the page as touched) and runs in the embed
+    // phase — AFTER the gate stamped the watermark. A page embedded by
+    // sync N therefore sits above sync N+1's watermark. That must cost one
+    // deferred run, not permanent immunity.
+    const repo = mkRepo({
+      'people/gamma.md': personMd('Gamma', 'Gamma is a person.'),
+      'people/keeper.md': personMd('Keeper', 'Keeper stays.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    execSync('git rm -q people/gamma.md && git commit -m "delete gamma"', { cwd: repo, stdio: 'pipe' });
+    // The embed phase's stamp, applied through the real engine method.
+    await engine.updatePageContextualRetrievalState('people/gamma', 'default', 'title', null);
+
+    const first = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(first.status).not.toBe('blocked_by_failures');
+    // Deferred: the stamp postdates the watermark this run read.
+    expect(await engine.getPage('people/gamma')).not.toBeNull();
+
+    // The first run's own advance moved the watermark past the stamp.
+    const second = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(second.status).not.toBe('blocked_by_failures');
+    expect(await engine.getPage('people/gamma')).toBeNull();
+    expect(await engine.getPage('people/keeper')).not.toBeNull();
+  });
+});
