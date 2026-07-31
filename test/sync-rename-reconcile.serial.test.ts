@@ -2919,3 +2919,88 @@ describe('#3583 review: GATE21 — non-content writers only ever defer the purge
     expect(await engine.getPage('people/keeper')).not.toBeNull();
   });
 });
+
+describe('#3583 review: GATE24 — the reconcile removes the way this repo removes', () => {
+  test('the removal is observationally identical to the supported delete_page soft delete', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // The reconcile's removal is not a new semantic: it is `delete_page`'s.
+    // Pinning the equivalence (rather than an "identical to a hard delete"
+    // claim, which is measurably false for the child-grain reads) is what
+    // keeps a later change from inventing a third removal behaviour here.
+    // DISCRIMINATOR: under the hard delete this replaces, the reconcile side
+    // of this comparison reports zero retained children and the two paths
+    // disagree.
+    const census = async (slug: string) => {
+      const rows = await engine.executeRaw<{ k: string; n: number }>(
+        `SELECT 'chunks' AS k, count(*)::int AS n FROM content_chunks c JOIN pages p ON p.id = c.page_id WHERE p.slug = $1
+         UNION ALL SELECT 'tags', count(*)::int FROM tags g JOIN pages p ON p.id = g.page_id WHERE p.slug = $1`,
+        [slug],
+      );
+      const out: Record<string, number> = {};
+      for (const r of rows) out[r.k] = Number(r.n);
+      return out;
+    };
+
+    const repo1 = mkRepo({
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+      'people/keeper.md': personMd('Keeper', 'Keeper stays.'),
+    });
+    await performSync(engine, { repoPath: repo1, ...SYNC_OPTS });
+    execSync('git rm -q people/alpha.md && git commit -m "delete alpha"', { cwd: repo1, stdio: 'pipe' });
+    const full = await performSync(engine, { repoPath: repo1, ...SYNC_OPTS, full: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    const viaReconcile = {
+      visible: await engine.getPage('people/alpha'),
+      children: await census('people/alpha'),
+    };
+
+    // Same fixture, removed by the operator-facing op instead.
+    await resetPgliteState(engine);
+    const repo2 = mkRepo({
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+      'people/keeper.md': personMd('Keeper', 'Keeper stays.'),
+    });
+    await performSync(engine, { repoPath: repo2, ...SYNC_OPTS });
+    expect(await engine.softDeletePage('people/alpha', { sourceId: 'default' })).not.toBeNull();
+    const viaDeletePage = {
+      visible: await engine.getPage('people/alpha'),
+      children: await census('people/alpha'),
+    };
+
+    expect(viaReconcile.visible).toBeNull();
+    expect(viaDeletePage.visible).toBeNull();
+    expect(viaReconcile.children).toEqual(viaDeletePage.children);
+    // …and the retained children are real, so the equality is not two zeroes.
+    expect(viaReconcile.children.chunks).toBeGreaterThan(0);
+  });
+
+  test('a removed file that comes back is imported again, not blocked by the removed row', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // A REGRESSION PIN for the new semantics, not a discriminator: under the
+    // hard delete the row was gone, so the re-import trivially created a
+    // fresh one. Soft removal leaves the row holding the (source_id, slug)
+    // UNIQUE, and import's unchanged-content short-circuit reads through
+    // getPage — so the byte-identical restore is the shape that would strand
+    // the page at deleted_at if either fact changed.
+    const body = personMd('Alpha', 'Alpha is a person.');
+    const repo = mkRepo({ 'people/alpha.md': body, 'people/keeper.md': personMd('Keeper', 'stays') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    execSync('git rm -q people/alpha.md && git commit -m "delete alpha"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(await engine.getPage('people/alpha')).toBeNull();
+
+    writeFileSync(join(repo, 'people/alpha.md'), body);
+    execSync('git add -A && git commit -m "restore alpha"', { cwd: repo, stdio: 'pipe' });
+    const back = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(back.status).not.toBe('blocked_by_failures');
+    const restored = await engine.getPage('people/alpha');
+    expect(restored).not.toBeNull();
+    expect(restored!.compiled_truth).toContain('Alpha is a person.');
+    // Exactly one row — the re-import landed on the removed row, it did not
+    // fabricate a second one behind the UNIQUE.
+    const rows = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pages WHERE source_id = 'default' AND slug = 'people/alpha'`,
+    );
+    expect(Number(rows[0]?.n ?? 0)).toBe(1);
+  });
+});

@@ -5090,13 +5090,18 @@ async function performFullSync(
       //
       // Two things close it, in this order:
       //
-      //   1. The removal below is a SOFT delete. v0.26.5 already made
-      //      user-facing removal soft (`delete_page` → softDeletePage,
-      //      hard-delete reserved for purgeDeletedPages and teardown);
-      //      the reconcile was the one path still hard-deleting. A
-      //      soft-removed row leaves search and get_page exactly as a
-      //      hard delete does, stays recoverable via `gbrain restore-page`
-      //      for the 72h window, and the autopilot reclaims it after that.
+      //   1. The removal below is a SOFT delete — the repo's own, not a
+      //      new one. v0.26.5 already made user-facing removal soft
+      //      (`delete_page` → softDeletePage, hard-delete reserved for
+      //      purgeDeletedPages and teardown); the reconcile was the one
+      //      path still hard-deleting. The row leaves get_page,
+      //      list_pages, every search arm and export; it stays
+      //      recoverable via `gbrain restore-page` for the 72h window;
+      //      the autopilot reclaims it after that. It does NOT leave the
+      //      child-grain reads (get_chunks / get_links / get_tags /
+      //      get_timeline / get_raw_data / get_versions, and the stats
+      //      those feed) until the purge cascades them — measured, and
+      //      identical to what `delete_page` has always left behind.
       //      Ambiguity therefore costs a recovery, not the content.
       //
       //   2. A cheap watermark keeps the common case out of that window
@@ -5115,60 +5120,60 @@ async function performFullSync(
       // branch re-exported those rows — resurrecting deleted files in the
       // working tree. A proof that resurrects files to avoid a recoverable
       // removal is the wrong trade.
-      if (deletableSlugs.length > 0 && purgeWatermark !== null) {
-        const untouched: string[] = [];
-        try {
-          for (let i = 0; i < deletableSlugs.length; i += DELETE_BATCH_SIZE) {
-            const batch = deletableSlugs.slice(i, i + DELETE_BATCH_SIZE);
-            const rows2 = await engine.executeRaw<{ slug: string }>(
-              `SELECT slug FROM pages
-                WHERE slug = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL
-                      AND updated_at <= $3::timestamptz`,
-              [batch, sid, purgeWatermark],
-            );
-            for (const r of rows2) untouched.push(r.slug);
-          }
-        } catch {
-          untouched.length = 0; // unprovable → defer everything this run
-        }
-        const deferredCount = deletableSlugs.length - untouched.length;
-        if (deferredCount > 0) {
-          serr(
-            `  [sync] full-sync reconcile: deferring ${deferredCount} page(s) ` +
-            `written since the previous sync; the next full sync reconciles them.`,
-          );
-        }
-        deletableSlugs = untouched;
-      } else if (deletableSlugs.length > 0) {
+      if (deletableSlugs.length > 0 && purgeWatermark === null) {
         serr(
           `  [sync] full-sync reconcile: no previous-sync watermark on source ` +
           `'${sid}'; deferring ${deletableSlugs.length} candidate(s) to the next run.`,
         );
         deletableSlugs = [];
       }
-      const deleteScopedOpts = { sourceId: sid };
-      for (let i = 0; i < deletableSlugs.length; i += DELETE_BATCH_SIZE) {
+      let deferredByWatermark = 0;
+      for (let i = 0; i < deletableSlugs.length && purgeWatermark !== null; i += DELETE_BATCH_SIZE) {
         const batch = deletableSlugs.slice(i, i + DELETE_BATCH_SIZE);
         try {
-          // SOFT removal (see the block above): identical to a hard delete
-          // from every read path, recoverable for the 72h window, reclaimed
-          // by the autopilot purge after it.
+          // SOFT removal, with the watermark predicate IN the destructive
+          // statement rather than in a separate eligibility pass. An
+          // eligibility SELECT followed by an unconditional UPDATE is a
+          // check-then-write race, and `put_page` is not serialized by the
+          // sync lock — a write landing between the two statements would be
+          // removed by a decision taken before it existed (adversarial
+          // review, executed repro). One statement means the decision is
+          // made on the row's state at write time.
           const softened = await engine.executeRaw<{ slug: string }>(
             `UPDATE pages SET deleted_at = now()
               WHERE slug = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL
+                    AND updated_at <= $3::timestamptz
               RETURNING slug`,
-            [batch, sid],
+            [batch, sid, purgeWatermark],
           );
           reconciledDeletes += softened.length;
+          deferredByWatermark += batch.length - softened.length;
         } catch {
-          // Per-slug fallback on a batch blip (mirrors the incremental delete
-          // loop). A stale page that won't soften is best-effort, not fatal.
+          // Per-slug fallback on a batch blip, carrying the SAME predicate —
+          // `softDeletePage` cannot express it, and an unguarded fallback
+          // would reopen the race the batch statement just closed. Failing
+          // to remove a stale row is harmless (the next run retries it);
+          // removing a written one is not, so this fails closed.
           for (const slug of batch) {
             try {
-              if (await engine.softDeletePage(slug, deleteScopedOpts)) reconciledDeletes++;
-            } catch { /* best-effort */ }
+              const one = await engine.executeRaw<{ slug: string }>(
+                `UPDATE pages SET deleted_at = now()
+                  WHERE slug = $1 AND source_id = $2 AND deleted_at IS NULL
+                        AND updated_at <= $3::timestamptz
+                  RETURNING slug`,
+                [slug, sid, purgeWatermark],
+              );
+              if (one.length > 0) reconciledDeletes++;
+              else deferredByWatermark++;
+            } catch { deferredByWatermark++; }
           }
         }
+      }
+      if (deferredByWatermark > 0) {
+        serr(
+          `  [sync] full-sync reconcile: deferring ${deferredByWatermark} page(s) ` +
+          `written since the previous sync; the next full sync reconciles them.`,
+        );
       }
       if (reconciledDeletes > 0) {
         slog(`  Reconciled ${reconciledDeletes} stale page(s) whose source file was removed.`);
