@@ -1416,3 +1416,109 @@ describe('#3583 review: the anchor tree is enumerated on its own paths, not look
     expect(await engine.getPage('people/ghost')).toBeNull();
   });
 });
+
+describe('#3583 review: GATE6 — the three anchor-enumeration refutations', () => {
+  test('a row carried by ANOTHER rename in the diff (ordinary path renamed to a slugless exotic path) survives', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      'notes/party.md': personMd('Party', 'Party content lives here.'),
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('notes/party')).not.toBeNull();
+
+    // Stale bookkeeping from a prior cheap rename + the usual ghost/occupier.
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'notes/party'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta (stale)', compiled_truth: 'occupies the destination slug',
+    }, { sourceId: 'default' });
+
+    // ONE commit renames notes/party.md to an exotic path (derives no slug,
+    // carries no frontmatter slug — its re-import will fail) AND carries the
+    // colliding alpha rename. No current path, blob, or anchor FALLBACK
+    // state names notes/party anymore — only the rename pair itself proves
+    // the content is still tracked.
+    execSync('git mv notes/party.md "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "carry party to an exotic path; rename alpha"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('blocked_by_failures');
+    expect(await engine.getPage('notes/party')).not.toBeNull();
+    expect(await engine.getPage('people/ghost')).toBeNull();
+  });
+
+  test('a leading-space filename survives NUL-delimited listing intact (no trim corruption, no decoy read)', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      // Sorts FIRST in every listing — the entry a trimmed NUL-joined
+      // string corrupts. Its decoy (same name minus the space) carries a
+      // DIFFERENT slug; a corrupted read would register the decoy's slug
+      // twice and never party-notes.
+      ' \u{1F389}.md': [
+        '---', 'type: person', 'title: Party Notes', 'slug: Party-Notes', '---',
+        '', 'Party notes live here.',
+      ].join('\n'),
+      '\u{1F389}.md': [
+        '---', 'type: person', 'title: Decoy', 'slug: decoy-notes', '---',
+        '', 'Decoy content.',
+      ].join('\n'),
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    expect(await engine.getPage('decoy-notes')).not.toBeNull();
+
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta (stale)', compiled_truth: 'occupies the destination slug',
+    }, { sourceId: 'default' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    expect(await engine.getPage('people/ghost')).toBeNull();
+  });
+
+  test('a content filter configured for a fallback-regime file makes anchor-blob proof unprovable (spared, not trusted)', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = await setupExoticScenario();
+    // Even an IDENTITY filter flips the verdict: `cat-file --filters`
+    // reconstructs historical blobs with TODAY's filter definitions, so a
+    // drifted smudge filter can hand back content whose slug differs from
+    // what was imported — a successful read is not evidence of absence.
+    writeFileSync(join(repo, '.gitattributes'), '*.md filter=ident\n');
+    execSync('git config filter.ident.clean cat', { cwd: repo, stdio: 'pipe' });
+    execSync('git config filter.ident.smudge cat', { cwd: repo, stdio: 'pipe' });
+    execSync('git add .gitattributes && git commit -m "add filter"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // The filter makes the anchor evidence unprovable → the index is
+    // incomplete → even the true ghost is spared this run (documented cost).
+    expect(await engine.getPage('people/ghost')).not.toBeNull();
+  });
+});

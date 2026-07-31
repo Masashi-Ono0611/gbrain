@@ -990,6 +990,21 @@ function git(
 }
 
 /**
+ * git() minus the trim — REQUIRED for NUL-delimited listings (`ls-files -z`,
+ * `ls-tree -z`): a filename that begins with a space is the FIRST entry of
+ * the listing, and trim() silently rewrites it into a different path (#3583
+ * review — the misread let a decoy blob stand in for the real file and a
+ * live page was deleted on the corrupted evidence).
+ */
+function gitRawOutput(repoPath: string, args: string[]): string {
+  return execFileSync('git', buildGitInvocation(repoPath, args, []), {
+    encoding: 'utf-8',
+    timeout: 30000,
+    maxBuffer: 100 * 1024 * 1024,
+  });
+}
+
+/**
  * #753/#774: walk up from inputPath to the nearest git repo root via
  * `git -C <path> rev-parse --show-toplevel`. Handles worktrees and submodules
  * natively (git itself resolves them). Throws a user-friendly error when no
@@ -1904,7 +1919,7 @@ function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): Tracke
     if (arr) arr.push(rel);
     else bySlug.set(slug, [rel]);
   };
-  const listing = git(gitContextRoot, ['ls-files', '-z']);
+  const listing = gitRawOutput(gitContextRoot, ['ls-files', '-z']);
   for (const rel of listing.split('\u0000')) {
     if (!rel) continue;
     const slug = resolveSlugForPath(rel);
@@ -1949,7 +1964,7 @@ function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): Tracke
   // for fallback-regime paths.
   if (anchorCommit && anchorCommit !== 'HEAD') {
     try {
-      const anchorListing = git(gitContextRoot, ['ls-tree', '-r', '-z', '--name-only', anchorCommit]);
+      const anchorListing = gitRawOutput(gitContextRoot, ['ls-tree', '-r', '-z', '--name-only', anchorCommit]);
       for (const rel of anchorListing.split(' ')) {
         if (!rel) continue;
         if (resolveSlugForPath(rel) !== '' || isCodeFilePath(rel)) continue;
@@ -1993,18 +2008,35 @@ function frontmatterSlugShapes(content: string, rel: string): string[] {
   }
 }
 
-/** Size-gated read + slug extraction of one anchor-tree blob. */
+/**
+ * Size-gated read + slug extraction of one anchor-tree blob. When a
+ * content filter is configured for the path, the read still registers what
+ * it can (spare-side) but the proof is NOT intact: `cat-file --filters`
+ * reconstructs the historical blob with TODAY's filter definitions, and a
+ * smudge filter that has drifted since the anchor import can hand back
+ * content whose slug differs from what was actually imported — a
+ * successful read is then not evidence of absence. (A filter whose
+ * .gitattributes entry was deleted outright is unknowable by any git
+ * surface and stays an accepted, documented residual.)
+ */
 function anchorBlobSlugs(
   gitContextRoot: string,
   anchorCommit: string,
   rel: string,
 ): { slugs: string[]; proofIntact: boolean } {
   try {
+    let filtered = false;
+    try {
+      const attr = git(gitContextRoot, ['check-attr', 'filter', '--', rel]);
+      filtered = !/: filter: unspecified$/.test(attr);
+    } catch {
+      filtered = true; // cannot rule a filter out — treat as unprovable
+    }
     const size = Number(git(gitContextRoot, ['cat-file', '-s', `${anchorCommit}:${rel}`]));
     if (Number.isFinite(size) && size > MAX_FILE_SIZE) return { slugs: [], proofIntact: false };
     const c = git(gitContextRoot, ['cat-file', '--filters', `${anchorCommit}:${rel}`]);
     if (c.length > MAX_FILE_SIZE) return { slugs: [], proofIntact: false };
-    return { slugs: frontmatterSlugShapes(c, rel), proofIntact: true };
+    return { slugs: frontmatterSlugShapes(c, rel), proofIntact: !filtered };
   } catch {
     return { slugs: [], proofIntact: false };
   }
@@ -3348,6 +3380,25 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       return treeSlugIndex.complete ? 'stale' : 'unknown';
     };
 
+    // #3583 review (GATE6): the old slug of EVERY rename in this diff. A
+    // row can be CARRIED by a different rename in the same diff whose
+    // destination derives no slug (ordinary path → exotic path, frontmatter
+    // absent): no current path, blob, or anchor state names its slug, but
+    // the rename pair itself proves the content is still tracked. The
+    // reconcile of rename R therefore spares candidates that are ANOTHER
+    // rename's old slug; R's OWN old slug stays deletable — that is
+    // exactly the duplicate the reconcile exists to remove once the
+    // destination materializes. Built over the FULL diff (not the
+    // resume-filtered list) so renames completed by an earlier partial run
+    // still protect the rows they carried.
+    const renameOldSlugs = new Map<string, string>();
+    for (const r of filtered.renamed) {
+      const s = opts.sourceId
+        ? (fromSlugByPath.get(r.from) ?? resolveSlugForPath(r.from))
+        : await resolveSlugByPathOrSourcePath(engine, r.from, undefined);
+      renameOldSlugs.set(r.from, s);
+    }
+
     for (const { from, to } of renamesToDo) {
       // v0.41.13.0 (T2 / D-V4-2): per-iteration abort check. Renames call
       // importFile() at line 1173-style sites which can be slow on big files;
@@ -3356,9 +3407,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         progress.finish();
         return await partial('timeout');
       }
-      const oldSlug = opts.sourceId
-        ? (fromSlugByPath.get(from) ?? resolveSlugForPath(from))
-        : await resolveSlugByPathOrSourcePath(engine, from, undefined);
+      const oldSlug = renameOldSlugs.get(from) ?? resolveSlugForPath(from);
       // The new path doesn't yet have a row, so resolve from path only.
       const newSlug = resolveSlugForPath(to);
       // #3056: the cheap rename is OBSERVED, not assumed. A zero-row UPDATE
@@ -3456,6 +3505,20 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             const candidates = (active.get(from) ?? []).filter(s => s !== newSlug);
             const staleSlugs: string[] = [];
             for (const s of candidates) {
+              // Carried by ANOTHER rename in this diff (see renameOldSlugs):
+              // its content is still tracked even when no slug state names
+              // it anymore — never a reconcile target of THIS rename.
+              let carriedByOtherRename = false;
+              for (const [rFrom, rOldSlug] of renameOldSlugs) {
+                if (rFrom !== from && rOldSlug === s) { carriedByOtherRename = true; break; }
+              }
+              if (carriedByOtherRename) {
+                serr(
+                  `  [sync] rename reconcile: skipping row ${s} — another rename in ` +
+                  `this diff still carries it (source_path ${from} is stale bookkeeping).`,
+                );
+                continue;
+              }
               const verdict = slugLiveness(s);
               if (verdict === 'live') {
                 serr(
