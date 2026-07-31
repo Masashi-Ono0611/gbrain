@@ -25,7 +25,7 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { execSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -2704,5 +2704,72 @@ describe('#3583 review: GATE18 — content-level rail on the cheap move + purge 
       if (prevThreshold === undefined) delete process.env.GBRAIN_SYNC_AUTOSKIP_AFTER;
       else process.env.GBRAIN_SYNC_AUTOSKIP_AFTER = prevThreshold;
     }
+  });
+});
+
+describe('#3583 review: GATE19 — walk-coverage guard + metadata joins the content rail', () => {
+  test('G19_UNWALKED_TRACKED_EACCES_PURGE_LOSS: an unreadable tracked file defers the purge instead of losing the legacy row', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // `git ls-files` names the tracked file, but the walker cannot read its
+    // directory (EACCES) and silently omits it — runImport records neither
+    // an import nor a failure, so the clean-run guard alone sees nothing
+    // wrong. The legacy row whose only living counterpart is exactly that
+    // unreadable file must survive: an incompletely-walked tree proves
+    // nothing.
+    const repo = mkRepo({ 'people/alpha.md': personMd('Alpha', 'Alpha last-good body.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.executeRaw(
+      `UPDATE pages SET slug = 'people/legacy-alpha'
+       WHERE source_id = 'default' AND slug = 'people/alpha'`,
+    );
+
+    const peopleDir = join(repo, 'people');
+    chmodSync(peopleDir, 0o000);
+    let full;
+    try {
+      full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    } finally {
+      chmodSync(peopleDir, 0o755);
+    }
+    expect(full!.status).not.toBe('blocked_by_failures');
+    const legacy = await engine.getPage('people/legacy-alpha');
+    expect(legacy).not.toBeNull();
+    expect(legacy!.compiled_truth).toContain('Alpha last-good body.');
+  });
+
+  test('G19_COMPILED_TRUTH_COLLISION_DECOY_LOSS: an identical-body decoy with its own title is not moved and overwritten', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // The co-spoofed decoy copies the file BODY exactly, so a
+    // compiled_truth-only rail passes it — but its title (and any other
+    // metadata) is its own, and the move+overwrite destroyed it. Title and
+    // timeline now join the content signal.
+    const repo = mkRepo({ 'people/alpha.md': personMd('Alpha', 'Alpha file body.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.executeRaw(
+      `UPDATE pages SET slug = 'people/real-elsewhere', source_path = 'old/alpha-home.md'
+       WHERE source_id = 'default' AND slug = 'people/alpha'`,
+    );
+    await engine.putPage('people/alpha', {
+      type: 'person', title: 'Decoy own title', compiled_truth: 'Alpha file body.',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/alpha'`,
+    );
+
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    // The decoy keeps its slug and its own title.
+    const decoy = await engine.getPage('people/alpha');
+    expect(decoy).not.toBeNull();
+    expect(decoy!.title).toBe('Decoy own title');
+    // The destination materialized and the drifted real row is kept.
+    const beta = await engine.getPage('people/beta');
+    expect(beta).not.toBeNull();
+    expect(beta!.compiled_truth).toContain('Alpha file body');
+    expect(await engine.getPage('people/real-elsewhere')).not.toBeNull();
   });
 });

@@ -2039,12 +2039,25 @@ function frontmatterSlugShapes(content: string, rel: string): string[] {
  * working tree; that mismatch also defers — the safe direction (the
  * filter family is exactly where content proofs go blind).
  */
-function anchorCompiledTruth(
+function anchorContentSignals(
   gitContextRoot: string, anchorCommit: string, rel: string,
-): string | null {
+): { title: string; compiledTruth: string; timeline: string } | null {
   try {
     const content = gitRawOutput(gitContextRoot, ['show', `${anchorCommit}:${rel}`]);
-    return parseMarkdown(content, rel).compiled_truth;
+    const parsed = parseMarkdown(content, rel);
+    // gate 19: compiled_truth alone let a decoy with an IDENTICAL body but
+    // its own title/timeline through the rail — those were then destroyed
+    // by the overwrite. Title and timeline are parsed deterministically
+    // from content (unlike `type`, which import may preserve from a
+    // curated row, or frontmatter, which the content-sanity gate stamps
+    // markers into — comparing either would falsely defer healthy rows),
+    // so they join the signal at zero fragility. The frontmatter-only
+    // variant remains a documented residual.
+    return {
+      title: parsed.title,
+      compiledTruth: parsed.compiled_truth,
+      timeline: parsed.timeline || '',
+    };
   } catch {
     return null;
   }
@@ -3596,14 +3609,18 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         derivedFrom !== '' && fromRows.includes(derivedFrom) ? derivedFrom : '';
       if (oldSlug !== '') {
         try {
-          const targetRows = await engine.executeRaw<{ compiled_truth: string | null }>(
-            `SELECT compiled_truth FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
+          const targetRows = await engine.executeRaw<{
+            title: string | null; compiled_truth: string | null; timeline: string | null;
+          }>(
+            `SELECT title, compiled_truth, timeline FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
             [opts.sourceId ?? DEFAULT_SOURCE_ID, oldSlug],
           );
-          const anchorTruth = anchorCompiledTruth(gitContextRoot, lastCommit, from);
+          const anchorSig = anchorContentSignals(gitContextRoot, lastCommit, from);
           if (
-            anchorTruth === null || targetRows.length === 0 ||
-            (targetRows[0].compiled_truth ?? '') !== anchorTruth
+            anchorSig === null || targetRows.length === 0 ||
+            (targetRows[0].compiled_truth ?? '') !== anchorSig.compiledTruth ||
+            (targetRows[0].title ?? '') !== anchorSig.title ||
+            (targetRows[0].timeline ?? '') !== anchorSig.timeline
           ) {
             oldSlug = '';
           }
@@ -3734,7 +3751,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             // gate 18: memoized per rename — the content-level signal for
             // the delete side (see anchorCompiledTruth and the cheap-move
             // rail above). `undefined` = not yet computed; `null` = no proof.
-            let anchorTruthForFrom: string | null | undefined;
+            let anchorTruthForFrom: ReturnType<typeof anchorContentSignals> | undefined;
             for (const s of candidates) {
               // Carried by ANOTHER rename in this diff (see renameOldSlugs):
               // its content is still tracked even when no slug state names
@@ -3782,15 +3799,19 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
                 let ownRow = false;
                 try {
                   if (anchorTruthForFrom === undefined) {
-                    anchorTruthForFrom = anchorCompiledTruth(gitContextRoot, lastCommit, from);
+                    anchorTruthForFrom = anchorContentSignals(gitContextRoot, lastCommit, from);
                   }
                   if (anchorTruthForFrom !== null) {
-                    const rowRows = await engine.executeRaw<{ compiled_truth: string | null }>(
-                      `SELECT compiled_truth FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
+                    const rowRows = await engine.executeRaw<{
+                      title: string | null; compiled_truth: string | null; timeline: string | null;
+                    }>(
+                      `SELECT title, compiled_truth, timeline FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
                       [opts.sourceId ?? DEFAULT_SOURCE_ID, s],
                     );
                     ownRow = rowRows.length > 0 &&
-                      (rowRows[0].compiled_truth ?? '') === anchorTruthForFrom;
+                      (rowRows[0].compiled_truth ?? '') === anchorTruthForFrom.compiledTruth &&
+                      (rowRows[0].title ?? '') === anchorTruthForFrom.title &&
+                      (rowRows[0].timeline ?? '') === anchorTruthForFrom.timeline;
                   }
                 } catch { ownRow = false; }
                 if (ownRow) {
@@ -4837,6 +4858,44 @@ async function performFullSync(
           if (!fb.proofIntact) livenessProofIntact = false;
         } catch {
           livenessProofIntact = false;
+        }
+      }
+      // gate 19: the walk is not authoritative when it could not READ
+      // everything it should have walked. `git ls-files` names a tracked
+      // file whose directory is unreadable (EACCES) — or absent from a
+      // sparse checkout — but collectSyncableFiles silently omits it, so
+      // runImport records neither an import nor a failure for it and the
+      // clean-run purge guard sees nothing wrong. The row whose only
+      // living counterpart is exactly that unreadable file then purged.
+      // Any tracked, in-walk-scope, syncable path missing from the walk
+      // makes staleness unprovable this run. Symlinks and gitlinks are
+      // exempt (the walker never imports them by policy, so no row's
+      // liveness can depend on walking them).
+      {
+        const walkPrefixRaw = relative(gitContextRoot, syncScopeRoot).replace(/\\/g, '/');
+        const walkPrefix = walkPrefixRaw === '' ? '' : walkPrefixRaw + '/';
+        const walkedSet = new Set(currentFiles.map(p => p.replace(/\\/g, '/')));
+        for (const rel of trackedSet) {
+          const norm = rel.replace(/\\/g, '/');
+          if (walkPrefix !== '' && !norm.startsWith(walkPrefix)) continue;
+          // currentFiles are relative to `slugRoot ?? syncScopeRoot`:
+          // git-root-relative when slugRoot is set, scope-relative otherwise.
+          const relToWalkBase = slugRoot
+            ? norm
+            : (walkPrefix === '' ? norm : norm.slice(walkPrefix.length));
+          if (!isSyncable(relToWalkBase, reconcileSyncOpts)) continue;
+          if (walkedSet.has(relToWalkBase)) continue;
+          try {
+            const st = lstatSync(join(gitContextRoot, norm));
+            if (st.isSymbolicLink() || st.isDirectory()) continue;
+          } catch { /* unreadable or absent — exactly the unprovable shape */ }
+          serr(
+            `  [sync] full-sync reconcile: tracked file ${norm} was not reachable ` +
+            `by this run's walk; staleness is unprovable against an incompletely-` +
+            `walked tree.`,
+          );
+          livenessProofIntact = false;
+          break;
         }
       }
     } catch {
