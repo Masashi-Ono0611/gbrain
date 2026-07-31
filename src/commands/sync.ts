@@ -1917,7 +1917,7 @@ function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): Tracke
     // punctuation-named artifact costs one lstat, never a read.
     if (slug === '' && !isCodeFilePath(rel)) {
       try {
-        const fallback = fallbackSlugsForFile(gitContextRoot, rel, anchorCommit);
+        const fallback = fallbackSlugsForFile(gitContextRoot, rel);
         for (const fmSlug of fallback.slugs) addSlug(fmSlug, rel);
         if (!fallback.proofIntact) {
           complete = false;
@@ -1938,7 +1938,76 @@ function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): Tracke
       }
     }
   }
+  // The anchor commit (`last_commit`, what the brain actually reflects) is
+  // enumerated as ITS OWN tree, not looked up through current paths: a
+  // commit that RENAMES a fallback-regime file (and drops its slug) leaves
+  // the anchor's content at the OLD path, which no current-path lookup can
+  // reach — the anchor-imported row was deleted while the index still
+  // claimed to be complete. Registration is purely spare-side (extra
+  // liveness can only delay a cleanup), so enumerating the whole anchor
+  // tree is safe; reads stay bounded by the same size gates and only fire
+  // for fallback-regime paths.
+  if (anchorCommit && anchorCommit !== 'HEAD') {
+    try {
+      const anchorListing = git(gitContextRoot, ['ls-tree', '-r', '-z', '--name-only', anchorCommit]);
+      for (const rel of anchorListing.split(' ')) {
+        if (!rel) continue;
+        if (resolveSlugForPath(rel) !== '' || isCodeFilePath(rel)) continue;
+        const res = anchorBlobSlugs(gitContextRoot, anchorCommit, rel);
+        for (const s of res.slugs) addSlug(s, rel);
+        if (!res.proofIntact) {
+          complete = false;
+          serr(
+            `  [sync] rename reconcile: could not resolve the slug of ${rel} at ` +
+            `the sync anchor; staleness is unprovable this run, so reconcile ` +
+            `will not delete any row missing from the index.`,
+          );
+        }
+      }
+    } catch {
+      complete = false;
+      serr(
+        `  [sync] rename reconcile: could not enumerate the sync anchor tree; ` +
+        `staleness is unprovable this run, so reconcile will not delete any ` +
+        `row missing from the index.`,
+      );
+    }
+  }
   return { bySlug, complete };
+}
+
+/**
+ * The frontmatter-slug shapes a content state can own a row under: the
+ * validateSlug chokepoint importFromContent runs (lowercases), or — when
+ * the current chokepoint REJECTS the slug — both raw casings, since a
+ * legacy row imported under older validation rules may still carry it
+ * (purely spare-side registration).
+ */
+function frontmatterSlugShapes(content: string, rel: string): string[] {
+  const fmSlug = parseMarkdown(content, rel).slug;
+  if (!fmSlug) return [];
+  try {
+    return [validateSlug(fmSlug)];
+  } catch {
+    return [fmSlug, fmSlug.toLowerCase()];
+  }
+}
+
+/** Size-gated read + slug extraction of one anchor-tree blob. */
+function anchorBlobSlugs(
+  gitContextRoot: string,
+  anchorCommit: string,
+  rel: string,
+): { slugs: string[]; proofIntact: boolean } {
+  try {
+    const size = Number(git(gitContextRoot, ['cat-file', '-s', `${anchorCommit}:${rel}`]));
+    if (Number.isFinite(size) && size > MAX_FILE_SIZE) return { slugs: [], proofIntact: false };
+    const c = git(gitContextRoot, ['cat-file', '--filters', `${anchorCommit}:${rel}`]);
+    if (c.length > MAX_FILE_SIZE) return { slugs: [], proofIntact: false };
+    return { slugs: frontmatterSlugShapes(c, rel), proofIntact: true };
+  } catch {
+    return { slugs: [], proofIntact: false };
+  }
 }
 
 /**
@@ -1952,16 +2021,18 @@ function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): Tracke
  * older validation rules may carry it, and extra entries are purely
  * spare-side.
  *
- * THREE content states are consulted and their slugs unioned:
+ * THREE current-path content states are consulted and their slugs unioned
+ * (the fourth state — the sync anchor commit — is enumerated as its own
+ * tree by trackedSlugIndex, since a rename moves its content to a path no
+ * current-path lookup can reach):
  *   - the working tree — what the next import would read; never followed
  *     through a symlink (import rejects symlinks via lstat before reading,
  *     and following one would read an arbitrary out-of-repo target);
  *   - the git index (staging) blob — what an in-flight `git add` holds;
- *   - the HEAD blob — the last committed content, the state sync's own
- *     imports actually came from. An uncommitted edit that removes or
- *     changes the `slug:` line must not un-prove the slug the imported
- *     row still carries — and STAGING that edit changes the first two
- *     states at once, so HEAD is the anchor that keeps proving it.
+ *   - the HEAD blob — the last committed content. An uncommitted edit
+ *     that removes or changes the `slug:` line must not un-prove the slug
+ *     the imported row still carries — and STAGING that edit changes the
+ *     first two states at once, so HEAD keeps proving it.
  *
  * `proofIntact` goes false when either side that might name a slug could
  * not be examined — an unreadable file (EACCES; plain working-tree absence
@@ -1975,7 +2046,6 @@ function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): Tracke
 function fallbackSlugsForFile(
   gitContextRoot: string,
   rel: string,
-  anchorCommit?: string,
 ): { slugs: string[]; proofIntact: boolean } {
   const contents: string[] = [];
   let proofIntact = true;
@@ -2029,43 +2099,14 @@ function fallbackSlugsForFile(
   } catch {
     proofIntact = false;
   }
-  // Anchor blob — the commit the BRAIN actually reflects (`last_commit`).
-  // HEAD can be ahead of the anchor mid-sync: a commit that both removes
-  // the slug: line AND carries the colliding rename shows the slugless
-  // content in ALL other states, while the row (imported at the anchor)
-  // still carries the anchor's slug — that state must keep proving it.
-  if (anchorCommit && anchorCommit !== 'HEAD') {
-    try {
-      const inAnchor = git(gitContextRoot, ['ls-tree', anchorCommit, '--', rel]);
-      if (inAnchor !== '') {
-        const anchorSize = Number(git(gitContextRoot, ['cat-file', '-s', `${anchorCommit}:${rel}`]));
-        if (Number.isFinite(anchorSize) && anchorSize > MAX_FILE_SIZE) {
-          proofIntact = false;
-        } else {
-          const c = git(gitContextRoot, ['cat-file', '--filters', `${anchorCommit}:${rel}`]);
-          if (c.length > MAX_FILE_SIZE) proofIntact = false;
-          else contents.push(c);
-        }
-      }
-    } catch {
-      proofIntact = false;
-    }
-  }
+  // No frontmatter slug in a content state → that state derives nothing
+  // (the import path refuses it). Residual, accepted: a row from a content
+  // revision older than EVERY consulted state carries a slug this pass
+  // cannot recover — it would also need drifted source_path bookkeeping to
+  // ever become a reconcile candidate.
   const slugs = new Set<string>();
   for (const content of contents) {
-    const fmSlug = parseMarkdown(content, rel).slug;
-    // No frontmatter slug in this content state → this state derives
-    // nothing (the import path refuses it). Residual, accepted: a row from
-    // a content revision older than BOTH states carries a slug this pass
-    // cannot recover — it would also need drifted source_path bookkeeping
-    // to ever become a reconcile candidate.
-    if (!fmSlug) continue;
-    try {
-      slugs.add(validateSlug(fmSlug));
-    } catch {
-      slugs.add(fmSlug);
-      slugs.add(fmSlug.toLowerCase());
-    }
+    for (const s of frontmatterSlugShapes(content, rel)) slugs.add(s);
   }
   return { slugs: [...slugs], proofIntact };
 }

@@ -1367,3 +1367,52 @@ describe('#3583 review: a throwing bookmark advance can no longer lose a sentine
     expect(await openDanaRows()).toHaveLength(1);
   });
 });
+
+describe('#3583 review: the anchor tree is enumerated on its own paths, not looked up through current ones', () => {
+  test('renaming the exotic file itself (while dropping its slug) must not lose the anchor-imported row', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      '\u{1F389}.md': exoticMd,
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta (stale)', compiled_truth: 'occupies the destination slug',
+    }, { sourceId: 'default' });
+
+    // ONE commit renames the exotic file to a NEW exotic path, drops its
+    // slug: line, and carries the colliding rename. The anchor's content
+    // for the row now lives at the OLD path — a liveness pass that only
+    // queries the anchor through CURRENT paths misses it entirely (and
+    // still believes its index is complete).
+    execSync('git mv "\u{1F389}.md" "\u{2728}.md"', { cwd: repo, stdio: 'pipe' });
+    writeFileSync(join(repo, '\u{2728}.md'), [
+      '---', 'type: person', 'title: Party Notes', '---',
+      '', 'Party notes live here (renamed and slug line dropped).',
+    ].join('\n'));
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git add -A && git commit -m "rename exotic file, drop slug, rename alpha"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    // The exotic file's re-import fails (no usable slug at its new path),
+    // so the run blocks — and the reconcile inside it must NOT have
+    // deleted the anchor-imported row.
+    expect(result.status).toBe('blocked_by_failures');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // The anchor tree answered, proof stays intact: the ghost is still gone.
+    expect(await engine.getPage('people/ghost')).toBeNull();
+  });
+});
