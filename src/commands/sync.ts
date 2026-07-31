@@ -27,7 +27,7 @@ import {
   renameReconcileErrorMessage,
   parseRenameReconcileFrom,
   clearFailures,
-  recordFailures,
+  restoreFailures,
 } from '../core/sync.ts';
 import {
   computeSyncDelta,
@@ -51,7 +51,7 @@ import {
 } from '../core/embedding.ts';
 import { estimateCostFromChars } from '../core/embedding-pricing.ts';
 import { SPEND_CAP_CONFIG_KEY } from '../core/embed-backfill-submit.ts';
-import type { SyncManifest } from '../core/sync.ts';
+import type { SyncManifest, SyncFailure } from '../core/sync.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { loadConfig } from '../core/config.ts';
@@ -1952,14 +1952,16 @@ function trackedSlugIndex(gitContextRoot: string): TrackedSlugIndex {
  * older validation rules may carry it, and extra entries are purely
  * spare-side.
  *
- * BOTH content states are consulted and their slugs unioned:
+ * THREE content states are consulted and their slugs unioned:
  *   - the working tree — what the next import would read; never followed
  *     through a symlink (import rejects symlinks via lstat before reading,
  *     and following one would read an arbitrary out-of-repo target);
- *   - the git index blob — the committed/staged content sync actually
- *     imported. An uncommitted working-tree edit that removes or changes
- *     the `slug:` line must not un-prove the slug the imported row still
- *     carries (deleting on the working tree alone lost exactly that row).
+ *   - the git index (staging) blob — what an in-flight `git add` holds;
+ *   - the HEAD blob — the last committed content, the state sync's own
+ *     imports actually came from. An uncommitted edit that removes or
+ *     changes the `slug:` line must not un-prove the slug the imported
+ *     row still carries — and STAGING that edit changes the first two
+ *     states at once, so HEAD is the anchor that keeps proving it.
  *
  * `proofIntact` goes false when either side that might name a slug could
  * not be examined — an unreadable file (EACCES; plain working-tree absence
@@ -2004,6 +2006,26 @@ function fallbackSlugsForFile(
   } catch {
     // No stage-0 entry (unmerged path) or another repo oddity: the
     // committed side could not be examined.
+    proofIntact = false;
+  }
+  // HEAD blob — the last COMMITTED content, the state sync's own imports
+  // actually came from. `:${rel}` above is the STAGING index, so staging
+  // an uncommitted edit that removes the slug: line changed BOTH other
+  // states at once — and un-proved (deleted) the row imported from HEAD.
+  try {
+    const inHead = git(gitContextRoot, ['ls-tree', 'HEAD', '--', rel]);
+    if (inHead !== '') {
+      const headSize = Number(git(gitContextRoot, ['cat-file', '-s', `HEAD:${rel}`]));
+      if (Number.isFinite(headSize) && headSize > MAX_FILE_SIZE) {
+        proofIntact = false;
+      } else {
+        const c = git(gitContextRoot, ['cat-file', '--filters', `HEAD:${rel}`]);
+        if (c.length > MAX_FILE_SIZE) proofIntact = false;
+        else contents.push(c);
+      }
+    }
+    // Absent from HEAD (a newly added file) is normal — nothing to prove.
+  } catch {
     proofIntact = false;
   }
   const slugs = new Set<string>();
@@ -2087,16 +2109,9 @@ async function orphanedRenameSentinels(
  * open forever. Clears directly through the ledger; a no-op (including the
  * no-ledger-file case) costs one small file read.
  *
- * Clear-then-verify: after the clear, the probe runs once more, and any
- * sentinel whose old path re-acquired an active row in the window (a
- * writer outside the sync lock — a raw import, restore_page) is RESTORED
- * from the row data captured before the clear. That converts the
- * probe/clear race from "silently lost" to "detected and repaired". A
- * writer landing after the verify probe is indistinguishable from one
- * landing a second after a legitimate clear — out of any sentinel's reach
- * by design (the sentinel is a one-shot failure record, not a
- * continuously re-derived invariant), and the file ledger and the DB
- * share no transaction that could close it.
+ * Clear-then-verify: after the clear, verifyOrRestoreClearedSentinels runs
+ * the probe once more and restores any sentinel whose old path re-acquired
+ * an active row in the window.
  */
 async function sweepOrphanedRenameSentinels(
   engine: BrainEngine,
@@ -2114,6 +2129,37 @@ async function sweepOrphanedRenameSentinels(
     `  [sync] cleared ${orphaned.length} orphaned rename sentinel(s) — ` +
     `the stale row(s) they guarded no longer resolve.`,
   );
+  await verifyOrRestoreClearedSentinels(engine, sourceId, clearedRows);
+}
+
+/**
+ * The verify half of clear-then-verify (#3583), shared by every path that
+ * clears `<rename:…>` sentinels on an orphan verdict (the quiet-run sweeps
+ * AND both failure gates): probe once more AFTER the clear and RESTORE —
+ * verbatim, via restoreFailures, so attempts / first_seen / commit survive
+ * — any sentinel whose old path re-acquired an active row. A writer
+ * outside the sync lock (a raw import, restore_page) landing between
+ * probe and clear thereby converts from silently-lost to
+ * detected-and-repaired.
+ *
+ * Fail-closed: when the verify probe itself is unavailable, EVERY cleared
+ * row is restored — a premature restore is self-healing (the next quiet
+ * run re-clears a genuinely-orphaned sentinel), a lost sentinel is not.
+ * restoreFailures skips rows that are already present, so this can never
+ * double-record or fight a gate that did not actually clear. A writer
+ * landing after the verify probe is indistinguishable from one landing a
+ * second after a legitimate clear — out of any sentinel's reach by design
+ * (the sentinel is a one-shot failure record, not a continuously
+ * re-derived invariant), and the file ledger and the DB share no
+ * transaction that could close it.
+ */
+async function verifyOrRestoreClearedSentinels(
+  engine: BrainEngine,
+  sourceId: string,
+  clearedRows: SyncFailure[],
+): Promise<void> {
+  if (clearedRows.length === 0) return;
+  let revived: SyncFailure[];
   try {
     const froms = new Map<string, string>();
     for (const row of clearedRows) {
@@ -2123,22 +2169,19 @@ async function sweepOrphanedRenameSentinels(
     const active = await activeSlugsBySourcePath(
       engine, [...new Set(froms.values())], sourceId,
     );
-    const revived = clearedRows.filter(r => {
+    revived = clearedRows.filter(r => {
       const from = froms.get(r.path);
       return from !== undefined && active.has(from);
     });
-    for (const r of revived) {
-      recordFailures(sourceId, [{ path: r.path, error: r.error }], r.commit);
-    }
-    if (revived.length > 0) {
-      serr(
-        `  [sync] restored ${revived.length} rename sentinel(s) — an active row ` +
-        `re-acquired the old path between the probe and the clear.`,
-      );
-    }
   } catch {
-    // Verify probe unavailable — the clear already happened on two
-    // consecutive positive verdicts; nothing safe to add here.
+    revived = clearedRows;
+  }
+  const restored = restoreFailures(sourceId, revived);
+  if (restored > 0) {
+    serr(
+      `  [sync] restored ${restored} rename sentinel(s) — an active row ` +
+      `re-acquired the old path after the clear, or verification was unavailable.`,
+    );
   }
 }
 
@@ -3837,6 +3880,16 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     await clearOpCheckpoint(engine, ckpt.target);
   };
 
+  // Computed BEFORE the gate call so the post-gate verify can restore the
+  // exact rows the gate is about to clear (#3583 clear-then-verify).
+  const gateOrphanedSentinels = await orphanedRenameSentinels(
+    engine, opts.sourceId ?? DEFAULT_SOURCE_ID, new Set(failedFiles.map(f => f.path)),
+  );
+  const gateOrphanSet = new Set(gateOrphanedSentinels);
+  const gateOrphanRows = loadSyncFailures().filter(
+    r => r.source_id === (opts.sourceId ?? DEFAULT_SOURCE_ID) && gateOrphanSet.has(r.path),
+  );
+
   // issue #1939 adversarial finding #1: a file that failed to parse (open ledger
   // row) and is then deleted/renamed-away never re-enters failedFiles and never
   // imports, so its row would never clear and would age doctor to a permanent
@@ -3856,9 +3909,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // stale source_path row no longer resolves has nothing left to reconcile
     // (the duplicate is gone — deleted by the operator, a full-sync purge, or
     // any other path), so it clears here, mirroring the `<head>` clear above.
-    ...(await orphanedRenameSentinels(
-      engine, opts.sourceId ?? DEFAULT_SOURCE_ID, new Set(failedFiles.map(f => f.path)),
-    )),
+    ...gateOrphanedSentinels,
   ];
 
   const gate = await applySyncFailureGate({
@@ -3869,6 +3920,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     skipFailed: opts.skipFailed === true,
     advance,
   });
+  // #3583: the gate's clear of the orphaned sentinels above shares the
+  // probe/clear window the quiet-run sweep has — verify after the clear and
+  // restore any sentinel whose old path re-acquired an active row.
+  await verifyOrRestoreClearedSentinels(engine, opts.sourceId ?? DEFAULT_SOURCE_ID, gateOrphanRows);
 
   if (!gate.advanced) {
     const codeBreakdown = formatCodeBreakdown(failedFiles);
@@ -4209,15 +4264,22 @@ async function performFullSync(
   // failures still climb their attempts.
   const fullSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
   const fullFailureSet = new Set(result.failures.map(f => f.path));
+  // #3479 blocker 2 — the same orphaned-`<rename:…>`-sentinel self-heal the
+  // incremental gate applies: an open sentinel whose stale source_path row
+  // no longer resolves has nothing left to reconcile, and a full sync is
+  // often exactly the operator's reset move after a wedge. Rows captured
+  // BEFORE the gate call so the post-gate verify can restore them (#3583
+  // clear-then-verify).
+  const fullOrphanedSentinels = await orphanedRenameSentinels(engine, fullSourceId, fullFailureSet);
+  const fullOrphanSet = new Set(fullOrphanedSentinels);
+  const fullOrphanRows = loadSyncFailures().filter(
+    r => r.source_id === fullSourceId && fullOrphanSet.has(r.path),
+  );
   const fullSucceeded = [
     ...loadSyncFailures()
       .filter(e => e.source_id === fullSourceId && isSkippablePath(e.path) && !fullFailureSet.has(e.path))
       .map(e => e.path),
-    // #3479 blocker 2 — the same orphaned-`<rename:…>`-sentinel self-heal the
-    // incremental gate applies: an open sentinel whose stale source_path row
-    // no longer resolves has nothing left to reconcile, and a full sync is
-    // often exactly the operator's reset move after a wedge.
-    ...(await orphanedRenameSentinels(engine, fullSourceId, fullFailureSet)),
+    ...fullOrphanedSentinels,
   ];
   const advanceFull = async (): Promise<void> => {
     // Persist sync state so the next sync is incremental. Routed through
@@ -4236,6 +4298,8 @@ async function performFullSync(
     skipFailed: opts.skipFailed === true,
     advance: advanceFull,
   });
+  // #3583 clear-then-verify, full-sync flavor of the incremental gate's.
+  await verifyOrRestoreClearedSentinels(engine, fullSourceId, fullOrphanRows);
 
   if (!fullGate.advanced) {
     const codeBreakdown = formatCodeBreakdown(result.failures);

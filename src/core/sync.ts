@@ -517,6 +517,7 @@ export {
   acknowledgeSyncFailures,
   recordFailures,
   clearFailures,
+  restoreFailures,
   acknowledgeFailures,
   autoSkipFailures,
   withLedgerLock,

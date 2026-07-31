@@ -561,6 +561,26 @@ export function clearFailures(sourceId: string, paths: string[]): void {
 }
 
 /**
+ * Re-insert previously-cleared rows VERBATIM (attempts, first_seen, ts,
+ * commit, state all preserved) — the undo half of a clear that a
+ * post-clear verification found premature (#3583: the orphan-sentinel
+ * sweep's clear-then-verify restore). Skips any (source_id, path) that
+ * already has a row so it can never double-record or fight a concurrent
+ * re-record. Returns how many rows were actually restored.
+ */
+export function restoreFailures(sourceId: string, rows: SyncFailure[]): number {
+  const mine = rows.filter(r => r.source_id === sourceId);
+  if (mine.length === 0) return 0;
+  return withLedgerLock(() => {
+    const entries = loadSyncFailures();
+    const present = new Set(entries.map(e => _ledgerKey(e)));
+    const missing = mine.filter(r => !present.has(_ledgerKey(r)));
+    if (missing.length > 0) _writeAll([...entries, ...missing]);
+    return missing.length;
+  });
+}
+
+/**
  * Acknowledge OPEN file failures (human `--skip-failed`). Scoped to one
  * source when `sourceId` is given (never acks another source — #1939 Codex
  * #2). Sentinels (`<head>`) are NEVER acknowledged this way.

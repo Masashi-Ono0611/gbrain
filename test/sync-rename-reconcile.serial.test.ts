@@ -1162,3 +1162,122 @@ describe('#3583 review: a writer landing AFTER the second probe gets its sentine
     expect(await openDanaRows()).toHaveLength(1);
   });
 });
+
+describe('#3583 review: HEAD keeps proving liveness through a STAGED uncommitted edit', () => {
+  test('staging the slug-line removal changes the working tree AND the staging index — HEAD still spares the row', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = await setupExoticScenario();
+
+    // Remove the slug: line AND stage it (no commit): the working tree and
+    // the staging-index blob now both derive nothing — only HEAD still
+    // carries the slug the imported row was created from.
+    writeFileSync(join(repo, '\u{1F389}.md'), [
+      '---', 'type: person', 'title: Party Notes', '---',
+      '', 'Party notes live here (slug line removed and STAGED).',
+    ].join('\n'));
+    execSync('git add -- "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // Proof intact through HEAD — the true ghost is still deleted.
+    expect(await engine.getPage('people/ghost')).toBeNull();
+  });
+});
+
+describe('#3583 review: the failure-gate clear paths also verify-and-restore', () => {
+  test('incremental gate: a writer landing after the orphan verdict gets its sentinel restored post-gate', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    await plantOrphanedSentinel();
+    expect(await openDanaRows()).toHaveLength(1);
+
+    // A COMMITTED unrelated change routes the run through the import path
+    // and the failure GATE (not the quiet-run sweep) — the gate's clear of
+    // the orphaned sentinel used to skip post-clear verification entirely.
+    writeFileSync(join(repo, 'people/newfile.md'), personMd('New', 'New person.'));
+    execSync('git add -A && git commit -m "unrelated addition"', { cwd: repo, stdio: 'pipe' });
+
+    const origExecuteRaw = engine.executeRaw.bind(engine);
+    let probeCalls = 0;
+    (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw =
+      (async (sql: string, params?: unknown[]) => {
+        const res = await origExecuteRaw(sql, params);
+        if (sql.includes('source_path = ANY')) {
+          probeCalls++;
+          if (probeCalls === 2) {
+            // After the double-probe verdict is final, before the gate clears.
+            await engine.putPage('people/dana-old-gate-writer', {
+              type: 'person', title: 'Dana (gate writer)',
+              compiled_truth: 'materialized between the gate verdict and the clear',
+            }, { sourceId: 'default' });
+            await origExecuteRaw(
+              `UPDATE pages SET source_path = 'people/dana-old.md'
+               WHERE source_id = 'default' AND slug = 'people/dana-old-gate-writer'`,
+            );
+          }
+        }
+        return res;
+      }) as typeof engine.executeRaw;
+    try {
+      const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      expect(result.status).toBe('synced');
+    } finally {
+      (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw = origExecuteRaw;
+    }
+
+    expect(await engine.getPage('people/dana-old-gate-writer')).not.toBeNull();
+    // The post-gate verify probe restored the sentinel.
+    expect(await openDanaRows()).toHaveLength(1);
+  });
+
+  test('a verify probe that THROWS after the clear restores every cleared sentinel (fail-closed), verbatim', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const { recordFailures, renameSentinelPath, renameReconcileErrorMessage } =
+      await import('../src/core/sync-failure-ledger.ts');
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    // Plant the orphan TWICE so attempts climbs to 2 — the restore must
+    // reproduce the row verbatim, not restart the streak at attempts 1.
+    const plant = () => recordFailures('default', [{
+      path: renameSentinelPath('people/dana.md'),
+      error: renameReconcileErrorMessage('people/dana-old.md', 'people/dana-old', 'injected wedge'),
+    }], 'deadbeef');
+    plant();
+    plant();
+    const before = (await openDanaRows())[0];
+    expect(before).toBeDefined();
+    expect(before!.attempts).toBe(2);
+
+    // Both orphan probes succeed (empty) → clear commits; the post-clear
+    // VERIFY probe (third matching SELECT) throws. Fail-closed means every
+    // cleared sentinel comes back.
+    const origExecuteRaw = engine.executeRaw.bind(engine);
+    let probeCalls = 0;
+    (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw =
+      (async (sql: string, params?: unknown[]) => {
+        if (sql.includes('source_path = ANY')) {
+          probeCalls++;
+          if (probeCalls === 3) throw new Error('injected verify-probe outage');
+        }
+        return origExecuteRaw(sql, params);
+      }) as typeof engine.executeRaw;
+    try {
+      const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      expect(result.status).toBe('up_to_date');
+    } finally {
+      (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw = origExecuteRaw;
+    }
+
+    expect(probeCalls).toBe(3);
+    const rows = await openDanaRows();
+    expect(rows).toHaveLength(1);
+    // Verbatim restore: streak metadata survives the round trip.
+    expect(rows[0]!.attempts).toBe(2);
+    expect(rows[0]!.first_seen).toBe(before!.first_seen);
+    expect(rows[0]!.commit).toBe(before!.commit);
+  });
+});
