@@ -2083,25 +2083,6 @@ function anchorContentSignals(
 }
 
 /**
- * #3583 gate20: every commit that ever touched a path (newest first,
- * capped). `--full-history` so a merge-simplified epoch cannot hide a
- * blob (the gate-11 lesson); a missing commit only ever causes a
- * spare-side miss. Empty on any failure.
- */
-function historicalPathCommits(
-  gitContextRoot: string, rel: string, cap: number,
-): string[] {
-  try {
-    const out = gitRawOutput(gitContextRoot, [
-      'log', '--full-history', '--format=%H', '-n', String(cap), 'HEAD', '--', rel,
-    ]);
-    return out.split('\n').map(s => s.trim()).filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-/**
  * Size-gated read + slug extraction of one anchor-tree blob. When a
  * content filter is in effect for the path under TODAY's attributes, or
  * ANY reachable attribute epoch assigns a filter to ANYTHING
@@ -4712,6 +4693,24 @@ async function performFullSync(
   // now has been resolved → clear it (resets its auto-skip streak); current
   // failures still climb their attempts.
   const fullSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
+  // #3583 gate21: the purge's write-provenance watermark, read BEFORE the
+  // gate's advance overwrites it. `pages.updated_at` moves only on real
+  // content writes (putPage, updateSlug, revertVersion) — link extraction,
+  // embedding and retrieval bookkeeping all write their own columns — so a
+  // candidate whose updated_at postdates the previous sync was written by
+  // something other than that sync's import, and is not the removed file's
+  // projection. NULL (never synced, or a pre-anchor brain) is not a licence
+  // to delete: the purge simply defers, and THIS run's own advance stamps
+  // the watermark, so the next full sync converges.
+  let purgeWatermark: string | null = null;
+  try {
+    const wm = await engine.executeRaw<{ last_sync_at: string | Date | null }>(
+      `SELECT last_sync_at FROM sources WHERE id = $1`,
+      [fullSourceId],
+    );
+    const raw = wm[0]?.last_sync_at ?? null;
+    purgeWatermark = raw === null ? null : new Date(raw).toISOString();
+  } catch { purgeWatermark = null; }
   const fullFailureSet = new Set(result.failures.map(f => f.path));
   const fullSucceeded = loadSyncFailures()
     .filter(e => e.source_id === fullSourceId && isSkippablePath(e.path) && !fullFailureSet.has(e.path))
@@ -5070,68 +5069,59 @@ async function performFullSync(
           `so the next sync sees them as file-backed.`,
         );
       }
-      // #3583 gate20: "dead committed path + underivable slug + no dedup
+      // #3583 gate20/21: "dead committed path + underivable slug + no dedup
       // match" proves the FILE is gone — not that the ROW is that file's
       // projection. A supported put_page can update a file-backed row (the
       // upsert preserves source_path when the caller supplies none) while
       // the file projection is unavailable; the file's committed deletion
       // then made this partition hard-delete the user's ACCEPTED update.
-      // Delete only rows whose content provably IS the removed file's
-      // projection: the row's {title, compiled_truth, timeline} must match
-      // what SOME historical blob of its claimed path parses to (inference
-      // mirrored — parsedContentSignals). A row matching NO committed
-      // state was written by something other than this file's import and
-      // is spared with a log; unprovable history spares too. Genuine
-      // stale projections match their import-time blob and still purge.
-      // Cost: up to 50 `git show` per candidate — the purge runs rarely
-      // and candidates are bounded by the mass valve.
+      //
+      // Content equality with a historical blob is the WRONG discriminator
+      // (gate 21): an accepted resurrection that happens to match a brief
+      // earlier revision is still a distinct write carrying its own
+      // provenance and curated metadata, and equality is unprovable in the
+      // other direction whenever a filter, a CRLF rule or a parser upgrade
+      // sits between the blob and what import stored. Provenance is the
+      // real axis: delete only rows that NOTHING has written since the
+      // previous sync — those, and only those, are that sync's import
+      // projection of the now-removed file.
       if (deletableSlugs.length > 0) {
-        const provenProjections: string[] = [];
-        let sparedNotProjection = 0;
-        const rowSigBySlug = new Map<string, { title: string | null; compiled_truth: string | null; timeline: string | null }>();
-        try {
-          for (let i = 0; i < deletableSlugs.length; i += DELETE_BATCH_SIZE) {
-            const batch = deletableSlugs.slice(i, i + DELETE_BATCH_SIZE);
-            const sigRows = await engine.executeRaw<{ slug: string; title: string | null; compiled_truth: string | null; timeline: string | null }>(
-              `SELECT slug, title, compiled_truth, timeline FROM pages
-                WHERE slug = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL`,
-              [batch, sid],
-            );
-            for (const r of sigRows) rowSigBySlug.set(r.slug, r);
-          }
-        } catch { /* unfetchable rows simply spare below */ }
-        for (const slug of deletableSlugs) {
-          const spRaw = pathBySlug.get(slug);
-          const sig = rowSigBySlug.get(slug);
-          let isProjection = false;
-          if (spRaw && sig) {
-            const sp = spRaw.replace(/\\/g, '/');
-            for (const c of historicalPathCommits(gitContextRoot, sp, 50)) {
-              let blobContent: string;
-              try {
-                blobContent = gitRawOutput(gitContextRoot, ['show', `${c}:${sp}`]);
-              } catch { continue; } // e.g. the deletion commit itself
-              try {
-                const h = parsedContentSignals(sp, blobContent);
-                if (
-                  h.title === (sig.title ?? '') &&
-                  h.compiledTruth === (sig.compiled_truth ?? '') &&
-                  h.timeline === (sig.timeline ?? '')
-                ) { isProjection = true; break; }
-              } catch { /* unparsable at this state — try the next */ }
-            }
-          }
-          if (isProjection) provenProjections.push(slug);
-          else sparedNotProjection++;
-        }
-        if (sparedNotProjection > 0) {
+        let untouched: string[] = [];
+        let sparedWritten = 0;
+        if (purgeWatermark === null) {
+          sparedWritten = deletableSlugs.length;
           serr(
-            `  [sync] full-sync reconcile: spared ${sparedNotProjection} page(s) whose ` +
-            `content matches no committed state of their claimed path (edited after ` +
-            `import, or unprovable history) — not provably the removed file's projection.`,
+            `  [sync] full-sync reconcile: no previous-sync watermark on source ` +
+            `'${sid}', so no row can be proven untouched since its import; ` +
+            `deferring ${sparedWritten} purge candidate(s) to the next full sync.`,
+          );
+        } else {
+          try {
+            for (let i = 0; i < deletableSlugs.length; i += DELETE_BATCH_SIZE) {
+              const batch = deletableSlugs.slice(i, i + DELETE_BATCH_SIZE);
+              const fresh = await engine.executeRaw<{ slug: string }>(
+                `SELECT slug FROM pages
+                  WHERE slug = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL
+                        AND updated_at <= $3::timestamptz`,
+                [batch, sid, purgeWatermark],
+              );
+              for (const r of fresh) untouched.push(r.slug);
+            }
+            sparedWritten = deletableSlugs.length - untouched.length;
+          } catch {
+            // Unprovable → spare everything this run (the reconcile's posture).
+            untouched = [];
+            sparedWritten = deletableSlugs.length;
+          }
+        }
+        if (sparedWritten > 0) {
+          serr(
+            `  [sync] full-sync reconcile: spared ${sparedWritten} page(s) written ` +
+            `since the previous sync — an accepted update, not the removed file's ` +
+            `import projection.`,
           );
         }
-        deletableSlugs = provenProjections;
+        deletableSlugs = untouched;
       }
       const deleteScopedOpts = { sourceId: sid };
       for (let i = 0; i < deletableSlugs.length; i += DELETE_BATCH_SIZE) {

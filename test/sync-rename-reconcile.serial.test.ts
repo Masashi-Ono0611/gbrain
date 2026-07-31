@@ -2104,20 +2104,14 @@ describe('#3583 review: GATE13 — the full-sync purge vs cheap-rename bookkeepi
     );
     // And one genuinely-stale page: its file is really gone from disk AND
     // history-committed, so the purge must still delete it.
-    // gate 20: capture the imported projection BEFORE deletion — the
-    // re-planted row must hold content matching a committed state of its
-    // path, or the projection proof (correctly) spares it as not-ours.
-    const gammaRow = await engine.getPage('people/gamma');
+    // gate 21: the genuinely-stale row must be what the earlier sync
+    // imported and NOTHING has written since — that is what a missed
+    // delete actually leaves behind. Committing the deletion and going
+    // straight to the full sync (no intervening incremental sync to
+    // reconcile it) preserves exactly that state. Re-planting the row
+    // with a fresh write would instead look like an accepted post-sync
+    // update, which the purge now (correctly) spares.
     execSync('git rm -q people/gamma.md && git commit -m "delete gamma"', { cwd: repo, stdio: 'pipe' });
-    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    // Re-plant gamma's row as if the incremental delete had been missed.
-    await engine.putPage('people/gamma', {
-      type: 'person', title: gammaRow!.title, compiled_truth: gammaRow!.compiled_truth,
-    }, { sourceId: 'default' });
-    await engine.executeRaw(
-      `UPDATE pages SET source_path = 'people/gamma.md'
-       WHERE source_id = 'default' AND slug = 'people/gamma'`,
-    );
 
     const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
     expect(full.status).not.toBe('blocked_by_failures');
@@ -2263,19 +2257,14 @@ describe('#3583 review: GATE14 — the purge liveness proof is repo-wide and sou
       'people/gamma.md': personMd('Gamma', 'Gamma is a person.'),
     });
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    // gate 20: capture the imported projection BEFORE deletion — the
-    // re-planted row must hold content matching a committed state of its
-    // path, or the projection proof (correctly) spares it as not-ours.
-    const gammaRow = await engine.getPage('people/gamma');
+    // gate 21: the genuinely-stale row must be what the earlier sync
+    // imported and NOTHING has written since — that is what a missed
+    // delete actually leaves behind. Committing the deletion and going
+    // straight to the full sync (no intervening incremental sync to
+    // reconcile it) preserves exactly that state. Re-planting the row
+    // with a fresh write would instead look like an accepted post-sync
+    // update, which the purge now (correctly) spares.
     execSync('git rm -q people/gamma.md && git commit -m "delete gamma"', { cwd: repo, stdio: 'pipe' });
-    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    await engine.putPage('people/gamma', {
-      type: 'person', title: gammaRow!.title, compiled_truth: gammaRow!.compiled_truth,
-    }, { sourceId: 'default' });
-    await engine.executeRaw(
-      `UPDATE pages SET source_path = 'people/gamma.md'
-       WHERE source_id = 'default' AND slug = 'people/gamma'`,
-    );
     // An UNTRACKED exotic file: it has no staging or HEAD state at all —
     // the working tree is its complete evidence, not a proof failure.
     writeFileSync(join(repo, '\u{1F389}.md'), exoticMd);
@@ -2299,19 +2288,14 @@ describe('#3583 review: GATE14 — the purge liveness proof is repo-wide and sou
     }
     const repo = mkRepo(files);
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    // gate 20: capture the imported projection BEFORE deletion — the
-    // re-planted row must hold content matching a committed state of its
-    // path, or the projection proof (correctly) spares it as not-ours.
-    const gammaRow = await engine.getPage('people/gamma');
+    // gate 21: the genuinely-stale row must be what the earlier sync
+    // imported and NOTHING has written since — that is what a missed
+    // delete actually leaves behind. Committing the deletion and going
+    // straight to the full sync (no intervening incremental sync to
+    // reconcile it) preserves exactly that state. Re-planting the row
+    // with a fresh write would instead look like an accepted post-sync
+    // update, which the purge now (correctly) spares.
     execSync('git rm -q people/gamma.md && git commit -m "delete gamma"', { cwd: repo, stdio: 'pipe' });
-    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    await engine.putPage('people/gamma', {
-      type: 'person', title: gammaRow!.title, compiled_truth: gammaRow!.compiled_truth,
-    }, { sourceId: 'default' });
-    await engine.executeRaw(
-      `UPDATE pages SET source_path = 'people/gamma.md'
-       WHERE source_id = 'default' AND slug = 'people/gamma'`,
-    );
     // Ten LIVE rows carry legacy bookkeeping naming paths that are gone —
     // pre-filter that is 11 candidates over 21 file-backed rows (> 50%),
     // post-filter it is exactly ONE genuinely-stale row.
@@ -2835,5 +2819,56 @@ describe('#3583 review: GATE20 — the purge deletes only proven projections; in
     const moved = await engine.getPage('notes/2026-01-16-team-meeting');
     expect(moved).not.toBeNull();
     expect(moved!.id).toBe(orig!.id);
+  });
+});
+
+describe('#3583 review: GATE21 — the purge proves write provenance, not content equality', () => {
+  test('G21_HISTORICAL_TWIN_PUT_RESURRECTION_PURGE_LOSS: an accepted put_page resurrection matching an old revision survives', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // All supported operations. Sync state A; commit a brief state B that
+    // no sync ever imported; commit the deletion; then resurrect the row
+    // through put_page with B's content but the user's own type. Content
+    // equality with that historical blob is NOT proof the row is the
+    // removed file's projection — the accepted write has its own
+    // provenance, and only "nothing has written this row since the last
+    // sync" can tell the two apart.
+    const repo = mkRepo({ 'people/alpha.md': personMd('Alpha', 'State A body.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    writeFileSync(join(repo, 'people/alpha.md'), personMd('Alpha', 'State B body.'));
+    execSync('git add people/alpha.md && git commit -m "brief state B"', { cwd: repo, stdio: 'pipe' });
+    execSync('git rm -q people/alpha.md && git commit -m "delete alpha"', { cwd: repo, stdio: 'pipe' });
+    await engine.putPage('people/alpha', {
+      type: 'note', title: 'Alpha', compiled_truth: 'State B body.',
+    }, { sourceId: 'default' });
+
+    const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    const resurrected = await engine.getPage('people/alpha');
+    expect(resurrected).not.toBeNull();
+    expect(resurrected!.type).toBe('note');
+    expect(resurrected!.compiled_truth).toContain('State B body.');
+  });
+
+  test('G21_CRLF_FILTER_PROJECTION_FOREVER_SPARE: a genuine projection under a CRLF rule still purges', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // Provenance does not care what transformed the bytes between the blob
+    // and what import read — nothing wrote the row since its import, so it
+    // is that import's projection and purges. A REGRESSION PIN, not a
+    // discriminator: this harness's CRLF setup did not reproduce the
+    // blob/working-tree divergence the adversarial probe observed, so the
+    // test also passed against the content-equality proof it replaces.
+    const repo = mkRepo({
+      '.gitattributes': '*.md text eol=crlf\n',
+      'people/gamma.md': personMd('Gamma', 'Gamma is a person.'),
+      'people/keeper.md': personMd('Keeper', 'Keeper stays.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('people/gamma')).not.toBeNull();
+    execSync('git rm -q people/gamma.md && git commit -m "delete gamma"', { cwd: repo, stdio: 'pipe' });
+
+    const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    expect(await engine.getPage('people/gamma')).toBeNull();
+    expect(await engine.getPage('people/keeper')).not.toBeNull();
   });
 });
