@@ -1281,3 +1281,89 @@ describe('#3583 review: the failure-gate clear paths also verify-and-restore', (
     expect(rows[0]!.commit).toBe(before!.commit);
   });
 });
+
+describe('#3583 review: the anchor commit keeps proving liveness when HEAD moved past it', () => {
+  test('a single commit that removes the slug: line AND carries the colliding rename must not delete the row imported at the anchor', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      '\u{1F389}.md': exoticMd,
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta (stale)', compiled_truth: 'occupies the destination slug',
+    }, { sourceId: 'default' });
+
+    // ONE commit does both: the emoji file loses its slug: line (its
+    // re-import will fail with "produces no usable slug") AND the rename
+    // that triggers the reconcile lands. Working tree, staging index, and
+    // HEAD all show the slugless content — only the ANCHOR commit (what
+    // the brain actually reflects) still proves the row.
+    writeFileSync(join(repo, '\u{1F389}.md'), [
+      '---', 'type: person', 'title: Party Notes', '---',
+      '', 'Party notes live here (slug line removed at HEAD).',
+    ].join('\n'));
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git add -A && git commit -m "remove slug and rename in one commit"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    // The emoji file's re-import fails (no usable slug), so the run blocks —
+    // and the reconcile that ran within it must NOT have deleted the row.
+    expect(result.status).toBe('blocked_by_failures');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // The true ghost is still gone: the anchor state answered, proof intact.
+    expect(await engine.getPage('people/ghost')).toBeNull();
+  });
+});
+
+describe('#3583 review: a throwing bookmark advance can no longer lose a sentinel', () => {
+  test('the orphan sweep sits outside the gate: advance() throwing leaves the sentinel untouched', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    await plantOrphanedSentinel();
+    expect(await openDanaRows()).toHaveLength(1);
+
+    // A committed change routes the run through the gate; the injected
+    // failure makes the bookmark advance throw AFTER the gate's internal
+    // record/clear pass. The orphaned sentinel must survive: its clear
+    // lives OUTSIDE the gate now, and is never reached on a throw.
+    writeFileSync(join(repo, 'people/newfile.md'), personMd('New', 'New person.'));
+    execSync('git add -A && git commit -m "unrelated addition"', { cwd: repo, stdio: 'pipe' });
+
+    const origExecuteRaw = engine.executeRaw.bind(engine);
+    (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw =
+      (async (sql: string, params?: unknown[]) => {
+        if (sql.includes('UPDATE sources SET last_commit')) {
+          throw new Error('injected advance outage');
+        }
+        return origExecuteRaw(sql, params);
+      }) as typeof engine.executeRaw;
+    let threw = false;
+    try {
+      await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    } catch {
+      threw = true;
+    } finally {
+      (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw = origExecuteRaw;
+    }
+    expect(threw).toBe(true);
+
+    // Fail-closed: nothing cleared, nothing lost.
+    expect(await openDanaRows()).toHaveLength(1);
+  });
+});

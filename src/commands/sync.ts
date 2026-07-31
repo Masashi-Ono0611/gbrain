@@ -1896,7 +1896,7 @@ interface TrackedSlugIndex {
   complete: boolean;
 }
 
-function trackedSlugIndex(gitContextRoot: string): TrackedSlugIndex {
+function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): TrackedSlugIndex {
   const bySlug = new Map<string, string[]>();
   let complete = true;
   const addSlug = (slug: string, rel: string): void => {
@@ -1917,7 +1917,7 @@ function trackedSlugIndex(gitContextRoot: string): TrackedSlugIndex {
     // punctuation-named artifact costs one lstat, never a read.
     if (slug === '' && !isCodeFilePath(rel)) {
       try {
-        const fallback = fallbackSlugsForFile(gitContextRoot, rel);
+        const fallback = fallbackSlugsForFile(gitContextRoot, rel, anchorCommit);
         for (const fmSlug of fallback.slugs) addSlug(fmSlug, rel);
         if (!fallback.proofIntact) {
           complete = false;
@@ -1975,6 +1975,7 @@ function trackedSlugIndex(gitContextRoot: string): TrackedSlugIndex {
 function fallbackSlugsForFile(
   gitContextRoot: string,
   rel: string,
+  anchorCommit?: string,
 ): { slugs: string[]; proofIntact: boolean } {
   const contents: string[] = [];
   let proofIntact = true;
@@ -2027,6 +2028,28 @@ function fallbackSlugsForFile(
     // Absent from HEAD (a newly added file) is normal — nothing to prove.
   } catch {
     proofIntact = false;
+  }
+  // Anchor blob — the commit the BRAIN actually reflects (`last_commit`).
+  // HEAD can be ahead of the anchor mid-sync: a commit that both removes
+  // the slug: line AND carries the colliding rename shows the slugless
+  // content in ALL other states, while the row (imported at the anchor)
+  // still carries the anchor's slug — that state must keep proving it.
+  if (anchorCommit && anchorCommit !== 'HEAD') {
+    try {
+      const inAnchor = git(gitContextRoot, ['ls-tree', anchorCommit, '--', rel]);
+      if (inAnchor !== '') {
+        const anchorSize = Number(git(gitContextRoot, ['cat-file', '-s', `${anchorCommit}:${rel}`]));
+        if (Number.isFinite(anchorSize) && anchorSize > MAX_FILE_SIZE) {
+          proofIntact = false;
+        } else {
+          const c = git(gitContextRoot, ['cat-file', '--filters', `${anchorCommit}:${rel}`]);
+          if (c.length > MAX_FILE_SIZE) proofIntact = false;
+          else contents.push(c);
+        }
+      }
+    } catch {
+      proofIntact = false;
+    }
   }
   const slugs = new Set<string>();
   for (const content of contents) {
@@ -2116,8 +2139,9 @@ async function orphanedRenameSentinels(
 async function sweepOrphanedRenameSentinels(
   engine: BrainEngine,
   sourceId: string,
+  excludePaths: ReadonlySet<string> = new Set(),
 ): Promise<void> {
-  const orphaned = await orphanedRenameSentinels(engine, sourceId, new Set());
+  const orphaned = await orphanedRenameSentinels(engine, sourceId, excludePaths);
   if (orphaned.length === 0) return;
   const orphanSet = new Set(orphaned);
   // Captured BEFORE the clear so a restore can reproduce the exact row.
@@ -3276,7 +3300,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // proves nothing, so the row is spared as 'unknown' rather than deleted.
     let treeSlugIndex: TrackedSlugIndex | undefined;
     const slugLiveness = (s: string): 'live' | 'stale' | 'unknown' => {
-      treeSlugIndex ??= trackedSlugIndex(gitContextRoot);
+      // lastCommit = the commit the brain reflects; its blob is one of the
+      // consulted content states (see fallbackSlugsForFile).
+      treeSlugIndex ??= trackedSlugIndex(gitContextRoot, lastCommit);
       if (treeSlugIndex.bySlug.has(s)) return 'live';
       return treeSlugIndex.complete ? 'stale' : 'unknown';
     };
@@ -3880,16 +3906,6 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     await clearOpCheckpoint(engine, ckpt.target);
   };
 
-  // Computed BEFORE the gate call so the post-gate verify can restore the
-  // exact rows the gate is about to clear (#3583 clear-then-verify).
-  const gateOrphanedSentinels = await orphanedRenameSentinels(
-    engine, opts.sourceId ?? DEFAULT_SOURCE_ID, new Set(failedFiles.map(f => f.path)),
-  );
-  const gateOrphanSet = new Set(gateOrphanedSentinels);
-  const gateOrphanRows = loadSyncFailures().filter(
-    r => r.source_id === (opts.sourceId ?? DEFAULT_SOURCE_ID) && gateOrphanSet.has(r.path),
-  );
-
   // issue #1939 adversarial finding #1: a file that failed to parse (open ledger
   // row) and is then deleted/renamed-away never re-enters failedFiles and never
   // imports, so its row would never clear and would age doctor to a permanent
@@ -3902,14 +3918,6 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // operators cannot acknowledge manually. Once pin ancestry is verified on
     // a later run, clear that stale sentinel through the ordinary success path.
     ...(headVerificationSucceeded ? ['<head>'] : []),
-    // #3479 blocker 2 — same self-heal for `<rename:…>` sentinels: a force-push
-    // that invalidates the pinned target means the rename never re-enters the
-    // diff, so the ordinary convergence path above can never clear the row and
-    // doctor ages it to a permanent FAIL no CLI can fix. An open sentinel whose
-    // stale source_path row no longer resolves has nothing left to reconcile
-    // (the duplicate is gone — deleted by the operator, a full-sync purge, or
-    // any other path), so it clears here, mirroring the `<head>` clear above.
-    ...gateOrphanedSentinels,
   ];
 
   const gate = await applySyncFailureGate({
@@ -3920,10 +3928,18 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     skipFailed: opts.skipFailed === true,
     advance,
   });
-  // #3583: the gate's clear of the orphaned sentinels above shares the
-  // probe/clear window the quiet-run sweep has — verify after the clear and
-  // restore any sentinel whose old path re-acquired an active row.
-  await verifyOrRestoreClearedSentinels(engine, opts.sourceId ?? DEFAULT_SOURCE_ID, gateOrphanRows);
+  // #3479 blocker 2 — self-heal for orphaned `<rename:…>` sentinels: a
+  // force-push that invalidates the pinned target means the rename never
+  // re-enters the diff, so the ordinary convergence path above can never
+  // clear the row and doctor ages it to a permanent FAIL no CLI can fix.
+  // Deliberately AFTER the gate and OUTSIDE it (#3583): the gate used to
+  // clear these via succeededPaths, which cleared BEFORE advance() — a
+  // throwing advance then lost the sentinel with the verify never reached.
+  // Out here, a gate that throws never clears anything (fail-closed), and
+  // the sweep carries the full clear-then-verify-restore semantics.
+  await sweepOrphanedRenameSentinels(
+    engine, opts.sourceId ?? DEFAULT_SOURCE_ID, new Set(failedFiles.map(f => f.path)),
+  );
 
   if (!gate.advanced) {
     const codeBreakdown = formatCodeBreakdown(failedFiles);
@@ -4264,23 +4280,9 @@ async function performFullSync(
   // failures still climb their attempts.
   const fullSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
   const fullFailureSet = new Set(result.failures.map(f => f.path));
-  // #3479 blocker 2 — the same orphaned-`<rename:…>`-sentinel self-heal the
-  // incremental gate applies: an open sentinel whose stale source_path row
-  // no longer resolves has nothing left to reconcile, and a full sync is
-  // often exactly the operator's reset move after a wedge. Rows captured
-  // BEFORE the gate call so the post-gate verify can restore them (#3583
-  // clear-then-verify).
-  const fullOrphanedSentinels = await orphanedRenameSentinels(engine, fullSourceId, fullFailureSet);
-  const fullOrphanSet = new Set(fullOrphanedSentinels);
-  const fullOrphanRows = loadSyncFailures().filter(
-    r => r.source_id === fullSourceId && fullOrphanSet.has(r.path),
-  );
-  const fullSucceeded = [
-    ...loadSyncFailures()
-      .filter(e => e.source_id === fullSourceId && isSkippablePath(e.path) && !fullFailureSet.has(e.path))
-      .map(e => e.path),
-    ...fullOrphanedSentinels,
-  ];
+  const fullSucceeded = loadSyncFailures()
+    .filter(e => e.source_id === fullSourceId && isSkippablePath(e.path) && !fullFailureSet.has(e.path))
+    .map(e => e.path);
   const advanceFull = async (): Promise<void> => {
     // Persist sync state so the next sync is incremental. Routed through
     // writeSyncAnchor so --source pins the right sources row.
@@ -4298,8 +4300,12 @@ async function performFullSync(
     skipFailed: opts.skipFailed === true,
     advance: advanceFull,
   });
-  // #3583 clear-then-verify, full-sync flavor of the incremental gate's.
-  await verifyOrRestoreClearedSentinels(engine, fullSourceId, fullOrphanRows);
+  // #3479 blocker 2 — the same orphaned-`<rename:…>`-sentinel self-heal the
+  // incremental path applies (a full sync is often exactly the operator's
+  // reset move after a wedge). AFTER and OUTSIDE the gate (#3583): a gate
+  // that throws never clears anything, and the sweep carries the full
+  // clear-then-verify-restore semantics.
+  await sweepOrphanedRenameSentinels(engine, fullSourceId, fullFailureSet);
 
   if (!fullGate.advanced) {
     const codeBreakdown = formatCodeBreakdown(result.failures);
@@ -4481,11 +4487,11 @@ async function performFullSync(
         slog(`  Reconciled ${reconciledDeletes} stale page(s) whose source file was removed.`);
       }
     }
-    // #3479 blocker 2 — the pre-gate orphan probe above ran BEFORE this purge,
+    // #3479 blocker 2 — the post-gate sweep above ran BEFORE this purge,
     // so a `<rename:…>` sentinel whose stale row the purge just removed would
     // stay open until the NEXT run. Sweep again post-purge: a full sync is the
     // operator's usual reset move, and it should converge in one run.
-    await sweepOrphanedRenameSentinels(engine, fullSourceId);
+    await sweepOrphanedRenameSentinels(engine, fullSourceId, fullFailureSet);
   }
 
   // Full sync doesn't track pagesAffected, so fall back to embed --stale.
