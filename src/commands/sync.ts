@@ -2010,14 +2010,17 @@ function frontmatterSlugShapes(content: string, rel: string): string[] {
 
 /**
  * Size-gated read + slug extraction of one anchor-tree blob. When a
- * content filter is configured for the path, the read still registers what
- * it can (spare-side) but the proof is NOT intact: `cat-file --filters`
- * reconstructs the historical blob with TODAY's filter definitions, and a
- * smudge filter that has drifted since the anchor import can hand back
- * content whose slug differs from what was actually imported — a
- * successful read is then not evidence of absence. (A filter whose
- * .gitattributes entry was deleted outright is unknowable by any git
- * surface and stays an accepted, documented residual.)
+ * content filter is in effect for the path — under TODAY's attributes OR
+ * under the ANCHOR commit's attributes (--source) — the read still
+ * registers what it can (spare-side) but the proof is NOT intact:
+ * `cat-file --filters` reconstructs the historical blob with TODAY's
+ * filter definitions, and content imported at the anchor was converted by
+ * the filter active THEN, so either side's filter makes a successful read
+ * not evidence of absence. Consulting both sides also covers attribute
+ * MUTATIONS between anchor and now (`!filter` resets, entries deleted
+ * outright). The remaining residual is an UNVERSIONED attribute source
+ * (info/attributes, core.attributesFile) whose filter entry was removed
+ * since the import — invisible to every git surface.
  */
 function anchorBlobSlugs(
   gitContextRoot: string,
@@ -2025,7 +2028,9 @@ function anchorBlobSlugs(
   rel: string,
 ): { slugs: string[]; proofIntact: boolean } {
   try {
-    const filtered = pathHasContentFilter(gitContextRoot, rel);
+    const filtered =
+      pathHasContentFilter(gitContextRoot, rel) ||
+      pathHasContentFilter(gitContextRoot, rel, anchorCommit);
     const size = Number(git(gitContextRoot, ['cat-file', '-s', `${anchorCommit}:${rel}`]));
     if (Number.isFinite(size) && size > MAX_FILE_SIZE) return { slugs: [], proofIntact: false };
     // BOTH the raw blob and the filter-converted view register (union,
@@ -2058,10 +2063,19 @@ function anchorBlobSlugs(
  * converted content back when it was imported) — counts as filtered.
  * Explicit `-filter` lands here too: spare-side only, never delete-side.
  * Any failure counts as filtered (fail toward unprovable, never a delete).
+ *
+ * With `source` set, attributes are read from that tree-ish
+ * (`check-attr --source`, git >= 2.40) — the anchor-time view. On an
+ * older git the flag fails and the catch answers filtered/unprovable,
+ * which only widens sparing, never deleting.
  */
-function pathHasContentFilter(gitContextRoot: string, rel: string): boolean {
+function pathHasContentFilter(gitContextRoot: string, rel: string, source?: string): boolean {
   try {
-    const out = gitRawOutput(gitContextRoot, ['check-attr', '--all', '-z', '--', rel]);
+    const out = gitRawOutput(gitContextRoot, [
+      'check-attr',
+      ...(source ? [`--source=${source}`] : []),
+      '--all', '-z', '--', rel,
+    ]);
     if (out === '') return false;
     // -z output is a flat sequence of NUL-terminated <path> <attr> <value>
     // triplets; the attribute name sits at every 3k+1 position.

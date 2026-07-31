@@ -1693,3 +1693,66 @@ describe('#3583 review: GATE8 — a REMOVED filter driver cannot impersonate no 
     expect(await engine.getPage('people/ghost')).not.toBeNull();
   });
 });
+
+describe('#3583 review: GATE9 — attribute mutations after the import cannot erase the anchor-time filter', () => {
+  test('resetting the attribute to !filter still leaves the anchor-imported row alive (anchor attrs consulted via --source)', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // Same historical-smudge construction as GATE8: the raw blob has no
+    // slug, the smudge injects it, and the imported row exists only
+    // through the anchor-time conversion.
+    const rawExotic = [
+      '---', 'type: person', 'title: Party Notes', '---',
+      '', 'Party notes live here.',
+    ].join('\n');
+    const repo = mkRepo({
+      '\u{1F389}.md': rawExotic,
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+      '.gitattributes': '*.md filter=probe\n',
+    });
+    execSync(`git config filter.probe.clean "sed '/^slug: Party-Notes$/d'"`, { cwd: repo, stdio: 'pipe' });
+    execSync(`git config filter.probe.smudge "awk 'NR==2{print \\"slug: Party-Notes\\"}1'"`, { cwd: repo, stdio: 'pipe' });
+    rmSync(join(repo, '\u{1F389}.md'));
+    execSync('git checkout -- "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+    expect(readFileSync(join(repo, '\u{1F389}.md'), 'utf8')).toContain('slug: Party-Notes');
+
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    // The attribute is RESET to force-unspecified — the driver stays
+    // configured, but today's check-attr --all output for the path is
+    // EMPTY. Only the anchor commit's attributes still name the filter.
+    writeFileSync(join(repo, '.gitattributes'), '*.md !filter\n');
+    execSync('git add .gitattributes && git commit -m "reset filter attribute"', { cwd: repo, stdio: 'pipe' });
+    rmSync(join(repo, '\u{1F389}.md'));
+    execSync('git checkout -- "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+    expect(readFileSync(join(repo, '\u{1F389}.md'), 'utf8')).not.toContain('slug: Party-Notes');
+    const attrToday = execSync('git check-attr --all -- "\u{1F389}.md"', {
+      cwd: repo, stdio: 'pipe',
+    }).toString();
+    expect(attrToday).toBe('');
+
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta occupier', compiled_truth: 'occupies destination',
+    }, { sourceId: 'default' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // Anchor-time filter detected via --source → evidence unprovable →
+    // every miss spared, the ghost included (documented cost).
+    expect(await engine.getPage('people/ghost')).not.toBeNull();
+  });
+});
