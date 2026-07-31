@@ -556,14 +556,18 @@ describe('#3583 review: a live page sharing the stale source_path survives the r
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(await engine.getPage('people/alpha')).not.toBeNull();
 
-    // Ordinary cheap rename alpha -> beta. updateSlug moves the slug but
-    // never rewrites source_path, and the follow-up import is an
-    // unchanged-content no-write skip — so the LIVE beta row keeps the OLD
-    // path. Pinned here because it is the precondition that made the
+    // Ordinary cheap rename alpha -> beta. The cheap rename now repairs
+    // source_path at the moment it lands (GATE13), so recreate the LEGACY
+    // bookkeeping a pre-fix brain still carries: the live beta row naming
+    // the OLD path. That legacy shape is the precondition that made the
     // widened source_path delete a data-loss bug (#3583 review).
     execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
     execSync('git commit -m "cheap rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/beta'`,
+    );
     const betaRows = await engine.executeRaw<{ source_path: string | null }>(
       `SELECT source_path FROM pages
         WHERE source_id = 'default' AND slug = 'people/beta' AND deleted_at IS NULL`,
@@ -2051,5 +2055,120 @@ describe('#3583 review: GATE11 — filter epochs invisible to the default histor
     expect(await engine.getPage('party-notes')).not.toBeNull();
     // Truncated history is unprovable history: the ghost is spared too.
     expect(await engine.getPage('people/ghost')).not.toBeNull();
+  });
+});
+
+describe('#3583 review: GATE13 — the full-sync purge vs cheap-rename bookkeeping', () => {
+  test('a cheap rename repairs source_path at the moment it lands, and the row survives a full sync', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/alpha.md': personMd('Alpha', 'Alpha is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('people/alpha')).not.toBeNull();
+
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+    const inc = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(inc.status).toBe('synced');
+    expect(await engine.getPage('people/beta')).not.toBeNull();
+    expect(await engine.getPage('people/alpha')).toBeNull();
+    // The root fix: the cheap rename no longer leaves source_path behind
+    // (updateSlug moves the row; the unchanged-content reimport is a
+    // no-write skip that would never have repaired it).
+    const bookkeeping = await engine.executeRaw<{ source_path: string | null }>(
+      `SELECT source_path FROM pages WHERE source_id = 'default' AND slug = 'people/beta'`,
+    );
+    expect(bookkeeping[0]?.source_path).toBe('people/beta.md');
+
+    const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    expect(await engine.getPage('people/beta')).not.toBeNull();
+  });
+
+  test('a LEGACY row with stale rename bookkeeping is spared by the purge liveness proof; a genuinely-stale row is still purged', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+      'people/gamma.md': personMd('Gamma', 'Gamma is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('people/beta')).not.toBeNull();
+
+    // Recreate the PRE-FIX state a production brain already carries: the
+    // row moved but its bookkeeping still names the old, deleted path.
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/beta'`,
+    );
+    // And one genuinely-stale page: its file is really gone from disk AND
+    // history-committed, so the purge must still delete it.
+    execSync('git rm -q people/gamma.md && git commit -m "delete gamma"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    // Re-plant gamma's row as if the incremental delete had been missed.
+    await engine.putPage('people/gamma', {
+      type: 'person', title: 'Gamma (stale)', compiled_truth: 'file deleted from disk and history',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/gamma.md'
+       WHERE source_id = 'default' AND slug = 'people/gamma'`,
+    );
+
+    const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    // The live renamed row survives on the liveness proof (a tracked file
+    // still derives to its slug)...
+    expect(await engine.getPage('people/beta')).not.toBeNull();
+    // ...and the spare is not a blanket one: the genuinely-stale row goes.
+    expect(await engine.getPage('people/gamma')).toBeNull();
+  });
+});
+
+describe('#3583 review: GATE13 — chunker_version is acknowledged only by a completed re-chunk', () => {
+  test('a chunker-version-gate dry run leaves chunker_version untouched', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/alpha.md': personMd('Alpha', 'Alpha is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.executeRaw(
+      `UPDATE sources SET chunker_version = 'gate13-stale' WHERE id = 'default'`,
+    );
+    const preview = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, dryRun: true });
+    expect(preview.status).toBe('dry_run');
+    const version = await engine.executeRaw<{ chunker_version: string | null }>(
+      `SELECT chunker_version FROM sources WHERE id = 'default'`,
+    );
+    expect(version[0]?.chunker_version).toBe('gate13-stale');
+  });
+
+  test('a BLOCKED forced re-chunk keeps the version stale, so the retry actually re-runs', async () => {
+    const { CHUNKER_VERSION } = await import('../src/core/chunkers/code.ts');
+    const { performSync } = await import('../src/commands/sync.ts');
+    const goodAlpha = personMd('Alpha', 'Alpha is a person.');
+    const repo = mkRepo({ 'people/alpha.md': goodAlpha });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.executeRaw(
+      `UPDATE sources SET chunker_version = 'gate13-stale' WHERE id = 'default'`,
+    );
+    // Corrupt the tracked working copy so the forced full re-chunk fails.
+    writeFileSync(join(repo, 'people/alpha.md'), '---' + String.fromCharCode(0) + 'garbage');
+    const blocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(blocked.status).toBe('blocked_by_failures');
+    const staleVersion = await engine.executeRaw<{ chunker_version: string | null }>(
+      `SELECT chunker_version FROM sources WHERE id = 'default'`,
+    );
+    // The failed re-chunk must NOT be acknowledged...
+    expect(staleVersion[0]?.chunker_version).toBe('gate13-stale');
+
+    // ...so once the operator repairs the file, the retry actually
+    // re-runs the re-chunk instead of reporting up_to_date.
+    writeFileSync(join(repo, 'people/alpha.md'), goodAlpha);
+    const retry = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(retry.status).not.toBe('up_to_date');
+    const ackedVersion = await engine.executeRaw<{ chunker_version: string | null }>(
+      `SELECT chunker_version FROM sources WHERE id = 'default'`,
+    );
+    expect(ackedVersion[0]?.chunker_version).toBe(String(CHUNKER_VERSION));
+    expect(await engine.getPage('people/alpha')).not.toBeNull();
   });
 });

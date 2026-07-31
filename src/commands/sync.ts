@@ -2905,9 +2905,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] chunker_version gate: stored=${storedVersion ?? 'unset'}, current=${currentVersion}. ` +
       `Forcing full re-chunk pass (git HEAD unchanged but pipeline version advanced).`,
     );
-    const result = await performFullSync(engine, fullSyncRoots, headCommit, opts);
-    await writeChunkerVersion(engine, opts.sourceId, currentVersion);
-    return result;
+    // #3583 gate13: NO unconditional version write here. performFullSync's
+    // own gated advance writes the version exactly when the re-chunk
+    // actually completed — writing it here acknowledged the version on a
+    // BLOCKED run (losing the retry signal: the next run said up_to_date
+    // and the failed re-walk never re-ran) and on a --dry-run PREVIEW
+    // (persistent brain-state write from a preview).
+    return await performFullSync(engine, fullSyncRoots, headCommit, opts);
   }
 
   // Diff using git diff (net result, not per-commit). v0.42.x (#1794): diff
@@ -3532,6 +3536,28 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       } catch {
         // Destination slug occupied or invalid — treat as add; the reconcile
         // below removes the stale old row once the destination materialized.
+      }
+      if (renameApplied) {
+        // #3583 gate13: the cheap rename moves the ROW but updateSlug never
+        // rewrites source_path — and the unchanged-content reimport below is
+        // a no-write skip, so the stale bookkeeping survived indefinitely
+        // and the full-sync purge later read it as "source file removed"
+        // and hard-deleted the LIVE renamed page. Repair the bookkeeping at
+        // the moment the rename lands (best-effort: the purge's own
+        // liveness spare is the backstop for rows this misses).
+        try {
+          if (opts.sourceId) {
+            await engine.executeRaw(
+              `UPDATE pages SET source_path = $1 WHERE source_id = $2 AND slug = $3 AND source_path = $4`,
+              [to, opts.sourceId, newSlug, from],
+            );
+          } else {
+            await engine.executeRaw(
+              `UPDATE pages SET source_path = $1 WHERE slug = $2 AND source_path = $3`,
+              [to, newSlug, from],
+            );
+          }
+        } catch { /* bookkeeping only — never fail the rename over it */ }
       }
       // Reimport at new path (picks up content changes). Wrapped to match the
       // deletes/adds loops: a malformed renamed file is recorded to failedFiles
@@ -4629,14 +4655,56 @@ async function performFullSync(
       currentFiles,
       p => (scopePrefix === '' || p.startsWith(scopePrefix)) && isSyncable(p, reconcileSyncOpts),
     );
-    if (plan.staleSlugs.length > 0 && plan.massDelete && !massReconcileAllowed()) {
+    // #3583 gate13: staleness by source_path bookkeeping alone is NOT proof.
+    // A cheap rename historically moved the row's slug but left source_path
+    // at the old path, and this purge then hard-deleted the LIVE renamed
+    // page as "source file removed". A row whose slug a current file still
+    // derives to is live regardless of its bookkeeping. Path-derived slugs
+    // are free; fallback-regime files (path derives no slug) prove theirs
+    // from content, and an unprovable read spares EVERY candidate this run
+    // (no delete without proof — the incremental reconcile's posture).
+    const liveSlugs = new Set<string>();
+    let livenessProofIntact = true;
+    for (const f of currentFiles) {
+      const rel = f.replace(/\\/g, '/');
+      const derived = resolveSlugForPath(rel);
+      if (derived !== '') { liveSlugs.add(derived); continue; }
+      if (isCodeFilePath(rel)) continue;
+      try {
+        const fb = fallbackSlugsForFile(gitContextRoot, rel);
+        for (const fs of fb.slugs) liveSlugs.add(fs);
+        if (!fb.proofIntact) livenessProofIntact = false;
+      } catch {
+        livenessProofIntact = false;
+      }
+    }
+    let staleCandidates = plan.staleSlugs;
+    if (!livenessProofIntact) {
+      if (staleCandidates.length > 0) {
+        serr(
+          `  [sync] full-sync reconcile: could not fully resolve the slug of ` +
+          `every tracked file; staleness is unprovable this run, so no pages ` +
+          `were purged.`,
+        );
+      }
+      staleCandidates = [];
+    } else if (staleCandidates.some(s => liveSlugs.has(s))) {
+      const sparedCount = staleCandidates.filter(s => liveSlugs.has(s)).length;
+      staleCandidates = staleCandidates.filter(s => !liveSlugs.has(s));
+      serr(
+        `  [sync] full-sync reconcile: spared ${sparedCount} page(s) whose slug ` +
+        `a tracked file still derives to (stale source_path bookkeeping, live ` +
+        `content).`,
+      );
+    }
+    if (staleCandidates.length > 0 && plan.massDelete && !massReconcileAllowed()) {
       // #2828 mass-delete safety valve: a reconcile that would sweep more than
       // half of the pages this strategy manages, on a source with a non-trivial
       // number of them, is almost always a path-comparison bug or the wrong repo
       // path — NOT a genuine bulk deletion. Skip the delete and warn loudly
       // instead of silently wiping the brain.
       serr(
-        `\n  WARNING: refusing to reconcile-delete ${plan.staleSlugs.length} of ` +
+        `\n  WARNING: refusing to reconcile-delete ${staleCandidates.length} of ` +
         `${plan.reconcilableCount} file-backed page(s) for source '${sid}' ` +
         `(> ${Math.round(MASS_RECONCILE_RATIO * 100)}% of them).\n` +
         `  A full sync removes pages only when their backing file is gone. Deleting\n` +
@@ -4646,7 +4714,7 @@ async function performFullSync(
         `  If this bulk removal is genuinely intended, re-run with ` +
         `GBRAIN_ALLOW_MASS_RECONCILE=1 to restore the old behavior.`,
       );
-    } else if (plan.staleSlugs.length > 0) {
+    } else if (staleCandidates.length > 0) {
       // #2426: a stale page whose source_path was NEVER committed to git is
       // DB-only write-through (the file was written into the clone but never
       // committed/pushed, then lost — e.g. a fresh clone). "Absent from git"
@@ -4656,11 +4724,11 @@ async function performFullSync(
       // history (i.e. was genuinely deleted) are reconcile-deleted.
       const everCommitted = listEverCommittedPaths(gitContextRoot);
       const pathBySlug = new Map(rows.map(r => [r.slug, r.source_path]));
-      let deletableSlugs = plan.staleSlugs;
+      let deletableSlugs = staleCandidates;
       const dbOnlySlugs: string[] = [];
       if (everCommitted) {
         deletableSlugs = [];
-        for (const slug of plan.staleSlugs) {
+        for (const slug of staleCandidates) {
           const sp = pathBySlug.get(slug);
           if (sp && !everCommitted.has(sp.replace(/\\/g, '/'))) dbOnlySlugs.push(slug);
           else deletableSlugs.push(slug);
