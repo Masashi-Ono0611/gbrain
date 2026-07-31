@@ -3004,3 +3004,36 @@ describe('#3583 review: GATE24 — the reconcile removes the way this repo remov
     expect(Number(rows[0]?.n ?? 0)).toBe(1);
   });
 });
+
+describe('#3583 review: GATE24 — the post-purge sweep site converges in one run', () => {
+  test('a sentinel whose stale row the purge itself removes clears in the SAME full sync', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // The one self-heal call site the earlier coverage work left unexercised
+    // (blocker 3 named it). The pre-gate probe cannot clear this sentinel:
+    // at that point the stale row is still ACTIVE and still carries the old
+    // path, so the sentinel is legitimately open. Only the sweep that runs
+    // AFTER the purge removed that row can close it — and it has to, or a
+    // full sync (the operator's usual reset move) leaves the wedge open for
+    // a whole extra run.
+    const repo = mkRepo({
+      'people/carol.md': personMd('Carol', 'Carol is a person.'),
+      'people/dana-old.md': personMd('Dana Old', 'Dana Old is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('people/dana-old')).not.toBeNull();
+
+    // The file leaves git, so the row becomes a genuine purge candidate…
+    execSync('git rm -q people/dana-old.md && git commit -m "delete dana-old"', { cwd: repo, stdio: 'pipe' });
+    // …and the sentinel names that same old path, so it is NOT orphaned yet.
+    await plantOrphanedSentinel();
+    expect(await openDanaRows()).toHaveLength(1);
+
+    const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    // The purge took the stale row…
+    expect(await engine.getPage('people/dana-old')).toBeNull();
+    // …and the post-purge sweep closed the wedge in the same run.
+    expect(await openDanaRows()).toHaveLength(0);
+    expect(await engine.getPage('people/carol')).not.toBeNull();
+  });
+});
