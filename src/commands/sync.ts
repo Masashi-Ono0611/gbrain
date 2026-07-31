@@ -2075,8 +2075,16 @@ function anchorBlobSlugs(
  */
 function attributeEpochCommits(gitContextRoot: string, anchorCommit: string): string[] | null {
   try {
+    // A shallow clone's history is truncated: an import-time filter epoch
+    // can sit below the shallow boundary where no enumeration reaches it.
+    // Unprovable, not absent.
+    if (git(gitContextRoot, ['rev-parse', '--is-shallow-repository']) === 'true') return null;
+    // --full-history: the default path-simplified walk prunes a side line
+    // whose attribute change was discarded at a merge (`-s ours` of an
+    // experiment branch is TREESAME to the kept parent) — but a sync
+    // anchored ON that side line imported under the pruned filter state.
     const out = git(gitContextRoot, [
-      'log', '--format=%H', 'HEAD', anchorCommit, '--',
+      'log', '--full-history', '--format=%H', 'HEAD', anchorCommit, '--',
       '.gitattributes', ':(glob)**/.gitattributes',
     ]);
     const epochs = out.split('\n').filter(Boolean);

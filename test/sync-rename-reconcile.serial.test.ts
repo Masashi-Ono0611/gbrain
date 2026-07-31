@@ -1922,3 +1922,134 @@ describe('#3583 review: GATE10 — historical path-specific attributes survive a
     expect(await engine.getPage('people/ghost')).not.toBeNull();
   });
 });
+
+describe('#3583 review: GATE11 — filter epochs invisible to the default history walk', () => {
+  test('a filter epoch on a side branch discarded by a merge (-s ours) still downgrades the proof', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const rawExotic = [
+      '---', 'type: person', 'title: Party Notes', '---',
+      '', 'Party notes live here.',
+    ].join('\n');
+    // Base commit has NO attributes file at all.
+    const repo = mkRepo({
+      '\u{1F389}.md': rawExotic,
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    // The filter lives only on an experiment branch; the sync that imports
+    // the row runs while THAT branch is checked out.
+    const mainBranch = execSync('git branch --show-current', { cwd: repo, stdio: 'pipe' })
+      .toString().trim();
+    execSync('git switch -qc filtered-side', { cwd: repo, stdio: 'pipe' });
+    writeFileSync(join(repo, '.gitattributes'), '*.md filter=probe\n');
+    execSync('git add .gitattributes && git commit -m "side: enable filter"', { cwd: repo, stdio: 'pipe' });
+    const sideCommit = execSync('git rev-parse HEAD', { cwd: repo, stdio: 'pipe' }).toString().trim();
+    execSync(`git config filter.probe.clean "sed '/^slug: Party-Notes$/d'"`, { cwd: repo, stdio: 'pipe' });
+    execSync(`git config filter.probe.smudge "awk 'NR==2{print \\"slug: Party-Notes\\"}1'"`, { cwd: repo, stdio: 'pipe' });
+    rmSync(join(repo, '\u{1F389}.md'));
+    execSync('git checkout -- "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+    expect(readFileSync(join(repo, '\u{1F389}.md'), 'utf8')).toContain('slug: Party-Notes');
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    // The experiment is DISCARDED at the merge: `-s ours` keeps the main
+    // tree (no attributes file), so the merge is TREESAME to the kept
+    // parent and the default path-simplified walk prunes the side line.
+    execSync(`git switch -q ${mainBranch}`, { cwd: repo, stdio: 'pipe' });
+    execSync('git merge -q -s ours filtered-side -m "discard filter experiment"', { cwd: repo, stdio: 'pipe' });
+    rmSync(join(repo, '\u{1F389}.md'));
+    execSync('git checkout -- "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+    expect(readFileSync(join(repo, '\u{1F389}.md'), 'utf8')).not.toContain('slug: Party-Notes');
+    // An ordinary edit so the intermediate sync advances the anchor.
+    writeFileSync(join(repo, 'people/alpha.md'), personMd('Alpha', 'Alpha is a person. Edited.'));
+    execSync('git add people/alpha.md && git commit -m "edit alpha"', { cwd: repo, stdio: 'pipe' });
+    const postMergeCommit = execSync('git rev-parse HEAD', { cwd: repo, stdio: 'pipe' }).toString().trim();
+    const mid = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(mid.status).toBe('synced');
+    const anchorRows = await engine.executeRaw<{ last_commit: string }>(
+      `SELECT last_commit FROM sources WHERE id = 'default'`,
+    );
+    expect(anchorRows[0]?.last_commit).toBe(postMergeCommit);
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    // Pin the defect mechanism: the default walk omits the side epoch,
+    // --full-history keeps it.
+    const defaultLog = execSync(
+      `git log --format=%H HEAD ${postMergeCommit} -- .gitattributes ':(glob)**/.gitattributes'`,
+      { cwd: repo, stdio: 'pipe' },
+    ).toString();
+    expect(defaultLog).not.toContain(sideCommit);
+    const fullLog = execSync(
+      `git log --full-history --format=%H HEAD ${postMergeCommit} -- .gitattributes ':(glob)**/.gitattributes'`,
+      { cwd: repo, stdio: 'pipe' },
+    ).toString();
+    expect(fullLog).toContain(sideCommit);
+
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta occupier', compiled_truth: 'occupies destination',
+    }, { sourceId: 'default' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    expect(await engine.getPage('people/ghost')).not.toBeNull();
+  });
+
+  test('a shallow clone makes attribute history unprovable: no fallback-anchor delete on truncated history', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // Full source repo: an attributes-free history whose ghost WOULD be
+    // deletable — then a shallow re-clone truncates the history the epoch
+    // enumeration needs, and every fallback anchor proof degrades.
+    const src = mkRepo({
+      '\u{1F389}.md': exoticMd,
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    execSync('git commit --allow-empty -m "second commit for depth"', { cwd: src, stdio: 'pipe' });
+    const shallow = mkdtempSync(join(tmpdir(), 'gbrain-3056-shallow-'));
+    repos.push(shallow);
+    execSync(`git clone --no-local --depth 1 "file://${src}" "${shallow}"`, { stdio: 'pipe' });
+    execSync('git config user.email "test@test.com" && git config user.name "Test"', {
+      cwd: shallow, stdio: 'pipe',
+    });
+    expect(execSync('git rev-parse --is-shallow-repository', { cwd: shallow, stdio: 'pipe' })
+      .toString().trim()).toBe('true');
+
+    await performSync(engine, { repoPath: shallow, ...SYNC_OPTS });
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta occupier', compiled_truth: 'occupies destination',
+    }, { sourceId: 'default' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: shallow, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: shallow, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: shallow, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // Truncated history is unprovable history: the ghost is spared too.
+    expect(await engine.getPage('people/ghost')).not.toBeNull();
+  });
+});
