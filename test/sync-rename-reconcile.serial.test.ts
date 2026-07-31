@@ -25,7 +25,7 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { execSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -1609,12 +1609,87 @@ describe('#3583 review: GATE7 — exclude-filtered carriers and filter-name impe
     const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(result.status).toBe('blocked_by_failures');
     expect(await engine.getPage('party-notes')).not.toBeNull();
-    // The impersonating filter IS detected (a filter.unspecified.* driver
-    // exists), so anchor evidence is unprovable and the index incomplete —
-    // even the true ghost is spared this run, the same documented cost as
-    // any filtered fallback path. (party-notes above additionally survives
-    // through the RAW anchor blob, which still carries the slug the
-    // drifted smudge strips.)
+    // The impersonating filter IS detected (the filter ATTRIBUTE is
+    // specified for the path — check-attr --all lists it regardless of
+    // its magic-looking value), so anchor evidence is unprovable and the
+    // index incomplete — even the true ghost is spared this run, the same
+    // documented cost as any filtered fallback path. (party-notes above
+    // additionally survives through the RAW anchor blob, which still
+    // carries the slug the drifted smudge strips.)
+    expect(await engine.getPage('people/ghost')).not.toBeNull();
+  });
+});
+
+describe('#3583 review: GATE8 — a REMOVED filter driver cannot impersonate no filter', () => {
+  test('deleting filter.<name>.* config while .gitattributes still names it keeps the historically-smudged row alive', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // The raw blob carries NO slug — the smudge filter INJECTS it at
+    // checkout, so the row sync imports exists ONLY through the filter
+    // conversion. mkRepo commits BEFORE the driver is configured, so the
+    // committed blob is the raw form.
+    const rawExotic = [
+      '---', 'type: person', 'title: Party Notes', '---',
+      '', 'Party notes live here.',
+    ].join('\n');
+    const repo = mkRepo({
+      '\u{1F389}.md': rawExotic,
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+      '.gitattributes': '*.md filter=unspecified\n',
+    });
+    execSync(`git config filter.unspecified.clean "sed '/^slug: Party-Notes$/d'"`, { cwd: repo, stdio: 'pipe' });
+    execSync(`git config filter.unspecified.smudge "awk 'NR==2{print \\"slug: Party-Notes\\"}1'"`, { cwd: repo, stdio: 'pipe' });
+    // Materialize the smudged working tree (checkout runs the smudge).
+    rmSync(join(repo, '\u{1F389}.md'));
+    execSync('git checkout -- "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+    expect(readFileSync(join(repo, '\u{1F389}.md'), 'utf8')).toContain('slug: Party-Notes');
+
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    // The operator (or a fresh clone) loses the LOCAL driver config; the
+    // committed .gitattributes entry stays behind. Re-checkout leaves the
+    // raw, slugless content in the working tree.
+    execSync('git config --remove-section filter.unspecified', { cwd: repo, stdio: 'pipe' });
+    rmSync(join(repo, '\u{1F389}.md'));
+    execSync('git checkout -- "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+    expect(readFileSync(join(repo, '\u{1F389}.md'), 'utf8')).not.toContain('slug: Party-Notes');
+    // The exact ambiguity: check-attr still reports the magic-looking
+    // token, and the driver lookup that used to "disambiguate" it finds
+    // nothing (config --get-regexp exits non-zero).
+    const attr = execSync('git check-attr filter -- "\u{1F389}.md"', {
+      cwd: repo, stdio: 'pipe',
+    }).toString().trim();
+    expect(attr).toEndWith(': filter: unspecified');
+    expect(() => execSync(`git config --get-regexp '^filter\\.unspecified\\.'`, {
+      cwd: repo, stdio: 'pipe',
+    })).toThrow();
+
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta occupier', compiled_truth: 'occupies destination',
+    }, { sourceId: 'default' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    // No current git surface (worktree, staging, HEAD, anchor raw OR
+    // anchor filter-converted — the driver is gone) carries the slug the
+    // historical smudge injected. Only the still-specified filter
+    // attribute proves the evidence is unprovable.
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // Unprovable evidence spares every miss, including the true ghost
+    // (the same documented conservative cost as any filtered path).
     expect(await engine.getPage('people/ghost')).not.toBeNull();
   });
 });

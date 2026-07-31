@@ -1965,7 +1965,7 @@ function trackedSlugIndex(gitContextRoot: string, anchorCommit?: string): Tracke
   if (anchorCommit && anchorCommit !== 'HEAD') {
     try {
       const anchorListing = gitRawOutput(gitContextRoot, ['ls-tree', '-r', '-z', '--name-only', anchorCommit]);
-      for (const rel of anchorListing.split(' ')) {
+      for (const rel of anchorListing.split('\u0000')) {
         if (!rel) continue;
         if (resolveSlugForPath(rel) !== '' || isCodeFilePath(rel)) continue;
         const res = anchorBlobSlugs(gitContextRoot, anchorCommit, rel);
@@ -2049,30 +2049,27 @@ function anchorBlobSlugs(
 }
 
 /**
- * Is a content filter configured for this path? check-attr prints the
- * literal token `unspecified` for an UNSET attribute — but a filter whose
- * NAME is literally "unspecified" (or "unset"/"set") prints the same
- * token, so those three magic values are disambiguated by checking whether
- * a filter DRIVER of that name is actually configured. Any parse anomaly
- * counts as filtered (fail toward unprovable, never toward a delete).
+ * Is a `filter` attribute in effect for this path? `check-attr --all`
+ * omits genuinely-unspecified attributes from its output entirely, so ANY
+ * `filter` line — whatever its value, including the magic-looking
+ * `unspecified`/`unset` tokens that a literal driver name or an attr
+ * macro can produce, and regardless of whether a driver is still
+ * configured (a removed driver leaves the attribute behind and may have
+ * converted content back when it was imported) — counts as filtered.
+ * Explicit `-filter` lands here too: spare-side only, never delete-side.
+ * Any failure counts as filtered (fail toward unprovable, never a delete).
  */
 function pathHasContentFilter(gitContextRoot: string, rel: string): boolean {
   try {
-    const attr = git(gitContextRoot, ['check-attr', 'filter', '--', rel]);
-    const m = /: filter: (.*)$/.exec(attr);
-    if (!m) return true;
-    const value = m[1];
-    if (value === 'unspecified' || value === 'unset' || value === 'set') {
-      // Magic output tokens collide with same-named filter drivers.
-      try {
-        const drivers = git(gitContextRoot, ['config', '--get-regexp', `^filter\\.${value}\\.`]);
-        return drivers !== '';
-      } catch {
-        // config --get-regexp exits non-zero on no match → genuinely magic.
-        return false;
-      }
+    const out = gitRawOutput(gitContextRoot, ['check-attr', '--all', '-z', '--', rel]);
+    if (out === '') return false;
+    // -z output is a flat sequence of NUL-terminated <path> <attr> <value>
+    // triplets; the attribute name sits at every 3k+1 position.
+    const fields = out.split('\u0000');
+    for (let i = 1; i + 1 < fields.length; i += 3) {
+      if (fields[i] === 'filter') return true;
     }
-    return true;
+    return false;
   } catch {
     return true;
   }
