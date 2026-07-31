@@ -25,7 +25,7 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { execSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -695,59 +695,59 @@ describe('#3583 review: --dry-run must not rewrite the failure ledger', () => {
   });
 });
 
+// A markdown file whose PATH derives no slug (emoji filename) imports
+// under its frontmatter `slug:` (#598). Such a live row's slug is NOT
+// path-derivable, so a tracked-file index built from resolveSlugForPath
+// alone would miss it and misclassify the row as stale — the same
+// data-loss shape as the ordinary cheap-rename case, one regime deeper.
+// Mixed-case on purpose: importFromContent normalizes through
+// validateSlug (lowercase), so the row is stored as `party-notes` — an
+// index that carried the raw frontmatter casing would miss it and
+// delete the live row all the same.
+const exoticMd = [
+  '---', 'type: person', 'title: Party Notes', 'slug: Party-Notes', '---',
+  '', 'Party notes live here.',
+].join('\n');
+
+async function setupExoticScenario(): Promise<string> {
+  const { performSync } = await import('../src/commands/sync.ts');
+  const repo = mkRepo({
+    '\u{1F389}.md': exoticMd,
+    'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+  });
+  await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+  const party = await engine.getPage('party-notes');
+  expect(party).not.toBeNull();
+  expect(party!.compiled_truth).toContain('Party notes live here.');
+
+  // Manufacture the stale bookkeeping a prior cheap rename leaves behind:
+  // the LIVE party-notes row (backed by the tracked emoji file) carries
+  // the old path of the rename below. A genuinely-stale ghost row shares
+  // the same path as the inverse control — it has no backing file and
+  // MUST still be deleted.
+  await engine.executeRaw(
+    `UPDATE pages SET source_path = 'people/alpha.md'
+     WHERE source_id = 'default' AND slug = 'party-notes'`,
+  );
+  await engine.putPage('people/ghost', {
+    type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+  }, { sourceId: 'default' });
+  await engine.executeRaw(
+    `UPDATE pages SET source_path = 'people/alpha.md'
+     WHERE source_id = 'default' AND slug = 'people/ghost'`,
+  );
+
+  // Occupied destination forces the fallback-to-add reconcile with
+  // from=people/alpha.md.
+  await engine.putPage('people/beta', {
+    type: 'person', title: 'Beta (stale)', compiled_truth: 'occupies the destination slug',
+  }, { sourceId: 'default' });
+  execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+  execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+  return repo;
+}
+
 describe('#3583 review: frontmatter-fallback (CJK-wave) live rows survive the reconcile', () => {
-  // A markdown file whose PATH derives no slug (emoji filename) imports
-  // under its frontmatter `slug:` (#598). Such a live row's slug is NOT
-  // path-derivable, so a tracked-file index built from resolveSlugForPath
-  // alone would miss it and misclassify the row as stale — the same
-  // data-loss shape as the ordinary cheap-rename case, one regime deeper.
-  // Mixed-case on purpose: importFromContent normalizes through
-  // validateSlug (lowercase), so the row is stored as `party-notes` — an
-  // index that carried the raw frontmatter casing would miss it and
-  // delete the live row all the same.
-  const exoticMd = [
-    '---', 'type: person', 'title: Party Notes', 'slug: Party-Notes', '---',
-    '', 'Party notes live here.',
-  ].join('\n');
-
-  async function setupExoticScenario(): Promise<string> {
-    const { performSync } = await import('../src/commands/sync.ts');
-    const repo = mkRepo({
-      '\u{1F389}.md': exoticMd,
-      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
-    });
-    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    const party = await engine.getPage('party-notes');
-    expect(party).not.toBeNull();
-    expect(party!.compiled_truth).toContain('Party notes live here.');
-
-    // Manufacture the stale bookkeeping a prior cheap rename leaves behind:
-    // the LIVE party-notes row (backed by the tracked emoji file) carries
-    // the old path of the rename below. A genuinely-stale ghost row shares
-    // the same path as the inverse control — it has no backing file and
-    // MUST still be deleted.
-    await engine.executeRaw(
-      `UPDATE pages SET source_path = 'people/alpha.md'
-       WHERE source_id = 'default' AND slug = 'party-notes'`,
-    );
-    await engine.putPage('people/ghost', {
-      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
-    }, { sourceId: 'default' });
-    await engine.executeRaw(
-      `UPDATE pages SET source_path = 'people/alpha.md'
-       WHERE source_id = 'default' AND slug = 'people/ghost'`,
-    );
-
-    // Occupied destination forces the fallback-to-add reconcile with
-    // from=people/alpha.md.
-    await engine.putPage('people/beta', {
-      type: 'person', title: 'Beta (stale)', compiled_truth: 'occupies the destination slug',
-    }, { sourceId: 'default' });
-    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
-    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
-    return repo;
-  }
-
   test('emoji-filename row with a frontmatter slug is spared; the stale ghost sharing the path is still deleted', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     const repo = await setupExoticScenario();
@@ -792,7 +792,11 @@ describe('#3583 review: frontmatter-fallback (CJK-wave) live rows survive the re
   });
 });
 
-describe('#3583 review: --dry-run must not mutate ANY persistent state', () => {
+// Scope note: "persistent state" here means the BRAIN's state (DB rows,
+// checkpoints, the failure ledger). The internal `git pull` a preview runs
+// without --no-pull mutates the operator's REPO and is longstanding
+// upstream behavior with its own knob — out of this suite's scope.
+describe('#3583 review: --dry-run must not mutate persistent brain state', () => {
   test('quiet named-source dry run leaves the last_sync_at heartbeat untouched; the real run bumps it', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
@@ -948,5 +952,165 @@ describe('#3583 review: an over-size-gate fallback-regime file suspends deletes 
     // Deliberate, documented cost of the incomplete index: the genuinely
     // stale ghost is ALSO spared this run (no delete without proof).
     expect(await engine.getPage('people/ghost')).not.toBeNull();
+  });
+});
+
+describe('#3583 review: both content states prove liveness — working tree AND index blob', () => {
+  test('an uncommitted edit that removes the slug: line must not un-prove the imported row', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = await setupExoticScenario();
+
+    // Uncommitted working-tree edit removes `slug:` — the WORKING TREE now
+    // derives nothing, but the row was imported from the COMMITTED content,
+    // which still names party-notes. Deleting on the working tree alone
+    // loses the row.
+    writeFileSync(join(repo, '\u{1F389}.md'), [
+      '---', 'type: person', 'title: Party Notes', '---',
+      '', 'Party notes live here (slug line temporarily removed).',
+    ].join('\n'));
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // Proof stayed intact (the blob answered), so the true ghost is still deleted.
+    expect(await engine.getPage('people/ghost')).toBeNull();
+  });
+
+  test('an extensionless exotic file imports under its frontmatter slug and must count as live', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const { importFromFile } = await import('../src/core/import-file.ts');
+    const repo = mkRepo({
+      '\u{1F389}': [
+        '---', 'type: person', 'title: Party Notes', 'slug: Party-Notes', '---',
+        '', 'Party notes live here.',
+      ].join('\n'),
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    // Sync's walker does not import the extensionless file, but the direct
+    // import path does — importFromFile has NO extension gate, and the path
+    // derives no slug, so the frontmatter fallback fires.
+    const imported = await importFromFile(
+      engine, join(repo, '\u{1F389}'), '\u{1F389}', { sourceId: 'default', noEmbed: true },
+    );
+    expect(imported.status).toBe('imported');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta (stale)', compiled_truth: 'occupies the destination slug',
+    }, { sourceId: 'default' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+  });
+
+  test('a tracked markdown symlink is never followed: its out-of-repo target cannot prove liveness', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const external = mkdtempSync(join(tmpdir(), 'gbrain-3583-external-'));
+    repos.push(external);
+    const externalTarget = join(external, 'outside.md');
+    writeFileSync(externalTarget, [
+      '---', 'type: person', 'title: Outside', 'slug: outside-probe', '---',
+      '', 'This file is outside the repository.',
+    ].join('\n'));
+    const repo = mkRepo({ 'people/alpha.md': personMd('Alpha', 'Alpha is a person.') });
+    symlinkSync(externalTarget, join(repo, '\u{1F389}.md'));
+    execSync('git add -A', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "add symlink"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    // A row named by the TARGET's frontmatter slug, wearing the stale path
+    // of the rename below. Import refuses symlinks, so no in-repo file can
+    // legitimately back this row — the index must treat the symlink as its
+    // blob (the target path text, which derives nothing) and let the row
+    // be reconciled, NOT follow the link out of the repository and spare it.
+    await engine.putPage('outside-probe', {
+      type: 'person', title: 'Outside (stale)', compiled_truth: 'no in-repo backing file',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'outside-probe'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta (stale)', compiled_truth: 'occupies the destination slug',
+    }, { sourceId: 'default' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('outside-probe')).toBeNull();
+  });
+
+  test('absent working copy plus unmerged index makes the fallback index incomplete and spares every miss', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = await setupExoticScenario();
+
+    // Replace the emoji file's stage-0 index entry with unmerged stage-1/2
+    // entries and remove the working copy: neither content state is
+    // readable, so no slug can be proven and NOTHING may be deleted.
+    const stageZero = execSync('git ls-files -s -- "\u{1F389}.md"', {
+      cwd: repo, stdio: 'pipe',
+    }).toString();
+    const blob = stageZero.trim().split(/\s+/)[1];
+    expect(blob).toBeTruthy();
+    execSync('git update-index --force-remove -- "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+    execSync('git update-index --index-info', {
+      cwd: repo,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      input:
+        `100644 ${blob} 1\t\u{1F389}.md\n` +
+        `100644 ${blob} 2\t\u{1F389}.md\n`,
+    });
+    rmSync(join(repo, '\u{1F389}.md'));
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // Incomplete index: even the true ghost is spared this run.
+    expect(await engine.getPage('people/ghost')).not.toBeNull();
+  });
+
+  test('unreachable checkpoint rows survive dry-run and are cleared by the real run', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const { loadOpCheckpoint, recordCompleted, syncFingerprint } =
+      await import('../src/core/op-checkpoint.ts');
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    const anchor = execSync('git rev-parse HEAD', { cwd: repo, stdio: 'pipe' }).toString().trim();
+
+    writeFileSync(join(repo, 'people/old-line.md'), personMd('Old line', 'old history'));
+    execSync('git add -A && git commit -m "old line"', { cwd: repo, stdio: 'pipe' });
+    const unreachableTarget =
+      execSync('git rev-parse HEAD', { cwd: repo, stdio: 'pipe' }).toString().trim();
+    // Rewind to the anchor and diverge — the recorded target becomes
+    // unreachable from the new history line (temp repo, nothing of value
+    // is discarded).
+    execSync(`git reset --hard ${anchor}`, { cwd: repo, stdio: 'pipe' });
+    writeFileSync(join(repo, 'people/new-line.md'), personMd('New line', 'new history'));
+    execSync('git add -A && git commit -m "new line"', { cwd: repo, stdio: 'pipe' });
+
+    const fingerprint = syncFingerprint({ sourceId: 'default', lastCommit: anchor });
+    const pathsKey = { op: 'sync', fingerprint };
+    const targetKey = { op: 'sync-target', fingerprint };
+    await recordCompleted(engine, pathsKey, ['people/already-done.md']);
+    await recordCompleted(engine, targetKey, [unreachableTarget]);
+
+    const dry = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, dryRun: true });
+    expect(dry.status).toBe('dry_run');
+    expect(await loadOpCheckpoint(engine, pathsKey)).toEqual(['people/already-done.md']);
+    expect(await loadOpCheckpoint(engine, targetKey)).toEqual([unreachableTarget]);
+
+    const real = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(real.status).toBe('synced');
+    expect(await loadOpCheckpoint(engine, pathsKey)).toEqual([]);
+    expect(await loadOpCheckpoint(engine, targetKey)).toEqual([]);
   });
 });

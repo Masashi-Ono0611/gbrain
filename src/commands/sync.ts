@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, statSync, realpathSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, statSync, lstatSync, realpathSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { isAbsolute, join, relative, sep } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
@@ -13,6 +13,7 @@ import {
   unsyncableReason,
   matchesAnyGlob,
   resolveSlugForPath,
+  isCodeFilePath,
   unacknowledgedSyncFailures,
   acknowledgeFailures,
   loadSyncFailures,
@@ -1868,8 +1869,9 @@ async function activeSlugsBySourcePath(
  *     resolve it the way import does end to end: parseMarkdown on the
  *     content (working tree first, git index blob when the working-tree
  *     copy is absent, e.g. a sparse checkout), then the same validateSlug
- *     chokepoint importFromContent runs (which lowercases). Only markdown
- *     files reach this regime; see fallbackSlugsForFile.
+ *     chokepoint importFromContent runs (which lowercases). Every non-code
+ *     file with an empty derived slug is a candidate — importFromFile has
+ *     no extension gate; see fallbackSlugsForFile.
  *
  * `complete` goes false when some fallback-regime file's content could not
  * be read at all: its true slug is then unknowable, so absence from the
@@ -1906,25 +1908,31 @@ function trackedSlugIndex(gitContextRoot: string): TrackedSlugIndex {
     if (!rel) continue;
     const slug = resolveSlugForPath(rel);
     addSlug(slug, rel);
-    // Fallback-regime files are, exactly, markdown files: only `.md`/`.mdx`
-    // reaches the frontmatter fallback (any other extension keeps its
-    // extension letters in the derived slug, so it can't be empty; code
-    // files derive through slugifyCodePath; neither ever imports under a
-    // frontmatter slug). The gate also bounds the read set — an
-    // extensionless multi-GB artifact with a punctuation-only name derives
-    // '' too, but can never own a row, so it is never opened.
-    if (slug === '' && /\.mdx?$/i.test(rel)) {
+    // Fallback-regime candidates are every non-code file whose path derives
+    // no slug. NOT just `.md`/`.mdx`: importFromFile has no extension gate —
+    // an extensionless emoji-named file imports under its frontmatter slug
+    // all the same, so skipping it here deleted its live row. Reads are
+    // bounded by the size gates inside fallbackSlugsForFile, so a multi-GB
+    // punctuation-named artifact costs one lstat, never a read.
+    if (slug === '' && !isCodeFilePath(rel)) {
       try {
-        for (const fmSlug of fallbackSlugsForFile(gitContextRoot, rel)) {
-          addSlug(fmSlug, rel);
+        const fallback = fallbackSlugsForFile(gitContextRoot, rel);
+        for (const fmSlug of fallback.slugs) addSlug(fmSlug, rel);
+        if (!fallback.proofIntact) {
+          complete = false;
+          serr(
+            `  [sync] rename reconcile: could not fully resolve the slug of ` +
+            `tracked file ${rel} (unreadable, unmerged, or over the import ` +
+            `size gate); staleness is unprovable this run, so reconcile will ` +
+            `not delete any row missing from the index.`,
+          );
         }
       } catch {
         complete = false;
         serr(
           `  [sync] rename reconcile: could not resolve the slug of tracked ` +
-          `file ${rel} (unreadable, or over the import size gate); staleness ` +
-          `is unprovable this run, so reconcile will not delete any row ` +
-          `missing from the index.`,
+          `file ${rel}; staleness is unprovable this run, so reconcile will ` +
+          `not delete any row missing from the index.`,
         );
       }
     }
@@ -1941,55 +1949,79 @@ function trackedSlugIndex(gitContextRoot: string): TrackedSlugIndex {
  * and misclassify the live row as stale). A slug the current chokepoint
  * REJECTS still registers in both casings: a legacy row imported under
  * older validation rules may carry it, and extra entries are purely
- * spare-side. Returns [] only when the current content derives nothing (no
- * usable frontmatter slug — the current import path refuses the file).
- * Throws when the content cannot be read, AND when the file sits over the
- * import size gate: an over-gate file is never read (the unbounded-read
- * hole), but a row imported while it was under the gate stays live, so
- * "unprovable" (the caller marks the index incomplete; misses spare) is
- * the only verdict that cannot delete a live page.
+ * spare-side.
+ *
+ * BOTH content states are consulted and their slugs unioned:
+ *   - the working tree — what the next import would read; never followed
+ *     through a symlink (import rejects symlinks via lstat before reading,
+ *     and following one would read an arbitrary out-of-repo target);
+ *   - the git index blob — the committed/staged content sync actually
+ *     imported. An uncommitted working-tree edit that removes or changes
+ *     the `slug:` line must not un-prove the slug the imported row still
+ *     carries (deleting on the working tree alone lost exactly that row).
+ *
+ * `proofIntact` goes false when either side that might name a slug could
+ * not be examined — an unreadable file (EACCES; plain working-tree absence
+ * is normal, the blob covers it), a side over the import size gate (a row
+ * imported while the file was under the gate stays live, and an unread
+ * file must never supply a staleness proof), a smudge filter expanding the
+ * blob past the gate after the raw-size check, or a path with no stage-0
+ * index entry (unmerged). The caller then marks the whole index incomplete
+ * and every miss is spared as unknown.
  */
-function fallbackSlugsForFile(gitContextRoot: string, rel: string): string[] {
-  let content: string;
+function fallbackSlugsForFile(
+  gitContextRoot: string,
+  rel: string,
+): { slugs: string[]; proofIntact: boolean } {
+  const contents: string[] = [];
+  let proofIntact = true;
   try {
     const abs = join(gitContextRoot, rel);
-    // Over the import size gate: DON'T read it (that is the unbounded-read
-    // hole), but DON'T conclude "no row" either — a row imported while the
-    // file was still under the gate stays live after the file grows past
-    // it. Throw instead: the caller marks the index incomplete and every
-    // index miss is spared as unknown. Never a delete on an unread file.
-    if (statSync(abs).size > MAX_FILE_SIZE) {
-      throw new Error(`tracked fallback-regime file over the import size gate`);
+    const st = lstatSync(abs);
+    if (!st.isSymbolicLink()) {
+      if (st.size > MAX_FILE_SIZE) proofIntact = false;
+      else contents.push(readFileSync(abs, 'utf-8'));
     }
-    content = readFileSync(abs, 'utf-8');
+    // A symlink's own registrable content is its index blob (the target
+    // path text, read below) — matching both git's view and import's
+    // refusal to follow it.
   } catch (e) {
-    if (e instanceof Error && e.message.includes('size gate')) throw e;
-    // Tracked but absent from the working tree (sparse/partial checkout):
-    // the index blob is the next-best source. git()'s trim() can only ADD
-    // a frontmatter parse (leading whitespace stripped), so any divergence
-    // from import's untrimmed read lands on the spare side, never the
-    // delete side. Size-gate the blob the same way before reading it.
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') proofIntact = false;
+  }
+  try {
     const blobSize = Number(git(gitContextRoot, ['cat-file', '-s', `:${rel}`]));
     if (Number.isFinite(blobSize) && blobSize > MAX_FILE_SIZE) {
-      throw new Error(`tracked fallback-regime file over the import size gate`);
+      proofIntact = false;
+    } else {
+      // git()'s trim() can only ADD a frontmatter parse (leading
+      // whitespace stripped) — spare side. Re-check the size AFTER the
+      // read: a smudge filter can expand output past the raw blob size.
+      const c = git(gitContextRoot, ['cat-file', '--filters', `:${rel}`]);
+      if (c.length > MAX_FILE_SIZE) proofIntact = false;
+      else contents.push(c);
     }
-    content = git(gitContextRoot, ['cat-file', '--filters', `:${rel}`]);
-  }
-  const fmSlug = parseMarkdown(content, rel).slug;
-  // No frontmatter slug in the CURRENT content → the current import path
-  // refuses the file, and any row a PAST content revision created carries a
-  // slug this pass cannot recover (accepted residual: it would also need
-  // drifted source_path bookkeeping to ever become a reconcile candidate).
-  if (!fmSlug) return [];
-  try {
-    return [validateSlug(fmSlug)];
   } catch {
-    // The CURRENT import chokepoint rejects this slug — but a legacy row
-    // imported under older validation rules may still carry it, in either
-    // casing. Registering both shapes is purely spare-side: it can only
-    // widen liveness, never name a delete.
-    return [fmSlug, fmSlug.toLowerCase()];
+    // No stage-0 entry (unmerged path) or another repo oddity: the
+    // committed side could not be examined.
+    proofIntact = false;
   }
+  const slugs = new Set<string>();
+  for (const content of contents) {
+    const fmSlug = parseMarkdown(content, rel).slug;
+    // No frontmatter slug in this content state → this state derives
+    // nothing (the import path refuses it). Residual, accepted: a row from
+    // a content revision older than BOTH states carries a slug this pass
+    // cannot recover — it would also need drifted source_path bookkeeping
+    // to ever become a reconcile candidate.
+    if (!fmSlug) continue;
+    try {
+      slugs.add(validateSlug(fmSlug));
+    } catch {
+      slugs.add(fmSlug);
+      slugs.add(fmSlug.toLowerCase());
+    }
+  }
+  return { slugs: [...slugs], proofIntact };
 }
 
 /**
