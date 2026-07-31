@@ -5128,6 +5128,7 @@ async function performFullSync(
         deletableSlugs = [];
       }
       let deferredByWatermark = 0;
+      let removalFailures = 0;
       for (let i = 0; i < deletableSlugs.length && purgeWatermark !== null; i += DELETE_BATCH_SIZE) {
         const batch = deletableSlugs.slice(i, i + DELETE_BATCH_SIZE);
         try {
@@ -5139,10 +5140,18 @@ async function performFullSync(
           // removed by a decision taken before it existed (adversarial
           // review, executed repro). One statement means the decision is
           // made on the row's state at write time.
+          //
+          // STRICTLY less, not `<=`: a supported put_page landing in the same
+          // millisecond the previous run stamped `last_sync_at` ties the
+          // watermark, and equality would remove that accepted write. The
+          // timestamp also loses its sub-millisecond tail through the JS Date
+          // round-trip, so equality is not even rare at ms resolution. A
+          // genuine projection stamped exactly at the watermark defers one
+          // run and converges on the next, when the watermark has advanced.
           const softened = await engine.executeRaw<{ slug: string }>(
             `UPDATE pages SET deleted_at = now()
               WHERE slug = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL
-                    AND updated_at <= $3::timestamptz
+                    AND updated_at < $3::timestamptz
               RETURNING slug`,
             [batch, sid, purgeWatermark],
           );
@@ -5159,13 +5168,28 @@ async function performFullSync(
               const one = await engine.executeRaw<{ slug: string }>(
                 `UPDATE pages SET deleted_at = now()
                   WHERE slug = $1 AND source_id = $2 AND deleted_at IS NULL
-                        AND updated_at <= $3::timestamptz
+                        AND updated_at < $3::timestamptz
                   RETURNING slug`,
                 [slug, sid, purgeWatermark],
               );
-              if (one.length > 0) reconciledDeletes++;
-              else deferredByWatermark++;
-            } catch { deferredByWatermark++; }
+              if (one.length > 0) { reconciledDeletes++; continue; }
+              // Zero rows has three causes and they are not the same story.
+              // The batch statement may have COMMITTED and only its
+              // acknowledgement been lost, in which case this row is already
+              // removed — calling that a "deferral" tells the operator the
+              // opposite of what happened, and under-reports `deleted`.
+              // Classify instead of assuming (adversarial review).
+              const probe = await engine.executeRaw<{ deleted: boolean; fresh: boolean }>(
+                `SELECT (deleted_at IS NOT NULL) AS deleted,
+                        (updated_at >= $3::timestamptz) AS fresh
+                   FROM pages WHERE slug = $1 AND source_id = $2`,
+                [slug, sid, purgeWatermark],
+              );
+              if (probe.length === 0) reconciledDeletes++;      // already gone entirely
+              else if (probe[0].deleted) reconciledDeletes++;   // the batch did land
+              else if (probe[0].fresh) deferredByWatermark++;   // a genuine deferral
+              else removalFailures++;                           // eligible, still here
+            } catch { removalFailures++; }
           }
         }
       }
@@ -5173,6 +5197,12 @@ async function performFullSync(
         serr(
           `  [sync] full-sync reconcile: deferring ${deferredByWatermark} page(s) ` +
           `written since the previous sync; the next full sync reconciles them.`,
+        );
+      }
+      if (removalFailures > 0) {
+        serr(
+          `  [sync] full-sync reconcile: ${removalFailures} stale page(s) could not be ` +
+          `removed (database error, not a deferral); the next full sync retries them.`,
         );
       }
       if (reconciledDeletes > 0) {

@@ -2989,6 +2989,14 @@ describe('#3583 review: GATE24 — the reconcile removes the way this repo remov
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
     expect(await engine.getPage('people/alpha')).toBeNull();
 
+    // The tombstone's identity, so the assertion below can tell "the removed
+    // row was reused" from "a fresh row was inserted in its place" — visible
+    // + count 1 is satisfied by both (adversarial review, test-strength).
+    const tomb = await engine.executeRaw<{ id: string }>(
+      `SELECT id::text FROM pages WHERE source_id = 'default' AND slug = 'people/alpha'`,
+    );
+    expect(tomb).toHaveLength(1);
+
     writeFileSync(join(repo, 'people/alpha.md'), body);
     execSync('git add -A && git commit -m "restore alpha"', { cwd: repo, stdio: 'pipe' });
     const back = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
@@ -2997,11 +3005,15 @@ describe('#3583 review: GATE24 — the reconcile removes the way this repo remov
     expect(restored).not.toBeNull();
     expect(restored!.compiled_truth).toContain('Alpha is a person.');
     // Exactly one row — the re-import landed on the removed row, it did not
-    // fabricate a second one behind the UNIQUE.
-    const rows = await engine.executeRaw<{ n: number }>(
-      `SELECT count(*)::int AS n FROM pages WHERE source_id = 'default' AND slug = 'people/alpha'`,
+    // fabricate a second one behind the UNIQUE…
+    const rows = await engine.executeRaw<{ n: number; id: string }>(
+      `SELECT count(*) OVER ()::int AS n, id::text FROM pages WHERE source_id = 'default' AND slug = 'people/alpha'`,
     );
+    expect(rows).toHaveLength(1);
     expect(Number(rows[0]?.n ?? 0)).toBe(1);
+    // …and it is the SAME row, so the upsert cleared the tombstone rather
+    // than the row being deleted and re-inserted underneath.
+    expect(rows[0]?.id).toBe(tomb[0].id);
   });
 });
 
@@ -3035,5 +3047,46 @@ describe('#3583 review: GATE24 — the post-purge sweep site converges in one ru
     // …and the post-purge sweep closed the wedge in the same run.
     expect(await openDanaRows()).toHaveLength(0);
     expect(await engine.getPage('people/carol')).not.toBeNull();
+  });
+});
+
+describe('#3583 review: GATE24 — the purge watermark is strict, not inclusive', () => {
+  test('a row stamped exactly AT the watermark is deferred, not removed', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // Reachability: an adversarial probe produced updated_at == last_sync_at
+    // on the first attempt with a supported quiet sync followed immediately
+    // by put_page — the timestamp also loses its sub-millisecond tail through
+    // the JS Date round-trip, so a tie is not exotic at ms resolution. This
+    // test pins the tie deterministically instead of racing for it.
+    // DISCRIMINATOR: with an inclusive `<=` predicate the accepted write is
+    // soft-removed by this same sync.
+    const repo = mkRepo({
+      'people/alpha.md': personMd('Alpha', 'State A body.'),
+      'people/keeper.md': personMd('Keeper', 'Keeper stays.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    execSync('git rm -q people/alpha.md && git commit -m "delete alpha"', { cwd: repo, stdio: 'pipe' });
+    await engine.putPage('people/alpha', {
+      type: 'note', title: 'Alpha', compiled_truth: 'ACCEPTED USER UPDATE.',
+    }, { sourceId: 'default' });
+
+    // Tie the row's updated_at to the source's watermark exactly.
+    await engine.executeRaw(
+      `UPDATE pages SET updated_at = (SELECT last_sync_at FROM sources WHERE id = $1)
+        WHERE source_id = $1 AND slug = $2`,
+      ['default', 'people/alpha'],
+    );
+    const tied = await engine.executeRaw<{ tied: boolean }>(
+      `SELECT (p.updated_at = s.last_sync_at) AS tied FROM pages p, sources s
+        WHERE p.source_id = $1 AND p.slug = $2 AND s.id = $1`,
+      ['default', 'people/alpha'],
+    );
+    expect(tied[0]?.tied).toBe(true);
+
+    const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    const survivor = await engine.getPage('people/alpha');
+    expect(survivor).not.toBeNull();
+    expect(survivor!.compiled_truth).toContain('ACCEPTED USER UPDATE.');
   });
 });
