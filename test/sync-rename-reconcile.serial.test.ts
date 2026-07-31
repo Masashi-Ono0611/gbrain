@@ -469,9 +469,36 @@ describe('#3479: rename sentinel error format round-trips', () => {
     const { parseRenameReconcileFrom } = await import('../src/core/sync-failure-ledger.ts');
     expect(parseRenameReconcileFrom('some legacy error text')).toBeUndefined();
     expect(parseRenameReconcileFrom('')).toBeUndefined();
-    // Pre-#3479 unquoted legacy shape: unparseable by design (left open).
-    expect(parseRenameReconcileFrom('rename reconcile failed (stale row for people/x.md not removed): boom')).toBeUndefined();
     expect(parseRenameReconcileFrom('rename reconcile failed (stale row "x" for "unterminated): boom')).toBeUndefined();
+  });
+
+  test('the PRE-#3479 unquoted shape parses when unambiguous, and only then', async () => {
+    const { renameReconcileErrorMessage, parseRenameReconcileFrom } =
+      await import('../src/core/sync-failure-ledger.ts');
+    // Anyone wedged by #3056 before upgrading carries this shape. Refusing to
+    // read it leaves exactly those operators wedged forever (review: the fix
+    // is incomplete for them).
+    expect(parseRenameReconcileFrom(
+      'rename reconcile failed (stale row for people/x.md not removed): boom',
+    )).toBe('people/x.md');
+    // Ambiguity is the reason #3479 started JSON-encoding the slot: a raw
+    // interpolation is undecidable once the delimiter appears twice, whether
+    // it came from the path or from the cause. Both still fail closed.
+    expect(parseRenameReconcileFrom(
+      'rename reconcile failed (stale row for weird not removed): path.md not removed): boom',
+    )).toBeUndefined();
+    expect(parseRenameReconcileFrom(
+      'rename reconcile failed (stale row for people/x.md not removed): cause not removed): tail',
+    )).toBeUndefined();
+    // An empty path slot names nothing to probe.
+    expect(parseRenameReconcileFrom(
+      'rename reconcile failed (stale row for  not removed): boom',
+    )).toBeUndefined();
+    // The current format is never read as legacy — the slug slot is in the way.
+    const current = renameReconcileErrorMessage('people/y.md', 'people/y', 'boom');
+    expect(parseRenameReconcileFrom(current)).toBe('people/y.md');
+    const noSlug = renameReconcileErrorMessage('people/z.md', undefined, 'boom');
+    expect(parseRenameReconcileFrom(noSlug)).toBe('people/z.md');
   });
 });
 
@@ -3088,5 +3115,67 @@ describe('#3583 review: GATE24 — the purge watermark is strict, not inclusive'
     const survivor = await engine.getPage('people/alpha');
     expect(survivor).not.toBeNull();
     expect(survivor!.compiled_truth).toContain('ACCEPTED USER UPDATE.');
+  });
+});
+
+describe('#3583 review: GATE25 — the upgrade path for someone already wedged by #3056', () => {
+  test('a PRE-#3479 legacy sentinel self-heals on the first run after upgrading', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const { recordFailures, renameSentinelPath, loadSyncFailures } =
+      await import('../src/core/sync-failure-ledger.ts');
+    // The review flagged this as unverified and, on the previous head, as an
+    // incomplete fix: the self-heal read only the JSON-quoted format, so a
+    // ledger row written by the PRE-#3479 code could never be parsed, never
+    // be proven orphaned, and never clear — a permanent doctor FAIL for
+    // exactly the operators the self-heal was written for. This is the
+    // upgrade simulation: the ledger row is byte-for-byte what the old code
+    // wrote, and the run is the new code.
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    const legacyPath = 'people/dana-old.md';
+    recordFailures('default', [{
+      path: renameSentinelPath('people/dana.md'),
+      // Verbatim pre-#3479 shape: no slug slot, path interpolated raw.
+      error: `rename reconcile failed (stale row for ${legacyPath} not removed): injected wedge`,
+    }], 'deadbeef');
+    const openBefore = loadSyncFailures().filter(
+      f => f.path === '<rename:people/dana.md>' && f.state === 'open',
+    );
+    expect(openBefore).toHaveLength(1);
+    // No active row carries that path, so the sentinel is genuinely orphaned.
+    const carriers = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pages
+        WHERE source_id = 'default' AND source_path = $1 AND deleted_at IS NULL`,
+      [legacyPath],
+    );
+    expect(Number(carriers[0]?.n ?? 0)).toBe(0);
+
+    const quiet = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(quiet.status).toBe('up_to_date');
+    expect(loadSyncFailures().filter(
+      f => f.path === '<rename:people/dana.md>' && f.state === 'open',
+    )).toHaveLength(0);
+  });
+
+  test('an AMBIGUOUS legacy sentinel is still left open — fail-closed survives the widening', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const { recordFailures, renameSentinelPath, loadSyncFailures } =
+      await import('../src/core/sync-failure-ledger.ts');
+    // Same upgrade, but the raw interpolation is undecidable (the delimiter
+    // appears twice). Widening the parser must not turn "cannot tell" into a
+    // clear — that is the failure mode #3479 introduced JSON encoding for.
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    recordFailures('default', [{
+      path: renameSentinelPath('people/eve.md'),
+      error: 'rename reconcile failed (stale row for a not removed): b.md not removed): injected wedge',
+    }], 'deadbeef');
+
+    const quiet = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(quiet.status).toBe('up_to_date');
+    expect(loadSyncFailures().filter(
+      f => f.path === '<rename:people/eve.md>' && f.state === 'open',
+    )).toHaveLength(1);
   });
 });

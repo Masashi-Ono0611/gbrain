@@ -135,22 +135,54 @@ export function renameReconcileErrorMessage(
   );
 }
 
+/** The literal that closes the path slot in BOTH sentinel formats. */
+const RENAME_SENTINEL_DELIM = ' not removed): ';
+
 /**
  * Recover the rename's OLD path from a `<rename:…>` sentinel's error text
  * (written by `renameReconcileErrorMessage` — this pair owns the format).
  * Returns undefined on anything that doesn't parse; callers treat that as
- * "leave the row alone" (fail-closed), so a hand-edited or legacy row can
- * never be auto-cleared on a misread.
+ * "leave the row alone" (fail-closed), so a hand-edited row can never be
+ * auto-cleared on a misread.
+ *
+ * Two formats are read. The current one JSON-encodes the path, which makes
+ * the quoted span self-delimiting for any path bytes. The PRE-#3479 one
+ * interpolated the path raw and carried no slug slot:
+ *
+ *   rename reconcile failed (stale row for <path> not removed): <cause>
+ *
+ * Reading only the current format would leave anyone ALREADY wedged by
+ * #3056 before upgrading wedged forever: their ledger row cannot be parsed,
+ * so the self-heal can never prove it orphaned, so `doctor` keeps failing —
+ * the exact condition this self-heal exists to end, denied to the users who
+ * need it most (review: "incomplete fix"). The legacy branch is admitted
+ * ONLY when it is unambiguous: the raw interpolation is undecidable if the
+ * delimiter appears more than once (a path or a cause containing it), so
+ * that case still returns undefined and the row stays open. The two formats
+ * cannot be confused — the current one always has a slug slot between
+ * `stale row ` and ` for `, which the legacy pattern does not match.
  */
 export function parseRenameReconcileFrom(error: string): string | undefined {
   const m = /^rename reconcile failed \(stale row (?:"(?:[^"\\]|\\.)*"|\?) for ("(?:[^"\\]|\\.)*") not removed\): /.exec(error);
-  if (!m) return undefined;
-  try {
-    const parsed: unknown = JSON.parse(m[1]);
-    return typeof parsed === 'string' ? parsed : undefined;
-  } catch {
-    return undefined;
+  if (m) {
+    try {
+      const parsed: unknown = JSON.parse(m[1]);
+      return typeof parsed === 'string' ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
   }
+  const legacy = /^rename reconcile failed \(stale row for (.+) not removed\): /.exec(error);
+  if (!legacy) return undefined;
+  // Undecidable if the delimiter occurs more than once: the greedy capture
+  // above would swallow a cause that contains it, and a lazy one would cut
+  // a path that contains it. Neither guess is safe when the consequence is
+  // clearing a sentinel that still guards a real duplicate.
+  let occurrences = 0;
+  for (let i = error.indexOf(RENAME_SENTINEL_DELIM); i !== -1;
+       i = error.indexOf(RENAME_SENTINEL_DELIM, i + 1)) occurrences++;
+  if (occurrences !== 1) return undefined;
+  return legacy[1] === '' ? undefined : legacy[1];
 }
 
 /**
