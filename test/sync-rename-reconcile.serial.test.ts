@@ -2104,11 +2104,15 @@ describe('#3583 review: GATE13 — the full-sync purge vs cheap-rename bookkeepi
     );
     // And one genuinely-stale page: its file is really gone from disk AND
     // history-committed, so the purge must still delete it.
+    // gate 20: capture the imported projection BEFORE deletion — the
+    // re-planted row must hold content matching a committed state of its
+    // path, or the projection proof (correctly) spares it as not-ours.
+    const gammaRow = await engine.getPage('people/gamma');
     execSync('git rm -q people/gamma.md && git commit -m "delete gamma"', { cwd: repo, stdio: 'pipe' });
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     // Re-plant gamma's row as if the incremental delete had been missed.
     await engine.putPage('people/gamma', {
-      type: 'person', title: 'Gamma (stale)', compiled_truth: 'file deleted from disk and history',
+      type: 'person', title: gammaRow!.title, compiled_truth: gammaRow!.compiled_truth,
     }, { sourceId: 'default' });
     await engine.executeRaw(
       `UPDATE pages SET source_path = 'people/gamma.md'
@@ -2259,10 +2263,14 @@ describe('#3583 review: GATE14 — the purge liveness proof is repo-wide and sou
       'people/gamma.md': personMd('Gamma', 'Gamma is a person.'),
     });
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    // gate 20: capture the imported projection BEFORE deletion — the
+    // re-planted row must hold content matching a committed state of its
+    // path, or the projection proof (correctly) spares it as not-ours.
+    const gammaRow = await engine.getPage('people/gamma');
     execSync('git rm -q people/gamma.md && git commit -m "delete gamma"', { cwd: repo, stdio: 'pipe' });
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     await engine.putPage('people/gamma', {
-      type: 'person', title: 'Gamma (stale)', compiled_truth: 'file deleted from disk and history',
+      type: 'person', title: gammaRow!.title, compiled_truth: gammaRow!.compiled_truth,
     }, { sourceId: 'default' });
     await engine.executeRaw(
       `UPDATE pages SET source_path = 'people/gamma.md'
@@ -2291,10 +2299,14 @@ describe('#3583 review: GATE14 — the purge liveness proof is repo-wide and sou
     }
     const repo = mkRepo(files);
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    // gate 20: capture the imported projection BEFORE deletion — the
+    // re-planted row must hold content matching a committed state of its
+    // path, or the projection proof (correctly) spares it as not-ours.
+    const gammaRow = await engine.getPage('people/gamma');
     execSync('git rm -q people/gamma.md && git commit -m "delete gamma"', { cwd: repo, stdio: 'pipe' });
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     await engine.putPage('people/gamma', {
-      type: 'person', title: 'Gamma (stale)', compiled_truth: 'file deleted from disk and history',
+      type: 'person', title: gammaRow!.title, compiled_truth: gammaRow!.compiled_truth,
     }, { sourceId: 'default' });
     await engine.executeRaw(
       `UPDATE pages SET source_path = 'people/gamma.md'
@@ -2771,5 +2783,57 @@ describe('#3583 review: GATE19 — walk-coverage guard + metadata joins the cont
     expect(beta).not.toBeNull();
     expect(beta!.compiled_truth).toContain('Alpha file body');
     expect(await engine.getPage('people/real-elsewhere')).not.toBeNull();
+  });
+});
+
+describe('#3583 review: GATE20 — the purge deletes only proven projections; inference joins the signal parse', () => {
+  test('G20_SUPPORTED_PUT_AFTER_DELETE_FULLSYNC_PURGE_LOSS: a put_page update accepted after the file deletion survives the purge', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // All supported operations: sync a committed file; commit its deletion;
+    // update the same slug through put_page BEFORE any sync sees the
+    // deletion (the upsert preserves the existing source_path when the
+    // caller supplies none). The purge then read the dead committed path
+    // as "file removed" and hard-deleted the user's ACCEPTED update — the
+    // row's content matches no committed state of the path, which is
+    // exactly the proof it is NOT the removed file's projection.
+    const repo = mkRepo({ 'people/alpha.md': personMd('Alpha', 'Alpha file body.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    execSync('git rm -q people/alpha.md && git commit -m "delete alpha"', { cwd: repo, stdio: 'pipe' });
+    await engine.putPage('people/alpha', {
+      type: 'person', title: 'Alpha curated', compiled_truth: 'CURATED REPLACEMENT BODY',
+    }, { sourceId: 'default' });
+
+    const full = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(full.status).not.toBe('blocked_by_failures');
+    const curated = await engine.getPage('people/alpha');
+    expect(curated).not.toBeNull();
+    expect(curated!.compiled_truth).toContain('CURATED REPLACEMENT BODY');
+  });
+
+  test('G20_INFERRED_TITLE_RAIL_FALSE_DEFER: a date-prefixed bare-markdown rename still takes the cheap move', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // Import runs frontmatter inference (title = filename with the date
+    // prefix stripped) before parsing; a RAW anchor parse produces a
+    // different title, so the content rail deferred every healthy
+    // date-prefixed rename and left the old row behind as a duplicate.
+    // The signal parse now mirrors import end to end.
+    const repo = mkRepo({
+      'notes/2026-01-15-team-meeting.md': 'Team meeting notes body, no frontmatter and no heading.',
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    const orig = await engine.getPage('notes/2026-01-15-team-meeting');
+    expect(orig).not.toBeNull();
+
+    execSync('git mv notes/2026-01-15-team-meeting.md notes/2026-01-16-team-meeting.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "roll the meeting notes forward"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    // The cheap move fired: no duplicate left at the old slug, and the row
+    // KEPT ITS IDENTITY at the destination.
+    expect(await engine.getPage('notes/2026-01-15-team-meeting')).toBeNull();
+    const moved = await engine.getPage('notes/2026-01-16-team-meeting');
+    expect(moved).not.toBeNull();
+    expect(moved!.id).toBe(orig!.id);
   });
 });

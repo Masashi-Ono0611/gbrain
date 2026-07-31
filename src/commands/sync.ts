@@ -5,6 +5,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
 import { importFile, MAX_FILE_SIZE } from '../core/import-file.ts';
 import { parseMarkdown } from '../core/markdown.ts';
+import { applyInference } from '../core/frontmatter-inference.ts';
 import { validateSlug } from '../core/utils.ts';
 import { collectSyncableFiles } from './import.ts';
 import { createInterface } from 'readline';
@@ -2039,27 +2040,64 @@ function frontmatterSlugShapes(content: string, rel: string): string[] {
  * working tree; that mismatch also defers — the safe direction (the
  * filter family is exactly where content proofs go blind).
  */
+/**
+ * Parse a blob's content the way IMPORT parses it and reduce it to the
+ * comparable content signals. Mirrors importFile end to end: frontmatter
+ * inference runs first (sync's importFile calls never disable it) — a raw
+ * parse compared against a row stored through inference falsely deferred
+ * every date-prefixed batch rename (gate 20).
+ * gate 19: compiled_truth alone let a decoy with an IDENTICAL body but
+ * its own title/timeline through the rail — those were then destroyed
+ * by the overwrite. Title and timeline are parsed deterministically
+ * from content (unlike `type`, which import may preserve from a curated
+ * row, or frontmatter, which the content-sanity gate stamps markers
+ * into — comparing either would falsely defer healthy rows), so they
+ * join the signal at zero fragility. The frontmatter-only variant
+ * remains a documented residual.
+ */
+function parsedContentSignals(
+  rel: string, content: string,
+): { title: string; compiledTruth: string; timeline: string } {
+  let effective = content;
+  try {
+    const { content: inferred, inferred: meta } = applyInference(rel, content);
+    if (!meta.skipped) effective = inferred;
+  } catch { /* raw parse fallback — worst case is a spare-side mismatch */ }
+  const parsed = parseMarkdown(effective, rel);
+  return {
+    title: parsed.title,
+    compiledTruth: parsed.compiled_truth,
+    timeline: parsed.timeline || '',
+  };
+}
+
 function anchorContentSignals(
   gitContextRoot: string, anchorCommit: string, rel: string,
 ): { title: string; compiledTruth: string; timeline: string } | null {
   try {
     const content = gitRawOutput(gitContextRoot, ['show', `${anchorCommit}:${rel}`]);
-    const parsed = parseMarkdown(content, rel);
-    // gate 19: compiled_truth alone let a decoy with an IDENTICAL body but
-    // its own title/timeline through the rail — those were then destroyed
-    // by the overwrite. Title and timeline are parsed deterministically
-    // from content (unlike `type`, which import may preserve from a
-    // curated row, or frontmatter, which the content-sanity gate stamps
-    // markers into — comparing either would falsely defer healthy rows),
-    // so they join the signal at zero fragility. The frontmatter-only
-    // variant remains a documented residual.
-    return {
-      title: parsed.title,
-      compiledTruth: parsed.compiled_truth,
-      timeline: parsed.timeline || '',
-    };
+    return parsedContentSignals(rel, content);
   } catch {
     return null;
+  }
+}
+
+/**
+ * #3583 gate20: every commit that ever touched a path (newest first,
+ * capped). `--full-history` so a merge-simplified epoch cannot hide a
+ * blob (the gate-11 lesson); a missing commit only ever causes a
+ * spare-side miss. Empty on any failure.
+ */
+function historicalPathCommits(
+  gitContextRoot: string, rel: string, cap: number,
+): string[] {
+  try {
+    const out = gitRawOutput(gitContextRoot, [
+      'log', '--full-history', '--format=%H', '-n', String(cap), 'HEAD', '--', rel,
+    ]);
+    return out.split('\n').map(s => s.trim()).filter(Boolean);
+  } catch {
+    return [];
   }
 }
 
@@ -5031,6 +5069,69 @@ async function performFullSync(
           `\n  Commit + push them (e.g. scripts/brain-commit-push.sh, or 'gbrain sources harden') ` +
           `so the next sync sees them as file-backed.`,
         );
+      }
+      // #3583 gate20: "dead committed path + underivable slug + no dedup
+      // match" proves the FILE is gone — not that the ROW is that file's
+      // projection. A supported put_page can update a file-backed row (the
+      // upsert preserves source_path when the caller supplies none) while
+      // the file projection is unavailable; the file's committed deletion
+      // then made this partition hard-delete the user's ACCEPTED update.
+      // Delete only rows whose content provably IS the removed file's
+      // projection: the row's {title, compiled_truth, timeline} must match
+      // what SOME historical blob of its claimed path parses to (inference
+      // mirrored — parsedContentSignals). A row matching NO committed
+      // state was written by something other than this file's import and
+      // is spared with a log; unprovable history spares too. Genuine
+      // stale projections match their import-time blob and still purge.
+      // Cost: up to 50 `git show` per candidate — the purge runs rarely
+      // and candidates are bounded by the mass valve.
+      if (deletableSlugs.length > 0) {
+        const provenProjections: string[] = [];
+        let sparedNotProjection = 0;
+        const rowSigBySlug = new Map<string, { title: string | null; compiled_truth: string | null; timeline: string | null }>();
+        try {
+          for (let i = 0; i < deletableSlugs.length; i += DELETE_BATCH_SIZE) {
+            const batch = deletableSlugs.slice(i, i + DELETE_BATCH_SIZE);
+            const sigRows = await engine.executeRaw<{ slug: string; title: string | null; compiled_truth: string | null; timeline: string | null }>(
+              `SELECT slug, title, compiled_truth, timeline FROM pages
+                WHERE slug = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL`,
+              [batch, sid],
+            );
+            for (const r of sigRows) rowSigBySlug.set(r.slug, r);
+          }
+        } catch { /* unfetchable rows simply spare below */ }
+        for (const slug of deletableSlugs) {
+          const spRaw = pathBySlug.get(slug);
+          const sig = rowSigBySlug.get(slug);
+          let isProjection = false;
+          if (spRaw && sig) {
+            const sp = spRaw.replace(/\\/g, '/');
+            for (const c of historicalPathCommits(gitContextRoot, sp, 50)) {
+              let blobContent: string;
+              try {
+                blobContent = gitRawOutput(gitContextRoot, ['show', `${c}:${sp}`]);
+              } catch { continue; } // e.g. the deletion commit itself
+              try {
+                const h = parsedContentSignals(sp, blobContent);
+                if (
+                  h.title === (sig.title ?? '') &&
+                  h.compiledTruth === (sig.compiled_truth ?? '') &&
+                  h.timeline === (sig.timeline ?? '')
+                ) { isProjection = true; break; }
+              } catch { /* unparsable at this state — try the next */ }
+            }
+          }
+          if (isProjection) provenProjections.push(slug);
+          else sparedNotProjection++;
+        }
+        if (sparedNotProjection > 0) {
+          serr(
+            `  [sync] full-sync reconcile: spared ${sparedNotProjection} page(s) whose ` +
+            `content matches no committed state of their claimed path (edited after ` +
+            `import, or unprovable history) — not provably the removed file's projection.`,
+          );
+        }
+        deletableSlugs = provenProjections;
       }
       const deleteScopedOpts = { sourceId: sid };
       for (let i = 0; i < deletableSlugs.length; i += DELETE_BATCH_SIZE) {
