@@ -2025,20 +2025,56 @@ function anchorBlobSlugs(
   rel: string,
 ): { slugs: string[]; proofIntact: boolean } {
   try {
-    let filtered = false;
-    try {
-      const attr = git(gitContextRoot, ['check-attr', 'filter', '--', rel]);
-      filtered = !/: filter: unspecified$/.test(attr);
-    } catch {
-      filtered = true; // cannot rule a filter out — treat as unprovable
-    }
+    const filtered = pathHasContentFilter(gitContextRoot, rel);
     const size = Number(git(gitContextRoot, ['cat-file', '-s', `${anchorCommit}:${rel}`]));
     if (Number.isFinite(size) && size > MAX_FILE_SIZE) return { slugs: [], proofIntact: false };
-    const c = git(gitContextRoot, ['cat-file', '--filters', `${anchorCommit}:${rel}`]);
-    if (c.length > MAX_FILE_SIZE) return { slugs: [], proofIntact: false };
-    return { slugs: frontmatterSlugShapes(c, rel), proofIntact: !filtered };
+    // BOTH the raw blob and the filter-converted view register (union,
+    // spare-side): a smudge filter that STRIPS the slug line hides it from
+    // the converted view while the raw blob still carries it. The
+    // injection direction (a drifted smudge that ADDED the slug at import
+    // time) is invisible to every git surface — that is what the
+    // filter-presence proof downgrade below is for.
+    const slugs = new Set<string>();
+    const raw = git(gitContextRoot, ['cat-file', 'blob', `${anchorCommit}:${rel}`]);
+    if (raw.length > MAX_FILE_SIZE) return { slugs: [], proofIntact: false };
+    for (const s of frontmatterSlugShapes(raw, rel)) slugs.add(s);
+    const converted = git(gitContextRoot, ['cat-file', '--filters', `${anchorCommit}:${rel}`]);
+    if (converted.length <= MAX_FILE_SIZE) {
+      for (const s of frontmatterSlugShapes(converted, rel)) slugs.add(s);
+    }
+    return { slugs: [...slugs], proofIntact: !filtered };
   } catch {
     return { slugs: [], proofIntact: false };
+  }
+}
+
+/**
+ * Is a content filter configured for this path? check-attr prints the
+ * literal token `unspecified` for an UNSET attribute — but a filter whose
+ * NAME is literally "unspecified" (or "unset"/"set") prints the same
+ * token, so those three magic values are disambiguated by checking whether
+ * a filter DRIVER of that name is actually configured. Any parse anomaly
+ * counts as filtered (fail toward unprovable, never toward a delete).
+ */
+function pathHasContentFilter(gitContextRoot: string, rel: string): boolean {
+  try {
+    const attr = git(gitContextRoot, ['check-attr', 'filter', '--', rel]);
+    const m = /: filter: (.*)$/.exec(attr);
+    if (!m) return true;
+    const value = m[1];
+    if (value === 'unspecified' || value === 'unset' || value === 'set') {
+      // Magic output tokens collide with same-named filter drivers.
+      try {
+        const drivers = git(gitContextRoot, ['config', '--get-regexp', `^filter\\.${value}\\.`]);
+        return drivers !== '';
+      } catch {
+        // config --get-regexp exits non-zero on no match → genuinely magic.
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return true;
   }
 }
 
@@ -3388,11 +3424,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // reconcile of rename R therefore spares candidates that are ANOTHER
     // rename's old slug; R's OWN old slug stays deletable — that is
     // exactly the duplicate the reconcile exists to remove once the
-    // destination materializes. Built over the FULL diff (not the
-    // resume-filtered list) so renames completed by an earlier partial run
-    // still protect the rows they carried.
+    // destination materializes. Built over the RAW manifest — not the
+    // scope/exclude/resume-filtered list — so a carried row is protected
+    // even when its own rename was filtered out of processing (an
+    // --exclude'd or out-of-scope destination still proves the content is
+    // tracked; registration is purely spare-side).
     const renameOldSlugs = new Map<string, string>();
-    for (const r of filtered.renamed) {
+    for (const r of manifest.renamed) {
       const s = opts.sourceId
         ? (fromSlugByPath.get(r.from) ?? resolveSlugForPath(r.from))
         : await resolveSlugByPathOrSourcePath(engine, r.from, undefined);

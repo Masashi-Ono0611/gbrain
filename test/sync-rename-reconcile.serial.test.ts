@@ -1522,3 +1522,99 @@ describe('#3583 review: GATE6 — the three anchor-enumeration refutations', () 
     expect(await engine.getPage('people/ghost')).not.toBeNull();
   });
 });
+
+describe('#3583 review: GATE7 — exclude-filtered carriers and filter-name impersonation', () => {
+  test('excluded carried rename is still part of the full diff proof', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      'notes/party.md': personMd('Party', 'Party content lives here.'),
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('notes/party')).not.toBeNull();
+
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'notes/party'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta occupier', compiled_truth: 'occupies destination',
+    }, { sourceId: 'default' });
+
+    execSync('git mv notes/party.md "\u{1F389}.md"', { cwd: repo, stdio: 'pipe' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "carry excluded party; rename alpha"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, {
+      repoPath: repo,
+      ...SYNC_OPTS,
+      exclude: ['\u{1F389}.md'],
+    });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('notes/party')).not.toBeNull();
+    expect(await engine.getPage('people/ghost')).toBeNull();
+  });
+
+  test('a configured filter literally named unspecified cannot impersonate no filter', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      '\u{1F389}.md': exoticMd,
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    const anchor = execSync('git rev-parse HEAD', { cwd: repo, stdio: 'pipe' }).toString().trim();
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta occupier', compiled_truth: 'occupies destination',
+    }, { sourceId: 'default' });
+
+    writeFileSync(join(repo, '\u{1F389}.md'), [
+      '---', 'type: person', 'title: Party Notes', '---',
+      '', 'Slug line removed in the current tree.',
+    ].join('\n'));
+    writeFileSync(join(repo, '.gitattributes'), '*.md filter=unspecified\n');
+    execSync('git config filter.unspecified.clean cat', { cwd: repo, stdio: 'pipe' });
+    execSync(`git config filter.unspecified.smudge "sed '/^slug:/d'"`, { cwd: repo, stdio: 'pipe' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git add -A && git commit -m "drift ambiguous filter and rename"', { cwd: repo, stdio: 'pipe' });
+
+    const attr = execSync('git check-attr filter -- "\u{1F389}.md"', {
+      cwd: repo, stdio: 'pipe',
+    }).toString().trim();
+    expect(attr).toEndWith(': filter: unspecified');
+    const filteredAnchor = execSync(`git cat-file --filters "${anchor}:\u{1F389}.md"`, {
+      cwd: repo, stdio: 'pipe',
+    }).toString();
+    expect(filteredAnchor).not.toContain('slug: Party-Notes');
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('blocked_by_failures');
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+    // The impersonating filter IS detected (a filter.unspecified.* driver
+    // exists), so anchor evidence is unprovable and the index incomplete —
+    // even the true ghost is spared this run, the same documented cost as
+    // any filtered fallback path. (party-notes above additionally survives
+    // through the RAW anchor blob, which still carries the slug the
+    // drifted smudge strips.)
+    expect(await engine.getPage('people/ghost')).not.toBeNull();
+  });
+});
