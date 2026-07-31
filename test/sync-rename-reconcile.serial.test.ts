@@ -610,25 +610,26 @@ describe('#3583 review: a live page sharing the stale source_path survives the r
   });
 });
 
-describe('#3583 review: --dry-run must not rewrite the failure ledger', () => {
-  const openDanaRows = async () => {
-    const { loadSyncFailures } = await import('../src/core/sync-failure-ledger.ts');
-    return loadSyncFailures().filter(
-      f => f.path === '<rename:people/dana.md>' && f.state === 'open',
-    );
-  };
+const openDanaRows = async () => {
+  const { loadSyncFailures } = await import('../src/core/sync-failure-ledger.ts');
+  return loadSyncFailures().filter(
+    f => f.path === '<rename:people/dana.md>' && f.state === 'open',
+  );
+};
 
-  /** Plant one open, ORPHANED `<rename:…>` sentinel (its old path has no
-   * active row) — exactly what the self-heal sweep would clear, which is
-   * why a preview must not run the sweep. */
-  async function plantOrphanedSentinel(): Promise<void> {
-    const { recordFailures, renameSentinelPath, renameReconcileErrorMessage } =
-      await import('../src/core/sync-failure-ledger.ts');
-    recordFailures('default', [{
-      path: renameSentinelPath('people/dana.md'),
-      error: renameReconcileErrorMessage('people/dana-old.md', 'people/dana-old', 'injected wedge'),
-    }], 'deadbeef');
-  }
+/** Plant one open, ORPHANED `<rename:…>` sentinel (its old path has no
+ * active row) — exactly what the self-heal sweep would clear, which is
+ * why a preview must not run the sweep. */
+async function plantOrphanedSentinel(): Promise<void> {
+  const { recordFailures, renameSentinelPath, renameReconcileErrorMessage } =
+    await import('../src/core/sync-failure-ledger.ts');
+  recordFailures('default', [{
+    path: renameSentinelPath('people/dana.md'),
+    error: renameReconcileErrorMessage('people/dana-old.md', 'people/dana-old', 'injected wedge'),
+  }], 'deadbeef');
+}
+
+describe('#3583 review: --dry-run must not rewrite the failure ledger', () => {
 
   test('quiet-repo dry run reports up_to_date and leaves the open sentinel untouched; the real run still self-heals it', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
@@ -638,10 +639,18 @@ describe('#3583 review: --dry-run must not rewrite the failure ledger', () => {
     await plantOrphanedSentinel();
     expect(await openDanaRows()).toHaveLength(1);
 
+    // Byte-identical, not just semantically-open: a preview must not touch
+    // the ledger file at all (a rewrite that happened to preserve the open
+    // row would still pass a rows-only assertion).
+    const { syncFailuresPath } = await import('../src/core/sync-failure-ledger.ts');
+    const { readFileSync: readLedger } = await import('node:fs');
+    const ledgerBefore = readLedger(syncFailuresPath(), 'utf-8');
+
     const dry = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, dryRun: true });
     expect(dry.status).toBe('up_to_date');
     // The operator's only wedge signal survives the preview.
     expect(await openDanaRows()).toHaveLength(1);
+    expect(readLedger(syncFailuresPath(), 'utf-8')).toBe(ledgerBefore);
 
     // Control: the same quiet run WITHOUT --dry-run self-heals the orphan.
     const real = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
@@ -683,5 +692,206 @@ describe('#3583 review: --dry-run must not rewrite the failure ledger', () => {
     expect(result.status).toBe('first_sync');
     expect(await engine.getPage('people/carol')).not.toBeNull();
     expect(await openDanaRows()).toHaveLength(0);
+  });
+});
+
+describe('#3583 review: frontmatter-fallback (CJK-wave) live rows survive the reconcile', () => {
+  // A markdown file whose PATH derives no slug (emoji filename) imports
+  // under its frontmatter `slug:` (#598). Such a live row's slug is NOT
+  // path-derivable, so a tracked-file index built from resolveSlugForPath
+  // alone would miss it and misclassify the row as stale — the same
+  // data-loss shape as the ordinary cheap-rename case, one regime deeper.
+  // Mixed-case on purpose: importFromContent normalizes through
+  // validateSlug (lowercase), so the row is stored as `party-notes` — an
+  // index that carried the raw frontmatter casing would miss it and
+  // delete the live row all the same.
+  const exoticMd = [
+    '---', 'type: person', 'title: Party Notes', 'slug: Party-Notes', '---',
+    '', 'Party notes live here.',
+  ].join('\n');
+
+  async function setupExoticScenario(): Promise<string> {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      '\u{1F389}.md': exoticMd,
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    const party = await engine.getPage('party-notes');
+    expect(party).not.toBeNull();
+    expect(party!.compiled_truth).toContain('Party notes live here.');
+
+    // Manufacture the stale bookkeeping a prior cheap rename leaves behind:
+    // the LIVE party-notes row (backed by the tracked emoji file) carries
+    // the old path of the rename below. A genuinely-stale ghost row shares
+    // the same path as the inverse control — it has no backing file and
+    // MUST still be deleted.
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'party-notes'`,
+    );
+    await engine.putPage('people/ghost', {
+      type: 'person', title: 'Ghost (stale)', compiled_truth: 'no backing file anywhere',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'people/alpha.md'
+       WHERE source_id = 'default' AND slug = 'people/ghost'`,
+    );
+
+    // Occupied destination forces the fallback-to-add reconcile with
+    // from=people/alpha.md.
+    await engine.putPage('people/beta', {
+      type: 'person', title: 'Beta (stale)', compiled_truth: 'occupies the destination slug',
+    }, { sourceId: 'default' });
+    execSync('git mv people/alpha.md people/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename alpha to beta"', { cwd: repo, stdio: 'pipe' });
+    return repo;
+  }
+
+  test('emoji-filename row with a frontmatter slug is spared; the stale ghost sharing the path is still deleted', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = await setupExoticScenario();
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+
+    // The frontmatter-fallback row is LIVE (its emoji file is tracked and
+    // still derives to party-notes through the import path) — it survives.
+    const party = await engine.getPage('party-notes');
+    expect(party).not.toBeNull();
+    expect(party!.compiled_truth).toContain('Party notes live here.');
+
+    // Inverse control: the ghost row sharing the same stale path has no
+    // backing file — the widened reconcile still removes it.
+    expect(await engine.getPage('people/ghost')).toBeNull();
+
+    // And the rename itself converged.
+    const beta = await engine.getPage('people/beta');
+    expect(beta).not.toBeNull();
+    expect(beta!.compiled_truth).toContain('Alpha is a person.');
+  });
+
+  test('sparse-checkout shape: the emoji file absent from the working tree still resolves through the git index blob', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = await setupExoticScenario();
+
+    // Simulate a sparse/partial checkout: the file is tracked (in the git
+    // index) but its working-tree copy is absent. The uncommitted disk
+    // deletion never enters the commit diff, so sync does not see it as a
+    // delete — but a naive on-disk read would now fail, and liveness must
+    // fall through to the index blob.
+    rmSync(join(repo, '\u{1F389}.md'));
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+
+    const party = await engine.getPage('party-notes');
+    expect(party).not.toBeNull();
+    expect(party!.compiled_truth).toContain('Party notes live here.');
+    expect(await engine.getPage('people/ghost')).toBeNull();
+  });
+});
+
+describe('#3583 review: --dry-run must not mutate ANY persistent state', () => {
+  test('quiet named-source dry run leaves the last_sync_at heartbeat untouched; the real run bumps it', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    // The heartbeat UPDATE targets the sources row; create it the way
+    // `gbrain sources add` would so the quiet-run UPDATE has a target.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('default', 'default') ON CONFLICT (id) DO NOTHING`,
+    );
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.executeRaw(
+      `UPDATE sources SET last_sync_at = '2000-01-01T00:00:00Z' WHERE id = 'default'`,
+    );
+    const heartbeat = async (): Promise<string | undefined> => {
+      const rows = await engine.executeRaw<{ t: string }>(
+        `SELECT last_sync_at::text AS t FROM sources WHERE id = 'default'`,
+      );
+      return rows[0]?.t;
+    };
+    const pinned = await heartbeat();
+    expect(pinned).toContain('2000-01-01');
+
+    const dry = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, dryRun: true });
+    expect(dry.status).toBe('up_to_date');
+    // A preview that bumps the freshness heartbeat masks real staleness
+    // from doctor — it must stay pinned.
+    expect(await heartbeat()).toBe(pinned);
+
+    const real = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(real.status).toBe('up_to_date');
+    expect(await heartbeat()).not.toBe(pinned);
+  });
+
+  test('a preview under a narrower strategy must not hard-delete the now-un-syncable page; the real run still does', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('people/carol')).not.toBeNull();
+
+    // Modify + commit so the file enters manifest.modified; under
+    // strategy=code it is then "modified but un-syncable" — the cleanup
+    // class that used to be hard-deleted BEFORE the dry-run return.
+    writeFileSync(join(repo, 'people/carol.md'), personMd('Carol', 'Carol updated body.'));
+    execSync('git add -A && git commit -m "update carol"', { cwd: repo, stdio: 'pipe' });
+
+    const dry = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, strategy: 'code', dryRun: true });
+    expect(dry.status).toBe('dry_run');
+    expect(await engine.getPage('people/carol')).not.toBeNull();
+
+    // Control: the real run keeps the pre-existing cleanup behavior.
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS, strategy: 'code' });
+    expect(await engine.getPage('people/carol')).toBeNull();
+  });
+});
+
+describe('#3583 review: orphan-sentinel self-heal probe/clear race', () => {
+  test('an active row materializing between the two probes keeps the sentinel open', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol is a person.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    await plantOrphanedSentinel();
+    expect(await openDanaRows()).toHaveLength(1);
+
+    // Simulate a writer outside the sync lock (a raw import, restore_page)
+    // committing an active row with the sentinel's old path IMMEDIATELY
+    // after the first orphan probe returned "no active row". The second
+    // probe must see it and keep the sentinel open — a single-probe sweep
+    // cleared it while the duplicate existed.
+    const origExecuteRaw = engine.executeRaw.bind(engine);
+    let probeCalls = 0;
+    (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw =
+      (async (sql: string, params?: unknown[]) => {
+        const res = await origExecuteRaw(sql, params);
+        if (sql.includes('source_path = ANY')) {
+          probeCalls++;
+          if (probeCalls === 1) {
+            await engine.putPage('people/dana-old-revenant', {
+              type: 'person', title: 'Dana (revenant)',
+              compiled_truth: 'materialized between probe and clear',
+            }, { sourceId: 'default' });
+            await origExecuteRaw(
+              `UPDATE pages SET source_path = 'people/dana-old.md'
+               WHERE source_id = 'default' AND slug = 'people/dana-old-revenant'`,
+            );
+          }
+        }
+        return res;
+      }) as typeof engine.executeRaw;
+    try {
+      const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      expect(result.status).toBe('up_to_date');
+    } finally {
+      (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw = origExecuteRaw;
+    }
+
+    // The duplicate is real, so its sentinel survives...
+    expect(await openDanaRows()).toHaveLength(1);
+    // ...and the double-probe actually ran (this assertion fails on a
+    // single-probe implementation even before the survival check does).
+    expect(probeCalls).toBe(2);
   });
 });

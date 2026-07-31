@@ -3,7 +3,9 @@ import { execFileSync } from 'child_process';
 import { isAbsolute, join, relative, sep } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
-import { importFile } from '../core/import-file.ts';
+import { importFile, MAX_FILE_SIZE } from '../core/import-file.ts';
+import { parseMarkdown } from '../core/markdown.ts';
+import { validateSlug } from '../core/utils.ts';
 import { collectSyncableFiles } from './import.ts';
 import { createInterface } from 'readline';
 import {
@@ -1853,25 +1855,118 @@ async function activeSlugsBySourcePath(
  * unchanged-content re-import is a no-write skip, so after an ordinary cheap
  * rename the LIVE row still carries its OLD path — `source_path = from`
  * therefore matches live pages, not just stale ones. A reconcile candidate is
- * only genuinely stale when NO working-tree file derives to its CURRENT slug.
- * Derivation goes through resolveSlugForPath — the exact mapping the import
- * path uses — so a slugified path (case folding, spaces) can never be
- * misclassified the way a naive `slug + '.md'` inversion would. Built at most
- * once per sync run, and only when a fallback rename actually has reconcile
- * candidates. Throws on git failure: the caller's catch records the
- * `<rename:…>` sentinel (fail-closed) instead of guessing.
+ * only genuinely stale when NO tracked file derives to its CURRENT slug.
+ *
+ * Derivation mirrors the import path exactly, in both of its regimes:
+ *   - Ordinary paths: resolveSlugForPath. Import's anti-spoof check rejects
+ *     any frontmatter slug that disagrees with the path-derived one, so for
+ *     these files the path IS the slug authority (case folding and spaces
+ *     included — a naive `slug + '.md'` inversion would misclassify those).
+ *   - CJK-wave frontmatter fallback (#598): a markdown file whose path
+ *     derives NO slug (emoji / exotic-script filename) imports under its
+ *     frontmatter `slug:` — resolveSlugForPath cannot see that slug, so
+ *     resolve it the way import does end to end: parseMarkdown on the
+ *     content (working tree first, git index blob when the working-tree
+ *     copy is absent, e.g. a sparse checkout), then the same validateSlug
+ *     chokepoint importFromContent runs (which lowercases). Only markdown
+ *     files reach this regime; see fallbackSlugForFile.
+ *
+ * `complete` goes false when some fallback-regime file's content could not
+ * be read at all: its true slug is then unknowable, so absence from the
+ * index no longer PROVES staleness — callers must treat an index miss as
+ * unknown and spare the row, never delete on it. That same fail-safe
+ * absorbs the awkward index states: an unmerged path (no stage-0 blob →
+ * cat-file throws) and an undecodable filename (utf-8 replacement mangles
+ * the name → both reads miss) both land on `complete = false`, not on a
+ * delete. Deliberately BROADER than the sync scope: every tracked file
+ * counts (submodule interiors never appear — ls-files lists the gitlink
+ * only, and the walker never imports them — and scope/exclude-filtered
+ * files still register). Over-inclusion can only delay a cleanup, never
+ * delete a live page.
+ *
+ * Built at most once per sync run, and only when a fallback rename actually
+ * has reconcile candidates. Throws on git ls-files failure: the caller's
+ * catch records the `<rename:…>` sentinel (fail-closed) instead of guessing.
  */
-function trackedSlugIndex(gitContextRoot: string): Map<string, string[]> {
-  const out = new Map<string, string[]>();
+interface TrackedSlugIndex {
+  bySlug: Map<string, string[]>;
+  complete: boolean;
+}
+
+function trackedSlugIndex(gitContextRoot: string): TrackedSlugIndex {
+  const bySlug = new Map<string, string[]>();
+  let complete = true;
+  const addSlug = (slug: string, rel: string): void => {
+    const arr = bySlug.get(slug);
+    if (arr) arr.push(rel);
+    else bySlug.set(slug, [rel]);
+  };
   const listing = git(gitContextRoot, ['ls-files', '-z']);
   for (const rel of listing.split('\u0000')) {
     if (!rel) continue;
     const slug = resolveSlugForPath(rel);
-    const arr = out.get(slug);
-    if (arr) arr.push(rel);
-    else out.set(slug, [rel]);
+    addSlug(slug, rel);
+    // Fallback-regime files are, exactly, markdown files: only `.md`/`.mdx`
+    // reaches the frontmatter fallback (any other extension keeps its
+    // extension letters in the derived slug, so it can't be empty; code
+    // files derive through slugifyCodePath; neither ever imports under a
+    // frontmatter slug). The gate also bounds the read set — an
+    // extensionless multi-GB artifact with a punctuation-only name derives
+    // '' too, but can never own a row, so it is never opened.
+    if (slug === '' && /\.mdx?$/i.test(rel)) {
+      try {
+        const fmSlug = fallbackSlugForFile(gitContextRoot, rel);
+        if (fmSlug !== undefined) addSlug(fmSlug, rel);
+      } catch {
+        complete = false;
+        serr(
+          `  [sync] rename reconcile: could not read tracked file ${rel} to ` +
+          `resolve its slug; staleness is unprovable this run, so reconcile ` +
+          `will not delete any row missing from the index.`,
+        );
+      }
+    }
   }
-  return out;
+  return { bySlug, complete };
+}
+
+/**
+ * The true slug of a fallback-regime file (path derives no slug), resolved
+ * the way import resolves it — parseMarkdown for the frontmatter `slug:`,
+ * then the SAME validateSlug chokepoint importFromContent runs, which
+ * lowercases (a `slug: Party-Notes` row is stored as `party-notes`; an
+ * index carrying the raw casing would miss it and misclassify the live row
+ * as stale). Returns undefined when the file can never own a row — import's
+ * own refusal conditions, mirrored: over the MAX_FILE_SIZE gate, no usable
+ * frontmatter slug, or a slug validateSlug rejects. Throws only when the
+ * content cannot be read at all; the caller turns that into an incomplete
+ * index (spare, never delete).
+ */
+function fallbackSlugForFile(gitContextRoot: string, rel: string): string | undefined {
+  let content: string;
+  try {
+    const abs = join(gitContextRoot, rel);
+    if (statSync(abs).size > MAX_FILE_SIZE) return undefined;
+    content = readFileSync(abs, 'utf-8');
+  } catch {
+    // Tracked but absent from the working tree (sparse/partial checkout):
+    // the index blob is the next-best source. git()'s trim() can only ADD
+    // a frontmatter parse (leading whitespace stripped), so any divergence
+    // from import's untrimmed read lands on the spare side, never the
+    // delete side. Size-gate the blob the same way before reading it.
+    const blobSize = Number(git(gitContextRoot, ['cat-file', '-s', `:${rel}`]));
+    if (Number.isFinite(blobSize) && blobSize > MAX_FILE_SIZE) return undefined;
+    content = git(gitContextRoot, ['cat-file', '--filters', `:${rel}`]);
+  }
+  const fmSlug = parseMarkdown(content, rel).slug;
+  if (!fmSlug) return undefined;
+  try {
+    return validateSlug(fmSlug);
+  } catch {
+    // validateSlug would throw identically inside importFromContent, so a
+    // row with this slug can never have been created from this file.
+    return undefined;
+  }
 }
 
 /**
@@ -1908,7 +2003,21 @@ async function orphanedRenameSentinels(
     const active = await activeSlugsBySourcePath(
       engine, [...new Set(candidates.map(c => c.from))], sourceId,
     );
-    return candidates.filter(c => !active.has(c.from)).map(c => c.path);
+    const firstPass = candidates.filter(c => !active.has(c.from));
+    if (firstPass.length === 0) return [];
+    // Second probe, immediately before the verdict leaves this function: a
+    // writer outside the sync lock (a raw import, restore_page) can
+    // materialize an active row with the old path between probe and clear.
+    // Requiring two consecutive positive "no active row" verdicts shrinks
+    // that window to the clear itself. Full atomicity is unreachable here —
+    // the file ledger and the DB share no transaction — and a duplicate
+    // re-created AFTER the clear is out of any sentinel's reach by design:
+    // the sentinel is a one-shot failure record of a specific reconcile,
+    // not a continuously re-derived invariant.
+    const recheck = await activeSlugsBySourcePath(
+      engine, [...new Set(firstPass.map(c => c.from))], sourceId,
+    );
+    return firstPass.filter(c => !recheck.has(c.from)).map(c => c.path);
   } catch {
     // Probe unavailable — leave every row open rather than guess.
     return [];
@@ -2356,8 +2465,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           `[sync] checkpoint target ${storedTarget.slice(0, 8)} no longer reachable ` +
           `(history rewritten); restarting against HEAD.`,
         );
-        await clearOpCheckpoint(engine, ckpt.paths);
-        await clearOpCheckpoint(engine, ckpt.target);
+        // #3583 review: NOT under --dry-run — this hygiene clear is a
+        // persistent write, and the real run re-detects the unreachable
+        // pin and clears it itself; a preview only reports.
+        if (!opts.dryRun) {
+          await clearOpCheckpoint(engine, ckpt.paths);
+          await clearOpCheckpoint(engine, ckpt.target);
+        }
       }
     }
   }
@@ -2410,7 +2524,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // reads it), separate from the import-converged bookmark. Without this,
     // a cron-driven `*/15 sync` over a quiet vault leaves last_sync_at pinned
     // to the last real commit, so doctor falsely flags the source as stale.
-    if (opts.sourceId) {
+    // #3583 review: NOT under --dry-run — a preview that bumps the freshness
+    // heartbeat masks real staleness from doctor.
+    if (opts.sourceId && !opts.dryRun) {
       await engine.executeRaw(
         `UPDATE sources SET last_sync_at = now() WHERE id = $1`,
         [opts.sourceId],
@@ -2567,8 +2683,15 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     try {
       const existing = await engine.getPage(slug, pageOpts);
       if (existing) {
-        await engine.deletePage(slug, pageOpts);
-        slog(`  Deleted un-syncable page: ${slug}`);
+        // #3583 review: this loop sits ABOVE the dry-run return below, so
+        // an unguarded delete made a preview under a narrower strategy
+        // hard-delete previously-imported pages. A preview only reports.
+        if (opts.dryRun) {
+          slog(`  [dry-run] would delete un-syncable page: ${slug}`);
+        } else {
+          await engine.deletePage(slug, pageOpts);
+          slog(`  Deleted un-syncable page: ${slug}`);
+        }
       }
     } catch { /* ignore */ }
   }
@@ -3008,10 +3131,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // tracked file is intentionally absent from the working tree — an
     // on-disk check would misclassify its live page as stale and delete it,
     // the same failure shape this filter exists to prevent.
-    let treeSlugIndex: Map<string, string[]> | undefined;
-    const isLiveSlug = (s: string): boolean => {
+    // Three-way verdict, not boolean: when the index is incomplete (an
+    // unreadable fallback-regime file — see trackedSlugIndex), an index miss
+    // proves nothing, so the row is spared as 'unknown' rather than deleted.
+    let treeSlugIndex: TrackedSlugIndex | undefined;
+    const slugLiveness = (s: string): 'live' | 'stale' | 'unknown' => {
       treeSlugIndex ??= trackedSlugIndex(gitContextRoot);
-      return treeSlugIndex.has(s);
+      if (treeSlugIndex.bySlug.has(s)) return 'live';
+      return treeSlugIndex.complete ? 'stale' : 'unknown';
     };
 
     for (const { from, to } of renamesToDo) {
@@ -3116,15 +3243,23 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             // matches LIVE pages — after an ordinary cheap rename the
             // surviving row keeps the OLD path (updateSlug never rewrites
             // source_path; an unchanged-content re-import writes nothing).
-            // Delete only rows whose CURRENT slug no working-tree file
-            // derives to; skip the rest as live.
+            // Delete only rows whose CURRENT slug no tracked file derives
+            // to; spare the rest — 'live' when a tracked file still derives
+            // to the slug, 'unknown' when staleness could not be proven.
             const candidates = (active.get(from) ?? []).filter(s => s !== newSlug);
             const staleSlugs: string[] = [];
             for (const s of candidates) {
-              if (isLiveSlug(s)) {
+              const verdict = slugLiveness(s);
+              if (verdict === 'live') {
                 serr(
-                  `  [sync] rename reconcile: skipping live row ${s} — a working-tree ` +
+                  `  [sync] rename reconcile: skipping live row ${s} — a tracked ` +
                   `file still derives to it (source_path ${from} is stale bookkeeping).`,
+                );
+              } else if (verdict === 'unknown') {
+                serr(
+                  `  [sync] rename reconcile: leaving row ${s} in place — staleness ` +
+                  `is unprovable this run (an unreadable tracked file could own this ` +
+                  `slug), so it is spared rather than deleted.`,
                 );
               } else {
                 staleSlugs.push(s);
@@ -3143,7 +3278,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
                 serr(`  [sync] rename reconciled: removed stale row ${s} (${from} -> ${to} fell back to add).`);
               }
             } else if (candidates.length > 0) {
-              serr(`  [sync] rename fallback: every active row with source_path ${from} is live; nothing stale to reconcile.`);
+              serr(`  [sync] rename fallback: every active row with source_path ${from} was spared (live or unprovable); nothing stale to reconcile.`);
             } else {
               serr(`  [sync] rename fallback: no active row has source_path ${from}; nothing left to reconcile.`);
             }
