@@ -2323,6 +2323,39 @@ describe('#3583 review: GATE14 — the purge liveness proof is repo-wide and sou
   });
 });
 
+describe('#3583 review: GATE15 — the untracked liveness basis is repo-wide too', () => {
+  test('a scoped full sync spares a legacy row whose live carrier is untracked AND outside the scope', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      'scope/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+      'scope/keeper.md': personMd('Keeper', 'Keeper stays in scope.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    mkdirSync(join(repo, 'outside'), { recursive: true });
+    execSync('git mv scope/alpha.md outside/beta.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "move alpha outside the scope"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('outside/beta')).not.toBeNull();
+    // Legacy bookkeeping re-planted (the cheap rename now repairs it).
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = 'scope/alpha.md'
+       WHERE source_id = 'default' AND slug = 'outside/beta'`,
+    );
+    // The carrier goes UNTRACKED but stays on disk: it is now in neither
+    // the tracked listing (basis A) nor a scoped walk.
+    execSync('git rm --cached -q outside/beta.md && git commit -m "untrack beta"', {
+      cwd: repo, stdio: 'pipe',
+    });
+    expect(readFileSync(join(repo, 'outside/beta.md'), 'utf8')).toContain('Alpha is a person.');
+
+    const full = await performSync(engine, {
+      repoPath: repo, ...SYNC_OPTS, full: true, srcSubpath: 'scope',
+    });
+    expect(full.status).not.toBe('blocked_by_failures');
+    expect(await engine.getPage('outside/beta')).not.toBeNull();
+  });
+});
+
 describe('#3583 review: FUGU — the carried-rename spare survives a decoy row displacing the DB resolve', () => {
   test('a decoy row sharing the carrying rename\'s from-path cannot strip the path-derived slug from the spare set', async () => {
     const { performSync } = await import('../src/commands/sync.ts');

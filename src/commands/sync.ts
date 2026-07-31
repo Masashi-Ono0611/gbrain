@@ -4719,26 +4719,36 @@ async function performFullSync(
     } catch {
       livenessProofIntact = false;
     }
-    // Basis B — walked files the tracked listing does not know (untracked):
-    // they have no git states to consult, so the working tree IS the whole
-    // evidence. Read it directly instead of degrading the proof over git
-    // states an untracked file cannot have (gate 14 — the degraded proof
-    // blanket-spared a genuinely-stale row over one untracked exotic file).
-    for (const f of currentFiles) {
-      const rel = f.replace(/\\/g, '/');
-      if (trackedSet?.has(rel)) continue;
-      const derived = resolveSlugForPath(rel);
-      if (derived !== '') { liveSlugs.add(derived); continue; }
-      if (isCodeFilePath(rel)) continue;
-      try {
-        const st = lstatSync(join(gitContextRoot, rel));
-        if (st.isSymbolicLink()) continue;
-        if (st.size > MAX_FILE_SIZE) { livenessProofIntact = false; continue; }
-        const content = readFileSync(join(gitContextRoot, rel), 'utf-8');
-        for (const shape of frontmatterSlugShapes(content, rel)) liveSlugs.add(shape);
-      } catch {
-        livenessProofIntact = false;
+    // Basis B — repo-wide UNTRACKED files (`ls-files --others` from the
+    // git root — NOT the scoped walk: an out-of-scope carrier left on disk
+    // by `git rm --cached` is in neither the tracked listing nor a scoped
+    // walk, and the proof must not be scoped by EITHER basis; gate 15).
+    // `--others` without --exclude-standard deliberately includes
+    // gitignored entries: extra registrations only widen sparing. An
+    // untracked file has no git states to consult, so the working tree IS
+    // its whole evidence — read it directly instead of degrading the
+    // proof over states it cannot have (gate 14 — the degraded proof
+    // blanket-spared a genuinely-stale row over one untracked exotic
+    // file).
+    try {
+      const untrackedListing = gitRawOutput(gitContextRoot, ['ls-files', '-z', '--others']);
+      for (const rel of untrackedListing.split('\u0000')) {
+        if (!rel) continue;
+        const derived = resolveSlugForPath(rel);
+        if (derived !== '') { liveSlugs.add(derived); continue; }
+        if (isCodeFilePath(rel)) continue;
+        try {
+          const st = lstatSync(join(gitContextRoot, rel));
+          if (st.isSymbolicLink()) continue;
+          if (st.size > MAX_FILE_SIZE) { livenessProofIntact = false; continue; }
+          const content = readFileSync(join(gitContextRoot, rel), 'utf-8');
+          for (const shape of frontmatterSlugShapes(content, rel)) liveSlugs.add(shape);
+        } catch {
+          livenessProofIntact = false;
+        }
       }
+    } catch {
+      livenessProofIntact = false;
     }
     let staleCandidates = plan.staleSlugs;
     if (!livenessProofIntact) {
