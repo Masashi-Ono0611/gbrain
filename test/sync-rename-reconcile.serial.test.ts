@@ -2847,6 +2847,18 @@ describe('#3583 review: GATE21 — the purge proves write provenance, not conten
     expect(resurrected).not.toBeNull();
     expect(resurrected!.type).toBe('note');
     expect(resurrected!.compiled_truth).toContain('State B body.');
+
+    // And it must STAY. A watermark alone only defers: it keeps advancing,
+    // so a one-time accepted write falls below it within a run or two.
+    // The second proof (the row's content_hash is one import would have
+    // produced for a committed state of its path) is what makes the spare
+    // durable.
+    const second = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(second.status).not.toBe('blocked_by_failures');
+    expect(await engine.getPage('people/alpha')).not.toBeNull();
+    const third = await performSync(engine, { repoPath: repo, ...SYNC_OPTS, full: true });
+    expect(third.status).not.toBe('blocked_by_failures');
+    expect(await engine.getPage('people/alpha')).not.toBeNull();
   });
 
   test('G21_CRLF_FILTER_PROJECTION_FOREVER_SPARE: a genuine projection under a CRLF rule still purges', async () => {

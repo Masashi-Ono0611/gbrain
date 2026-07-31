@@ -6,6 +6,7 @@ import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
 import { importFile, MAX_FILE_SIZE } from '../core/import-file.ts';
 import { parseMarkdown } from '../core/markdown.ts';
 import { applyInference } from '../core/frontmatter-inference.ts';
+import { importContentHash } from '../core/import-file.ts';
 import { validateSlug } from '../core/utils.ts';
 import { collectSyncableFiles } from './import.ts';
 import { createInterface } from 'readline';
@@ -2069,6 +2070,56 @@ function parsedContentSignals(
     compiledTruth: parsed.compiled_truth,
     timeline: parsed.timeline || '',
   };
+}
+
+/**
+ * #3583 gate21/22: the content hash IMPORT would store for a committed
+ * state of `rel`, computed through the same inference + parse + hash the
+ * import path uses (importContentHash is exported from import-file.ts so
+ * the formulas cannot drift). Null when the blob is unreadable or
+ * unparsable — callers treat null as no proof.
+ */
+function importHashOfBlob(
+  gitContextRoot: string, commit: string, rel: string,
+): string | null {
+  try {
+    const raw = gitRawOutput(gitContextRoot, ['show', `${commit}:${rel}`]);
+    let effective = raw;
+    try {
+      const { content: inferred, inferred: meta } = applyInference(rel, raw);
+      if (!meta.skipped) effective = inferred;
+    } catch { /* raw parse fallback */ }
+    const parsed = parseMarkdown(effective, rel);
+    return importContentHash({
+      title: parsed.title,
+      type: parsed.type,
+      compiled_truth: parsed.compiled_truth,
+      timeline: parsed.timeline,
+      frontmatter: parsed.frontmatter as Record<string, unknown> | undefined,
+      tags: parsed.tags,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #3583 gate22: the commits that most recently touched `rel` (newest
+ * first, capped). `--full-history` so a merge-simplified epoch cannot
+ * hide a state (the gate-11 lesson). Empty on any failure — a missing
+ * commit can only ever cause a spare.
+ */
+function recentPathCommits(
+  gitContextRoot: string, rel: string, cap: number,
+): string[] {
+  try {
+    const out = gitRawOutput(gitContextRoot, [
+      'log', '--full-history', '--format=%H', '-n', String(cap), 'HEAD', '--', rel,
+    ]);
+    return out.split('\n').map(x => x.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
 }
 
 function anchorContentSignals(
@@ -5079,59 +5130,118 @@ async function performFullSync(
           `so the next sync sees them as file-backed.`,
         );
       }
-      // #3583 gate20/21: "dead committed path + underivable slug + no dedup
-      // match" proves the FILE is gone — not that the ROW is that file's
-      // projection. A supported put_page can update a file-backed row (the
-      // upsert preserves source_path when the caller supplies none) while
-      // the file projection is unavailable; the file's committed deletion
-      // then made this partition hard-delete the user's ACCEPTED update.
+      // #3583 gate20/21/22: "dead committed path + underivable slug + no
+      // dedup match" proves the FILE is gone — not that the ROW is that
+      // file's projection. A supported put_page can update a file-backed
+      // row (the upsert preserves source_path when the caller supplies
+      // none, and the write-through to the working tree is best-effort),
+      // and this partition then hard-deleted the user's ACCEPTED update.
+      // #2426 already recorded this exact shape from the other side:
+      // write-through content that never reached git was "silently
+      // deleted by a later sync --full delete-reconcile".
       //
-      // Content equality with a historical blob is the WRONG discriminator
-      // (gate 21): an accepted resurrection that happens to match a brief
-      // earlier revision is still a distinct write carrying its own
-      // provenance and curated metadata, and equality is unprovable in the
-      // other direction whenever a filter, a CRLF rule or a parser upgrade
-      // sits between the blob and what import stored. Provenance is the
-      // real axis: delete only rows that NOTHING has written since the
-      // previous sync — those, and only those, are that sync's import
-      // projection of the now-removed file.
+      // Two independent proofs are required, because each alone was
+      // refuted by an executed probe:
+      //   (a) NOTHING wrote the row since the previous sync. Alone this
+      //       only defers: the watermark keeps advancing, so a one-time
+      //       user write falls below it within a run or two (and a quiet
+      //       sync's last_sync_at heartbeat advances it without importing
+      //       anything at all).
+      //   (b) The row's stored content_hash is one that IMPORT would have
+      //       produced for a recent committed state of its path — the
+      //       hash formula is shared with import-file.ts so it cannot
+      //       drift. Alone this is defeated by an accepted write that
+      //       coincidentally equals an old revision.
+      // Together, an accepted write survives unless it BOTH predates the
+      // previous sync AND reproduces a committed revision in every hashed
+      // field (title, type, body, timeline, frontmatter, tags).
+      //
+      // A candidate that fails either proof is NOT deleted: it joins the
+      // #2426 db-only class — kept, and re-exported to the working tree so
+      // it becomes file-backed again. That is this repo's established
+      // answer to "absent from git is the symptom, not evidence the
+      // content is disposable".
       if (deletableSlugs.length > 0) {
-        let untouched: string[] = [];
-        let sparedWritten = 0;
-        if (purgeWatermark === null) {
-          sparedWritten = deletableSlugs.length;
-          serr(
-            `  [sync] full-sync reconcile: no previous-sync watermark on source ` +
-            `'${sid}', so no row can be proven untouched since its import; ` +
-            `deferring ${sparedWritten} purge candidate(s) to the next full sync.`,
-          );
-        } else {
-          try {
-            for (let i = 0; i < deletableSlugs.length; i += DELETE_BATCH_SIZE) {
-              const batch = deletableSlugs.slice(i, i + DELETE_BATCH_SIZE);
-              const fresh = await engine.executeRaw<{ slug: string }>(
-                `SELECT slug FROM pages
-                  WHERE slug = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL
-                        AND updated_at <= $3::timestamptz`,
-                [batch, sid, purgeWatermark],
-              );
-              for (const r of fresh) untouched.push(r.slug);
-            }
-            sparedWritten = deletableSlugs.length - untouched.length;
-          } catch {
-            // Unprovable → spare everything this run (the reconcile's posture).
-            untouched = [];
-            sparedWritten = deletableSlugs.length;
+        const proven: string[] = [];
+        const deferred: string[] = [];   // (a) failed only — written since the watermark
+        const notProjection: string[] = []; // (b) failed — content git never held
+        const rowSig = new Map<string, string | null>();
+        try {
+          for (let i = 0; i < deletableSlugs.length; i += DELETE_BATCH_SIZE) {
+            const batch = deletableSlugs.slice(i, i + DELETE_BATCH_SIZE);
+            const sigRows = await engine.executeRaw<{ slug: string; content_hash: string | null }>(
+              `SELECT slug, content_hash FROM pages
+                WHERE slug = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL
+                      AND updated_at <= $3::timestamptz`,
+              [batch, sid, purgeWatermark ?? new Date(0).toISOString()],
+            );
+            for (const r of sigRows) rowSig.set(r.slug, r.content_hash);
           }
+        } catch { rowSig.clear(); }
+        const hashCache = new Map<string, string | null>();
+        for (const slug of deletableSlugs) {
+          const spRaw = pathBySlug.get(slug);
+          const sp = spRaw ? spRaw.replace(/\\/g, '/') : null;
+          // Proof (b) first: it decides WHICH kind of keep this is.
+          let storedHash = rowSig.get(slug) ?? null;
+          if (!rowSig.has(slug)) {
+            // Not in the untouched set — still need its hash for proof (b).
+            try {
+              const r = await engine.executeRaw<{ content_hash: string | null }>(
+                `SELECT content_hash FROM pages WHERE slug = $1 AND source_id = $2 AND deleted_at IS NULL LIMIT 1`,
+                [slug, sid],
+              );
+              storedHash = r[0]?.content_hash ?? null;
+            } catch { storedHash = null; }
+          }
+          let isProjection = false;
+          if (storedHash && sp) {
+            for (const c of recentPathCommits(gitContextRoot, sp, PURGE_PROOF_STATE_CAP)) {
+              const key = `${c}:${sp}`;
+              if (!hashCache.has(key)) hashCache.set(key, importHashOfBlob(gitContextRoot, c, sp));
+              if (hashCache.get(key) === storedHash) { isProjection = true; break; }
+            }
+          }
+          if (!isProjection) { notProjection.push(slug); continue; }
+          if (!rowSig.has(slug)) { deferred.push(slug); continue; }
+          proven.push(slug);
         }
-        if (sparedWritten > 0) {
+        if (notProjection.length > 0) {
+          // The #2426 class: the row holds content no committed state of its
+          // path ever produced, so git losing the file is not evidence the
+          // content is disposable. Keep it AND re-export it so it becomes
+          // file-backed again — the same treatment the never-committed
+          // branch above applies.
+          let reExported = 0;
+          try {
+            const { writePageThrough } = await import('../core/write-through.ts');
+            for (const slug of notProjection) {
+              const r = await writePageThrough(engine, slug, { sourceId: sid });
+              if (r.written) reExported++;
+            }
+          } catch { /* best-effort — the pages are kept either way */ }
           serr(
-            `  [sync] full-sync reconcile: spared ${sparedWritten} page(s) written ` +
-            `since the previous sync — an accepted update, not the removed file's ` +
-            `import projection.`,
+            `\n  Kept ${notProjection.length} page(s) whose backing file is gone but ` +
+            `whose content no committed state of that path produced — an accepted ` +
+            `update, not this file's import projection.` +
+            (reExported > 0 ? ` Re-exported ${reExported} of them to the working tree.` : '') +
+            `\n  Commit them (e.g. scripts/brain-commit-push.sh, or 'gbrain sources ` +
+            `harden') to keep them file-backed, or 'gbrain delete <slug>' to remove one.`,
           );
         }
-        deletableSlugs = untouched;
+        if (deferred.length > 0) {
+          // Content IS a committed state, but something wrote the row after
+          // the previous sync — including non-content writers like the
+          // embedding-tier stamp. Just wait: this run's advance moves the
+          // watermark past that write, so the next full sync purges it. No
+          // re-export here — writing the file back would resurrect it and
+          // make the row permanently live.
+          serr(
+            `  [sync] full-sync reconcile: deferring ${deferred.length} page(s) ` +
+            `written since the previous sync; the next full sync reconciles them.`,
+          );
+        }
+        deletableSlugs = proven;
       }
       const deleteScopedOpts = { sourceId: sid };
       for (let i = 0; i < deletableSlugs.length; i += DELETE_BATCH_SIZE) {
@@ -5202,6 +5312,16 @@ async function performFullSync(
  */
 export const MASS_RECONCILE_RATIO = 0.5;
 export const MASS_RECONCILE_MIN_PAGES = 20;
+/**
+ * #3583 gate22: how many recent committed states of a candidate's path the
+ * purge will hash before giving up and keeping the page. Newest-first with
+ * an early exit, and only for candidates that already passed every other
+ * rail, so the realistic cost is a couple of `git show` per genuinely-stale
+ * page. Deliberately small: a deeper walk buys almost nothing (a projection
+ * matches its import-time state, which is recent) and the failure mode of
+ * being too small is a KEPT page, never a deleted one.
+ */
+export const PURGE_PROOF_STATE_CAP = 10;
 
 /**
  * Normalize path separators so a page whose stored `source_path` was written

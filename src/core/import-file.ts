@@ -228,6 +228,50 @@ export const MAX_FILE_SIZE = 5_000_000; // 5MB
  * so the guard has to live on this function — otherwise an authenticated caller
  * can spend the owner's OpenAI budget at will by shipping a megabyte-sized page.
  */
+/**
+ * The content hash import stores on a page row. Exported (and used by
+ * importFromContent itself, so the formulas cannot drift) because the
+ * full-sync purge in `sync.ts` recomputes it from a committed blob to
+ * decide whether a row still IS that file's import projection: a row
+ * whose stored hash matches no committed state of its path was written
+ * by something other than this file's import and must not be purged
+ * (#3583 review).
+ *
+ * Ephemeral frontmatter keys are excluded so identical body content from
+ * `gbrain capture` (which stamps `captured_at` / `ingested_at` per call)
+ * and the content-sanity gate's re-derived markers produce a stable hash.
+ */
+export function importContentHash(parsed: {
+  title: string;
+  type: string;
+  compiled_truth: string;
+  timeline?: string;
+  frontmatter?: Record<string, unknown>;
+  tags?: string[];
+}): string {
+  const HASH_EPHEMERAL_FRONTMATTER_KEYS = [
+    'captured_at',
+    'ingested_at',
+    QUARANTINE_KEY,
+    CONTENT_FLAG_KEY,
+    EMBED_SKIP_KEY,
+  ];
+  const stableFrontmatter: Record<string, unknown> = { ...(parsed.frontmatter ?? {}) };
+  for (const k of HASH_EPHEMERAL_FRONTMATTER_KEYS) {
+    delete stableFrontmatter[k];
+  }
+  return createHash('sha256')
+    .update(JSON.stringify({
+      title: parsed.title,
+      type: parsed.type,
+      compiled_truth: parsed.compiled_truth,
+      timeline: parsed.timeline,
+      frontmatter: stableFrontmatter,
+      tags: (parsed.tags ?? []).sort(),
+    }))
+    .digest('hex');
+}
+
 export async function importFromContent(
   engine: BrainEngine,
   slug: string,
@@ -557,28 +601,7 @@ export async function importFromContent(
     parsed.type = existing.type;
   }
 
-  const HASH_EPHEMERAL_FRONTMATTER_KEYS = [
-    'captured_at',
-    'ingested_at',
-    QUARANTINE_KEY,
-    CONTENT_FLAG_KEY,
-    EMBED_SKIP_KEY,
-  ];
-  const stableFrontmatter: Record<string, unknown> = { ...parsed.frontmatter };
-  for (const k of HASH_EPHEMERAL_FRONTMATTER_KEYS) {
-    delete stableFrontmatter[k];
-  }
-  // Hash includes all meaningful fields for idempotency.
-  const hash = createHash('sha256')
-    .update(JSON.stringify({
-      title: parsed.title,
-      type: parsed.type,
-      compiled_truth: parsed.compiled_truth,
-      timeline: parsed.timeline,
-      frontmatter: stableFrontmatter,
-      tags: parsed.tags.sort(),
-    }))
-    .digest('hex');
+  const hash = importContentHash(parsed);
 
   const parsedPage: ParsedPage = {
     type: parsed.type,
