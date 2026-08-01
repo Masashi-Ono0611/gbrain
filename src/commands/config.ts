@@ -35,6 +35,10 @@ export function redactConfigValue(key: string, value: string): string {
   return value;
 }
 
+// #3661: the flags `config set` actually honors. Everything else that looks
+// like a flag is rejected before the write — see the gate in the `set` branch.
+const CONFIG_SET_KNOWN_FLAGS = ['--force', '--coverage-override', '--yes'];
+
 export async function runConfig(engine: BrainEngine, args: string[]) {
   const action = args[0];
 
@@ -129,6 +133,23 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       process.exit(1);
     }
   } else if (action === 'set' && key && value) {
+    // #3661: `config set` dropped flags it does not implement and wrote
+    // anyway. `--dry-run` — honored by sync/import/extract/quarantine/pages —
+    // printed the usual "Set <key> = <value>" confirmation and persisted the
+    // mutation, so a caller probing a value silently changed live config.
+    // Unknown flags are now refused BEFORE any validation or write runs.
+    const unknownFlags = args
+      .slice(3)
+      .filter(a => a.startsWith('-') && !CONFIG_SET_KNOWN_FLAGS.includes(a));
+    if (unknownFlags.length > 0) {
+      for (const flag of unknownFlags) {
+        console.error(`[config] unknown flag: ${flag}`);
+      }
+      console.error(`[config] \`gbrain config set\` accepts: ${CONFIG_SET_KNOWN_FLAGS.join(', ')}.`);
+      console.error(`[config] Nothing was written.`);
+      process.exit(1);
+    }
+
     // v0.37.11.0 fix wave (Lane C.2 + CDX2-13): refuse writes to schema-sizing
     // fields unconditionally. These fields size the `content_chunks.embedding`
     // column at init time and are file-plane canonical. `gbrain config set
