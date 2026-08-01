@@ -8,7 +8,7 @@
  * glue.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, spyOn } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -360,6 +360,102 @@ describe('#2922: submit-time source resolution', () => {
       });
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('--source "" (empty explicit value) exits 2 without silently falling back', async () => {
+    const spy = spyOn(process, 'exit').mockImplementation(() => { throw new Error('EXIT'); });
+    const errSpy = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await withEnv({ GBRAIN_SOURCE: undefined }, async () => {
+        try {
+          await runAgentRun(engine, ['--detach', '--source', '', 'write', 'a', 'page']);
+          throw new Error('expected runAgentRun to exit');
+        } catch (e: any) {
+          expect(e.message).toBe('EXIT');
+        }
+      });
+      expect(spy).toHaveBeenCalledWith(2);
+      const rows = await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM minion_jobs WHERE name = 'subagent'`,
+      );
+      expect(rows.length).toBe(0);
+    } finally {
+      spy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
+  test('--source __all__ is rejected (subagent writes must target exactly one source)', async () => {
+    const spy = spyOn(process, 'exit').mockImplementation(() => { throw new Error('EXIT'); });
+    const errSpy = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await withEnv({ GBRAIN_SOURCE: undefined }, async () => {
+        try {
+          await runAgentRun(engine, ['--detach', '--source', '__all__', 'write', 'a', 'page']);
+          throw new Error('expected runAgentRun to exit');
+        } catch (e: any) {
+          expect(e.message).toBe('EXIT');
+        }
+      });
+      expect(spy).toHaveBeenCalledWith(2);
+      const rows = await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM minion_jobs WHERE name = 'subagent'`,
+      );
+      expect(rows.length).toBe(0);
+    } finally {
+      spy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
+  test('--source pointing at a nonexistent id surfaces a clean error, not a stack trace', async () => {
+    const spy = spyOn(process, 'exit').mockImplementation(() => { throw new Error('EXIT'); });
+    const errSpy = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await withEnv({ GBRAIN_SOURCE: undefined }, async () => {
+        try {
+          await runAgentRun(engine, ['--detach', '--source', 'does-not-exist', 'write', 'a', 'page']);
+          throw new Error('expected runAgentRun to exit');
+        } catch (e: any) {
+          expect(e.message).toBe('EXIT');
+        }
+      });
+      expect(spy).toHaveBeenCalledWith(1);
+      expect(errSpy.mock.calls.some(call => String(call[0]).includes('not found'))).toBe(true);
+      const rows = await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM minion_jobs WHERE name = 'subagent'`,
+      );
+      expect(rows.length).toBe(0);
+    } finally {
+      spy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
+  test('--source pointing at an archived source is rejected with a restore hint', async () => {
+    const spy = spyOn(process, 'exit').mockImplementation(() => { throw new Error('EXIT'); });
+    const errSpy = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await engine.executeRaw(`UPDATE sources SET archived = true WHERE id = 'corporate'`);
+      await withEnv({ GBRAIN_SOURCE: undefined }, async () => {
+        try {
+          await runAgentRun(engine, ['--detach', '--source', 'corporate', 'write', 'a', 'page']);
+          throw new Error('expected runAgentRun to exit');
+        } catch (e: any) {
+          expect(e.message).toBe('EXIT');
+        }
+      });
+      expect(spy).toHaveBeenCalledWith(1);
+      expect(errSpy.mock.calls.some(call => String(call[0]).includes('archived'))).toBe(true);
+      const rows = await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM minion_jobs WHERE name = 'subagent'`,
+      );
+      expect(rows.length).toBe(0);
+    } finally {
+      await engine.executeRaw(`UPDATE sources SET archived = false WHERE id = 'corporate'`);
+      spy.mockRestore();
+      errSpy.mockRestore();
     }
   });
 });
