@@ -12,7 +12,7 @@
  * Subcommands:
  *   gbrain integrity check              Read-only report to stdout
  *   gbrain integrity auto               Three-bucket repair with confidence
- *   gbrain integrity --dry-run          Same as auto, no writes
+ *   gbrain integrity auto --dry-run     Same as auto, no writes
  *
  * Three-bucket confidence (contract with x_handle_to_tweet resolver):
  *   >= 0.8 → auto-repair through BrainWriter transaction
