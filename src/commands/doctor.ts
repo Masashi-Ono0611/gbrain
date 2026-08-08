@@ -5851,6 +5851,31 @@ export async function buildChecks(
     // Best-effort environment check; never block doctor.
   }
 
+  // 3g. pglite_leftovers (#3856). A pglite -> postgres migration leaves the
+  // old engine store (`brain.pglite/`) AND its pre-migrate safety copy
+  // (`brain.pglite.pre-migrate-<date>/`) under the gbrain home forever —
+  // roughly 2x the live DB of dead weight that nothing surfaces, silently
+  // riding along in any backup that archives the home dir. Assessment is a
+  // pure helper (src/core/pglite-leftovers-check.ts); it skips on pglite
+  // brains (the store is live) and on an unreadable config (fail open).
+  // Warn-only by design: WHEN a pre-migrate copy is safe to drop is a policy
+  // question (#3856), so the remediation is a verified manual delete — no
+  // CLI command is named that does not exist (#3697).
+  try {
+    const cfgForLeftovers = loadConfig();
+    const { assessPgliteLeftovers } = await import('../core/pglite-leftovers-check.ts');
+    const leftovers = assessPgliteLeftovers(cfgForLeftovers?.engine, gbrainPath());
+    if (leftovers.status !== 'skip') {
+      checks.push({
+        name: 'pglite_leftovers',
+        status: leftovers.status,
+        message: leftovers.message,
+      });
+    }
+  } catch {
+    // Best-effort filesystem-hygiene check; never block doctor.
+  }
+
   // 3b-multi-source. Multi-source drift (v0.31.8 — D8 + D17 + OV12 + OV13).
   // Pre-v0.30.3 putPage misrouted multi-source writes to (default, slug).
   // For each non-default source with local_path set, walk the FS and surface
