@@ -278,7 +278,7 @@ describe('#2753 — the doctor-proposed gateway-loop command is accepted by `con
     const { engine, setCalls } = sourcesEngine(['wiki']);
     const { errs, exit } = await runConfigCapture(engine, ['set', 'sources.default', 'Not A Source']);
     expect(exit).toBe(1);
-    expect(errs.join('\n')).toContain('[a-z0-9-]');
+    expect(errs.join('\n')).toContain('lowercase alphanumerics');
     expect(setCalls).toEqual([]);
   });
 
@@ -296,7 +296,26 @@ describe('#2753 — the doctor-proposed gateway-loop command is accepted by `con
     expect(exit).toBeNull();
     // The false "Nothing in gbrain reads this" line is the bug this fixes.
     expect(errs.join('\n')).not.toContain('Nothing in gbrain reads this');
-    expect(setCalls).toContainEqual(['sources.default', 'wiki']);
+    expect(setCalls).toEqual([['sources.default', 'wiki']]);
+  });
+
+  // A DB failure must not be laundered into "source is not registered" — that
+  // would send an operator chasing a source-registration problem that doesn't
+  // exist while the real fault (connection, permissions, SQL regression) is
+  // swallowed.
+  test('sources.default: a lookup failure propagates instead of reading as unregistered', async () => {
+    const setCalls: Array<[string, string]> = [];
+    const engine = {
+      getConfig: async () => null,
+      setConfig: async (k: string, v: string) => { setCalls.push([k, v]); },
+      executeRaw: async () => { throw new Error('connection terminated unexpectedly'); },
+    } as unknown as BrainEngine;
+    // The real error must escape rather than be reshaped into a validation
+    // message, so this rejects instead of returning an exit code.
+    await expect(
+      runConfigCapture(engine, ['set', 'sources.default', 'wiki']),
+    ).rejects.toThrow('connection terminated unexpectedly');
+    expect(setCalls).toEqual([]);
   });
 
   test('doctor-proposed command round-trips through `config set` without --force', async () => {

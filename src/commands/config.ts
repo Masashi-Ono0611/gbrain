@@ -215,13 +215,18 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       const { isValidSourceId } = await import('../core/source-id.ts');
       if (!isValidSourceId(value)) {
         console.error(
-          `[config] sources.default must match [a-z0-9-]{1,32} (got '${value}').\n` +
+          `[config] sources.default must be 1-32 lowercase alphanumerics with ` +
+          `optional interior hyphens (got '${value}').\n` +
           `[config]   gbrain sources default <id>   # preferred — validates and reports`,
         );
         process.exit(1);
       }
+      // No .catch() here: a connection failure or SQL regression must NOT be
+      // reported as "source is not registered". fetchSource already absorbs
+      // the one expected legacy-column case; anything else is a real error and
+      // should surface as itself.
       const { fetchSource } = await import('../core/sources-load.ts');
-      const src = await fetchSource(engine, value).catch(() => null);
+      const src = await fetchSource(engine, value);
       if (!src) {
         // NOTE: keep flag literals out of this message. The generated flag
         // registry (#2185) scans command sources for flag tokens, so naming a
