@@ -797,4 +797,47 @@ describe('handler-entry capability gate on the config-resolved model', () => {
       await engine.unsetConfig('agent.use_gateway_loop');
     }
   });
+
+  test('a BARE Anthropic id in models.subagent still runs (not refused as unknown provider)', async () => {
+    // A bare `claude-*` id (no `provider:` prefix) is a supported config value
+    // everywhere else: isAnthropicProvider() has an explicit bare-`claude-`
+    // branch and the legacy path strips the prefix before calling the Messages
+    // API. classifyCapabilities() resolves through the recipe registry, which
+    // requires an explicit provider, so classifying the raw value would report
+    // `unknown` and this gate would refuse a config that works.
+    await engine.setConfig('models.subagent', 'claude-sonnet-4-6');
+    try {
+      const client = new FakeMessagesClient([
+        { content: [{ type: 'text', text: 'ran on the bare id' }] as any, stop_reason: 'end_turn' },
+      ]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' }); // no data.model → config resolves
+      const result = await handler(ctx);
+      expect(result.result).toBe('ran on the bare id');
+      // The provider call carries the bare id (the legacy path strips any prefix).
+      expect(client.calls.length).toBe(1);
+      expect(client.calls[0]!.model).toBe('claude-sonnet-4-6');
+    } finally {
+      await engine.unsetConfig('models.subagent');
+    }
+  });
+
+  test('a bare NON-Anthropic id in models.subagent is still refused', async () => {
+    // The normalization above is deliberately narrow: only bare ids that
+    // isAnthropicProvider() recognizes get an `anthropic:` prefix for the
+    // verdict. A bare `gpt-5` is not a recipe-resolvable model, so the gate
+    // must keep reporting `unknown` rather than classifying it as Anthropic.
+    await engine.setConfig('models.subagent', 'gpt-5');
+    try {
+      const client = new FakeMessagesClient([
+        { content: [{ type: 'text', text: 'should never run' }] as any, stop_reason: 'end_turn' },
+      ]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      await expect(handler(ctx)).rejects.toThrow(/references an unknown provider/);
+      expect(client.calls.length).toBe(0);
+    } finally {
+      await engine.unsetConfig('models.subagent');
+    }
+  });
 });

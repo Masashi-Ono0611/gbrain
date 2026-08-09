@@ -48,6 +48,7 @@ import {
   logSubagentHeartbeat,
 } from './subagent-audit.ts';
 import { resolveModel, isAnthropicProvider, TIER_DEFAULTS } from '../../model-config.ts';
+import { splitProviderModelId, normalizeModelId } from '../../model-id.ts';
 import { resolveAnthropicKey } from '../../ai/anthropic-key.ts';
 import { buildSystemPrompt, DEFAULT_SUBAGENT_SYSTEM } from '../system-prompt.ts';
 import { toolLoop as gatewayToolLoop } from '../../ai/gateway.ts';
@@ -256,7 +257,21 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         && !lastBlocks.some(b => b?.type === 'tool_use' || b?.type === 'tool-call')
         && lastBlocks.some(b => b?.type === 'text' && typeof b.text === 'string' && b.text.trim() !== '');
       const modelSource = data.model ? 'data.model' : 'the resolved subagent model config';
-      const verdict = alreadyTerminal ? 'ok' : classifyCapabilities(model);
+      // A BARE Anthropic id (`claude-sonnet-4-6`, no `provider:` prefix) is a
+      // supported value everywhere else: isAnthropicProvider() has an explicit
+      // bare-`claude-` branch, the legacy path strips the prefix before calling
+      // the Messages API, and this handler's own DEFAULT_MODEL is bare.
+      // classifyCapabilities() resolves through the recipe registry, which
+      // requires an explicit provider, so classifying the raw value would
+      // report `unknown` and refuse a working config. Normalize first — the
+      // dream cycle does the same before queueing children
+      // (src/core/cycle/synthesize.ts). Narrow on purpose: only bare ids that
+      // isAnthropicProvider() recognizes are normalized, so a bare
+      // non-Anthropic id still classifies as `unknown` and is still refused.
+      const modelForVerdict = splitProviderModelId(model).provider === null && isAnthropicProvider(model)
+        ? normalizeModelId(model)
+        : model;
+      const verdict = alreadyTerminal ? 'ok' : classifyCapabilities(modelForVerdict);
       if (verdict === 'unusable:no_tools') {
         throw new Error(
           `subagent job rejected: ${modelSource} "${model}" lacks native tool calling. ` +
