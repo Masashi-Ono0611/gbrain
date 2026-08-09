@@ -5852,19 +5852,21 @@ export async function buildChecks(
   }
 
   // 3g. pglite_leftovers (#3856). A pglite -> postgres migration leaves the
-  // old engine store (`brain.pglite/`) AND its pre-migrate safety copy
-  // (`brain.pglite.pre-migrate-<date>/`) under the gbrain home forever —
-  // roughly 2x the live DB of dead weight that nothing surfaces, silently
+  // old engine store (`brain.pglite/`) under the gbrain home forever — dead
+  // weight roughly the size of the live DB that nothing surfaces, silently
   // riding along in any backup that archives the home dir. Assessment is a
   // pure helper (src/core/pglite-leftovers-check.ts); it warns ONLY for a
-  // durable postgres engine and skips everything else (fail open).
+  // durable postgres engine, and skips while `migrate-manifest.json` exists
+  // (an in-flight/interrupted migration can make `brain.pglite` the LIVE
+  // target while the durable engine still reads postgres — #3194) and for
+  // everything else (fail open).
   // The engine is read from config.json DIRECTLY, not loadConfig(): a
   // transient DATABASE_URL (#427) can make a live PGLite brain resolve as
   // postgres for one process, and deletion advice must never rest on an
   // env override (Codex review P1).
-  // Warn-only by design: WHEN a pre-migrate copy is safe to drop is a policy
-  // question (#3856), so the remediation is a verified manual delete — no
-  // CLI command is named that does not exist (#3697).
+  // Warn-only by design: WHEN the abandoned store is safe to drop is a
+  // policy question (#3856), so the remediation is a verified manual delete
+  // — no CLI command is named that does not exist (#3697).
   try {
     const { readFileSync } = await import('node:fs');
     const durableEngine = (

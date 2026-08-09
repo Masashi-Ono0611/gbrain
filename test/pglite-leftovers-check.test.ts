@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import {
   assessPgliteLeftovers,
   isMigrationLeftoverName,
+  MIGRATE_MANIFEST_NAME,
   SIZE_WALK_MAX_ENTRIES,
 } from '../src/core/pglite-leftovers-check.ts';
 
@@ -42,11 +43,12 @@ afterAll(() => {
 });
 
 describe('isMigrationLeftoverName', () => {
-  test("matches only the migration's own artifacts", () => {
+  test('matches ONLY brain.pglite — the one dir the engines themselves create', () => {
     expect(isMigrationLeftoverName('brain.pglite')).toBe(true);
-    expect(isMigrationLeftoverName('brain.pglite.pre-migrate-20260524')).toBe(true);
-    // Unknown provenance — NOT claimed (Codex review: the evidence only
-    // supports the migration's own artifacts).
+    // gbrain never creates `brain.pglite.*` siblings — no version writes a
+    // pre-migrate copy (reviewer's full-history pickaxe found no creation
+    // site), so every sibling has unknown provenance and is NOT claimed.
+    expect(isMigrationLeftoverName('brain.pglite.pre-migrate-20260524')).toBe(false);
     expect(isMigrationLeftoverName('brain.pglite.bak')).toBe(false);
     expect(isMigrationLeftoverName('brain.pglite2')).toBe(false);
     expect(isMigrationLeftoverName('brain-pages')).toBe(false);
@@ -74,6 +76,24 @@ describe('assessPgliteLeftovers', () => {
     expect(assessPgliteLeftovers('postgres', join(root, 'no-such-home')).status).toBe('skip');
   });
 
+  test('skips while migrate-manifest.json exists — brain.pglite may be the live migration target', () => {
+    // An interrupted postgres -> pglite migration leaves the durable engine
+    // at `postgres` (config flips only on clean completion, #3194) while the
+    // manifest survives at the home root. brain.pglite is then the LIVE
+    // target: the check must not assess it, and must not advise deletion.
+    const home = makeHome('mid-migration');
+    makeStore(home, 'brain.pglite', [4096]);
+    writeFileSync(join(home, MIGRATE_MANIFEST_NAME), '{"schema_version":2}');
+    const a = assessPgliteLeftovers('postgres', home);
+    expect(a.status).toBe('skip');
+    expect(a.leftovers).toHaveLength(0);
+    expect(a.message).toContain('migration is in progress or was interrupted');
+    expect(a.message).toContain('not assessing leftovers');
+    // No deletion advice of any kind while a migration may be in flight.
+    expect(a.message).not.toContain('delete');
+    expect(a.message).not.toContain('reclaimable');
+  });
+
   test('ok on a postgres brain with no leftover dirs', () => {
     const home = makeHome('clean-postgres');
     mkdirSync(join(home, 'brain-pages'));
@@ -97,28 +117,27 @@ describe('assessPgliteLeftovers', () => {
     expect(assessPgliteLeftovers('postgres', home).status).toBe('ok');
   });
 
-  test('warns on a postgres brain with both the store and its pre-migrate copy', () => {
+  test('warns on a postgres brain with the abandoned store — siblings stay unclaimed', () => {
     const home = makeHome('migrated');
     const live = makeStore(home, 'brain.pglite', [4096, 2048]);
+    // A pre-migrate-named sibling (no gbrain version creates one — unknown
+    // provenance, e.g. an operator script) must never enter the warn.
     const pre = makeStore(home, 'brain.pglite.pre-migrate-20260524', [4096]);
-    // Freeze mtimes at a known date — the in-the-wild signature (#3856).
+    // Freeze mtime at a known date — the in-the-wild signature (#3856).
     const frozen = new Date('2026-05-24T02:38:42Z');
     utimesSync(live, frozen, frozen);
-    utimesSync(pre, frozen, frozen);
 
     const a = assessPgliteLeftovers('postgres', home);
     expect(a.status).toBe('warn');
-    expect(a.leftovers).toHaveLength(2);
-    // Deterministic order (sorted): the store first, then the dotted copy.
+    expect(a.leftovers).toHaveLength(1);
     expect(a.leftovers[0]?.path).toBe(live);
-    expect(a.leftovers[1]?.path).toBe(pre);
     expect(a.leftovers[0]?.approx_bytes).toBe(4096 + 2048);
-    expect(a.leftovers[1]?.approx_bytes).toBe(4096);
     expect(a.leftovers[0]?.size_incomplete).toBe(false);
-    // The message carries the receipts: paths, sizes, an honestly-labeled
+    // The message carries the receipts: path, size, an honestly-labeled
     // dir mtime (contents can change without touching it), manual remediation.
     expect(a.message).toContain(live);
-    expect(a.message).toContain(pre);
+    expect(a.message).not.toContain(pre);
+    expect(a.message).not.toContain('pre-migrate');
     expect(a.message).toContain('dir mtime 2026-05-24');
     expect(a.message).not.toContain('untouched since'); // over-claim, reviewed out
     expect(a.message).toContain('safe to delete by hand');
@@ -127,12 +146,12 @@ describe('assessPgliteLeftovers', () => {
     expect(a.message).not.toMatch(/gbrain (cleanup|migrate cleanup|prune)/);
   });
 
-  test('warns for a pre-migrate copy alone (store already hand-deleted)', () => {
-    const home = makeHome('half-cleaned');
+  test('ok for a pre-migrate-named sibling alone — never claimed (unknown provenance)', () => {
+    const home = makeHome('sibling-only');
     makeStore(home, 'brain.pglite.pre-migrate-20260101', [512]);
     const a = assessPgliteLeftovers('postgres', home);
-    expect(a.status).toBe('warn');
-    expect(a.leftovers).toHaveLength(1);
+    expect(a.status).toBe('ok');
+    expect(a.leftovers).toHaveLength(0);
   });
 
   test('nested symlinks are not followed — the walk cannot escape the store', () => {
@@ -165,17 +184,14 @@ describe('assessPgliteLeftovers', () => {
 
   test('size walk is bounded by an injectable assessment-wide budget', () => {
     const home = makeHome('bounded');
-    const a1 = makeStore(home, 'brain.pglite', [10, 10, 10]);
-    makeStore(home, 'brain.pglite.pre-migrate-20260202', [10, 10, 10]);
-    // Tiny budget: the walk must stop early and mark BOTH floors incomplete
-    // (one shared budget — the second dir gets whatever remains).
+    makeStore(home, 'brain.pglite', [10, 10, 10]); // 4 entries: base, nested/, nested/f1, nested/f2
+    // Tiny budget: the walk must stop early and mark the floor incomplete.
     const a = assessPgliteLeftovers('postgres', home, 2);
     expect(a.status).toBe('warn');
-    expect(a.leftovers).toHaveLength(2);
-    expect(a.leftovers.some((l) => l.size_incomplete)).toBe(true);
+    expect(a.leftovers).toHaveLength(1);
+    expect(a.leftovers[0]?.size_incomplete).toBe(true);
     expect(a.message).toContain('at least ');
     // Default budget is the exported constant (production callers pass nothing).
     expect(SIZE_WALK_MAX_ENTRIES).toBe(20_000);
-    void a1;
   });
 });

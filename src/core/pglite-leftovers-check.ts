@@ -2,13 +2,12 @@
  * pglite-leftovers-check — detect abandoned PGLite stores after an engine
  * migration (#3856).
  *
- * A pglite -> postgres migration leaves BOTH `brain.pglite/` (the old engine's
- * store) and `brain.pglite.pre-migrate-<date>/` (the safety copy the migration
- * takes first) under the gbrain home, untouched, forever. Together they weigh
- * roughly 2x the live DB, nothing ever surfaces them, and they silently ride
- * along in any backup that archives the gbrain home — the reporting brain paid
- * to permanently archive a dead engine's corpse on Arweave for 2.5 months
- * (898 MB -> 459 MB snapshot, ~half the monthly cost, once excluded by hand).
+ * A pglite -> postgres migration leaves `brain.pglite/` (the old engine's
+ * store) under the gbrain home, untouched, forever. It weighs roughly as much
+ * as the live DB, nothing ever surfaces it, and it silently rides along in any
+ * backup that archives the gbrain home — the reporting brain paid to
+ * permanently archive a dead engine's corpse on Arweave for 2.5 months
+ * (~half the monthly cost, once excluded by hand).
  *
  * Pure assessment helpers (filesystem-only, no network, no shelling out) so
  * `gbrain doctor` can warn with receipts, in the same shape as
@@ -17,16 +16,27 @@
  * transient `DATABASE_URL` (#427) can make a live PGLite brain look like
  * postgres for one process, and deletion advice must never rest on that.
  *
- * Scope is deliberately the migration's own artifacts only: `brain.pglite`
- * and `brain.pglite.pre-migrate-<suffix>`. Other `brain.pglite.*` siblings
- * (hand-made `.bak` copies etc.) have unknown provenance and are NOT claimed.
+ * Scope is deliberately `brain.pglite` alone — the one directory the engines
+ * themselves create. gbrain does NOT create pre-migrate safety copies or any
+ * other `brain.pglite.*` sibling (hand-made `.bak` copies, operator scripts,
+ * etc.); every such sibling has unknown provenance and is NOT claimed.
  *
- * Deliberately warn-only with a MANUAL remediation: deciding when a
- * pre-migration copy is safe to drop is a policy question (#3856 ask 2) — this
- * check only makes the corpse visible, it never deletes anything. The
- * remediation text names no CLI command that does not exist (#3697).
+ * Migration-in-flight gate: `gbrain migrate` banks resume progress in
+ * `migrate-manifest.json` at the gbrain home root and clears it only on clean
+ * completion — the same completion that flips the durable engine (#3194). So
+ * while the manifest exists, the durable engine can still read `postgres`
+ * even though `brain.pglite/` is the LIVE TARGET of an interrupted
+ * postgres -> pglite migration. Deleting it then would leave the manifest
+ * behind, and a re-run would silently skip the "already completed" pages
+ * against an empty store. The check therefore skips whenever the manifest is
+ * present and never assesses leftovers, let alone offers deletion advice.
+ *
+ * Deliberately warn-only with a MANUAL remediation: deciding when the old
+ * store is safe to drop is a policy question (#3856 ask 2) — this check only
+ * makes the corpse visible, it never deletes anything. The remediation text
+ * names no CLI command that does not exist (#3697).
  */
-import { lstatSync, opendirSync } from 'node:fs';
+import { existsSync, lstatSync, opendirSync } from 'node:fs';
 import { join } from 'node:path';
 
 export interface PgliteLeftoverDir {
@@ -54,11 +64,16 @@ export interface PgliteLeftoversAssessment {
  */
 export const SIZE_WALK_MAX_ENTRIES = 20_000;
 
-/** True only for the migration's own artifacts: the old store itself and the
- *  migration's pre-migrate safety copies. Other `brain.pglite.*` siblings
- *  (hand-made backups etc.) have unknown provenance and are out of scope. */
+/** The resume manifest `gbrain migrate` writes at the gbrain home root; it
+ *  survives an interrupted run and is cleared only on clean completion. */
+export const MIGRATE_MANIFEST_NAME = 'migrate-manifest.json';
+
+/** True only for the one directory the engines themselves create: the old
+ *  store `brain.pglite`. gbrain never creates `brain.pglite.*` siblings
+ *  (no pre-migrate copies, no backups) — those all have unknown provenance
+ *  and are out of scope. */
 export function isMigrationLeftoverName(name: string): boolean {
-  return name === 'brain.pglite' || name.startsWith('brain.pglite.pre-migrate-');
+  return name === 'brain.pglite';
 }
 
 /** Iterative, symlink-free size walk. Shares `budget` across calls; flags
@@ -138,6 +153,9 @@ function humanBytes(n: number, floor: boolean): string {
  *   target #3856 documents, and the one case where `brain.pglite` is known
  *   dead weight. `pglite` means the store is live; anything else (missing /
  *   unreadable / future engines) skips — deletion advice must fail open.
+ * - `migrate-manifest.json` present at the home root -> `skip`, even on a
+ *   durable postgres engine: an engine migration is in progress or was
+ *   interrupted, and `brain.pglite` may be its live target (see file header).
  * - postgres + no leftover dirs -> `ok`.
  * - postgres + leftovers -> `warn`, naming each dir with a floor-marked
  *   approximate size and its directory mtime.
@@ -152,6 +170,15 @@ export function assessPgliteLeftovers(
 ): PgliteLeftoversAssessment {
   if (engineKind !== 'postgres') {
     return { status: 'skip', message: '', leftovers: [] };
+  }
+  if (existsSync(join(gbrainHome, MIGRATE_MANIFEST_NAME))) {
+    return {
+      status: 'skip',
+      message:
+        `${MIGRATE_MANIFEST_NAME} is present: an engine migration is in progress or was ` +
+        `interrupted, and brain.pglite may be the live migration target — not assessing leftovers.`,
+      leftovers: [],
+    };
   }
   let names: string[] = [];
   const budget = { entries: maxEntries };
@@ -205,11 +232,11 @@ export function assessPgliteLeftovers(
   return {
     status: 'warn',
     message:
-      `Engine is postgres, but ${leftovers.length} PGLite store dir(s) from the migration remain: ${listing} — ` +
+      `Engine is postgres, but the old PGLite store remains: ${listing} — ` +
       `${anyIncomplete ? 'at least ' : ''}${humanBytes(total, anyIncomplete)} of reclaimable disk. ` +
-      `They also inflate any backup that archives the gbrain home. Your live data is in the postgres ` +
-      `engine; once you have verified that (a recent restore or backup of it), these dirs are safe to ` +
-      `delete by hand — gbrain never deletes them for you.`,
+      `It also inflates any backup that archives the gbrain home. Your live data is in the postgres ` +
+      `engine; once you have verified that (a recent restore or backup of it), the dir is safe to ` +
+      `delete by hand — gbrain never deletes it for you.`,
     leftovers,
   };
 }
