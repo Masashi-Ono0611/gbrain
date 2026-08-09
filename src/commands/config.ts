@@ -223,10 +223,13 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       const { fetchSource } = await import('../core/sources-load.ts');
       const src = await fetchSource(engine, value).catch(() => null);
       if (!src) {
+        // NOTE: keep flag literals out of this message. The generated flag
+        // registry (#2185) scans command sources for flag tokens, so naming a
+        // flag in prose would silently grant it to `gbrain config`.
         console.error(
           `[config] source "${value}" is not registered; refusing to set sources.default.\n` +
-          `[config]   gbrain sources list           # see registered sources\n` +
-          `[config]   gbrain sources add ${value} --path <p>`,
+          `[config]   gbrain sources list      # see registered sources\n` +
+          `[config]   gbrain sources add       # register one first`,
         );
         process.exit(1);
       }
