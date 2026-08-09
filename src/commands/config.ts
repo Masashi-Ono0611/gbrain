@@ -204,6 +204,34 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     const coverageOverride =
       args.includes('--coverage-override') || args.includes('--yes');
 
+    // Validate sources.default at set time. This key is read by
+    // source-resolver.ts tier 5 on EVERY unqualified call, and tier 5 calls
+    // assertSourceExists — so a syntactically valid but non-existent id set
+    // here would make every later unqualified command throw, far from the
+    // typo that caused it. `gbrain sources default <id>` already validates;
+    // config set is the lower-level door to the same key and must not be a
+    // way around that check.
+    if (key === 'sources.default') {
+      const { isValidSourceId } = await import('../core/source-id.ts');
+      if (!isValidSourceId(value)) {
+        console.error(
+          `[config] sources.default must match [a-z0-9-]{1,32} (got '${value}').\n` +
+          `[config]   gbrain sources default <id>   # preferred — validates and reports`,
+        );
+        process.exit(1);
+      }
+      const { fetchSource } = await import('../core/sources-load.ts');
+      const src = await fetchSource(engine, value).catch(() => null);
+      if (!src) {
+        console.error(
+          `[config] source "${value}" is not registered; refusing to set sources.default.\n` +
+          `[config]   gbrain sources list           # see registered sources\n` +
+          `[config]   gbrain sources add ${value} --path <p>`,
+        );
+        process.exit(1);
+      }
+    }
+
     // v0.42.42.0 (#2139): validate spend.posture at set time so a typo
     // ('tokenMax', 'max') doesn't silently fall back to gated.
     if (key === 'spend.posture') {
