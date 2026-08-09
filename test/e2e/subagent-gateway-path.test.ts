@@ -350,6 +350,28 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     expect(result.result).toBe('I cannot help with that');
   });
 
+  it('length stop reason: handler maps length → SubagentStopReason max_tokens (truncated, not clean)', async () => {
+    // finish_reason=length (e.g. an openai-compat model hitting its output
+    // cap) must NOT be recorded as a clean end_turn — the result text is
+    // truncated. Same marker as the legacy path's #2778 handling.
+    __setChatTransportForTests(async () => ({
+      text: 'a very long answer that got cut',
+      blocks: [{ type: 'text', text: 'a very long answer that got cut' }] as ChatBlock[],
+      stopReason: 'length',
+      usage: { input_tokens: 5, output_tokens: 4096, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'openai:gpt-5.2',
+      providerId: 'openai',
+    } satisfies ChatResult));
+
+    const tools = makeStubTools([]);
+    const handler = buildHandler(tools);
+    const { ctx } = await makeFakeJob({ prompt: 'write everything', model: 'openai:gpt-5.2' });
+
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('max_tokens');
+    expect(result.result).toBe('a very long answer that got cut');
+  });
+
   it('non-Anthropic model routes through gateway path (the load-bearing v0.38 unlock)', async () => {
     // This is the headline scenario: openai:gpt-5.2 (no caching) works.
     // Pre-v0.38, this would have refused at queue.ts. With the gateway path

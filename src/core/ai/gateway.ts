@@ -3645,7 +3645,7 @@ export interface ToolLoopOpts {
   onHeartbeat?: (event: string, data: Record<string, unknown>) => void;
 }
 
-export type ToolLoopStopReason = 'end' | 'max_turns' | 'refusal' | 'content_filter' | 'aborted' | 'unrecoverable';
+export type ToolLoopStopReason = 'end' | 'length' | 'max_turns' | 'refusal' | 'content_filter' | 'aborted' | 'unrecoverable';
 
 export interface ToolLoopResult {
   finalText: string;
@@ -3750,7 +3750,11 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
     );
 
     if (toolCalls.length === 0) {
-      stopReason = 'end';
+      // An output-cap stop (finish_reason=length / max-tokens) is NOT a clean
+      // end — the text is truncated. Propagate it so the caller can record a
+      // non-clean stop_reason instead of a silent success (the gateway-loop
+      // analog of the legacy path's #2778 handling).
+      stopReason = chatResult.stopReason === 'length' ? 'length' : 'end';
       finalText = chatResult.text;
       break;
     }

@@ -318,6 +318,67 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
     expect(result.totalTurns).toBeGreaterThanOrEqual(3);
   });
 
+  it('propagates length stop reason when the final turn is truncated (no tool calls)', async () => {
+    __setChatTransportForTests(async () => ({
+      text: 'this answer was cut off mid-sen',
+      blocks: [{ type: 'text', text: 'this answer was cut off mid-sen' }] as ChatBlock[],
+      stopReason: 'length',
+      usage: { input_tokens: 5, output_tokens: 4096, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'anthropic:claude-sonnet-4-6',
+      providerId: 'anthropic',
+    }));
+
+    const result = await toolLoop({
+      initialMessages: [{ role: 'user', content: 'write a long essay' }],
+      tools: [],
+      toolHandlers: new Map(),
+    });
+
+    // A truncated final turn must NOT surface as a clean 'end'.
+    expect(result.stopReason).toBe('length');
+    expect(result.finalText).toBe('this answer was cut off mid-sen');
+  });
+
+  it('control: length stop with tool calls still dispatches and continues (unchanged path)', async () => {
+    let turn = 0;
+    __setChatTransportForTests(async () => {
+      turn++;
+      if (turn === 1) {
+        // Provider reports length but still emitted a complete tool call —
+        // the loop's tool-continuation path is unchanged by length handling.
+        return {
+          text: '',
+          blocks: [
+            { type: 'tool-call', toolCallId: 'tc-len', toolName: 'search', input: { q: 'x' } },
+          ] as ChatBlock[],
+          stopReason: 'length',
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'anthropic:claude-sonnet-4-6',
+          providerId: 'anthropic',
+        };
+      }
+      return {
+        text: 'recovered fine',
+        blocks: [{ type: 'text', text: 'recovered fine' }] as ChatBlock[],
+        stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'anthropic:claude-sonnet-4-6',
+        providerId: 'anthropic',
+      };
+    });
+
+    let toolWasCalled = false;
+    const result = await toolLoop({
+      initialMessages: [{ role: 'user', content: 'go' }],
+      tools: [{ name: 'search', description: 's', inputSchema: { type: 'object' } }],
+      toolHandlers: new Map([['search', { idempotent: true, async execute() { toolWasCalled = true; return { hits: 1 }; } }]]),
+    });
+
+    expect(toolWasCalled).toBe(true);
+    expect(result.stopReason).toBe('end');
+    expect(result.finalText).toBe('recovered fine');
+  });
+
   it('returns refusal reason without dispatching tools when stopReason=refusal', async () => {
     __setChatTransportForTests(async () => ({
       text: 'I cannot help with that',

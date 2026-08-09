@@ -51,7 +51,7 @@ import { resolveModel, isAnthropicProvider, TIER_DEFAULTS } from '../../model-co
 import { resolveAnthropicKey } from '../../ai/anthropic-key.ts';
 import { buildSystemPrompt, DEFAULT_SUBAGENT_SYSTEM } from '../system-prompt.ts';
 import { toolLoop as gatewayToolLoop } from '../../ai/gateway.ts';
-import type { ChatToolDef, ChatMessage, ChatBlock, ChatResult, ToolHandler } from '../../ai/gateway.ts';
+import type { ChatToolDef, ChatMessage, ChatBlock, ChatResult, ToolHandler, ToolLoopStopReason } from '../../ai/gateway.ts';
 import { classifyCapabilities } from '../../ai/capabilities.ts';
 import { randomUUIDv7 } from 'bun';
 
@@ -1072,19 +1072,21 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     onHeartbeat: heartbeat,
   });
 
-  // Map gateway stop reason to SubagentStopReason. SubagentStopReason has
-  // {end_turn, max_turns, refusal, error}; aborted maps to error.
-  const stopReason: SubagentStopReason = result.stopReason === 'end'
-    ? 'end_turn'
-    : result.stopReason === 'max_turns'
-      ? 'max_turns'
-      : result.stopReason === 'refusal'
-        ? 'refusal'
-        : result.stopReason === 'content_filter'
-          ? 'refusal'
-          : result.stopReason === 'aborted'
-            ? 'error'
-            : 'end_turn';
+  // Map gateway stop reason to SubagentStopReason. length maps to max_tokens
+  // (same truncation marker the legacy path emits per #2778 — the result text
+  // is NOT a clean end_turn); aborted/unrecoverable map to error. The Record
+  // is exhaustive over ToolLoopStopReason so a future gateway stop reason
+  // fails typecheck here instead of silently mapping to a clean end_turn.
+  const stopReasonMap: Record<ToolLoopStopReason, SubagentStopReason> = {
+    end: 'end_turn',
+    length: 'max_tokens',
+    max_turns: 'max_turns',
+    refusal: 'refusal',
+    content_filter: 'refusal',
+    aborted: 'error',
+    unrecoverable: 'error',
+  };
+  const stopReason: SubagentStopReason = stopReasonMap[result.stopReason];
 
   return {
     result: result.finalText,
