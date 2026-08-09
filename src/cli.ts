@@ -55,7 +55,7 @@ export function bigintToStringReplacer(_key: string, value: unknown): unknown {
 }
 
 // CLI-only commands that bypass the operation layer
-export const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'enrich', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'maintain', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'reconcile-links', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'calibration', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'retrieval-upgrade', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'status', 'connect', 'skillopt', 'quarantine', 'self-upgrade', 'advisor', 'watch', 'reindex-search-vector', 'pages', 'bench', 'backfill']);
+export const CLI_ONLY = new Set(['init', 'reinit-pglite', 'pglite-repair', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'enrich', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'maintain', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'reconcile-links', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'calibration', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'retrieval-upgrade', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'status', 'connect', 'skillopt', 'quarantine', 'self-upgrade', 'advisor', 'watch', 'reindex-search-vector', 'pages', 'bench', 'backfill']);
 // CLI-only commands whose handlers print their own --help text. These are
 // excluded from the generic short-circuit so detailed per-command and
 // per-subcommand usage stays reachable.
@@ -93,11 +93,17 @@ const CLI_ONLY_SELF_HELP = new Set([
   // short-circuit fired before runSync could print its own usage block.
   // Adding `sync` here routes `gbrain sync --help` into runSync.
   'sync',
+  // #3834: extract ships detailed help for its mode-specific flags. Keep the
+  // generic CLI-only stub from hiding that contract.
+  'extract',
   // v0.37 fix wave (deferred TODO, shipped): reinit-pglite has its
   // own --help in runReinitPglite. Routing through SELF_HELP avoids
   // the generic short-circuit so the destructive-action warning text
   // reaches the user.
   'reinit-pglite',
+  // WAL-repair wave: pglite-repair ships its own --help with the
+  // dry-run/repair semantics + the un-checkpointed-tail caveat.
+  'pglite-repair',
   // v0.40.6.0 Schema Cathedral v3 — `gbrain schema --help` should hit
   // schema.ts printHelp() with the full 22+ verb taxonomy, not the
   // generic short-circuit's one-line stub.
@@ -1312,6 +1318,13 @@ async function handleCliOnly(command: string, args: string[]) {
     await runReinitPglite(args);
     return;
   }
+  // WAL-repair wave (#223/#1670/#2575): in-place torn-WAL recovery. Never
+  // connects an engine — the whole point is that the DB won't open.
+  if (command === 'pglite-repair') {
+    const { runPgliteRepair } = await import('./commands/pglite-repair.ts');
+    setCliExitVerdict(await runPgliteRepair(args));
+    return;
+  }
   if (command === 'auth') {
     const { runAuth } = await import('./commands/auth.ts');
     await runAuth(args);
@@ -1714,6 +1727,14 @@ async function handleCliOnly(command: string, args: string[]) {
   if (command === 'sync' && (args.includes('--help') || args.includes('-h'))) {
     const { runSync } = await import('./commands/sync.ts');
     await runSync(null as any, args);
+    return;
+  }
+
+  // #3834: extract help is engine-independent and must work on a fresh
+  // install before a brain has been configured.
+  if (command === 'extract' && (args.includes('--help') || args.includes('-h'))) {
+    const { runExtract } = await import('./commands/extract.ts');
+    await runExtract(null as never, args);
     return;
   }
 
@@ -2653,10 +2674,13 @@ TIMELINE
 
 TOOLS
   extract <links|timeline|all>       Extract links/timeline (idempotent)
-        [--source fs|db]             fs (default) walks .md files; db iterates engine pages
-        [--dir <brain>]              brain dir for fs source
-        [--type T] [--since DATE]    filters (db source)
-        [--dry-run] [--json]
+        [--source fs|db] [--source-id ID] [--dir <brain>]
+        [--type T] [--since DATE] [--include-frontmatter]
+        [--workers N|--concurrency N] [--dry-run] [--json]
+  extract links --by-mention [--ner] --source db
+  extract timeline --from-meetings [--infer-dates] --source db
+  extract --stale [--source-id ID] [--catch-up] [--dry-run] [--json]
+  extract --explain <kind> [--json] Full details: gbrain extract --help
   publish <page.md> [--password]     Shareable HTML (strips private data, optional AES-256)
   check-backlinks <check|fix> [dir]  Find/fix missing back-links across brain
   lint <dir|file> [--fix]            Catch LLM artifacts, placeholder dates, bad frontmatter
