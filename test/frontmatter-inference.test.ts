@@ -322,11 +322,17 @@ describe('DIRECTORY_RULES', () => {
     if (!isAppleRule(r) || isGenericApple(r)) return false;
     const seg = applePrefixOf(r).slice(APPLE_PREFIX.length).replace(/\/+$/, '').split('/')[0];
     const derived = seg.replace(/\s+/g, '-');
+    // inferFrontmatter defaults both optional strategy fields to 'filename'
+    // (frontmatter-inference.ts:310, :317), so an omitted field and an
+    // explicit 'filename' are the same rule. Comparing them literally would
+    // let a redundant rule escape by simply leaving them out.
+    const dp = (v?: string) => v ?? 'filename';
+    const ts = (v?: string) => v ?? 'filename';
     const sameFields =
       r.type === generic.type &&
       r.source === generic.source &&
-      r.datePattern === generic.datePattern &&
-      r.titleStrategy === generic.titleStrategy;
+      dp(r.datePattern) === dp(generic.datePattern) &&
+      ts(r.titleStrategy) === ts(generic.titleStrategy);
     return sameFields && [...(r.tags ?? [])].sort().join(',') === derived;
   };
 
@@ -374,6 +380,10 @@ describe('DIRECTORY_RULES', () => {
     expect(isRedundantApple(like('Apple Notes/YC/', ['yc']), generic)).toBe(true);
     expect(isRedundantApple(like('apple notes/yc/archive/', ['yc']), generic)).toBe(true);
     expect(isRedundantApple(like('apple notes/pitch notes/', ['pitch-notes']), generic)).toBe(true);
+    // Omitting the optional strategy fields is the same rule as spelling out
+    // their defaults, so leaving them out must not buy an escape.
+    const { datePattern: _dp, titleStrategy: _ts, ...withoutDefaults } = like('apple notes/yc/', ['yc']);
+    expect(isRedundantApple(withoutDefaults, generic)).toBe(true);
     // Real overrides must NOT be flagged: a different tag set, or a field the
     // generic rule sets differently.
     expect(isRedundantApple(like('apple notes/youtube shows/', ['youtube', 'shows']), generic)).toBe(false);
