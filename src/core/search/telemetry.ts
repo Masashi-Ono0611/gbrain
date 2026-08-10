@@ -65,9 +65,10 @@ const FLUSH_THRESHOLD_CALLS = 100;
 
 /**
  * Per-process telemetry singleton. Each gbrain process (CLI, stdio MCP,
- * HTTP MCP) gets one instance. The flush timer is installed lazily on the
- * first `record()` call so importing this module has no side effects. No
- * exit hooks are installed — see `ensureExitHook`.
+ * HTTP MCP) gets one instance. The flush timer is installed lazily by the
+ * first `setEngine()` call, not by `record()`, so importing this module has
+ * no side effects and a caller can wire an engine without recording. No exit
+ * hooks are installed — see `ensureExitHook`.
  */
 class TelemetryWriter {
   private buckets = new Map<string, Bucket>();
