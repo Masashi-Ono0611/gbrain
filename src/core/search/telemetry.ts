@@ -4,11 +4,12 @@
  * Architecture decision (D2 in the plan, [CDX-19]): per-process in-memory
  * bucket, flushed periodically (60s OR 100 calls, whichever first). There is
  * deliberately NO flush on process exit — `ensureExitHook` below documents why
- * the beforeExit/SIGINT/SIGTERM drain was removed. Consequence: a process that
- * exits holding fewer than FLUSH_THRESHOLD_CALLS buffered calls, less than
- * FLUSH_INTERVAL_MS after its last flush, loses them. Long-running processes
- * (HTTP MCP server, autopilot, jobs work) are covered by the timer; a
- * short-lived CLI invocation typically is not.
+ * the beforeExit/SIGINT/SIGTERM drain was removed. Consequence: anything still
+ * buffered when the process exits is lost, and so is a snapshot handed to an
+ * in-flight `flush()` that has not committed yet (`flush` clears `buckets`
+ * before awaiting the write). Long-running processes (HTTP MCP server,
+ * autopilot, jobs work) are covered by the timer; a short-lived CLI invocation
+ * usually exits before either trigger fires, so its calls are simply dropped.
  * The search hot path NEVER waits on this write — `record()` is sync and
  * the flush is fire-and-forget.
  *
@@ -24,8 +25,10 @@
  * Per-process bucketing means stdio MCP, HTTP MCP, and CLI processes each
  * maintain their own buffers. Stats are directional, not exact — acceptable
  * because the consumer is the operator (or an agent running `gbrain search
- * tune`), not a financial ledger. The "lose last bucket on hard crash"
- * downside is documented in the methodology doc.
+ * tune`), not a financial ledger. Note the loss is not limited to hard
+ * crashes: with no exit drain, an ordinary exit loses whatever has not been
+ * committed. Weigh that when reading counts from a process class that exits
+ * often.
  */
 
 import type { BrainEngine } from '../engine.ts';
@@ -59,9 +62,9 @@ const FLUSH_THRESHOLD_CALLS = 100;
 
 /**
  * Per-process telemetry singleton. Each gbrain process (CLI, stdio MCP,
- * HTTP MCP) gets one instance. The flush timer and exit hooks are
- * installed lazily on the first `record()` call so importing this module
- * has no side effects.
+ * HTTP MCP) gets one instance. The flush timer is installed lazily on the
+ * first `record()` call so importing this module has no side effects. No
+ * exit hooks are installed — see `ensureExitHook`.
  */
 class TelemetryWriter {
   private buckets = new Map<string, Bucket>();
@@ -191,7 +194,7 @@ class TelemetryWriter {
     return this.flushInFlight;
   }
 
-  /** Stop the timer and uninstall exit hooks. Called from tests / shutdown. */
+  /** Stop the timer and drop the buffer. Called from tests / shutdown. */
   stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
