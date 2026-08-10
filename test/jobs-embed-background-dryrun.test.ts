@@ -16,8 +16,24 @@
  *
  * Behavioral pin: a job whose data carries dryRun must not embed or write.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, it, expect, beforeAll, afterAll, mock } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+
+/**
+ * Hermetic transport. Without it the guard is only sound where no embedding
+ * provider is configured: runEmbedCore catches provider failures into
+ * `failures` and writes nothing, so an unfixed handler pointed at a broken
+ * provider would also leave the count unchanged and pass. Counting calls
+ * removes that window — a real run must call embedBatch, a dry run must not.
+ */
+let embedCalls = 0;
+mock.module('../src/core/embedding.ts', () => ({
+  embedBatch: async (texts: string[]) => {
+    embedCalls++;
+    return texts.map(() => new Float32Array(1536));
+  },
+  currentEmbeddingSignature: () => 'test:model:1536',
+}));
 import { MinionWorker } from '../src/core/minions/worker.ts';
 import { registerBuiltinHandlers } from '../src/commands/jobs.ts';
 
@@ -76,6 +92,7 @@ async function embeddedChunkCount(): Promise<number> {
 
 describe('embed worker honours dryRun from the job payload (#3594 class)', () => {
   it('a dryRun job embeds nothing', async () => {
+    embedCalls = 0;
     await seedStalePage('bg-dryrun-check');
     // Coverage: without real stale chunks the dry-run path short-circuits and
     // every assertion below would hold for the wrong reason.
@@ -84,23 +101,23 @@ describe('embed worker honours dryRun from the job payload (#3594 class)', () =>
 
     const handler = await embedHandler();
     // Exactly what `embed --stale --dry-run --background` queues.
-    await handler({
+    const result = (await handler({
       id: 1,
       data: { stale: true, dryRun: true },
       updateProgress: async () => {},
-    });
+    })) as { embedded: number; dry_run: boolean; would_embed: number };
 
-    // Two independent signals, so the guard bites in either environment:
-    //
-    // Without embedding credentials (CI), a real run cannot even start — it
-    // throws EmbeddingCredentialError from the preflight. Reaching this line
-    // at all proves the dry-run branch was taken, because a preview has no
-    // business needing an API key.
-    //
-    // With credentials, the run would succeed and write vectors, so the count
-    // is what catches it. A dry-run test that only checks the return value
-    // still passes while the write happens underneath — #3594's explanation
-    // for why this class escapes tests.
+    // The job result must not claim work it did not do: `gbrain jobs get`
+    // showed `embedded: true` for a dry run.
+    expect(result.dry_run).toBe(true);
+    expect(result.embedded).toBe(0);
+    expect(result.would_embed).toBeGreaterThan(0);
+
+    // The call counter is the primary signal: a real run must reach the
+    // transport, a dry run must not. The write count is the secondary one —
+    // #3594's point is that a dry-run test asserting only the return value
+    // passes while the side effect happens underneath.
+    expect(embedCalls).toBe(0);
     expect(await embeddedChunkCount()).toBe(before);
   }, 60_000);
 });

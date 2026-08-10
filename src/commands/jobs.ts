@@ -1530,7 +1530,7 @@ export async function registerBuiltinHandlers(
     // readable via `gbrain jobs get <id>`). Stderr from the worker daemon
     // only emits coarse job-start / job-done lines; per-page detail lives
     // in the DB. Per Codex review #20.
-    await runEmbedCore(engine, {
+    const embedResult = await runEmbedCore(engine, {
       slug: typeof job.data.slug === 'string' ? job.data.slug : undefined,
       slugs: Array.isArray(job.data.slugs) ? (job.data.slugs as string[]) : undefined,
       all: !!job.data.all,
@@ -1558,7 +1558,16 @@ export async function registerBuiltinHandlers(
         job.updateProgress({ done, total, embedded, phase: 'embed.pages' }).catch(() => {});
       },
     });
-    return { embedded: true };
+    // Report what happened, not a constant. `embedded: true` claimed a dry run
+    // had embedded, which is the same lie in miniature: `gbrain jobs get`
+    // showed it. `embedded` stays the key it always was and stays truthy on a
+    // real run (it is now the count, 0 on a dry run).
+    return {
+      embedded: embedResult.embedded,
+      dry_run: !!embedResult.dryRun,
+      would_embed: embedResult.would_embed,
+      failures: embedResult.failures,
+    };
   });
 
   worker.register('lint', async (job) => {
