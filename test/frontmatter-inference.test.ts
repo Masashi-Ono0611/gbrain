@@ -303,17 +303,44 @@ describe('DIRECTORY_RULES', () => {
     expect(catchAll!.type).toBe('note');
   });
 
+  // Mirror production normalization: inferFrontmatter lowercases BOTH sides
+  // before `startsWith` (frontmatter-inference.ts:297), so a rule authored as
+  // 'Apple Notes/YC/' matches at runtime and must be examined here too.
+  const APPLE_PREFIX = 'apple notes/';
+  const applePrefixOf = (r: { pathPrefix: string }) => r.pathPrefix.toLowerCase();
+  const isAppleRule = (r: { pathPrefix: string }) => applePrefixOf(r).startsWith(APPLE_PREFIX);
+  const isGenericApple = (r: { pathPrefix: string }) => applePrefixOf(r) === APPLE_PREFIX;
+
+  /**
+   * True when a subfolder rule reproduces exactly what the generic
+   * 'apple notes/' rule already derives, and so can never change an outcome.
+   */
+  const isRedundantApple = (
+    r: { pathPrefix: string; tags?: string[]; type?: string; source?: string; datePattern?: string; titleStrategy?: string },
+    generic: { type?: string; source?: string; datePattern?: string; titleStrategy?: string },
+  ): boolean => {
+    if (!isAppleRule(r) || isGenericApple(r)) return false;
+    const seg = applePrefixOf(r).slice(APPLE_PREFIX.length).replace(/\/+$/, '').split('/')[0];
+    const derived = seg.replace(/\s+/g, '-');
+    const sameFields =
+      r.type === generic.type &&
+      r.source === generic.source &&
+      r.datePattern === generic.datePattern &&
+      r.titleStrategy === generic.titleStrategy;
+    return sameFields && [...(r.tags ?? [])].sort().join(',') === derived;
+  };
+
   test('Apple Notes rules are more specific than the catch-all', () => {
-    const appleRules = DIRECTORY_RULES.filter(r => r.pathPrefix.startsWith('apple notes/'));
+    const appleRules = DIRECTORY_RULES.filter(isAppleRule);
     expect(appleRules.length).toBeGreaterThan(1); // subfolder rules + catch-all
     // EVERY subfolder rule must come before the generic one, not just a named
     // example: findIndex on an absent prefix returns -1, which satisfies
     // `toBeLessThan(genericIdx)` vacuously, so an assertion naming one rule
     // keeps passing after that rule is deleted.
-    const genericIdx = DIRECTORY_RULES.findIndex(r => r.pathPrefix === 'apple notes/');
+    const genericIdx = DIRECTORY_RULES.findIndex(isGenericApple);
     expect(genericIdx).toBeGreaterThanOrEqual(0);
     const subIdx = appleRules
-      .filter(r => r.pathPrefix !== 'apple notes/')
+      .filter(r => !isGenericApple(r))
       .map(r => DIRECTORY_RULES.indexOf(r));
     expect(subIdx.length).toBeGreaterThan(0);
     for (const i of subIdx) expect(i).toBeLessThan(genericIdx);
@@ -324,20 +351,33 @@ describe('DIRECTORY_RULES', () => {
     // the first path segment, lowercased and hyphenated. A subfolder rule that
     // reproduces exactly that is dead weight: it can never change an output,
     // but it reads as a deliberate override.
-    const generic = DIRECTORY_RULES.find(r => r.pathPrefix === 'apple notes/');
+    const generic = DIRECTORY_RULES.find(isGenericApple);
     expect(generic).toBeDefined();
-    const redundant = DIRECTORY_RULES.filter(r => {
-      if (!r.pathPrefix.startsWith('apple notes/') || r.pathPrefix === 'apple notes/') return false;
-      const seg = r.pathPrefix.slice('apple notes/'.length).replace(/\/$/, '');
-      const derived = seg.toLowerCase().replace(/\s+/g, '-');
-      const sameFields =
-        r.type === generic!.type &&
-        r.source === generic!.source &&
-        r.datePattern === generic!.datePattern &&
-        r.titleStrategy === generic!.titleStrategy;
-      const sameTags = [...(r.tags ?? [])].sort().join(',') === derived;
-      return sameFields && sameTags;
+    expect(DIRECTORY_RULES.filter(r => isRedundantApple(r, generic!)).map(r => r.pathPrefix)).toEqual([]);
+  });
+
+  test('the redundancy predicate catches the shapes a naive one misses', () => {
+    // A guard that never fires is indistinguishable from a guard that cannot
+    // fire. Feed it the two spellings production would still match: a
+    // mixed-case prefix (inferFrontmatter lowercases both sides before
+    // startsWith) and a nested prefix (the generic rule tags parts[1] only,
+    // so a deeper rule repeating the first segment is equally redundant).
+    const generic = DIRECTORY_RULES.find(isGenericApple)!;
+    const like = (pathPrefix: string, tags: string[]) => ({
+      pathPrefix,
+      tags,
+      type: generic.type,
+      source: generic.source,
+      datePattern: generic.datePattern,
+      titleStrategy: generic.titleStrategy,
     });
-    expect(redundant.map(r => r.pathPrefix)).toEqual([]);
+    expect(isRedundantApple(like('Apple Notes/YC/', ['yc']), generic)).toBe(true);
+    expect(isRedundantApple(like('apple notes/yc/archive/', ['yc']), generic)).toBe(true);
+    expect(isRedundantApple(like('apple notes/pitch notes/', ['pitch-notes']), generic)).toBe(true);
+    // Real overrides must NOT be flagged: a different tag set, or a field the
+    // generic rule sets differently.
+    expect(isRedundantApple(like('apple notes/youtube shows/', ['youtube', 'shows']), generic)).toBe(false);
+    expect(isRedundantApple({ ...like('apple notes/yc/', ['yc']), type: 'note' }, generic)).toBe(false);
+    expect(isRedundantApple(like('wiki/yc/', ['yc']), generic)).toBe(false); // not an Apple Notes rule
   });
 });
