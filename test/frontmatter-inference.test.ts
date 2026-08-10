@@ -306,9 +306,38 @@ describe('DIRECTORY_RULES', () => {
   test('Apple Notes rules are more specific than the catch-all', () => {
     const appleRules = DIRECTORY_RULES.filter(r => r.pathPrefix.startsWith('apple notes/'));
     expect(appleRules.length).toBeGreaterThan(1); // subfolder rules + catch-all
-    // Subfolder rules should come before the generic apple notes/ rule
-    const ycIdx = DIRECTORY_RULES.findIndex(r => r.pathPrefix === 'apple notes/yc/');
+    // EVERY subfolder rule must come before the generic one, not just a named
+    // example: findIndex on an absent prefix returns -1, which satisfies
+    // `toBeLessThan(genericIdx)` vacuously, so an assertion naming one rule
+    // keeps passing after that rule is deleted.
     const genericIdx = DIRECTORY_RULES.findIndex(r => r.pathPrefix === 'apple notes/');
-    expect(ycIdx).toBeLessThan(genericIdx);
+    expect(genericIdx).toBeGreaterThanOrEqual(0);
+    const subIdx = appleRules
+      .filter(r => r.pathPrefix !== 'apple notes/')
+      .map(r => DIRECTORY_RULES.indexOf(r));
+    expect(subIdx.length).toBeGreaterThan(0);
+    for (const i of subIdx) expect(i).toBeLessThan(genericIdx);
+  });
+
+  test('no Apple Notes subfolder rule duplicates what the generic rule derives', () => {
+    // The generic 'apple notes/' rule assigns type/source/date/title and tags
+    // the first path segment, lowercased and hyphenated. A subfolder rule that
+    // reproduces exactly that is dead weight: it can never change an output,
+    // but it reads as a deliberate override.
+    const generic = DIRECTORY_RULES.find(r => r.pathPrefix === 'apple notes/');
+    expect(generic).toBeDefined();
+    const redundant = DIRECTORY_RULES.filter(r => {
+      if (!r.pathPrefix.startsWith('apple notes/') || r.pathPrefix === 'apple notes/') return false;
+      const seg = r.pathPrefix.slice('apple notes/'.length).replace(/\/$/, '');
+      const derived = seg.toLowerCase().replace(/\s+/g, '-');
+      const sameFields =
+        r.type === generic!.type &&
+        r.source === generic!.source &&
+        r.datePattern === generic!.datePattern &&
+        r.titleStrategy === generic!.titleStrategy;
+      const sameTags = [...(r.tags ?? [])].sort().join(',') === derived;
+      return sameFields && sameTags;
+    });
+    expect(redundant.map(r => r.pathPrefix)).toEqual([]);
   });
 });
