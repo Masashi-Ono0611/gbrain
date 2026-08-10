@@ -2,8 +2,13 @@
  * v0.32.3 search-lite telemetry rollup writer.
  *
  * Architecture decision (D2 in the plan, [CDX-19]): per-process in-memory
- * bucket, flushed periodically (60s OR 100 calls, whichever first) AND on
- * process exit via beforeExit/SIGINT/SIGTERM with a 2-second timeout cap.
+ * bucket, flushed periodically (60s OR 100 calls, whichever first). There is
+ * deliberately NO flush on process exit — `ensureExitHook` below documents why
+ * the beforeExit/SIGINT/SIGTERM drain was removed. Consequence: a process that
+ * exits holding fewer than FLUSH_THRESHOLD_CALLS buffered calls, less than
+ * FLUSH_INTERVAL_MS after its last flush, loses them. Long-running processes
+ * (HTTP MCP server, autopilot, jobs work) are covered by the timer; a
+ * short-lived CLI invocation typically is not.
  * The search hot path NEVER waits on this write — `record()` is sync and
  * the flush is fire-and-forget.
  *
