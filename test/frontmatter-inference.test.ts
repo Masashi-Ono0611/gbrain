@@ -362,6 +362,26 @@ describe('DIRECTORY_RULES', () => {
     expect(DIRECTORY_RULES.filter(r => isRedundantApple(r, generic!)).map(r => r.pathPrefix)).toEqual([]);
   });
 
+  test('a path under a removed prefix now reports the generic rule', () => {
+    // Accepted, and pinned rather than incidental: `matchedRule` is a
+    // diagnostic label, surfaced as results[].rule by `gbrain frontmatter`
+    // (frontmatter.ts:486). Deleting a rule necessarily changes which rule is
+    // named. Everything the label does NOT cover — title/type/date/source/tags,
+    // i.e. every field serializeFrontmatter persists — is unchanged.
+    const out = inferFrontmatter('Apple Notes/YC/2024-03-05 A Note.md', 'body');
+    expect(out.matchedRule).toBe('apple notes/');
+    expect(out).toMatchObject({
+      title: 'A Note',
+      type: 'apple-note',
+      date: '2024-03-05',
+      source: 'apple-notes',
+      tags: ['yc'],
+    });
+    // The catch-all branch in frontmatter.ts keys on the literal '(default)',
+    // so its skip decision is untouched by this rename.
+    expect(out.matchedRule).not.toBe('(default)');
+  });
+
   test('the redundancy predicate catches the shapes a naive one misses', () => {
     // A guard that never fires is indistinguishable from a guard that cannot
     // fire. Feed it the two spellings production would still match: a
