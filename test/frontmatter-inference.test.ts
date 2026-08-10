@@ -336,6 +336,25 @@ describe('DIRECTORY_RULES', () => {
     return sameFields && [...(r.tags ?? [])].sort().join(',') === derived;
   };
 
+  // The sensitivity vocabulary gbrain applies to its own corpus: transcripts
+  // matching these are excluded before any LLM call (see the excludePatterns
+  // default in src/core/cycle/synthesize.ts). A shipped DIRECTORY_RULE that
+  // maps a specific person's folder onto one of these categories encodes a
+  // private fact about a real individual into every install, which the Privacy
+  // rule in CLAUDE.md forbids for checked-in code. Personal mappings like that
+  // belong in the operator's own notes, not in the default rule table.
+  const SENSITIVE_CATEGORIES = ['medical', 'therapy'];
+
+  test('no shipped rule binds a path to a sensitive category', () => {
+    const offenders = DIRECTORY_RULES.filter(r =>
+      (r.tags ?? []).some(t => SENSITIVE_CATEGORIES.includes(t.toLowerCase())),
+    );
+    // Report indices, not prefixes: an offending prefix is by definition the
+    // kind of string this test exists to keep out of public artifacts, and a
+    // failing assertion is printed into CI logs.
+    expect(offenders.map(r => DIRECTORY_RULES.indexOf(r))).toEqual([]);
+  });
+
   test('Apple Notes rules are more specific than the catch-all', () => {
     const appleRules = DIRECTORY_RULES.filter(isAppleRule);
     expect(appleRules.length).toBeGreaterThan(1); // subfolder rules + catch-all
