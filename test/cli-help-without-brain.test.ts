@@ -46,9 +46,16 @@ const STILL_NEEDS_A_BRAIN = [
 
 async function runHelp(command: string): Promise<{ code: number; out: string }> {
   const home = mkdtempSync(join(tmpdir(), 'gbrain-nobrain-'));
+  // An empty GBRAIN_HOME is not enough: loadConfig also honours
+  // GBRAIN_DATABASE_URL and DATABASE_URL (config.ts:550-551), so a developer
+  // or CI runner that exports either would let the CLI connect anyway — the
+  // positive assertions would pass on master and this guard would be inert.
+  const env = { ...process.env, GBRAIN_HOME: home };
+  delete env.GBRAIN_DATABASE_URL;
+  delete env.DATABASE_URL;
   const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', command, '--help'], {
     cwd: REPO,
-    env: { ...process.env, GBRAIN_HOME: home },
+    env,
     stdout: 'pipe',
     stderr: 'pipe',
   });
