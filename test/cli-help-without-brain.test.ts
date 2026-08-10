@@ -53,7 +53,10 @@ async function runHelp(command: string): Promise<{ code: number; out: string }> 
   const env: Record<string, string | undefined> = { ...process.env, GBRAIN_HOME: home };
   delete env.GBRAIN_DATABASE_URL;
   delete env.DATABASE_URL;
-  const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', command, '--help'], {
+  // --no-env-file: bun auto-loads .env from cwd, and GBRAIN_DATABASE_URL is
+  // honored unconditionally, so a developer's local .env would put back
+  // exactly what the deletes above removed.
+  const proc = Bun.spawn(['bun', '--no-env-file', 'run', 'src/cli.ts', command, '--help'], {
     cwd: REPO,
     env,
     stdout: 'pipe',
