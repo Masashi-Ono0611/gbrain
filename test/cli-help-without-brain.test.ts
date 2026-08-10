@@ -83,11 +83,14 @@ describe('--help without a configured brain', () => {
   }
 
   test('the known-unfixed set is exactly what it claims', async () => {
-    const unexpectedlyWorking: string[] = [];
-    for (const command of STILL_NEEDS_A_BRAIN) {
-      const { out } = await runHelp(command);
-      if (!out.includes('No brain configured')) unexpectedlyWorking.push(command);
-    }
+    // Concurrently: seven sequential CLI spawns is most of this file's wall
+    // clock, and each one is independent (its own temp GBRAIN_HOME).
+    const results = await Promise.all(
+      STILL_NEEDS_A_BRAIN.map(async command => ({ command, ...(await runHelp(command)) })),
+    );
+    const unexpectedlyWorking = results
+      .filter(r => !r.out.includes('No brain configured'))
+      .map(r => r.command);
     // Not a wish that they stay broken — a tripwire. Fixing one is good and
     // should move it to HELP_WITHOUT_BRAIN in the same change, so the coverage
     // list never drifts away from reality in either direction.
