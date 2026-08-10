@@ -101,6 +101,25 @@ describe('BudgetMeter', () => {
     expect(r.estimatedCostUsd).toBeCloseTo(viaView!, 10);
   });
 
+  test('an inherited-key model id cannot poison the running total', () => {
+    // Both pricing tables are object literals, so 'constructor' resolves to a
+    // truthy Object.prototype value and the rate arithmetic yields NaN. If
+    // that reached cumulativeUsd, every later submit would pass the gate.
+    const meter = new BudgetMeter({ budgetUsd: 0.001, phase: 'auto_think', auditPath });
+    const poison = meter.check({ modelId: 'constructor', estimatedInputTokens: 1000, maxOutputTokens: 1000, label: 'poison' });
+    expect(poison.unpriced).toBe(true);              // treated as unpriceable
+    expect(Number.isFinite(poison.cumulativeCostUsd)).toBe(true);
+
+    const after = meter.check({
+      modelId: 'claude-opus-4-7',
+      estimatedInputTokens: 1_000_000,
+      maxOutputTokens: 1_000_000,
+      label: 'after-poison',
+    });
+    expect(after.allowed).toBe(false);               // gate still enforcing
+    expect(Number.isFinite(after.cumulativeCostUsd)).toBe(true);
+  });
+
   test('ledger captures every submit (allowed + denied + unpriced)', () => {
     const meter = new BudgetMeter({ budgetUsd: 0.001, phase: 'auto_think', auditPath });
     meter.check({ modelId: 'claude-opus-4-7', estimatedInputTokens: 5000, maxOutputTokens: 4000, label: 'a' });

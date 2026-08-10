@@ -100,17 +100,25 @@ export class BudgetMeter {
    */
   private estimateCost(estimate: SubmitEstimate): number | null {
     const p = canonicalLookup(estimate.modelId);
-    if (p) {
-      return (
-        (estimate.estimatedInputTokens / 1_000_000) * p.input +
+    const raw = p
+      ? (estimate.estimatedInputTokens / 1_000_000) * p.input +
         (estimate.maxOutputTokens      / 1_000_000) * p.output
-      );
-    }
-    return estimateMaxCostUsd(
-      estimate.modelId,
-      estimate.estimatedInputTokens,
-      estimate.maxOutputTokens,
-    );
+      : estimateMaxCostUsd(
+          estimate.modelId,
+          estimate.estimatedInputTokens,
+          estimate.maxOutputTokens,
+        );
+    // A non-finite estimate must not reach the accumulator. Both tables are
+    // plain object literals, so a model id colliding with an inherited key
+    // ('constructor', 'toString', '__proto__') resolves to a truthy
+    // Object.prototype value whose .input/.output are undefined, and the
+    // arithmetic yields NaN. `cumulative + NaN` is NaN, `NaN > budget` is
+    // false, so a single such submit would silently disable the gate for the
+    // rest of the cycle. Treated as unpriceable instead, which routes into
+    // the documented warn-and-allow branch for that one submit and leaves
+    // the running total intact. (The same shape exists on the
+    // estimateMaxCostUsd path today; not changed here.)
+    return raw !== null && Number.isFinite(raw) ? raw : null;
   }
 
   /**
