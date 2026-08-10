@@ -1535,6 +1535,11 @@ export async function registerBuiltinHandlers(
       slugs: Array.isArray(job.data.slugs) ? (job.data.slugs as string[]) : undefined,
       all: !!job.data.all,
       stale: job.data.all ? false : (job.data.stale !== false),
+      // `embed --background` serializes dryRun into the payload (embed.ts's
+      // job-args builder). Not reading it back here meant a backgrounded
+      // preview embedded for real: API spend and NULL->vector writes from an
+      // invocation whose whole point was to do neither.
+      dryRun: !!job.data.dryRun,
       sourceId: typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined,
       // CX1+CX5: pace overrides ride in the job payload as explicit overrides
       // only; runEmbedCore re-resolves env > config > bundle at execution so
