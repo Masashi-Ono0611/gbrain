@@ -60,7 +60,7 @@ import { getFtsLanguage } from './fts-language.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
-  Chunk, ChunkInput, StaleChunkRow, StalePageRow,
+  Chunk, ChunkInput, StaleChunkRow, StalePageRow, ChunklessPageRow,
   SearchResult, SearchOpts,
   Link, GraphNode, GraphPath,
   TimelineEntry, TimelineInput, TimelineOpts,
@@ -2869,6 +2869,73 @@ export class PostgresEngine implements BrainEngine {
         LIMIT ${limit}
       `;
       return rows as unknown as StaleChunkRow[];
+    });
+  }
+
+  /**
+   * Shared chunkless-page-with-content predicate (mirrors PGLiteEngine).
+   * Excludes quarantined + embed_skip pages — both are intentionally
+   * chunkless by design, not drift the safety net should repair.
+   */
+  private buildChunklessPagesWhere(opts?: { sourceId?: string }): { where: string; params: unknown[] } {
+    const conds: string[] = [
+      'p.deleted_at IS NULL',
+      `p.compiled_truth <> ''`,
+      `NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`,
+      `NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'quarantine')`,
+      'NOT EXISTS (SELECT 1 FROM content_chunks cc WHERE cc.page_id = p.id)',
+    ];
+    const params: unknown[] = [];
+    if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      conds.push(`p.source_id = $${params.length}`);
+    }
+    return { where: conds.join(' AND '), params };
+  }
+
+  async countChunklessPagesWithContent(opts?: { sourceId?: string }): Promise<number> {
+    const { where, params } = this.buildChunklessPagesWhere(opts);
+    // RLS scope binding (opt-in via GBRAIN_RLS_SCOPE_BINDING).
+    return await this.withScopedReadTransaction(undefined, opts?.sourceId, async (tx) => {
+      const rows = await tx.unsafe(
+        `SELECT count(*)::int AS count FROM pages p WHERE ${where}`,
+        params as Parameters<typeof tx.unsafe>[1],
+      );
+      return Number((rows[0] as { count?: number } | undefined)?.count ?? 0);
+    });
+  }
+
+  async listChunklessPagesWithContent(opts?: {
+    batchSize?: number;
+    afterPageId?: number;
+    sourceId?: string;
+  }): Promise<ChunklessPageRow[]> {
+    const { where, params } = this.buildChunklessPagesWhere(opts);
+    let afterClause = '';
+    if (opts?.afterPageId != null) {
+      params.push(opts.afterPageId);
+      afterClause = ` AND p.id > $${params.length}`;
+    }
+    const limit = opts?.batchSize ?? 500;
+    params.push(limit);
+    const limitIdx = params.length;
+    // RLS scope binding (opt-in via GBRAIN_RLS_SCOPE_BINDING).
+    return await this.withScopedReadTransaction(undefined, opts?.sourceId, async (tx) => {
+      const rows = await tx.unsafe(
+        `SELECT p.id, p.slug, p.source_id, p.compiled_truth, p.timeline
+           FROM pages p
+          WHERE ${where}${afterClause}
+          ORDER BY p.id
+          LIMIT $${limitIdx}`,
+        params as Parameters<typeof tx.unsafe>[1],
+      );
+      return (rows as Record<string, unknown>[]).map(r => ({
+        id: r.id as number,
+        slug: r.slug as string,
+        source_id: (r.source_id as string | undefined) ?? 'default',
+        compiled_truth: (r.compiled_truth as string | null) ?? '',
+        timeline: (r.timeline as string | null) ?? '',
+      }));
     });
   }
 

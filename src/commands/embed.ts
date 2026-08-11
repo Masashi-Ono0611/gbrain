@@ -199,6 +199,14 @@ export interface EmbedResult {
   /** True if this run was a dry-run. */
   dryRun: boolean;
   /**
+   * Chunkless-page safety net (`--stale` only): pages with non-empty
+   * content but zero `content_chunks` rows that this run chunked (or, in
+   * dryRun, would chunk) so their new NULL-embedding chunks fold into the
+   * SAME pass. 0 on a healthy brain. Additive field — see
+   * `ChunklessPageRow` for the detection rationale.
+   */
+  chunkless_pages_healed: number;
+  /**
    * E1 (paced-backfill): end-of-run pacing telemetry. Present ONLY when pacing
    * was active (enabled bundle). The number the operator could not get from an
    * external wrapper ("zero pauses" ≠ "queue safe").
@@ -317,6 +325,7 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
     failures: 0,
     failure_samples: [],
     dryRun: !!opts.dryRun,
+    chunkless_pages_healed: 0,
   };
 
   if (opts.slugs && opts.slugs.length > 0) {
@@ -950,6 +959,95 @@ async function embedAll(
 }
 
 /**
+ * Chunkless-page safety net for `embed --stale`. `listStaleChunks` /
+ * `countStaleChunks` only ever look at `content_chunks` rows where
+ * `embedding IS NULL` — a page written directly via `putPage` that never
+ * went through chunking (e.g. an enrichment-generated entity stub) has NO
+ * chunk row at all, so it is invisible to that scan forever, even after
+ * unlimited `embed --stale` runs.
+ *
+ * This sweep finds pages with non-empty content and zero `content_chunks`
+ * rows (`engine.listChunklessPagesWithContent`, which already excludes
+ * quarantined + embed_skip pages — both intentionally chunkless) and
+ * chunks them locally, mirroring `embedPage`'s chunkless branch exactly
+ * (same `chunkText` calls, same `compiled_truth`/`timeline` chunk_source
+ * split). The new chunk rows land with `embedding = NULL`, so they flow
+ * into the SAME `embed --stale` pass via the existing cursor below — no
+ * separate embed step needed here.
+ *
+ * dryRun chunks locally (a pure, in-memory operation) to report an
+ * accurate count without writing anything, matching embedPage's dry-run
+ * contract.
+ *
+ * Bounded, keyset-paginated (like listStalePagesForExtraction) — this is
+ * a safety net for a rare drift case, not the primary bulk-chunking path,
+ * so it does not need the wall-clock budget / pacing machinery below.
+ */
+async function healChunklessPages(
+  engine: BrainEngine,
+  sourceId: string | undefined,
+  dryRun: boolean,
+  result: EmbedResult,
+  quiet: boolean | undefined,
+  signal?: AbortSignal,
+): Promise<void> {
+  const BATCH_SIZE = 500;
+  let afterPageId: number | undefined;
+  let pagesHealed = 0;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    if (isAborted(signal)) break;
+    const batch = await engine.listChunklessPagesWithContent({
+      batchSize: BATCH_SIZE,
+      ...(afterPageId != null && { afterPageId }),
+      ...(sourceId && { sourceId }),
+    });
+    if (batch.length === 0) break;
+    afterPageId = batch[batch.length - 1].id;
+
+    for (const page of batch) {
+      if (isAborted(signal)) break;
+      const inputs: ChunkInput[] = [];
+      if (page.compiled_truth.trim()) {
+        for (const c of chunkText(page.compiled_truth)) {
+          inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'compiled_truth' });
+        }
+      }
+      if (page.timeline.trim()) {
+        for (const c of chunkText(page.timeline)) {
+          inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'timeline' });
+        }
+      }
+      // Whitespace-only content (SQL prefilter is `<> ''`, not trim-aware)
+      // chunks to nothing — nothing to heal, matches embedPage's contract.
+      if (inputs.length === 0) continue;
+
+      if (dryRun) {
+        result.total_chunks += inputs.length;
+        result.would_embed += inputs.length;
+        pagesHealed++;
+        continue;
+      }
+
+      await engine.upsertChunks(page.slug, inputs, { sourceId: page.source_id });
+      pagesHealed++;
+    }
+
+    if (batch.length < BATCH_SIZE) break;
+  }
+
+  result.chunkless_pages_healed = pagesHealed;
+  if (pagesHealed > 0 && !quiet) {
+    if (dryRun) {
+      serr(`[embed] [dry-run] would chunk ${pagesHealed} page(s) with non-empty content but zero content_chunks rows`);
+    } else {
+      serr(`[embed] chunked ${pagesHealed} page(s) that had non-empty content but zero content_chunks rows (embedding them in this pass)`);
+    }
+  }
+}
+
+/**
  * SQL-side stale path: replaces the listPages + per-page getChunks
  * walk with a count + slug-grouped SELECT. Preserves the existing
  * functional contract (every chunk where embedding IS NULL gets
@@ -993,6 +1091,17 @@ async function embedAllStale(
   // that source's NULL embeddings.
   const sourceOpt = sourceId ? { sourceId } : undefined;
   const includeNullSig = !!staleOpts?.includeNullSignature;
+
+  // Chunkless-page safety net: pre-flight count mirrors the countStaleChunks
+  // short-circuit just below — a healthy brain pays one extra SELECT
+  // count(*) and does no further work. Only when pages are actually found
+  // do we pay for the keyset-paginated chunk sweep. Chunking here (before
+  // countStaleChunks) means any newly-written NULL-embedding chunks flow
+  // into the SAME pass via the existing cursor.
+  const chunklessCount = await engine.countChunklessPagesWithContent(sourceOpt);
+  if (chunklessCount > 0) {
+    await healChunklessPages(engine, sourceId, dryRun, result, staleOpts?.quiet, externalSignal);
+  }
 
   // v0.41.31: re-embed pages whose embedding_signature drifted (model/dims
   // swap). dry-run must NOT mutate, so it counts signature-stale via the
@@ -1046,7 +1155,15 @@ async function embedAllStale(
   if (staleCount === 0) {
     if (!staleOpts?.quiet) {
       if (dryRun) {
-        slog('[dry-run] Would embed 0 chunks (0 stale found)');
+        // dryRun never writes, so a healed-but-hypothetical chunkless page's
+        // chunks never land in content_chunks and staleCount can't see them
+        // — report result.would_embed (already includes them) instead of a
+        // bare "0 chunks" that would contradict the returned EmbedResult.
+        if (result.would_embed > 0) {
+          slog(`[dry-run] Would embed ${result.would_embed} chunks (0 stale found; ${result.chunkless_pages_healed} chunkless page(s) would be chunked)`);
+        } else {
+          slog('[dry-run] Would embed 0 chunks (0 stale found)');
+        }
       } else {
         slog('Embedded 0 chunks (0 stale found)');
       }
