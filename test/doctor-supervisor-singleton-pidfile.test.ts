@@ -2,13 +2,13 @@
  * Regression test: `gbrain doctor`'s `supervisor_singleton` check should read
  * the pid-file path that was used at supervisor start (recorded on the
  * 'started' audit event as `pid_file` — `this.opts.pidFile` in
- * `MinionSupervisor.start()`), not blindly re-derive the HOME-derived
- * `DEFAULT_PID_FILE`.
+ * `MinionSupervisor.start()`), not blindly re-derive `DEFAULT_PID_FILE`
+ * locally.
  *
  * Pre-fix, `doctor.ts` read `readSupervisorPid(DEFAULT_PID_FILE).pid` even
  * though the 'started' event already carried the real path. A supervisor
- * launched with a custom `--pid-file` (the common launchd/systemd deployment
- * pattern) could then produce a false "singleton mismatch" warn against its
+ * launched with a custom `--pid-file` (e.g. a launchd/systemd unit passing an
+ * explicit pidfile path) could then produce a false "singleton mismatch" warn against its
  * own live DB lock, because the pidfile doctor.ts checked was never the one
  * the supervisor actually wrote.
  *

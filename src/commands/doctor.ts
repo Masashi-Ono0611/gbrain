@@ -5435,10 +5435,9 @@ export async function buildChecks(
       const effectiveMaxRss = typeof lastStarted.max_rss_mb === 'number' ? lastStarted.max_rss_mb : null;
       // The 'started' event already records the pid-file path actually in use
       // (this.opts.pidFile, which reflects a custom --pid-file). Prefer that
-      // over the HOME-derived DEFAULT_PID_FILE so a launchd/custom --pid-file
+      // over re-deriving DEFAULT_PID_FILE locally so a custom --pid-file
       // deployment doesn't false-positive a singleton mismatch against itself.
-      // Falls back to DEFAULT_PID_FILE when the event predates this field or
-      // wasn't recorded.
+      // Falls back to DEFAULT_PID_FILE when the event carries no usable value.
       const pidFilePath = typeof lastStarted.pid_file === 'string' && lastStarted.pid_file.length > 0
         ? lastStarted.pid_file
         : DEFAULT_PID_FILE;
