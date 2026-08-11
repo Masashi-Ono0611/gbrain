@@ -1184,14 +1184,9 @@ async function runAudit(engine: BrainEngine, args: string[]): Promise<void> {
   // frontmatter.type and estimates per-page segment count from body
   // bytes. Estimated per-segment Sonnet cost is a rough heuristic
   // (~2000 in + 500 out tokens at $3/MTok in + $15/MTok out ≈ $0.013).
-  const FACTS_BACKFILL_ALLOWED = [
-    'conversation',
-    'meeting',
-    'slack',
-    'email',
-    'imessage',
-    'imessage-daily',
-  ];
+  // Reuses the command's own ALLOWED_TYPES (not a hand-copied literal) so
+  // this estimator never under-reports pages the backfill actually processes.
+  const { ALLOWED_TYPES: FACTS_BACKFILL_ALLOWED } = await import('./extract-conversation-facts.ts');
   const FACTS_BACKFILL_CHARS_PER_SEGMENT = 6500; // matches SEGMENT_TEXT_CHAR_LIMIT
   const FACTS_BACKFILL_USD_PER_SEGMENT = 0.013;
   let factsBackfillPages = 0;
@@ -1235,7 +1230,7 @@ async function runAudit(engine: BrainEngine, args: string[]): Promise<void> {
     }
     // Facts-backfill estimator: counts pages matching allowed types.
     const fmType = (parsed.frontmatter?.type as string | undefined) ?? null;
-    if (fmType && FACTS_BACKFILL_ALLOWED.includes(fmType)) {
+    if (fmType && (FACTS_BACKFILL_ALLOWED as readonly string[]).includes(fmType)) {
       factsBackfillPages++;
       const totalBytes = sanity.bytes;
       const segmentsEstimate = Math.max(

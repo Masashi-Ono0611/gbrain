@@ -3401,11 +3401,15 @@ export async function computeConversationFactsBacklogCheck(
       };
     }
 
-    // Resolve types from same key as cycle phase + CLI default.
+    // Resolve types from same key as cycle phase + CLI default. Default
+    // list is the command's own ALLOWED_TYPES (not a hand-copied literal)
+    // so this check never drifts out of sync with what the backfill
+    // actually processes.
+    const { ALLOWED_TYPES } = await import('./extract-conversation-facts.ts');
     const typesRaw = await engine.getConfig(
       'cycle.conversation_facts_backfill.types',
     );
-    let types = ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'];
+    let types: string[] = [...ALLOWED_TYPES];
     if (typesRaw) {
       try {
         const parsed = JSON.parse(typesRaw);
@@ -5784,7 +5788,7 @@ export async function buildChecks(
     try {
       const { readConversationBodyForParsing } = await import('../core/conversation-parser/body.ts');
       const { parseConversation } = await import('../core/conversation-parser/parse.ts');
-      const allowedTypes = ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'] as const;
+      const { ALLOWED_TYPES: allowedTypes } = await import('./extract-conversation-facts.ts');
       // PageFilters supports singular `type` only; iterate the allowed types
       // and cap at ~50/each to land at ~200 total max.
       const sample: import('../core/types.ts').Page[] = [];

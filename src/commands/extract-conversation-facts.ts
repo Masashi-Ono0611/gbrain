@@ -143,6 +143,7 @@ export const DEFAULT_MAX_COST_USD = 5.0;
  */
 export const ALLOWED_TYPES = [
   'conversation',
+  'transcript',
   'meeting',
   'slack',
   'email',
@@ -163,6 +164,7 @@ export type AllowedType = (typeof ALLOWED_TYPES)[number];
  */
 export const ALLOWED_TYPE_ALIASES: Record<AllowedType, readonly string[]> = {
   conversation: ['conversation'],
+  transcript: ['transcript'],
   meeting: ['meeting'],
   slack: ['slack', 'slack-dm-day', 'slack-thread'],
   email: ['email', 'email-digest'],

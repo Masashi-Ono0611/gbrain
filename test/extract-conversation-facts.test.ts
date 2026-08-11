@@ -146,6 +146,30 @@ test('conversation-facts allowlist includes native iMessage page types (#2756)',
   expect(ALLOWED_TYPES).toContain('imessage-daily');
 });
 
+test('conversation-facts allowlist includes the transcript page type', () => {
+  expect(ALLOWED_TYPES).toContain('transcript');
+  expect(ALLOWED_TYPE_ALIASES.transcript).toEqual(['transcript']);
+  expect(pageTypesForAllowed(['transcript'])).toEqual(['transcript']);
+});
+
+test('parses a nightly transcript-ingest markdown-heading body (## User / ## Assistant)', () => {
+  const body = [
+    '## User',
+    'What is the capital of France?',
+    '## Assistant',
+    'The capital of France is Paris.',
+    'It is also its largest city.',
+  ].join('\n');
+  const msgs = parseConversationMessages(body, { fallbackDate: '2026-08-11' });
+  expect(msgs).toHaveLength(2);
+  expect(msgs[0].speaker).toBe('User');
+  expect(msgs[0].text).toBe('What is the capital of France?');
+  expect(msgs[1].speaker).toBe('Assistant');
+  expect(msgs[1].text).toBe(
+    'The capital of France is Paris.\nIt is also its largest city.',
+  );
+});
+
 // ---------------------------------------------------------------------------
 // splitIntoSegments — PR's 5 cases verbatim plus tuning regression.
 // ---------------------------------------------------------------------------
