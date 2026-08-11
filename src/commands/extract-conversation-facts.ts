@@ -136,18 +136,39 @@ export const MAX_PAGE_BODY_BYTES = 25 * 1024 * 1024;
 export const DEFAULT_MAX_COST_USD = 5.0;
 
 /**
- * The page-type allowlist and its collector aliases live in
- * `../core/conversation-facts-types.ts` — four call sites need them and used
- * to hand-copy the list. Re-exported here so this module's existing importers
- * keep working unchanged.
+ * Allowlist of page types this command operates on. Mirrors
+ * cycle.conversation_facts_backfill.types config default. CLI's
+ * `--types` flag is an explicit per-run override; cycle config is
+ * the single source of truth.
  */
-import {
-  ALLOWED_TYPES,
-  ALLOWED_TYPE_ALIASES,
-  type AllowedType,
-} from '../core/conversation-facts-types.ts';
+export const ALLOWED_TYPES = [
+  'conversation',
+  'meeting',
+  'slack',
+  'email',
+  'imessage',
+  'imessage-daily',
+] as const;
+export type AllowedType = (typeof ALLOWED_TYPES)[number];
 
-export { ALLOWED_TYPES, ALLOWED_TYPE_ALIASES, type AllowedType };
+/**
+ * Granular collector page-types that alias into each canonical conversation
+ * bucket. The v2 type-consolidation pack retypes these to the canonical names
+ * (`slack-dm-day`/`slack-thread` → `slack`, `email-digest` → `email`), but a
+ * brain that hasn't run that pack still carries the collector's granular types
+ * in `pages.type`. Without this expansion, `listPages({ type: 'slack' })`
+ * matches zero rows on such brains and the whole comms corpus is silently
+ * skipped (facts stay empty → `find_trajectory` returns nothing). The canonical
+ * name is always included first so consolidated brains keep working unchanged.
+ */
+export const ALLOWED_TYPE_ALIASES: Record<AllowedType, readonly string[]> = {
+  conversation: ['conversation'],
+  meeting: ['meeting'],
+  slack: ['slack', 'slack-dm-day', 'slack-thread'],
+  email: ['email', 'email-digest'],
+  imessage: ['imessage'],
+  'imessage-daily': ['imessage-daily'],
+};
 
 /**
  * Expand the requested logical types to the concrete `pages.type` values to

@@ -146,13 +146,7 @@ test('conversation-facts allowlist includes native iMessage page types (#2756)',
   expect(ALLOWED_TYPES).toContain('imessage-daily');
 });
 
-test('conversation-facts allowlist includes the transcript page type', () => {
-  expect(ALLOWED_TYPES).toContain('transcript');
-  expect(ALLOWED_TYPE_ALIASES.transcript).toEqual(['transcript']);
-  expect(pageTypesForAllowed(['transcript'])).toEqual(['transcript']);
-});
-
-test('parses a nightly transcript-ingest markdown-heading body (## User / ## Assistant)', () => {
+test('parses a markdown-heading turn body (## User / ## Assistant)', () => {
   const body = [
     '## User',
     'What is the capital of France?',
