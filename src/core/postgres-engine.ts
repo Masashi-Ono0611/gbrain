@@ -93,6 +93,8 @@ import { DELETE_BATCH_SIZE } from './engine-constants.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
+import { EMBED_SKIP_FILTER_FRAGMENT } from './embed-skip.ts';
+import { QUARANTINE_FILTER_FRAGMENT } from './quarantine.ts';
 
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
@@ -2880,9 +2882,12 @@ export class PostgresEngine implements BrainEngine {
   private buildChunklessPagesWhere(opts?: { sourceId?: string }): { where: string; params: unknown[] } {
     const conds: string[] = [
       'p.deleted_at IS NULL',
-      `p.compiled_truth <> ''`,
-      `NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`,
-      `NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'quarantine')`,
+      // healChunklessPages chunks BOTH compiled_truth and timeline (mirrors
+      // embedPage) — a timeline-only page (rare but schema-legal) has
+      // something to heal even with compiled_truth = ''.
+      `(p.compiled_truth <> '' OR p.timeline <> '')`,
+      EMBED_SKIP_FILTER_FRAGMENT,
+      QUARANTINE_FILTER_FRAGMENT,
       'NOT EXISTS (SELECT 1 FROM content_chunks cc WHERE cc.page_id = p.id)',
     ];
     const params: unknown[] = [];

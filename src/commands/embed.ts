@@ -977,11 +977,26 @@ async function embedAll(
  *
  * dryRun chunks locally (a pure, in-memory operation) to report an
  * accurate count without writing anything, matching embedPage's dry-run
- * contract.
+ * contract (including `pages_processed`, which embedPage's own dry-run
+ * branch increments for exactly this "examined, didn't write" case).
  *
- * Bounded, keyset-paginated (like listStalePagesForExtraction) — this is
- * a safety net for a rare drift case, not the primary bulk-chunking path,
- * so it does not need the wall-clock budget / pacing machinery below.
+ * Race note (review catch): between listing a page here and writing its
+ * chunks, a concurrent writer (sync, another `put_page`) could chunk the
+ * SAME page. `upsertChunks` re-checks `getChunks` immediately before
+ * writing and skips if chunks now exist, so a concurrent chunker's rows
+ * are never clobbered with this sweep's (possibly stale) in-memory
+ * snapshot. This narrows, rather than eliminates, the same check-then-write
+ * window `embedPage`'s existing single-page chunkless branch already
+ * accepts — no new race CLASS is introduced.
+ *
+ * Bounded, keyset-paginated (like listStalePagesForExtraction) — a safety
+ * net for a rare drift case, not the primary bulk-chunking path. It still
+ * respects the caller's pacer (no-op when pacing is off) and a soft
+ * wall-clock cap (`GBRAIN_EMBED_TIME_BUDGET_MS`, same default as the main
+ * stale loop below) so a pathologically large damaged brain can't run this
+ * sweep unbounded — it heals what it can and reports the rest for the next
+ * `embed --stale` run (the SQL predicate is idempotent; nothing here
+ * requires finishing in one pass).
  */
 async function healChunklessPages(
   engine: BrainEngine,
@@ -990,24 +1005,31 @@ async function healChunklessPages(
   result: EmbedResult,
   quiet: boolean | undefined,
   signal?: AbortSignal,
+  pacer?: DbPacer,
 ): Promise<void> {
   const BATCH_SIZE = 500;
+  const BUDGET_MS = parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
+  const startedAt = Date.now();
+  const activePacer = pacer ?? createNoopPacer();
   let afterPageId: number | undefined;
   let pagesHealed = 0;
+  let budgetExceeded = false;
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
     if (isAborted(signal)) break;
-    const batch = await engine.listChunklessPagesWithContent({
+    if (Date.now() - startedAt > BUDGET_MS) { budgetExceeded = true; break; }
+    const batch = await observed(activePacer, () => engine.listChunklessPagesWithContent({
       batchSize: BATCH_SIZE,
       ...(afterPageId != null && { afterPageId }),
       ...(sourceId && { sourceId }),
-    });
+    }));
     if (batch.length === 0) break;
     afterPageId = batch[batch.length - 1].id;
 
     for (const page of batch) {
       if (isAborted(signal)) break;
+      if (Date.now() - startedAt > BUDGET_MS) { budgetExceeded = true; break; }
       const inputs: ChunkInput[] = [];
       if (page.compiled_truth.trim()) {
         for (const c of chunkText(page.compiled_truth)) {
@@ -1026,15 +1048,30 @@ async function healChunklessPages(
       if (dryRun) {
         result.total_chunks += inputs.length;
         result.would_embed += inputs.length;
+        result.pages_processed++;
         pagesHealed++;
         continue;
       }
 
-      await engine.upsertChunks(page.slug, inputs, { sourceId: page.source_id });
+      // Re-check immediately before writing (see race note above) — skip
+      // rather than clobber if a concurrent writer already chunked this
+      // page since we listed it.
+      const stillChunkless = await observed(activePacer, () =>
+        engine.getChunks(page.slug, { sourceId: page.source_id }),
+      );
+      if (stillChunkless.length > 0) continue;
+      await observed(activePacer, () =>
+        engine.upsertChunks(page.slug, inputs, { sourceId: page.source_id }),
+      );
       pagesHealed++;
+      try {
+        await activePacer.pace(signal);
+      } catch (e) {
+        if (!(e instanceof AbortError)) throw e;
+      }
     }
 
-    if (batch.length < BATCH_SIZE) break;
+    if (budgetExceeded || batch.length < BATCH_SIZE) break;
   }
 
   result.chunkless_pages_healed = pagesHealed;
@@ -1044,6 +1081,9 @@ async function healChunklessPages(
     } else {
       serr(`[embed] chunked ${pagesHealed} page(s) that had non-empty content but zero content_chunks rows (embedding them in this pass)`);
     }
+  }
+  if (budgetExceeded && !quiet) {
+    serr(`[embed] chunkless-page sweep hit its time budget (${BUDGET_MS}ms) with more pages left; re-run embed --stale to continue healing them`);
   }
 }
 
@@ -1100,7 +1140,7 @@ async function embedAllStale(
   // into the SAME pass via the existing cursor.
   const chunklessCount = await engine.countChunklessPagesWithContent(sourceOpt);
   if (chunklessCount > 0) {
-    await healChunklessPages(engine, sourceId, dryRun, result, staleOpts?.quiet, externalSignal);
+    await healChunklessPages(engine, sourceId, dryRun, result, staleOpts?.quiet, externalSignal, staleOpts?.pacer);
   }
 
   // v0.41.31: re-embed pages whose embedding_signature drifted (model/dims
@@ -1179,7 +1219,16 @@ async function embedAllStale(
     // made `embed.pages` claim total:1 next to a summary naming a much larger
     // stale count. docs/progress-events.md allows omitting `total` when it is
     // not known up front; it does not allow asserting a wrong one.
-    if (!staleOpts?.quiet) slog(`[dry-run] Would embed ${staleCount} stale chunks`);
+    //
+    // Log result.would_embed (staleCount + any chunkless-page-healing
+    // contribution from above), not the bare staleCount — otherwise this
+    // line understates the total whenever chunkless pages were also found.
+    if (!staleOpts?.quiet) {
+      const chunklessNote = result.chunkless_pages_healed > 0
+        ? `, including ${result.chunkless_pages_healed} chunkless page(s)`
+        : '';
+      slog(`[dry-run] Would embed ${result.would_embed} stale chunks${chunklessNote}`);
+    }
     return;
   }
 

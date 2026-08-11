@@ -29,6 +29,7 @@ import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../
 import { runEmbedCore } from '../src/commands/embed.ts';
 import { EMBED_SKIP_KEY, buildEmbedSkipMarker } from '../src/core/embed-skip.ts';
 import { QUARANTINE_KEY, buildQuarantineMarker } from '../src/core/quarantine.ts';
+import type { BrainEngine } from '../src/core/engine.ts';
 
 const DIMS = 1536;
 let engine: PGLiteEngine;
@@ -90,6 +91,22 @@ describe('countChunklessPagesWithContent / listChunklessPagesWithContent', () =>
     await engine.putPage('empty/page', { type: 'note', title: 'Empty', compiled_truth: '' });
 
     expect(await engine.countChunklessPagesWithContent()).toBe(0);
+  });
+
+  test('detects a timeline-only page (empty compiled_truth, non-empty timeline)', async () => {
+    // healChunklessPages chunks compiled_truth AND timeline independently
+    // (mirrors embedPage) — the SQL predicate must not require
+    // compiled_truth alone or this class of page is never even detected.
+    await engine.putPage('timeline-only/page', {
+      type: 'note',
+      title: 'Timeline Only',
+      compiled_truth: '',
+      timeline: '2026-01-01: something happened',
+    });
+
+    expect(await engine.countChunklessPagesWithContent()).toBe(1);
+    const rows = await engine.listChunklessPagesWithContent();
+    expect(rows.map(r => r.slug)).toEqual(['timeline-only/page']);
   });
 
   test('excludes quarantined pages (intentionally chunkless by design)', async () => {
@@ -199,5 +216,52 @@ describe('embed --stale chunkless-page safety net (end-to-end)', () => {
 
     expect(result.chunkless_pages_healed).toBe(0);
     expect(result.embedded).toBe(1);
+  });
+
+  test('race mitigation: a page chunked by a concurrent writer between list and write is not clobbered', async () => {
+    // Review catch: healChunklessPages lists chunkless pages, chunks them
+    // in memory, then writes. If a concurrent writer (sync, another
+    // put_page/embed) chunks the SAME page in between, a naive write would
+    // overwrite the concurrent writer's (newer) chunks with this sweep's
+    // stale-content snapshot. Simulate that race by injecting a write
+    // immediately after listChunklessPagesWithContent returns — i.e. AFTER
+    // the sweep has decided to heal this page but BEFORE its own write.
+    await engine.putPage('stub/raced', {
+      type: 'person',
+      title: 'Raced',
+      compiled_truth: 'Original content the sweep read.',
+    });
+
+    let injected = false;
+    const realList = engine.listChunklessPagesWithContent.bind(engine);
+    const raceEngine = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'listChunklessPagesWithContent') {
+          return async (opts?: Parameters<typeof realList>[0]) => {
+            const rows = await realList(opts);
+            if (!injected && rows.some(r => r.slug === 'stub/raced')) {
+              injected = true;
+              // Simulate the concurrent writer: chunks the page with DIFFERENT
+              // content than what the sweep just read.
+              await engine.upsertChunks('stub/raced', [
+                { chunk_index: 0, chunk_text: 'concurrently-written chunk', chunk_source: 'compiled_truth' },
+              ]);
+            }
+            return rows;
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as unknown as BrainEngine;
+
+    const result = await runEmbedCore(raceEngine, { stale: true, quiet: true });
+
+    // The race was detected and the page was skipped this pass (not
+    // counted as healed by this sweep) rather than clobbered.
+    expect(result.chunkless_pages_healed).toBe(0);
+    const chunks = await engine.getChunks('stub/raced');
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].chunk_text).toBe('concurrently-written chunk');
   });
 });
