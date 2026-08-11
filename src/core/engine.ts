@@ -1089,24 +1089,27 @@ export interface BrainEngine {
   }): Promise<StaleChunkRow[]>;
   /**
    * Pre-flight count for the chunkless-page safety net: pages with
-   * non-empty `compiled_truth` and ZERO `content_chunks` rows. `embed
-   * --stale` only scans `content_chunks` (embedding IS NULL) — a page
-   * written directly via `putPage` that never got chunked has no chunk row
-   * to find, so it stays invisible to that scan forever. `opts.sourceId`
-   * scopes the count to a single source, matching `countStaleChunks`.
-   * Quarantined and `embed_skip` pages are excluded — both are
-   * intentionally chunkless by design, not drift needing repair. See
-   * `ChunklessPageRow` for the full rationale.
+   * non-empty `compiled_truth` AND/OR non-empty `timeline` — both are
+   * chunked independently by the healer — and ZERO `content_chunks` rows.
+   * `embed --stale` only scans `content_chunks` (embedding IS NULL) — a
+   * page written directly via `putPage` that never got chunked has no
+   * chunk row to find, so it stays invisible to that scan forever.
+   * `opts.sourceId` scopes the count to a single source, matching
+   * `countStaleChunks`. Quarantined and `embed_skip` pages are excluded —
+   * both are intentionally chunkless by design, not drift needing repair.
+   * See `ChunklessPageRow` for the full rationale.
    */
   countChunklessPagesWithContent(opts?: { sourceId?: string }): Promise<number>;
   /**
-   * List pages with non-empty `compiled_truth` and zero `content_chunks`
-   * rows (sibling of `countChunklessPagesWithContent`; same predicate).
-   * Keyset-paginated on `id` (mirrors `listStalePagesForExtraction`) —
-   * pass the last row's `id` as `afterPageId` for the next page. Default
-   * `batchSize` 500: this is a safety-net sweep for a rare drift case, not
-   * the primary bulk-import chunking path, so a small default keeps a
-   * pathological brain from blowing memory on one call.
+   * List pages with non-empty `compiled_truth` and/or `timeline` and zero
+   * `content_chunks` rows (sibling of `countChunklessPagesWithContent`;
+   * same predicate). Keyset-paginated on `id` (mirrors
+   * `listStalePagesForExtraction`) — pass the last row's `id` as
+   * `afterPageId` for the next page. Default `batchSize` 50 — deliberately
+   * small (unlike the 2000-row default on chunk-metadata-only cursors
+   * elsewhere): each row here carries a FULL page body, so a large batch
+   * of large pages is a real memory concern this is a safety-net sweep for
+   * a rare drift case, not the primary bulk-import chunking path.
    */
   listChunklessPagesWithContent(opts?: {
     batchSize?: number;

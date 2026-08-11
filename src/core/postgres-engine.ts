@@ -2921,7 +2921,9 @@ export class PostgresEngine implements BrainEngine {
       params.push(opts.afterPageId);
       afterClause = ` AND p.id > $${params.length}`;
     }
-    const limit = opts?.batchSize ?? 500;
+    // Small default (unlike the 2000-row chunk-metadata cursors elsewhere):
+    // each row here carries a FULL page body. See engine.ts docstring.
+    const limit = opts?.batchSize ?? 50;
     params.push(limit);
     const limitIdx = params.length;
     // RLS scope binding (opt-in via GBRAIN_RLS_SCOPE_BINDING).

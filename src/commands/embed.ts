@@ -966,37 +966,56 @@ async function embedAll(
  * chunk row at all, so it is invisible to that scan forever, even after
  * unlimited `embed --stale` runs.
  *
- * This sweep finds pages with non-empty content and zero `content_chunks`
- * rows (`engine.listChunklessPagesWithContent`, which already excludes
- * quarantined + embed_skip pages — both intentionally chunkless) and
- * chunks them locally, mirroring `embedPage`'s chunkless branch exactly
- * (same `chunkText` calls, same `compiled_truth`/`timeline` chunk_source
- * split). The new chunk rows land with `embedding = NULL`, so they flow
- * into the SAME `embed --stale` pass via the existing cursor below — no
- * separate embed step needed here.
+ * This sweep finds pages with non-empty content (`compiled_truth` and/or
+ * `timeline` — both are chunked independently, mirroring `embedPage`'s
+ * chunkless branch) and zero `content_chunks` rows
+ * (`engine.listChunklessPagesWithContent`, which already excludes
+ * quarantined + embed_skip pages — both intentionally chunkless). The new
+ * chunk rows land with `embedding = NULL`, so they flow into the SAME
+ * `embed --stale` pass via the existing cursor below — no separate embed
+ * step needed here.
  *
  * dryRun chunks locally (a pure, in-memory operation) to report an
  * accurate count without writing anything, matching embedPage's dry-run
  * contract (including `pages_processed`, which embedPage's own dry-run
  * branch increments for exactly this "examined, didn't write" case).
  *
- * Race note (review catch): between listing a page here and writing its
- * chunks, a concurrent writer (sync, another `put_page`) could chunk the
- * SAME page. `upsertChunks` re-checks `getChunks` immediately before
- * writing and skips if chunks now exist, so a concurrent chunker's rows
- * are never clobbered with this sweep's (possibly stale) in-memory
- * snapshot. This narrows, rather than eliminates, the same check-then-write
- * window `embedPage`'s existing single-page chunkless branch already
- * accepts — no new race CLASS is introduced.
+ * Race note (review catch, two rounds): between listing a page and writing
+ * its chunks, a concurrent writer (sync, another `put_page`) could change
+ * or chunk the SAME page. Two mitigations, both bounded — full
+ * transactional/version-guarded writes are out of scope for a safety net:
+ *   1. Immediately before writing, re-fetch the LIVE page via `getPage`
+ *      and build `inputs` from ITS CURRENT content, not the batch-list
+ *      snapshot — closes the "content changed but still chunkless"
+ *      sub-case, not just the "chunks appeared" one.
+ *   2. Re-check `getChunks` right after that same fetch — skip (don't
+ *      overwrite) if chunks now exist. A subsequent `embed --stale` run
+ *      re-discovers any page skipped this way (idempotent predicate).
+ * This narrows, rather than eliminates, the same check-then-write window
+ * `embedPage`'s existing single-page chunkless branch already accepts —
+ * no new race CLASS is introduced, and the window is now one sequential
+ * getPage+getChunks+upsertChunks instead of spanning a whole batch.
+ *
+ * Per-page failure isolation (review catch): one malformed/oversized
+ * chunkless page must not abort the sweep and, with it, the entire
+ * `--stale` run before the normal NULL-embedding pass even starts — that
+ * would make the safety net WORSE than the bug it fixes. Each page's
+ * work is try/caught; a failure is recorded (`EmbedResult.failures` +
+ * `failure_samples`, same convention as every other embed failure path)
+ * and the sweep moves on.
  *
  * Bounded, keyset-paginated (like listStalePagesForExtraction) — a safety
- * net for a rare drift case, not the primary bulk-chunking path. It still
- * respects the caller's pacer (no-op when pacing is off) and a soft
- * wall-clock cap (`GBRAIN_EMBED_TIME_BUDGET_MS`, same default as the main
- * stale loop below) so a pathologically large damaged brain can't run this
- * sweep unbounded — it heals what it can and reports the rest for the next
- * `embed --stale` run (the SQL predicate is idempotent; nothing here
- * requires finishing in one pass).
+ * net for a rare drift case, not the primary bulk-chunking path. `BATCH_SIZE`
+ * is deliberately small (unlike the 2000-chunk-row default elsewhere in
+ * this file): each row here carries a FULL page body (`compiled_truth` +
+ * `timeline`), so a large batch of large pages is a real memory/latency
+ * concern the metadata-only `listStaleChunks` rows never had (review
+ * catch). It still respects the caller's pacer (no-op when pacing is off)
+ * and a soft wall-clock cap (`GBRAIN_EMBED_TIME_BUDGET_MS`, same default as
+ * the main stale loop below) so a pathologically large damaged brain can't
+ * run this sweep unbounded — it heals what it can and reports the rest for
+ * the next `embed --stale` run (the SQL predicate is idempotent; nothing
+ * here requires finishing in one pass).
  */
 async function healChunklessPages(
   engine: BrainEngine,
@@ -1007,13 +1026,28 @@ async function healChunklessPages(
   signal?: AbortSignal,
   pacer?: DbPacer,
 ): Promise<void> {
-  const BATCH_SIZE = 500;
+  const BATCH_SIZE = 50;
   const BUDGET_MS = parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
   const startedAt = Date.now();
   const activePacer = pacer ?? createNoopPacer();
   let afterPageId: number | undefined;
   let pagesHealed = 0;
   let budgetExceeded = false;
+
+  const buildInputs = (compiledTruth: string, timeline: string): ChunkInput[] => {
+    const inputs: ChunkInput[] = [];
+    if (compiledTruth.trim()) {
+      for (const c of chunkText(compiledTruth)) {
+        inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'compiled_truth' });
+      }
+    }
+    if (timeline.trim()) {
+      for (const c of chunkText(timeline)) {
+        inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'timeline' });
+      }
+    }
+    return inputs;
+  };
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -1030,44 +1064,48 @@ async function healChunklessPages(
     for (const page of batch) {
       if (isAborted(signal)) break;
       if (Date.now() - startedAt > BUDGET_MS) { budgetExceeded = true; break; }
-      const inputs: ChunkInput[] = [];
-      if (page.compiled_truth.trim()) {
-        for (const c of chunkText(page.compiled_truth)) {
-          inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'compiled_truth' });
-        }
-      }
-      if (page.timeline.trim()) {
-        for (const c of chunkText(page.timeline)) {
-          inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'timeline' });
-        }
-      }
-      // Whitespace-only content (SQL prefilter is `<> ''`, not trim-aware)
-      // chunks to nothing — nothing to heal, matches embedPage's contract.
-      if (inputs.length === 0) continue;
 
-      if (dryRun) {
-        result.total_chunks += inputs.length;
-        result.would_embed += inputs.length;
-        result.pages_processed++;
-        pagesHealed++;
-        continue;
-      }
-
-      // Re-check immediately before writing (see race note above) — skip
-      // rather than clobber if a concurrent writer already chunked this
-      // page since we listed it.
-      const stillChunkless = await observed(activePacer, () =>
-        engine.getChunks(page.slug, { sourceId: page.source_id }),
-      );
-      if (stillChunkless.length > 0) continue;
-      await observed(activePacer, () =>
-        engine.upsertChunks(page.slug, inputs, { sourceId: page.source_id }),
-      );
-      pagesHealed++;
       try {
-        await activePacer.pace(signal);
+        if (dryRun) {
+          // dryRun never writes, so there's no live-refetch race to close —
+          // chunk the listed snapshot directly (matches embedPage's own
+          // dry-run, which chunks whatever getPage returned at call time).
+          const inputs = buildInputs(page.compiled_truth, page.timeline);
+          // Whitespace-only content (SQL prefilter is `<> ''`, not
+          // trim-aware) chunks to nothing — matches embedPage's contract.
+          if (inputs.length === 0) continue;
+          result.total_chunks += inputs.length;
+          result.would_embed += inputs.length;
+          result.pages_processed++;
+          pagesHealed++;
+          continue;
+        }
+
+        // Re-fetch the LIVE page + re-check chunks immediately before
+        // writing (see race note above): chunk CURRENT content, and skip
+        // rather than clobber if a concurrent writer already chunked this
+        // page since we listed it.
+        const [livePage, stillChunkless] = await Promise.all([
+          observed(activePacer, () => engine.getPage(page.slug, { sourceId: page.source_id })),
+          observed(activePacer, () => engine.getChunks(page.slug, { sourceId: page.source_id })),
+        ]);
+        if (!livePage || stillChunkless.length > 0) continue;
+        const inputs = buildInputs(livePage.compiled_truth, livePage.timeline);
+        if (inputs.length === 0) continue;
+
+        await observed(activePacer, () =>
+          engine.upsertChunks(page.slug, inputs, { sourceId: page.source_id }),
+        );
+        pagesHealed++;
+        try {
+          await activePacer.pace(signal);
+        } catch (e) {
+          if (!(e instanceof AbortError)) throw e;
+        }
       } catch (e) {
-        if (!(e instanceof AbortError)) throw e;
+        if (isAborted(signal)) break;
+        recordFailure(result, 1, page.slug, e);
+        serr(`\n  [embed] chunkless-page heal failed for ${page.slug}: ${e instanceof Error ? e.message : e}`);
       }
     }
 

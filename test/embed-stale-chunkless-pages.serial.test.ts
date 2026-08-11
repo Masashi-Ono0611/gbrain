@@ -264,4 +264,45 @@ describe('embed --stale chunkless-page safety net (end-to-end)', () => {
     expect(chunks).toHaveLength(1);
     expect(chunks[0].chunk_text).toBe('concurrently-written chunk');
   });
+
+  test('one broken chunkless page does not abort the whole --stale run (per-page failure isolation)', async () => {
+    // Review catch: healChunklessPages must try/catch per page. Before the
+    // fix, an exception from getPage/getChunks/upsertChunks for ONE
+    // chunkless page propagated out of healChunklessPages entirely,
+    // aborting embedAllStale before it even reached the normal
+    // NULL-embedding pass — making the safety net worse than the bug.
+    await engine.putPage('stub/broken', {
+      type: 'person',
+      title: 'Broken',
+      compiled_truth: 'This page will fail to heal.',
+    });
+    await engine.putPage('normal/unrelated', { type: 'note', title: 'Unrelated', compiled_truth: 'fine' });
+    await engine.upsertChunks('normal/unrelated', [
+      { chunk_index: 0, chunk_text: 'fine', chunk_source: 'compiled_truth' },
+    ]);
+
+    const brokenEngine = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'getPage') {
+          return async (slug: string, opts?: unknown) => {
+            if (slug === 'stub/broken') throw new Error('simulated getPage failure');
+            return (engine.getPage as (s: string, o?: unknown) => unknown)(slug, opts);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as unknown as BrainEngine;
+
+    const result = await runEmbedCore(brokenEngine, { stale: true, quiet: true });
+
+    // The broken page's failure is recorded, not swallowed silently...
+    expect(result.failures).toBeGreaterThanOrEqual(1);
+    expect(result.failure_samples.some(s => s.includes('stub/broken'))).toBe(true);
+    // ...but did NOT abort the run: the unrelated pre-existing stale chunk
+    // still got embedded in the SAME pass.
+    expect(result.embedded).toBeGreaterThanOrEqual(1);
+    const unrelatedChunks = await engine.getChunks('normal/unrelated');
+    expect(unrelatedChunks[0]?.embedded_at).not.toBeNull();
+  });
 });

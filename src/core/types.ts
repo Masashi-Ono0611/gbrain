@@ -610,7 +610,8 @@ export interface StaleChunkRow {
 }
 
 /**
- * A page with non-empty `compiled_truth` but ZERO `content_chunks` rows,
+ * A page with non-empty `compiled_truth` and/or `timeline` (both are
+ * chunked independently by the healer) but ZERO `content_chunks` rows,
  * returned by `listChunklessPagesWithContent`. `embed --stale` scans
  * `content_chunks` (embedding IS NULL) — a page written directly via
  * `putPage` that never went through the chunking step (e.g. an
