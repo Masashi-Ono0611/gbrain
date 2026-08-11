@@ -78,6 +78,37 @@ describe('enrichment-service', () => {
       const entities = extractEntities('Mary Jane Watson Parker joined the team.');
       expect(entities.some(e => e.name.split(' ').length >= 3)).toBe(true);
     });
+
+    test('does not merge capitalized words across a paragraph break', () => {
+      const entities = extractEntities('We spoke with Winters\n\nReyes continued the analysis.');
+      expect(entities.some(e => e.name.includes('\n'))).toBe(false);
+      expect(entities.some(e => e.name.replace(/\s+/g, ' ') === 'Winters Reyes')).toBe(false);
+    });
+
+    test('does not merge capitalized words across a single line break', () => {
+      const entities = extractEntities('Winters\nReyes discussed the proof.');
+      expect(entities.some(e => e.name.includes('\n'))).toBe(false);
+    });
+
+    test('still matches same-line multi-word capitalized names', () => {
+      const entities = extractEntities('Casey Morgan visited the lab.');
+      expect(entities.some(e => e.name === 'Casey Morgan')).toBe(true);
+    });
+
+    test('still matches names separated by a non-breaking space on the same line', () => {
+      const entities = extractEntities('Jordan Blake requested access.');
+      expect(entities.some(e => e.name === 'Jordan Blake')).toBe(true);
+    });
+
+    test('does not merge capitalized words across a Unicode line separator (U+2028)', () => {
+      const entities = extractEntities('Winters\u2028Reyes discussed the proof.');
+      expect(entities.some(e => e.name.includes('\u2028'))).toBe(false);
+    });
+
+    test('does not merge capitalized words across a Unicode paragraph separator (U+2029)', () => {
+      const entities = extractEntities('Winters\u2029Reyes discussed the proof.');
+      expect(entities.some(e => e.name.includes('\u2029'))).toBe(false);
+    });
   });
 
   describe('enrichEntity (mock)', () => {
