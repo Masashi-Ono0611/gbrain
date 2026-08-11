@@ -231,6 +231,7 @@ export async function listFactsByEntity(
     const activeOnly = opts?.activeOnly !== false;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+    const excludeAuditRows = opts?.excludeAuditRows === true;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
@@ -238,6 +239,7 @@ export async function listFactsByEntity(
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
+        ${excludeAuditRows ? sql`AND fact NOT IN ('EXTRACTION_COMPLETE', 'EXTRACTION_NOT_APPLICABLE')` : sql``}
       ORDER BY valid_from DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -257,6 +259,7 @@ export async function listFactsSince(
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
     const entitySlug = opts?.entitySlug ?? null;
+    const excludeAuditRows = opts?.excludeAuditRows === true;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
@@ -265,6 +268,7 @@ export async function listFactsSince(
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
+        ${excludeAuditRows ? sql`AND fact NOT IN ('EXTRACTION_COMPLETE', 'EXTRACTION_NOT_APPLICABLE')` : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -283,6 +287,7 @@ export async function listFactsBySession(
     const activeOnly = opts?.activeOnly !== false;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+    const excludeAuditRows = opts?.excludeAuditRows === true;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
@@ -290,6 +295,7 @@ export async function listFactsBySession(
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
+        ${excludeAuditRows ? sql`AND fact NOT IN ('EXTRACTION_COMPLETE', 'EXTRACTION_NOT_APPLICABLE')` : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;

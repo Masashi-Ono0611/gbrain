@@ -72,4 +72,113 @@ describe("Cross-session recall test (PGLite)", () => {
     expect(all.length).toBe(1);
     expect(all[0].expired_at).not.toBeNull();
   });
+
+  // extract-conversation-facts writes durable audit checkpoint rows
+  // (EXTRACTION_COMPLETE / EXTRACTION_NOT_APPLICABLE) into the facts table
+  // to mark batch-run progress. Their created_at is always the most recent
+  // write, so for trusted callers (no visibility filter) they dominate the
+  // newest-N fetch window right after a batch run and starve recall of real
+  // facts. excludeAuditRows keeps them out in SQL. Postgres parity in
+  // test/e2e/facts-separation-postgres.test.ts.
+  test('excludeAuditRows filters extraction audit checkpoint rows out of listFactsSince', async () => {
+    const before = new Date();
+    await engine.insertFact(
+      {
+        fact: 'EXTRACTION_COMPLETE',
+        kind: 'fact',
+        entity_slug: null,
+        source: 'cli:extract-conversation-facts:terminal:v2',
+        source_session: 'audit-checkpoint-session',
+        notability: 'low',
+      },
+      { source_id: 'default' },
+    );
+    await engine.insertFact(
+      {
+        fact: 'EXTRACTION_NOT_APPLICABLE',
+        kind: 'fact',
+        entity_slug: null,
+        source: 'cli:extract-conversation-facts:non-extractable:v2',
+        source_session: 'audit-checkpoint-session',
+        notability: 'low',
+      },
+      { source_id: 'default' },
+    );
+    await engine.insertFact(
+      { fact: 'real user fact about travel plans', kind: 'fact', entity_slug: 'travel', source: 'test' },
+      { source_id: 'default' },
+    );
+
+    // Default behavior (no excludeAuditRows) is unchanged: audit rows still
+    // come back, same as before this PR.
+    const withAudit = await engine.listFactsSince('default', before);
+    expect(withAudit.some(r => r.fact === 'EXTRACTION_COMPLETE')).toBe(true);
+    expect(withAudit.some(r => r.fact === 'EXTRACTION_NOT_APPLICABLE')).toBe(true);
+    expect(withAudit.some(r => r.fact === 'real user fact about travel plans')).toBe(true);
+
+    // excludeAuditRows: true strips both audit fact literals, real facts
+    // remain.
+    const withoutAudit = await engine.listFactsSince('default', before, { excludeAuditRows: true });
+    expect(withoutAudit.some(r => r.fact === 'EXTRACTION_COMPLETE')).toBe(false);
+    expect(withoutAudit.some(r => r.fact === 'EXTRACTION_NOT_APPLICABLE')).toBe(false);
+    expect(withoutAudit.some(r => r.fact === 'real user fact about travel plans')).toBe(true);
+  });
+
+  // The filter is an exact-match `fact NOT IN (...)`, not a substring/ILIKE
+  // match — a real fact that happens to CONTAIN one of the audit literals as
+  // a substring must still survive excludeAuditRows.
+  test('excludeAuditRows is exact-match, not substring — facts merely containing the audit literal survive', async () => {
+    const before = new Date();
+    await engine.insertFact(
+      {
+        fact: "the user's project tracker calls its done column EXTRACTION_COMPLETE",
+        kind: 'fact',
+        entity_slug: 'tracker-naming',
+        source: 'test',
+      },
+      { source_id: 'default' },
+    );
+    const rows = await engine.listFactsSince('default', before, { excludeAuditRows: true });
+    expect(
+      rows.some(r => r.fact === "the user's project tracker calls its done column EXTRACTION_COMPLETE"),
+    ).toBe(true);
+  });
+
+  // excludeAuditRows is honored consistently across all three FactListOpts
+  // consumers (listFactsSince above, listFactsByEntity + listFactsBySession
+  // here) — not silently ignored on the shared options bag.
+  test('excludeAuditRows also filters listFactsByEntity and listFactsBySession', async () => {
+    await engine.insertFact(
+      {
+        fact: 'EXTRACTION_COMPLETE',
+        kind: 'fact',
+        entity_slug: 'audit-entity-scope-test',
+        source: 'test',
+        source_session: 'audit-entity-scope-session',
+      },
+      { source_id: 'default' },
+    );
+    await engine.insertFact(
+      {
+        fact: 'real fact under the same entity/session',
+        kind: 'fact',
+        entity_slug: 'audit-entity-scope-test',
+        source: 'test',
+        source_session: 'audit-entity-scope-session',
+      },
+      { source_id: 'default' },
+    );
+
+    const byEntity = await engine.listFactsByEntity('default', 'audit-entity-scope-test', {
+      excludeAuditRows: true,
+    });
+    expect(byEntity.some(r => r.fact === 'EXTRACTION_COMPLETE')).toBe(false);
+    expect(byEntity.some(r => r.fact === 'real fact under the same entity/session')).toBe(true);
+
+    const bySession = await engine.listFactsBySession('default', 'audit-entity-scope-session', {
+      excludeAuditRows: true,
+    });
+    expect(bySession.some(r => r.fact === 'EXTRACTION_COMPLETE')).toBe(false);
+    expect(bySession.some(r => r.fact === 'real fact under the same entity/session')).toBe(true);
+  });
 });

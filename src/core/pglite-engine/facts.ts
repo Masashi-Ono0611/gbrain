@@ -247,9 +247,13 @@ export async function listFactsByEntity(
     entitySlug: string,
     opts?: FactListOpts,
   ): Promise<FactRow[]> {
+    const where: string[] = [`entity_slug = $entitySlug`];
+    if (opts?.excludeAuditRows === true) {
+      where.push(`fact NOT IN ('EXTRACTION_COMPLETE', 'EXTRACTION_NOT_APPLICABLE')`);
+    }
     return _listFacts(deps, source_id, {
       ...opts,
-      whereClauses: [`entity_slug = $entitySlug`],
+      whereClauses: where,
       whereParams: { entitySlug },
       order: 'valid_from DESC, id DESC',
     });
@@ -267,6 +271,9 @@ export async function listFactsSince(
       where.push(`entity_slug = $entitySlug`);
       params.entitySlug = opts.entitySlug;
     }
+    if (opts?.excludeAuditRows === true) {
+      where.push(`fact NOT IN ('EXTRACTION_COMPLETE', 'EXTRACTION_NOT_APPLICABLE')`);
+    }
     return _listFacts(deps, source_id, {
       ...opts,
       whereClauses: where,
@@ -281,9 +288,13 @@ export async function listFactsBySession(
     sessionId: string,
     opts?: FactListOpts,
   ): Promise<FactRow[]> {
+    const where: string[] = [`source_session = $sessionId`];
+    if (opts?.excludeAuditRows === true) {
+      where.push(`fact NOT IN ('EXTRACTION_COMPLETE', 'EXTRACTION_NOT_APPLICABLE')`);
+    }
     return _listFacts(deps, source_id, {
       ...opts,
-      whereClauses: [`source_session = $sessionId`],
+      whereClauses: where,
       whereParams: { sessionId },
       order: 'created_at DESC, id DESC',
     });

@@ -220,6 +220,7 @@ const recall: Operation = {
             activeOnly: !includeExpired,
             limit,
             visibility,
+            excludeAuditRows: true,
           });
         })),
         (rec) => rec.valid_from ?? rec.created_at,
@@ -231,6 +232,7 @@ const recall: Operation = {
             activeOnly: !includeExpired,
             limit,
             visibility,
+            excludeAuditRows: true,
           }),
         )),
         byCreated,
@@ -244,6 +246,7 @@ const recall: Operation = {
               activeOnly: !includeExpired,
               limit,
               visibility,
+              excludeAuditRows: true,
             }),
           )),
           byCreated,
@@ -257,11 +260,20 @@ const recall: Operation = {
             activeOnly: !includeExpired,
             limit,
             visibility,
+            excludeAuditRows: true,
           }),
         )),
         byCreated,
       );
     }
+
+    // extract-conversation-facts writes durable audit checkpoint rows
+    // (EXTRACTION_COMPLETE / EXTRACTION_NOT_APPLICABLE) into the facts
+    // table. They are checkpoints, not user facts. Every arm above already
+    // passes excludeAuditRows: true (SQL-level, both engines) — this
+    // client-side filter is belt-and-braces defense in depth, not the
+    // primary guard.
+    rows = rows.filter((r) => r.fact !== 'EXTRACTION_COMPLETE' && r.fact !== 'EXTRACTION_NOT_APPLICABLE');
 
     if (grep) rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
 
