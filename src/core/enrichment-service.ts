@@ -286,11 +286,12 @@ export function extractEntities(text: string): Array<{ name: string; type: 'pers
   // Match capitalized multi-word names (likely people or companies)
   // Pattern: 2-4 capitalized words in sequence, scoped to a single line so a
   // paragraph break (or any line break) can't splice unrelated capitalized
-  // words from adjacent sentences into one bogus candidate. `[^\S\r\n\u2028\u2029]+`
-  // matches same-line whitespace (spaces, tabs, NBSP, other Unicode space
-  // separators) but excludes `\n`/`\r` and the Unicode line/paragraph
-  // separators (U+2028/U+2029), unlike a plain `[ \t]+`.
-  const namePattern = /\b([A-Z][a-z]+(?:[^\S\r\n\u2028\u2029]+[A-Z][a-z]+){1,3})\b/g;
+  // words from adjacent sentences into one bogus candidate. The pattern
+  // excludes all vertical whitespace -- CR, LF, VT (U+000B), FF (U+000C),
+  // and the Unicode line/paragraph separators (U+2028/U+2029) -- while
+  // retaining horizontal whitespace (spaces, tabs, NBSP, other Unicode
+  // space separators), unlike a plain `[ \t]+`.
+  const namePattern = /\b([A-Z][a-z]+(?:[^\S\r\n\v\f\u2028\u2029]+[A-Z][a-z]+){1,3})\b/g;
   let match;
   while ((match = namePattern.exec(text)) !== null) {
     const name = match[1];

@@ -109,6 +109,16 @@ describe('enrichment-service', () => {
       const entities = extractEntities('Winters\u2029Reyes discussed the proof.');
       expect(entities.some(e => e.name.includes('\u2029'))).toBe(false);
     });
+
+    test('does not merge capitalized words across a vertical tab (U+000B)', () => {
+      const entities = extractEntities('Winters\vReyes discussed the proof.');
+      expect(entities.some(e => e.name.includes('\v'))).toBe(false);
+    });
+
+    test('does not merge capitalized words across a form feed (U+000C)', () => {
+      const entities = extractEntities('Winters\fReyes discussed the proof.');
+      expect(entities.some(e => e.name.includes('\f'))).toBe(false);
+    });
   });
 
   describe('enrichEntity (mock)', () => {
