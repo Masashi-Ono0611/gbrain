@@ -980,21 +980,39 @@ async function embedAll(
  * contract (including `pages_processed`, which embedPage's own dry-run
  * branch increments for exactly this "examined, didn't write" case).
  *
- * Race note (review catch, two rounds): between listing a page and writing
- * its chunks, a concurrent writer (sync, another `put_page`) could change
- * or chunk the SAME page. Two mitigations, both bounded — full
- * transactional/version-guarded writes are out of scope for a safety net:
+ * Race note (review catch, three rounds — ACCEPTED RESIDUAL RISK, not
+ * fully closed): between listing a page and writing its chunks, a
+ * concurrent writer (sync, another `put_page`) could change or chunk the
+ * SAME page. Two mitigations, both bounded — full atomicity (a
+ * transaction/version-guarded conditional write inside `upsertChunks`)
+ * would need a new engine primitive shared by every `upsertChunks` caller,
+ * which is out of scope for a chunkless-page safety net:
  *   1. Immediately before writing, re-fetch the LIVE page via `getPage`
  *      and build `inputs` from ITS CURRENT content, not the batch-list
  *      snapshot — closes the "content changed but still chunkless"
  *      sub-case, not just the "chunks appeared" one.
  *   2. Re-check `getChunks` right after that same fetch — skip (don't
- *      overwrite) if chunks now exist. A subsequent `embed --stale` run
- *      re-discovers any page skipped this way (idempotent predicate).
- * This narrows, rather than eliminates, the same check-then-write window
- * `embedPage`'s existing single-page chunkless branch already accepts —
- * no new race CLASS is introduced, and the window is now one sequential
- * getPage+getChunks+upsertChunks instead of spanning a whole batch.
+ *      overwrite) if chunks now exist AT THE TIME OF THE CHECK.
+ * What this does NOT close: a writer that inserts chunks in the gap
+ * BETWEEN step 2's check and the `upsertChunks` call immediately below it
+ * (no intervening `await` other than that one call, but `upsertChunks`
+ * itself is not conditioned on the check — this is still check-then-write,
+ * not compare-and-swap) can still have its chunks overwritten — HONESTLY:
+ * `upsertChunks` treats its input as the full desired chunk set for that
+ * page and deletes any existing chunk_index absent from it, so a
+ * concurrent writer's chunks landing in that exact gap CAN be replaced
+ * with this sweep's stale-content chunks (embedding NULL). This is the
+ * SAME check-then-write window `embedPage`'s existing single-page
+ * chunkless branch already ships with today (that branch doesn't even
+ * have step 2's re-check) — no new race CLASS is introduced, and the
+ * window here is a single sequential getPage+getChunks+upsertChunks
+ * instead of spanning a whole batch. The blast radius is bounded: the
+ * page is NOT deleted or corrupted, just re-chunked from a stale
+ * snapshot, and the NEXT write to that page (sync, another edit) that
+ * actually chunks it restores correct content — this sweep's own
+ * predicate is idempotent and doesn't compound the drift. Closing this
+ * fully (true atomicity) is tracked as a follow-up, not blocking this
+ * safety net.
  *
  * Per-page failure isolation (review catch): one malformed/oversized
  * chunkless page must not abort the sweep and, with it, the entire
@@ -1011,11 +1029,15 @@ async function embedAll(
  * `timeline`), so a large batch of large pages is a real memory/latency
  * concern the metadata-only `listStaleChunks` rows never had (review
  * catch). It still respects the caller's pacer (no-op when pacing is off)
- * and a soft wall-clock cap (`GBRAIN_EMBED_TIME_BUDGET_MS`, same default as
- * the main stale loop below) so a pathologically large damaged brain can't
- * run this sweep unbounded — it heals what it can and reports the rest for
- * the next `embed --stale` run (the SQL predicate is idempotent; nothing
- * here requires finishing in one pass).
+ * and a soft wall-clock cap (`GBRAIN_EMBED_TIME_BUDGET_MS`) so a
+ * pathologically large damaged brain can't run this sweep unbounded — it
+ * heals what it can and reports the rest for the next `embed --stale` run
+ * (the SQL predicate is idempotent; nothing here requires finishing in one
+ * pass). `startedAt` is shared with the caller's overall run clock (review
+ * catch) — healing and the main stale loop draw from ONE combined budget
+ * window, not two independent 30-minute ones. `catchUp` mirrors the main
+ * loop's own `--catch-up` handling: removes the cap entirely (the keyset
+ * cursor still terminates on its own; `signal` remains the abort path).
  */
 async function healChunklessPages(
   engine: BrainEngine,
@@ -1023,12 +1045,15 @@ async function healChunklessPages(
   dryRun: boolean,
   result: EmbedResult,
   quiet: boolean | undefined,
-  signal?: AbortSignal,
-  pacer?: DbPacer,
+  signal: AbortSignal | undefined,
+  pacer: DbPacer | undefined,
+  startedAt: number,
+  catchUp: boolean,
 ): Promise<void> {
   const BATCH_SIZE = 50;
-  const BUDGET_MS = parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
-  const startedAt = Date.now();
+  const BUDGET_MS: number | null = catchUp
+    ? null
+    : parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
   const activePacer = pacer ?? createNoopPacer();
   let afterPageId: number | undefined;
   let pagesHealed = 0;
@@ -1048,11 +1073,14 @@ async function healChunklessPages(
     }
     return inputs;
   };
+  // BUDGET_MS === null means catch-up: no wall-clock cap on this sweep,
+  // mirroring the main stale loop's own --catch-up handling below.
+  const overBudget = (): boolean => BUDGET_MS != null && Date.now() - startedAt > BUDGET_MS;
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
     if (isAborted(signal)) break;
-    if (Date.now() - startedAt > BUDGET_MS) { budgetExceeded = true; break; }
+    if (overBudget()) { budgetExceeded = true; break; }
     const batch = await observed(activePacer, () => engine.listChunklessPagesWithContent({
       batchSize: BATCH_SIZE,
       ...(afterPageId != null && { afterPageId }),
@@ -1063,7 +1091,7 @@ async function healChunklessPages(
 
     for (const page of batch) {
       if (isAborted(signal)) break;
-      if (Date.now() - startedAt > BUDGET_MS) { budgetExceeded = true; break; }
+      if (overBudget()) { budgetExceeded = true; break; }
 
       try {
         if (dryRun) {
@@ -1165,6 +1193,13 @@ async function embedAllStale(
   signature?: string,
   externalSignal?: AbortSignal,
 ) {
+  // Shared wall-clock anchor (review catch): the healing sweep below and the
+  // main stale loop's own budget timer (further down) both measure against
+  // this SAME start time, so a run's total wall-clock spend stays capped at
+  // ONE `GBRAIN_EMBED_TIME_BUDGET_MS` window instead of summing two
+  // independent 30-minute budgets.
+  const overallStartedAt = Date.now();
+
   // D7: thread sourceId so source-scoped runs only count + visit
   // that source's NULL embeddings.
   const sourceOpt = sourceId ? { sourceId } : undefined;
@@ -1178,8 +1213,17 @@ async function embedAllStale(
   // into the SAME pass via the existing cursor.
   const chunklessCount = await engine.countChunklessPagesWithContent(sourceOpt);
   if (chunklessCount > 0) {
-    await healChunklessPages(engine, sourceId, dryRun, result, staleOpts?.quiet, externalSignal, staleOpts?.pacer);
+    await healChunklessPages(
+      engine, sourceId, dryRun, result, staleOpts?.quiet, externalSignal, staleOpts?.pacer,
+      overallStartedAt, !!staleOpts?.catchUp,
+    );
   }
+  // Review catch: an abort during healing must stop the run HERE, before
+  // falling through into invalidateStaleSignatureEmbeddings below (which —
+  // pre-existing, unchanged by this PR — does not itself check
+  // externalSignal). Without this, a caller-cancelled run could still NULL
+  // out signature-drifted embeddings and exit, leaving retrieval degraded.
+  if (isAborted(externalSignal)) return;
 
   // v0.41.31: re-embed pages whose embedding_signature drifted (model/dims
   // swap). dry-run must NOT mutate, so it counts signature-stale via the
@@ -1297,9 +1341,12 @@ async function embedAllStale(
     ? null
     : parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
   const budgetController = new AbortController();
-  const budgetStart = Date.now();
+  // Shares overallStartedAt with the chunkless-page healing sweep above
+  // (review catch) so the two phases draw from ONE combined budget window
+  // instead of each getting a fresh 30 minutes.
+  const budgetStart = overallStartedAt;
   let budgetTimer = BUDGET_MS != null
-    ? setTimeout(() => budgetController.abort(), BUDGET_MS)
+    ? setTimeout(() => budgetController.abort(), Math.max(0, budgetStart + BUDGET_MS - Date.now()))
     : undefined;
   // E-4 (paced-backfill): the budget measures WORK, not waiting. After each
   // batch, re-arm the timer to fire at start + BUDGET + total-paced-sleep, so a
