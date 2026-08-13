@@ -191,12 +191,44 @@ describe('gbrain search stats', () => {
     expect(stats.coverage.cli_invocations).toBe('typically_not_recorded');
   });
 
+  // Wording-accuracy pin, independent of the TELEMETRY_COVERAGE_NOTE import:
+  // importing the same constant into production code and the assertion
+  // would let an inaccurate edit to the constant sail through unnoticed
+  // (round-1 review caught exactly this class of bug — "long-lived
+  // processes only" overclaimed and dropped `jobs work`). Hardcode the
+  // substance here instead of comparing production output to itself.
+  test('--json coverage.reason names all three long-lived process kinds + the threshold exception', async () => {
+    const out = await captureRun(() => runSearch(engine, ['stats', '--json']));
+    const reason: string = JSON.parse(out).coverage.reason;
+    expect(reason).toMatch(/gbrain serve/i);
+    expect(reason).toMatch(/mcp/i);
+    expect(reason).toMatch(/jobs work/i);
+    expect(reason).toMatch(/short-lived CLI/i);
+    // Must not claim CLI calls are NEVER recorded — a bulk CLI run that
+    // itself crosses the 100-call flush threshold before exiting IS
+    // captured, so the wording must hedge ("typically"/"usually"), not
+    // assert absolute exclusivity ("only"/"never").
+    expect(reason).toMatch(/typically|usually/i);
+    expect(reason).not.toMatch(/\bonly\b/i);
+    expect(reason).not.toMatch(/\bnever\b/i);
+  });
+
   test('human output surfaces the exact coverage caveat (empty table)', async () => {
     const out = await captureRun(() => runSearch(engine, ['stats']));
     // Pin the literal shared constant — proves the display layer isn't
     // paraphrasing (and risking drift on) the buffering caveat.
     expect(out).toContain(TELEMETRY_COVERAGE_CAVEAT);
     expect(out.toLowerCase()).toContain('coverage gap above');
+  });
+
+  // Same independent-wording-pin rationale as the --json test above,
+  // applied to the short human caveat.
+  test('human coverage caveat names long-lived processes + jobs work + the hedge word, independent of the import', async () => {
+    const out = await captureRun(() => runSearch(engine, ['stats']));
+    expect(out).toMatch(/favors long-lived processes/i);
+    expect(out).toMatch(/jobs work/i);
+    expect(out).toMatch(/typically not recorded/i);
+    expect(out).not.toMatch(/only long-lived processes/i);
   });
 
   test('human output surfaces the exact coverage caveat (non-empty table)', async () => {
