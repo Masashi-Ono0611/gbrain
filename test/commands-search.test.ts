@@ -165,6 +165,45 @@ describe('gbrain search stats', () => {
     const outBig = await captureRun(() => runSearch(engine, ['stats', '--days', '9999', '--json']));
     expect(JSON.parse(outBig).window_days).toBe(365);
   });
+
+  // Coverage disclosure: short-lived CLI search calls typically don't
+  // survive the telemetry flush timer/threshold, so `search stats` must
+  // say so instead of presenting the (possibly CLI-blind) count as total.
+  test('--json includes a coverage disclosure (empty table)', async () => {
+    const out = await captureRun(() => runSearch(engine, ['stats', '--json']));
+    const stats = JSON.parse(out);
+    expect(stats.coverage).toBeDefined();
+    expect(stats.coverage.cli_invocations).toBe('typically_not_recorded');
+    expect(typeof stats.coverage.reason).toBe('string');
+    expect(stats.coverage.reason.length).toBeGreaterThan(0);
+  });
+
+  test('--json includes a coverage disclosure (non-empty table)', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(engine, makeMeta({ cache: { status: 'hit' } }), { results_count: 5 });
+    await w.flush();
+
+    const out = await captureRun(() => runSearch(engine, ['stats', '--json']));
+    const stats = JSON.parse(out);
+    expect(stats.coverage.cli_invocations).toBe('typically_not_recorded');
+  });
+
+  test('human output surfaces a Coverage line (empty table)', async () => {
+    const out = await captureRun(() => runSearch(engine, ['stats']));
+    expect(out).toContain('Coverage:');
+    expect(out.toLowerCase()).toContain('not necessarily mean no search activity');
+  });
+
+  test('human output surfaces a Coverage line (non-empty table)', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(engine, makeMeta({ cache: { status: 'hit' } }), { results_count: 5 });
+    await w.flush();
+
+    const out = await captureRun(() => runSearch(engine, ['stats']));
+    expect(out).toContain('Coverage:');
+  });
 });
 
 describe('gbrain search tune (recommendations)', () => {
@@ -173,6 +212,20 @@ describe('gbrain search tune (recommendations)', () => {
     const r = JSON.parse(out);
     expect(r.status).toBe('insufficient_data');
     expect(r.recommendations).toEqual([]);
+  });
+
+  // Coverage disclosure: `tune`'s recommendations are only as complete as
+  // the telemetry they're read from — same caveat as `search stats`.
+  test('insufficient data → --json includes coverage disclosure', async () => {
+    const out = await captureRun(() => runSearch(engine, ['tune', '--json']));
+    const r = JSON.parse(out);
+    expect(r.coverage).toBeDefined();
+    expect(r.coverage.cli_invocations).toBe('typically_not_recorded');
+  });
+
+  test('insufficient data → human output notes the coverage caveat', async () => {
+    const out = await captureRun(() => runSearch(engine, ['tune']));
+    expect(out.toLowerCase()).toContain('coverage');
   });
 
   test('conservative + high budget drop rate → recommends balanced', async () => {
@@ -194,6 +247,25 @@ describe('gbrain search tune (recommendations)', () => {
     const modeRec = r.recommendations.find((x: { knob: string }) => x.knob === 'search.mode');
     expect(modeRec).toBeDefined();
     expect(modeRec.suggested).toBe('balanced');
+    // Coverage disclosure travels with real recommendations too, not just
+    // the insufficient-data early-return path.
+    expect(r.coverage.cli_invocations).toBe('typically_not_recorded');
+  });
+
+  test('has_recommendations → human output notes the coverage caveat', async () => {
+    await engine.setConfig('search.mode', 'conservative');
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    for (let i = 0; i < 30; i++) {
+      recordSearchTelemetry(engine, makeMeta({
+        mode: 'conservative',
+        token_budget: { budget: 4000, used: 4000, kept: 5, dropped: 5 },
+      }), { results_count: 5 });
+    }
+    await w.flush();
+
+    const out = await captureRun(() => runSearch(engine, ['tune']));
+    expect(out.toLowerCase()).toContain('coverage');
   });
 
   test('tokenmax + Haiku subagent → recommends balanced', async () => {
