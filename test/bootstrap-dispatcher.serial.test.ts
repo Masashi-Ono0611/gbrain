@@ -22,6 +22,7 @@ import { runBootstrap, workspaceBrainStats } from '../src/commands/bootstrap.ts'
 import type { ExecRunner } from '../src/core/bootstrap/repo.ts';
 import { attachWorkspace } from '../src/core/bootstrap/attach.ts';
 import { readReceipt, receiptPath, writeManifest, type InstallReceipt } from '../src/core/bootstrap/format.ts';
+import { deriveWorkspaceSourceId } from '../src/core/bootstrap/verify.ts';
 import { initState, setAnswer, skipAnswer, confirm, readBackHash } from '../src/core/bootstrap/interview.ts';
 
 let tmpParent: string; // GBRAIN_HOME parent (configDir appends .gbrain)
@@ -179,17 +180,23 @@ describe('hooks previews the source_id + creates brain/ eagerly [defect: multi-r
       );
     });
     expect(out.result).toBe(0);
-    // brain/ now exists — ready for `git init && git add -A && git commit`
-    // and `sources add` without a manual mkdir round trip.
+    // brain/ now exists — ready for `sources add` without a manual mkdir
+    // round trip.
     expect(existsSync(brainDir)).toBe(true);
     // The manifest's actual source_id (default: 'workspace' for a first
     // render) is spelled out verbatim — no guessing an "intuitive" name that
     // would only surface as an FK error three steps later at verify time.
-    expect(out.out).toContain(`gbrain sources add workspace --path ${brainDir}`);
-    // The collision-fallback id (verify.ts's deriveWorkspaceSourceId — a pure
-    // hash of the workspace path, no engine/DB lookup needed) is previewed
-    // too, so a colliding registration can go straight to the right id.
-    expect(out.out).toMatch(/'workspace-[0-9a-f]{8}'/);
+    // --force is required and printed: brain/ is freshly created and has no
+    // git history yet, so `sources add` without --force would fail-fast on
+    // `not_a_git_repo` (#2707) the instant the printed command is pasted —
+    // the exact same `{ force: true }` the engine-backed verify fixtures use
+    // to register a brand new brain/ (test/bootstrap-verify.serial.test.ts).
+    expect(out.out).toContain(`gbrain sources add workspace --path ${brainDir} --force`);
+    // The collision-fallback id is previewed too, pinned to the SAME formula
+    // verify.ts would derive (not just the id's shape) — so preview/verify
+    // drift, or a change to the derivation formula, fails this test.
+    expect(out.out).toContain(`'${deriveWorkspaceSourceId(fws)}'`);
+    expect(deriveWorkspaceSourceId(fws)).toMatch(/^workspace-[0-9a-f]{8}$/);
   }, 30_000);
 
   test('a --repair re-run is idempotent: brain/ survives, the same preview reprints', async () => {
@@ -207,10 +214,52 @@ describe('hooks previews the source_id + creates brain/ eagerly [defect: multi-r
         ),
       );
       expect(repaired.result).toBe(0);
-      expect(repaired.out).toContain(`gbrain sources add workspace --path ${brainDir}`);
+      expect(repaired.out).toContain(`gbrain sources add workspace --path ${brainDir} --force`);
       // Idempotent mkdir never clobbers what the human already committed.
       expect(existsSync(join(brainDir, 'probe.md'))).toBe(true);
     });
+  }, 30_000);
+
+  test('a workspace path containing a space is shell-quoted in the printed command', async () => {
+    const fparent = mkdtempSync(join(tmpdir(), 'gb-srcid-space-'));
+    scratch.push(fparent);
+    const fhome = join(fparent, '.gbrain');
+    mkdirSync(fhome, { recursive: true });
+    const fwsRoot = mkdtempSync(join(tmpdir(), 'gb-srcid-space-root-'));
+    scratch.push(fwsRoot);
+    const fws = join(fwsRoot, 'has space');
+    mkdirSync(fws, { recursive: true });
+    const prev = process.env.GBRAIN_HOME;
+    process.env.GBRAIN_HOME = fparent;
+    try {
+      expect(initState(fws).ok).toBe(true);
+      for (const [key, value] of Object.entries(REQUIRED_ANSWERS)) {
+        const r = setAnswer(fws, key, value);
+        if (!r.ok) throw new Error(r.message);
+      }
+      expect(setAnswer(fws, 'MCP_SCOPE', 'project').ok).toBe(true);
+      const h = readBackHash(fws);
+      if (!h.ok) throw new Error(h.message);
+      expect(confirm(fws, h.hash).ok).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.GBRAIN_HOME;
+      else process.env.GBRAIN_HOME = prev;
+    }
+    const brainDir = join(fws, 'brain');
+    const out = await withHome(fparent, async () => {
+      expect((await capture(() => runBootstrap(['render', '--workspace', fws]))).result).toBe(0);
+      const { runner } = makeRunner();
+      return capture(() =>
+        runBootstrap(['hooks', '--workspace', fws, '--harness', 'claude-code', '--gbrain-bin', process.execPath], {
+          runner,
+        }),
+      );
+    });
+    expect(out.result).toBe(0);
+    // A bare, unquoted path with a space would split into two shell words —
+    // the printed command must single-quote it so copy/paste actually works.
+    expect(out.out).toContain(`--path '${brainDir}' --force`);
+    expect(out.out).not.toContain(`--path ${brainDir} --force`);
   }, 30_000);
 });
 
