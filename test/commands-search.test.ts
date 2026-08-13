@@ -8,7 +8,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runSearch } from '../src/commands/search.ts';
-import { recordSearchTelemetry, _resetTelemetryWriterForTest, getTelemetryWriter } from '../src/core/search/telemetry.ts';
+import { recordSearchTelemetry, _resetTelemetryWriterForTest, getTelemetryWriter, TELEMETRY_COVERAGE_CAVEAT } from '../src/core/search/telemetry.ts';
 import type { HybridSearchMeta } from '../src/core/types.ts';
 
 let engine: PGLiteEngine;
@@ -174,8 +174,10 @@ describe('gbrain search stats', () => {
     const stats = JSON.parse(out);
     expect(stats.coverage).toBeDefined();
     expect(stats.coverage.cli_invocations).toBe('typically_not_recorded');
-    expect(typeof stats.coverage.reason).toBe('string');
-    expect(stats.coverage.reason.length).toBeGreaterThan(0);
+    // Pin the substance, not just presence — an inaccurate reason string
+    // (e.g. "long-lived processes only") must fail this test.
+    expect(stats.coverage.reason).toMatch(/short-lived CLI/i);
+    expect(stats.coverage.reason).toMatch(/typically.*not recorded|not.*typically recorded/i);
   });
 
   test('--json includes a coverage disclosure (non-empty table)', async () => {
@@ -189,20 +191,22 @@ describe('gbrain search stats', () => {
     expect(stats.coverage.cli_invocations).toBe('typically_not_recorded');
   });
 
-  test('human output surfaces a Coverage line (empty table)', async () => {
+  test('human output surfaces the exact coverage caveat (empty table)', async () => {
     const out = await captureRun(() => runSearch(engine, ['stats']));
-    expect(out).toContain('Coverage:');
-    expect(out.toLowerCase()).toContain('not necessarily mean no search activity');
+    // Pin the literal shared constant — proves the display layer isn't
+    // paraphrasing (and risking drift on) the buffering caveat.
+    expect(out).toContain(TELEMETRY_COVERAGE_CAVEAT);
+    expect(out.toLowerCase()).toContain('coverage gap above');
   });
 
-  test('human output surfaces a Coverage line (non-empty table)', async () => {
+  test('human output surfaces the exact coverage caveat (non-empty table)', async () => {
     const w = getTelemetryWriter();
     w.setEngine(engine);
     recordSearchTelemetry(engine, makeMeta({ cache: { status: 'hit' } }), { results_count: 5 });
     await w.flush();
 
     const out = await captureRun(() => runSearch(engine, ['stats']));
-    expect(out).toContain('Coverage:');
+    expect(out).toContain(TELEMETRY_COVERAGE_CAVEAT);
   });
 });
 
@@ -221,11 +225,17 @@ describe('gbrain search tune (recommendations)', () => {
     const r = JSON.parse(out);
     expect(r.coverage).toBeDefined();
     expect(r.coverage.cli_invocations).toBe('typically_not_recorded');
+    expect(r.coverage.reason).toMatch(/short-lived CLI/i);
   });
 
-  test('insufficient data → human output notes the coverage caveat', async () => {
+  test('insufficient data → human output notes the exact coverage caveat', async () => {
     const out = await captureRun(() => runSearch(engine, ['tune']));
-    expect(out.toLowerCase()).toContain('coverage');
+    expect(out).toContain(TELEMETRY_COVERAGE_CAVEAT);
+    // The old copy told the user to "run a few `gbrain query` calls" to fix
+    // a zero count — that's misleading advice given the caveat (a single
+    // CLI call is exactly what tends NOT to be recorded). Pin the corrected
+    // suggestion instead.
+    expect(out).toMatch(/gbrain serve.*or an MCP session/i);
   });
 
   test('conservative + high budget drop rate → recommends balanced', async () => {
@@ -252,7 +262,7 @@ describe('gbrain search tune (recommendations)', () => {
     expect(r.coverage.cli_invocations).toBe('typically_not_recorded');
   });
 
-  test('has_recommendations → human output notes the coverage caveat', async () => {
+  test('has_recommendations → human output notes the exact coverage caveat', async () => {
     await engine.setConfig('search.mode', 'conservative');
     const w = getTelemetryWriter();
     w.setEngine(engine);
@@ -265,7 +275,7 @@ describe('gbrain search tune (recommendations)', () => {
     await w.flush();
 
     const out = await captureRun(() => runSearch(engine, ['tune']));
-    expect(out.toLowerCase()).toContain('coverage');
+    expect(out).toContain(TELEMETRY_COVERAGE_CAVEAT);
   });
 
   test('tokenmax + Haiku subagent → recommends balanced', async () => {

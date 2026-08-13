@@ -456,6 +456,17 @@ export const TELEMETRY_COVERAGE_NOTE =
   'telemetry buffer flushes (60s timer or 100-call threshold), so its search is ' +
   'usually not recorded here — see search/telemetry.ts for the buffering design.';
 
+/**
+ * Short, single-line form of {@link TELEMETRY_COVERAGE_NOTE} for human CLI
+ * output (the long form is better suited to `--json`'s `reason` field).
+ * Every human-facing caveat in `gbrain search stats`/`gbrain search tune`
+ * reuses this literal string instead of paraphrasing it, so the wording
+ * cannot drift between call sites.
+ */
+export const TELEMETRY_COVERAGE_CAVEAT =
+  'Coverage favors long-lived processes (gbrain serve, MCP, jobs work) — a lone ' +
+  'short-lived CLI search call is typically not recorded.';
+
 export interface TelemetryCoverage {
   /** Whether a lone short-lived CLI search call is reliably counted. */
   cli_invocations: 'typically_not_recorded';
