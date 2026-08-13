@@ -121,6 +121,99 @@ describe('consent-skip is a decline (HOOKS_CONSENT)', () => {
   }, 30_000);
 });
 
+describe('hooks previews the source_id + creates brain/ eagerly [defect: multi-round-trip source registration]', () => {
+  // Self-contained fixtures (same pattern as the flip block below): the
+  // file-level `ws` is shared by other describes, so this needs its own.
+  const scratch: string[] = [];
+  function freshWorkspace(): { fws: string; fhome: string; fparent: string } {
+    const fparent = mkdtempSync(join(tmpdir(), 'gb-srcid-'));
+    const fhome = join(fparent, '.gbrain');
+    mkdirSync(fhome, { recursive: true });
+    const fws = mkdtempSync(join(tmpdir(), 'gb-srcid-ws-'));
+    scratch.push(fparent, fws);
+    const prev = process.env.GBRAIN_HOME;
+    process.env.GBRAIN_HOME = fparent;
+    try {
+      expect(initState(fws).ok).toBe(true);
+      for (const [key, value] of Object.entries(REQUIRED_ANSWERS)) {
+        const r = setAnswer(fws, key, value);
+        if (!r.ok) throw new Error(r.message);
+      }
+      expect(setAnswer(fws, 'MCP_SCOPE', 'project').ok).toBe(true);
+      const h = readBackHash(fws);
+      if (!h.ok) throw new Error(h.message);
+      expect(confirm(fws, h.hash).ok).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.GBRAIN_HOME;
+      else process.env.GBRAIN_HOME = prev;
+    }
+    return { fws, fhome, fparent };
+  }
+  afterAll(() => {
+    for (const d of scratch) rmSync(d, { recursive: true, force: true });
+  });
+
+  async function withHome<T>(parent: string, fn: () => Promise<T>): Promise<T> {
+    const prev = process.env.GBRAIN_HOME;
+    process.env.GBRAIN_HOME = parent;
+    try {
+      return await fn();
+    } finally {
+      if (prev === undefined) delete process.env.GBRAIN_HOME;
+      else process.env.GBRAIN_HOME = prev;
+    }
+  }
+
+  test('hooks prints the exact `sources add` command up front and creates brain/ before verify ever runs', async () => {
+    const { fws, fparent } = freshWorkspace();
+    const brainDir = join(fws, 'brain');
+    const out = await withHome(fparent, async () => {
+      expect((await capture(() => runBootstrap(['render', '--workspace', fws]))).result).toBe(0);
+      // render is engine-free and never touches brain/ — the gap this fix closes.
+      expect(existsSync(brainDir)).toBe(false);
+      const { runner } = makeRunner();
+      return capture(() =>
+        runBootstrap(['hooks', '--workspace', fws, '--harness', 'claude-code', '--gbrain-bin', process.execPath], {
+          runner,
+        }),
+      );
+    });
+    expect(out.result).toBe(0);
+    // brain/ now exists — ready for `git init && git add -A && git commit`
+    // and `sources add` without a manual mkdir round trip.
+    expect(existsSync(brainDir)).toBe(true);
+    // The manifest's actual source_id (default: 'workspace' for a first
+    // render) is spelled out verbatim — no guessing an "intuitive" name that
+    // would only surface as an FK error three steps later at verify time.
+    expect(out.out).toContain(`gbrain sources add workspace --path ${brainDir}`);
+    // The collision-fallback id (verify.ts's deriveWorkspaceSourceId — a pure
+    // hash of the workspace path, no engine/DB lookup needed) is previewed
+    // too, so a colliding registration can go straight to the right id.
+    expect(out.out).toMatch(/'workspace-[0-9a-f]{8}'/);
+  }, 30_000);
+
+  test('a --repair re-run is idempotent: brain/ survives, the same preview reprints', async () => {
+    const { fws, fparent } = freshWorkspace();
+    const brainDir = join(fws, 'brain');
+    await withHome(fparent, async () => {
+      expect((await capture(() => runBootstrap(['render', '--workspace', fws]))).result).toBe(0);
+      expect((await capture(() => runBootstrap(['hooks', '--workspace', fws, '--harness', 'claude-code', '--gbrain-bin', process.execPath], { runner: makeRunner().runner }))).result).toBe(0);
+      // Simulate the human having already registered + committed into brain/.
+      writeFileSync(join(brainDir, 'probe.md'), '# probe\n');
+      const repaired = await capture(() =>
+        runBootstrap(
+          ['hooks', '--workspace', fws, '--harness', 'claude-code', '--repair', '--gbrain-bin', process.execPath],
+          { runner: makeRunner().runner },
+        ),
+      );
+      expect(repaired.result).toBe(0);
+      expect(repaired.out).toContain(`gbrain sources add workspace --path ${brainDir}`);
+      // Idempotent mkdir never clobbers what the human already committed.
+      expect(existsSync(join(brainDir, 'probe.md'))).toBe(true);
+    });
+  }, 30_000);
+});
+
 describe('per-turn hooks are ON by default (v0.45 flip); --no-hooks opts out', () => {
   // Self-contained fixtures: the file-level `ws` deliberately SKIPS
   // HOOKS_CONSENT (for the decline test), so the default-on path needs a
