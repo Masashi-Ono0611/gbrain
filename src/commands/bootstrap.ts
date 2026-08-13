@@ -116,6 +116,60 @@ Env: GBRAIN_BOOTSTRAP_ABORT_AFTER=<phase> (test seam — abort after that phase'
 const SUPPORT_HINT =
   'If you are stuck: run `gbrain bootstrap status --json` and relay the "support" block verbatim.';
 
+/**
+ * Per-subcommand `--help`/`-h`/`help` usage text for the subcommands that
+ * MUTATE state (create a repo, register MCP/hooks, run the verify contract,
+ * adopt a workspace, remove receipt-tracked paths, record an interview
+ * answer). `runBootstrap`'s dispatch checks `args[0]` for top-level help
+ * (`--help`/`-h`/`help`/no args), but a help token AFTER the subcommand name
+ * (e.g. `gbrain bootstrap repo --help`, `gbrain bootstrap uninstall help`)
+ * previously fell straight into the subcommand's own arg parsing, which had
+ * no help handling of its own — so it ran the real mutation instead of
+ * printing help. `status`/`cloud-setup-script` are pure reads, so they don't
+ * need a guard.
+ */
+const SUBCOMMAND_HELP: Record<string, string> = {
+  render:
+    'gbrain bootstrap render [--force] [--only F] [--minimal]\n' +
+    '  Render identity files from the confirmed interview answers. Never clobbers; --force backs up first.',
+  repo:
+    'gbrain bootstrap repo\n' +
+    '  Create the dedicated PRIVATE GitHub repo (or adopt an EMPTY private repo you created\n' +
+    '  under your own account), verify the privacy bit via the API, push.',
+  hooks:
+    'gbrain bootstrap hooks [--harness claude-code|codex] [--repair] [--no-hooks] [--gbrain-bin <path>]\n' +
+    '  Register MCP (+ per-turn hooks on Claude Code, ON by default; --no-hooks opts out).',
+  verify:
+    'gbrain bootstrap verify [--json]\n' +
+    '  The whole install contract (round-trip, graph floor, magic moment, scans, hooks smoke). Exit 0 or not done.',
+  attach:
+    'gbrain bootstrap attach [--harness H]\n' +
+    '  Machine two: adopt a cloned agent workspace.',
+  uninstall:
+    'gbrain bootstrap uninstall [--delete-brain] [--home <dir>] [--yes]\n' +
+    '  Receipt-keyed removal. The repo stays yours.',
+  interview:
+    'gbrain bootstrap interview --init | --set KEY "value" | --skip KEY | --status | --show | --confirm <hash>\n' +
+    '  Create/record/read interview state. See `gbrain bootstrap --help` for the per-flag description.',
+};
+
+/**
+ * `--help`/`-h` are always recognized. The bare word `help` (no dashes) is
+ * ALSO recognized for every subcommand above EXCEPT `interview` — mirroring
+ * the top-level `sub === 'help'` handling for a user who tries the same
+ * spelling after a subcommand name. `interview` is excluded from the
+ * bare-word form because its `--set KEY "value"` free-text answers could
+ * legitimately BE the literal word "help" (e.g. a one-word answer); none of
+ * the other subcommands' flags take arbitrary prose, only booleans, enums,
+ * or paths, so the bare-word collision risk there is negligible (matches the
+ * already-accepted low-impact risk of `-h` colliding with a literal path
+ * value like `--home -h`).
+ */
+function hasHelpToken(args: string[], allowBareWord: boolean): boolean {
+  if (args.includes('--help') || args.includes('-h')) return true;
+  return allowBareWord && args.includes('help');
+}
+
 /** Thrown by the A7 abort seam; mapped to exit 130 (simulated kill). */
 export class BootstrapAbortInjected extends Error {
   constructor(phase: string) {
@@ -1058,6 +1112,16 @@ export async function runBootstrap(args: string[], opts: RunBootstrapOpts = {}):
     console.error(`unknown subcommand: ${sub}`);
     console.error(BOOTSTRAP_HELP);
     return 2;
+  }
+
+  // Subcommand-level help: BEFORE any subcommand body runs, so a help token
+  // after a mutating subcommand (repo/hooks/verify/attach/uninstall/render/
+  // interview) never falls through into the real operation, regardless of
+  // what other flags/values precede it in `rest`. No install-log entry
+  // either — this isn't a phase run.
+  if (SUBCOMMAND_HELP[sub] && hasHelpToken(rest, sub !== 'interview')) {
+    console.log(SUBCOMMAND_HELP[sub]);
+    return 0;
   }
 
   // The install log records the PHASE name, and the hooks subcommand is the
