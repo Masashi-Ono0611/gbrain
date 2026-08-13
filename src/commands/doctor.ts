@@ -2939,12 +2939,18 @@ export function checkAutopilotLockScope(): Check {
 /**
  * v0.41.6.0 D3 — stale_locks doctor check.
  *
- * Surfaces every row in `gbrain_cycle_locks` whose `ttl_expires_at < NOW()`.
- * The TTL is the canonical staleness signal already trusted by
- * tryAcquireDbLock's UPDATE-on-conflict SQL — when TTL is in the past,
- * the next acquire attempt will sweep the row anyway. Doctor's job is to
- * warn the user proactively so the next sync doesn't get a surprise
- * "Another sync is in progress" with no fix hint.
+ * Surfaces every row in `gbrain_cycle_locks` whose `ttl_expires_at < NOW()`
+ * AND whose holder is not still heartbeating. Raw TTL expiry alone is not
+ * the actionable signal: `isLockHolderLive` (v0.42.x #1794 — the same
+ * heartbeat-aware liveness check `tryAcquireDbLock`'s steal grace and
+ * `gbrain migrate`'s quiesce wait already trust) treats a holder whose
+ * `last_refreshed_at` is within the steal-grace window as alive even
+ * though its TTL lapsed (a starved-but-alive holder, e.g. a CPU-bound
+ * long-running dream cycle). Flagging those as "stale" with a
+ * `--break-lock` hint is a false positive that invites the user to steal
+ * a live lock out from under active work. Only holders whose heartbeat
+ * has also gone stale (past the grace) are reported here; live-but-TTL-
+ * expired holders are counted but not warned on.
  *
  * Paste-ready hint per stale lock: names the source-id from the
  * `gbrain-sync:<source>` lock-key shape so users can copy-paste the
@@ -2960,7 +2966,7 @@ export async function checkStaleLocks(
   opts: { fix?: boolean; dryRun?: boolean } = {},
 ): Promise<Check> {
   try {
-    const { listStaleLocks, reapDeadHolderLocks } = await import('../core/db-lock.ts');
+    const { listStaleLocks, reapDeadHolderLocks, isLockHolderLive, HOLDER_TAKEOVER_GRACE_MS } = await import('../core/db-lock.ts');
 
     // #1972: under `gbrain doctor --fix`, reap dead-holder sync/cycle locks
     // using the SAME namespace-scoped, host-scoped, snapshot-matched reaper the
@@ -2980,16 +2986,57 @@ export async function checkStaleLocks(
       : null;
 
     const stale = await listStaleLocks(engine);
-    if (stale.length === 0) {
+    // Every row here has ttl_expired=true (that's listStaleLocks' filter), so
+    // isLockHolderLive resolves purely on the heartbeat: still-refreshing
+    // holders (within the steal grace) are live despite the lapsed TTL.
+    //
+    // `gbrain_cycle_locks` holds many lock classes with different TTLs
+    // (cycle locks use 5min, sync locks default to 30min, embed-backfill/
+    // skillopt use 60min, per-page extraction locks use 2min, ...), and
+    // isLockHolderLive's steal-grace window is DERIVED FROM the ttlMinutes
+    // it's given — so a bare `isLockHolderLive(s)` (implicit 30min default)
+    // would use the wrong grace for every other class. `tryAcquireDbLock`'s
+    // INSERT and `refresh()`'s UPDATE both set `ttl_expires_at = NOW() + ttl`
+    // and `last_refreshed_at = NOW()` in the SAME statement, so
+    // `ttl_expires_at - last_refreshed_at` reconstructs the exact ttlMinutes
+    // that row was last acquired/refreshed with — no new heuristic, just
+    // algebra on data db-lock.ts already writes, and it generalizes to every
+    // lock class without doctor needing to import each one's TTL constant.
+    //
+    // Guarded against migration v98's backfill (src/core/migrate.ts, version
+    // 98): pre-existing rows got last_refreshed_at = NOW() at migration time
+    // WITHOUT ttl_expires_at being touched, so a row whose (old, pre-
+    // migration) TTL happened to be close to lapsing right when the
+    // migration ran can show a small, bogus gap here that understates its
+    // real class TTL. Below HOLDER_TAKEOVER_GRACE_MS (the smallest staleness
+    // window this file already reasons about, via classifyHolderLiveness's
+    // PID-reuse grace) that gap is more likely such an artifact than a real
+    // per-row TTL, so fall back to isLockHolderLive's own default instead of
+    // trusting it -- biasing toward NOT recommending --break-lock on a
+    // holder that might still be alive, since a missed warning is far
+    // cheaper than steering a user to steal a live lock.
+    const rowTtlMinutes = (s: (typeof stale)[number]): number | undefined => {
+      if (!s.last_refreshed_at) return undefined;
+      const ms = s.ttl_expires_at.getTime() - s.last_refreshed_at.getTime();
+      return ms >= HOLDER_TAKEOVER_GRACE_MS ? ms / 60_000 : undefined;
+    };
+    const deadStale = stale.filter((s) => !isLockHolderLive(s, rowTtlMinutes(s)));
+    const liveCount = stale.length - deadStale.length;
+    const liveNote = liveCount > 0
+      ? `${liveCount} lock(s) past TTL but with a recent holder heartbeat (within the steal-grace window) — omitted from the stale-lock warnings below.`
+      : null;
+
+    if (deadStale.length === 0) {
       return {
         name: 'stale_locks',
         status: 'ok',
-        message: reapedNote
-          ? `${reapedNote} No stale locks remain.`
-          : 'No stale locks (no rows with ttl_expires_at < NOW())',
+        message: [
+          reapedNote,
+          liveNote ?? 'No stale locks (no rows with ttl_expires_at < NOW())',
+        ].filter(Boolean).join('\n'),
       };
     }
-    const lines = stale.slice(0, 10).map(s => {
+    const lines = deadStale.slice(0, 10).map(s => {
       const ageH = Math.floor(s.age_ms / 3600_000);
       let breakHint = 'gbrain doctor';
       if (s.id.startsWith('gbrain-sync:')) {
@@ -3001,15 +3048,16 @@ export async function checkStaleLocks(
       }
       return `  ${s.id} (pid ${s.holder_pid} on ${s.holder_host}, age ${ageH}h) → ${breakHint}`;
     });
-    const tail = stale.length > 10 ? `  ... and ${stale.length - 10} more.` : null;
+    const tail = deadStale.length > 10 ? `  ... and ${deadStale.length - 10} more.` : null;
     const header = opts.fix
-      ? `${stale.length} stale lock(s) remain that could not be auto-reaped (live holder, cross-host, or within the PID-reuse grace):`
-      : `${stale.length} stale lock(s) detected (ttl_expires_at < NOW()):`;
+      ? `${deadStale.length} stale lock(s) remain that could not be auto-reaped (live holder, cross-host, or within the PID-reuse grace):`
+      : `${deadStale.length} stale lock(s) detected (ttl_expires_at < NOW()):`;
     return {
       name: 'stale_locks',
       status: 'warn',
       message: [
         reapedNote,
+        liveNote,
         header,
         ...lines,
         tail,
