@@ -154,11 +154,19 @@ const CLI_ONLY_SELF_HELP = new Set([
   // would leave that help dead code behind the generic stub (the init.ts:117
   // trap ENG-2 names).
   'bootstrap', 'hook', 'sweep',
+  // cathedral-4: transcripts ships its own HELP (the ingest import lane +
+  // the v0.29 recent reader). Without this the generic stub hides both.
+  'transcripts',
   // jobs ships JOBS_HELP + a per-subcommand record (JOBS_SUBCOMMAND_HELP) in
   // jobs.ts, guarded BEFORE the thin-client refusal and the subcommand switch
   // so `jobs work --help` prints help instead of starting a worker daemon.
   // Without this entry the generic stub hid the worker entry point entirely.
   'jobs',
+  // #4152: dream ships its own printHelp AND the `dream retriage --help`
+  // subverb help (dispatched engine-free before parseArgs). The generic stub
+  // would hide both — `gbrain dream retriage --help` printed the one-line
+  // dream stub instead of the retriage contract (outside-voice CX9).
+  'dream',
   // sources ships its own printHelp() (sources.ts, wired to `case '--help'`)
   // covering all ~28 subcommands, but was missing from this set — so
   // `gbrain sources --help` hit the generic one-line stub, which itself says
@@ -186,9 +194,13 @@ const SELF_HELP_WITHOUT_ENGINE: Record<string, () => Promise<(engine: never, arg
   maintain: async () => (await import('./commands/maintain.ts')).runMaintain as never,
   'extract-conversation-facts': async () =>
     (await import('./commands/extract-conversation-facts.ts')).runExtractConversationFacts as never,
+  transcripts: async () => (await import('./commands/transcripts.ts')).runTranscripts as never,
   // runJobs accepts BrainEngine | null and its help guard returns before any
   // engine (or subcommand body) is touched.
   jobs: async () => (await import('./commands/jobs.ts')).runJobs as never,
+  // runDream accepts BrainEngine | null; --help (and `retriage --help`) is
+  // answered before any engine-bearing work per the dream.ts IRON RULE.
+  dream: async () => (await import('./commands/dream.ts')).runDream as never,
   // runSources's `--help`/`-h`/undefined-subcommand branch calls printHelp()
   // without ever touching `engine` — safe to dispatch with no brain
   // configured, matching the reader who runs `sources --help` because they
@@ -2366,16 +2378,26 @@ async function handleCliOnly(command: string, args: string[]) {
   try {
     switch (command) {
       case 'import': {
-        const { runImport } = await import('./commands/import.ts');
+        const { runImport, ImportAbortError } = await import('./commands/import.ts');
         // v0.41 (Codex r2 #3 fix): honor errors counter for exit code.
         // runImport's per-file catch already records failures, but the
         // CLI was discarding the result so the process exited 0 even
         // when files failed (e.g. content-sanity hard-block throws,
         // size-cap throws, parse errors). Surface non-zero on errors > 0
         // so wrappers (sync, CI scripts, `&& gbrain doctor`) propagate.
-        const importResult = await runImport(engine, args);
-        if (importResult.errors > 0) {
-          setCliExitVerdict(1);
+        try {
+          const importResult = await runImport(engine, args);
+          if (importResult.errors > 0) {
+            setCliExitVerdict(1);
+          }
+        } catch (e) {
+          // W0 (Tier-1 #5): runImport throws typed aborts instead of
+          // process.exit(1) so in-process callers (sync_brain MCP op,
+          // autopilot, minion handler) survive a preflight failure. The CLI
+          // keeps the exact pre-fix behavior: message already printed at the
+          // throw site, exit non-zero here.
+          if (e instanceof ImportAbortError) process.exit(e.exitCode);
+          throw e;
         }
         break;
       }
@@ -3199,7 +3221,7 @@ TOOLS
   orphans [--json] [--count]         Find pages with no inbound wikilinks
   salience [--days N] [--kind P]     v0.29: pages ranked by emotional + activity salience
   anomalies [--since D] [--sigma N]  v0.29: cohort-based statistical anomalies (tag, type)
-  transcripts recent [--days N]      v0.29: recent raw .txt transcripts (local-only)
+  transcripts <ingest|status|recent> v0.46: import agent session logs + chat exports (local-only)
   dream [--dry-run] [--json]         Run the overnight maintenance cycle once (cron-friendly).
                                      See also: autopilot --install (continuous daemon).
   check-resolvable [--json] [--fix]  Validate skill tree (reachability/MECE/DRY)
