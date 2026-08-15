@@ -1828,7 +1828,9 @@ export async function registerBuiltinHandlers(
   // the core level and returned as `result.budget_exhausted: true` (NOT
   // a job failure) so the user can resume with a higher cap.
   registerBuiltinJob(worker, engine, 'extract-conversation-facts', async (job) => {
-    const { runExtractConversationFactsCore } = await import('./extract-conversation-facts.ts');
+    // ALLOWED_TYPES is the single source of truth for the conversation-facts
+    // type allowlist (see extract-conversation-facts.ts).
+    const { runExtractConversationFactsCore, ALLOWED_TYPES } = await import('./extract-conversation-facts.ts');
     const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
     if (!sourceId) {
       // Multi-source iteration not supported in the Minion-handler path;
@@ -1837,13 +1839,14 @@ export async function registerBuiltinHandlers(
       throw new Error('extract-conversation-facts Minion job requires data.sourceId');
     }
     const types = Array.isArray(job.data.types)
-      ? (job.data.types as string[]).filter((t) =>
-          ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'].includes(t),
+      ? (job.data.types as string[]).filter(
+          (t): t is import('./extract-conversation-facts.ts').AllowedType =>
+            (ALLOWED_TYPES as readonly string[]).includes(t),
         )
       : undefined;
     const result = await runExtractConversationFactsCore(engine, {
       sourceId,
-      types: types as ('conversation' | 'meeting' | 'slack' | 'email')[] | undefined,
+      types,
       slug: typeof job.data.slug === 'string' ? job.data.slug : undefined,
       dryRun: !!job.data.dryRun,
       limit: typeof job.data.limit === 'number' ? job.data.limit : undefined,

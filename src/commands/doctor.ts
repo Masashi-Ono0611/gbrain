@@ -3831,7 +3831,10 @@ export async function computeConversationFactsBacklogCheck(
     const typesRaw = await engine.getConfig(
       'cycle.conversation_facts_backfill.types',
     );
-    let types = ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'];
+    // Default mirrors extract-conversation-facts.ts's ALLOWED_TYPES — the
+    // single source of truth for the conversation-facts type allowlist.
+    const { ALLOWED_TYPES } = await import('./extract-conversation-facts.ts');
+    let types: string[] = [...ALLOWED_TYPES];
     if (typesRaw) {
       try {
         const parsed = JSON.parse(typesRaw);
@@ -6273,7 +6276,8 @@ export async function buildChecks(
     try {
       const { readConversationBodyForParsing } = await import('../core/conversation-parser/body.ts');
       const { parseConversation } = await import('../core/conversation-parser/parse.ts');
-      const allowedTypes = ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'] as const;
+      // Single source of truth for the conversation-facts type allowlist.
+      const { ALLOWED_TYPES: allowedTypes } = await import('./extract-conversation-facts.ts');
       // PageFilters supports singular `type` only; iterate the allowed types
       // and cap at ~50/each to land at ~200 total max.
       const sample: import('../core/types.ts').Page[] = [];
