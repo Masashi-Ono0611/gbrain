@@ -871,6 +871,41 @@ function resolveCycleLockRefreshMs(): number {
   return CYCLE_LOCK_REFRESH_INTERVAL_MS;
 }
 
+/**
+ * Did runCycle's private steal controller fire, and is this a steal rather than
+ * an external abort?
+ *
+ * Keyed on the ABORTED FLAG, not on `reason instanceof LockStolenError`. The
+ * `stolen` controller never leaves runCycle: the only two things that can abort
+ * it are startCycleLockRefresher (which passes `new LockStolenError(lockId)`)
+ * and the `onStolen` callback (typed to take a LockStolenError). So its aborted
+ * flag IS the steal signal, and re-deriving that answer from the reason only
+ * adds a way to get it wrong.
+ *
+ * It does get it wrong: the runtime can deliver `aborted === true` with
+ * `reason === undefined` when abort() runs in a microtask continuation
+ * scheduled from a timer callback — exactly startCycleLockRefresher's shape.
+ * Gating on the reason then INVERTS this branch, so a real steal rethrows
+ * instead of reporting the structured `lock_stolen` partial that exists to
+ * spare daemon callers that classification.
+ *
+ * The external-abort conjunct is preserved: a caller-initiated abort keeps the
+ * throw-out contract even if a steal races it.
+ *
+ * Takes minimal structural types rather than AbortSignal so it stays callable
+ * with the duck-typed stubs this file already documents (see anyAbortSignal)
+ * — and so the reason-dropped case is reachable in a test at all, since
+ * `abort()` / `abort(undefined)` both yield a DOMException, never `undefined`.
+ */
+export function isLockStolenAbort(
+  stolen: { aborted: boolean; reason?: unknown } | undefined,
+  external: { aborted: boolean } | undefined,
+): boolean {
+  if (stolen?.aborted !== true) return false;
+  if (external?.aborted === true) return false;
+  return true;
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────
 
 function makeErrorFromException(e: unknown, fallbackClass = 'InternalError'): PhaseError {
@@ -1896,17 +1931,22 @@ export async function runCycle(
   const cycleSignal: AbortSignal | undefined = combinedSignal
     ? combinedSignal.signal
     : (stolen?.signal ?? externalSignal);
+  const cycleLockId = cycleLockIdFor(opts.sourceId);
   const stopRefresher: (() => void) | undefined = lock && stolen
-    ? startCycleLockRefresher(lock, stolen, cycleLockIdFor(opts.sourceId))
+    ? startCycleLockRefresher(lock, stolen, cycleLockId)
     : undefined;
   const onStolen = stolen ? (e: LockStolenError) => { if (!stolen.signal.aborted) stolen.abort(e); } : undefined;
+  // The reason can arrive as undefined (see isLockStolenAbort); rejecting a
+  // raced phase with `undefined` would hand the outer catch a valueless throw.
+  const stolenReason = () =>
+    (stolen!.signal.reason as unknown) ?? new LockStolenError(cycleLockId);
   const raceStolen = !stolen
     ? <T,>(p: Promise<T>): Promise<T> => p
     : <T,>(p: Promise<T>): Promise<T> => {
-        if (stolen.signal.aborted) return Promise.reject(stolen.signal.reason);
+        if (stolen.signal.aborted) return Promise.reject(stolenReason());
         let onAbort!: () => void;
         const abortP = new Promise<never>((_, rej) => {
-          onAbort = () => rej(stolen.signal.reason);
+          onAbort = () => rej(stolenReason());
           stolen.signal.addEventListener('abort', onAbort, { once: true });
         });
         return Promise.race([p, abortP]).finally(() => {
@@ -2714,12 +2754,15 @@ export async function runCycle(
     // per D5.6); report a structured partial instead of throwing so daemon
     // callers (jobs.ts / autopilot) don't have to classify an exception.
     // External aborts (cycleSignal) keep the existing throw-out contract.
-    const stolenFired = stolen?.signal.aborted === true
-      && stolen.signal.reason instanceof LockStolenError
-      && externalSignal?.aborted !== true;
+    const stolenFired = isLockStolenAbort(stolen?.signal, externalSignal);
     if (stolenFired) {
       lockStolenAbort = true;
-      console.error(`[cycle] aborting: ${stolen!.signal.reason.message} — ${phaseResults.length} phase(s) completed before the steal; their writes are durable`);
+      // The reason is the better message when it survived; it is not always
+      // there (see isLockStolenAbort), so never dereference it unguarded.
+      const why = stolen!.signal.reason instanceof LockStolenError
+        ? stolen!.signal.reason.message
+        : `lock '${cycleLockId}' was stolen out from under this holder`;
+      console.error(`[cycle] aborting: ${why} — ${phaseResults.length} phase(s) completed before the steal; their writes are durable`);
     } else {
       throw e;
     }
