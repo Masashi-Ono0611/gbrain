@@ -4881,6 +4881,15 @@ export class PGLiteEngine implements BrainEngine {
     }
     return this._listFacts(source_id, {
       activeOnly: false,
+      // Engine parity (postgres-engine.ts's listSupersessions does not
+      // filter audit rows either): this is a supersession AUDIT LOG, not a
+      // knowledge-recall surface. An audit row CAN be superseded (any row
+      // can — expireFact(id, { supersededBy }) sets expired_at/superseded_by
+      // on whatever id it's given), and when it is, this log should show it
+      // like any other superseded row, on both engines identically. Do not
+      // default this to true just because _listFacts defaults it to true
+      // for the knowledge-facing methods.
+      excludeAuditRows: false,
       limit: opts?.limit,
       whereClauses: where,
       whereParams: params,

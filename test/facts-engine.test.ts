@@ -169,7 +169,7 @@ describe('listFactsSince + listFactsBySession', () => {
   });
 });
 
-describe('listFactsSince excludeAuditRows (internal extraction audit rows)', () => {
+describe('excludeAuditRows (internal extraction audit rows) — listFactsSince', () => {
   // extract-conversation-facts writes per-page terminal audit rows
   // (kind:'fact', entity_slug:null, never expired) as internal completion
   // markers. Every non-engine caller of listFacts* is a user-facing
@@ -233,6 +233,136 @@ describe('listFactsSince excludeAuditRows (internal extraction audit rows)', () 
     const scoped = rows.filter(r => r.source_session === session);
     expect(scoped.length).toBe(1);
     expect(scoped[0].fact).toBe('real user fact');
+  });
+});
+
+describe('excludeAuditRows — listFactsByEntity', () => {
+  // In production, writeTerminalAuditRow/writeNonExtractableAuditRow always
+  // set entity_slug: null, so listFactsByEntity (which requires an
+  // entity_slug match) would never reach a real audit row regardless of
+  // this filter — that would make a test seeding a null-entity_slug audit
+  // row here VACUOUS (it'd pass whether or not the source predicate exists,
+  // since the entity_slug predicate alone already excludes it). To actually
+  // exercise the source predicate, seed an audit-sourced row WITH a
+  // non-null entity_slug the query COULD otherwise reach.
+  const ENTITY = 'people/audit-row-filter-entity-test';
+
+  test('audit-sourced row reachable by entity_slug is NOT returned by default', async () => {
+    await engine.insertFact(
+      {
+        fact: 'EXTRACTION_COMPLETE',
+        kind: 'fact',
+        entity_slug: ENTITY,
+        source: TERMINAL_AUDIT_SOURCE,
+        source_session: 'audit-row-filter-entity-test-complete',
+      },
+      { source_id: 'default' },
+    );
+    const rows = await engine.listFactsByEntity('default', ENTITY);
+    expect(rows.find(r => r.source_session === 'audit-row-filter-entity-test-complete')).toBeUndefined();
+  });
+
+  test('audit-sourced row IS returned when excludeAuditRows: false is passed explicitly', async () => {
+    await engine.insertFact(
+      {
+        fact: 'EXTRACTION_NOT_APPLICABLE',
+        kind: 'fact',
+        entity_slug: ENTITY,
+        source: NON_EXTRACTABLE_AUDIT_SOURCE,
+        source_session: 'audit-row-filter-entity-test-non-applicable',
+      },
+      { source_id: 'default' },
+    );
+    const rows = await engine.listFactsByEntity('default', ENTITY, { excludeAuditRows: false });
+    const row = rows.find(r => r.source_session === 'audit-row-filter-entity-test-non-applicable');
+    expect(row).toBeDefined();
+    expect(row!.source).toBe(NON_EXTRACTABLE_AUDIT_SOURCE);
+  });
+
+  test('a real fact under the same entity_slug is still returned (filter is not over-broad)', async () => {
+    await engine.insertFact(
+      { fact: 'real entity fact', kind: 'fact', entity_slug: ENTITY, source: 'test', source_session: 'audit-row-filter-entity-test-real' },
+      { source_id: 'default' },
+    );
+    const rows = await engine.listFactsByEntity('default', ENTITY);
+    const row = rows.find(r => r.source_session === 'audit-row-filter-entity-test-real');
+    expect(row).toBeDefined();
+    expect(row!.fact).toBe('real entity fact');
+  });
+});
+
+describe('excludeAuditRows — listFactsBySession', () => {
+  test('audit row (entity_slug: null, as production writes it) is NOT returned by listFactsBySession by default', async () => {
+    const session = 'audit-row-filter-bysession-test';
+    await engine.insertFact(
+      { fact: 'EXTRACTION_COMPLETE', kind: 'fact', entity_slug: null, source: TERMINAL_AUDIT_SOURCE, source_session: session },
+      { source_id: 'default' },
+    );
+    const rows = await engine.listFactsBySession('default', session);
+    expect(rows.length).toBe(0);
+  });
+
+  test('audit row IS returned when excludeAuditRows: false is passed explicitly', async () => {
+    const session = 'audit-row-filter-bysession-test-override';
+    await engine.insertFact(
+      { fact: 'EXTRACTION_NOT_APPLICABLE', kind: 'fact', entity_slug: null, source: NON_EXTRACTABLE_AUDIT_SOURCE, source_session: session },
+      { source_id: 'default' },
+    );
+    const rows = await engine.listFactsBySession('default', session, { excludeAuditRows: false });
+    expect(rows.length).toBe(1);
+    expect(rows[0].source).toBe(NON_EXTRACTABLE_AUDIT_SOURCE);
+  });
+
+  test('a real fact in the same session is still returned (filter is not over-broad)', async () => {
+    const session = 'audit-row-filter-bysession-test-mixed';
+    await engine.insertFact(
+      { fact: 'real session fact', kind: 'fact', source: 'test', source_session: session },
+      { source_id: 'default' },
+    );
+    await engine.insertFact(
+      { fact: 'EXTRACTION_COMPLETE', kind: 'fact', entity_slug: null, source: TERMINAL_AUDIT_SOURCE, source_session: session },
+      { source_id: 'default' },
+    );
+    const rows = await engine.listFactsBySession('default', session);
+    expect(rows.length).toBe(1);
+    expect(rows[0].fact).toBe('real session fact');
+  });
+});
+
+describe('listSupersessions is NOT filtered by excludeAuditRows (audit-log parity, Item 1)', () => {
+  // listSupersessions is a supersession AUDIT LOG, not a knowledge-recall
+  // surface — postgres-engine.ts's listSupersessions never filtered audit
+  // rows, so pglite-engine.ts's must not either, or the two engines
+  // diverge (adversarial-review finding: PGLite's shared `_listFacts`
+  // helper defaults excludeAuditRows to true, and without an explicit
+  // override at the listSupersessions call site, a superseded audit row
+  // would vanish from PGLite's log while staying visible on Postgres's).
+  // Any row — including an audit row — can be superseded: expireFact(id,
+  // { supersededBy }) sets expired_at/superseded_by on whatever id it's
+  // given, with nothing that special-cases audit sources.
+  test('a superseded audit row IS returned by listSupersessions (matches Postgres, which never filtered it)', async () => {
+    const audit = await engine.insertFact(
+      {
+        fact: 'EXTRACTION_COMPLETE',
+        kind: 'fact',
+        entity_slug: null,
+        source: TERMINAL_AUDIT_SOURCE,
+        source_session: 'audit-row-supersession-test',
+      },
+      { source_id: 'default' },
+    );
+    const newer = await engine.insertFact(
+      { fact: 'superseder of audit row', kind: 'fact', source: 'test' },
+      { source_id: 'default' },
+    );
+    const didExpire = await engine.expireFact(audit.id, { supersededBy: newer.id });
+    expect(didExpire).toBe(true);
+
+    const supersessions = await engine.listSupersessions('default');
+    const row = supersessions.find(r => r.id === audit.id);
+    expect(row).toBeDefined();
+    expect(row!.source).toBe(TERMINAL_AUDIT_SOURCE);
+    expect(row!.superseded_by).toBe(newer.id);
   });
 });
 

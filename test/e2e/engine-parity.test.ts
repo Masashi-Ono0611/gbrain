@@ -19,6 +19,7 @@ import type { ChunkInput, SearchResult } from '../../src/core/types.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { getSessionContextState, upsertSessionContextState } from '../../src/core/context/session-state.ts';
 import { hasDatabase, setupDB, teardownDB, getEngine } from './helpers.ts';
+import { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE } from '../../src/core/facts/audit-sources.ts';
 
 const SKIP_PG = !hasDatabase();
 const describeBoth = SKIP_PG ? describe.skip : describe;
@@ -1168,6 +1169,134 @@ describeBoth('Engine parity — ambient recall keyset + session cursor (v0.45.7)
       expect(st!.standing_entities).toEqual(entities);
       expect(st!.surfaced_slugs).toEqual(['ks/tie-04']);
       expect(st!.last_wake_at).toBe(KS_LATE_TS);
+    }
+  });
+});
+
+describeBoth('Engine parity — extraction audit-row exclusion (recall-audit-rows)', () => {
+  // extract-conversation-facts writes per-page terminal audit rows
+  // (kind:'fact', entity_slug:null, never expired) as internal completion
+  // markers, source=TERMINAL_AUDIT_SOURCE / NON_EXTRACTABLE_AUDIT_SOURCE.
+  // FactListOpts.excludeAuditRows (default true) hides them from the
+  // knowledge-facing listFacts* methods; listSupersessions is deliberately
+  // NOT filtered (it's a supersession AUDIT LOG, and Postgres never
+  // filtered it). This block pins that BOTH engines behave identically —
+  // an adversarial review found PGLite's listSupersessions diverging from
+  // Postgres's (a superseded audit row vanished from PGLite's log while
+  // staying visible on Postgres's); see pglite-engine.ts's listSupersessions
+  // for the fix.
+  let pgEngine: BrainEngine;
+  let pgliteEngine: PGLiteEngine;
+
+  beforeAll(async () => {
+    pgEngine = await setupDB();
+    pgliteEngine = new PGLiteEngine();
+    await pgliteEngine.connect({});
+    await pgliteEngine.initSchema();
+  }, 90_000);
+
+  afterAll(async () => {
+    await pgliteEngine.disconnect();
+    await teardownDB();
+  }, 30_000);
+
+  test('listFactsSince excludes audit rows identically on both engines', async () => {
+    for (const eng of [pgEngine, pgliteEngine]) {
+      await eng.insertFact(
+        { fact: 'real fact', kind: 'fact', source: 'test', source_session: 'audit-parity-since-real' },
+        { source_id: 'default' },
+      );
+      await eng.insertFact(
+        {
+          fact: 'EXTRACTION_COMPLETE',
+          kind: 'fact',
+          entity_slug: null,
+          source: TERMINAL_AUDIT_SOURCE,
+          source_session: 'audit-parity-since-audit',
+        },
+        { source_id: 'default' },
+      );
+    }
+    for (const eng of [pgEngine, pgliteEngine]) {
+      const rows = await eng.listFactsSince('default', new Date(0));
+      expect(rows.find(r => r.source_session === 'audit-parity-since-real')).toBeDefined();
+      expect(rows.find(r => r.source_session === 'audit-parity-since-audit')).toBeUndefined();
+    }
+  });
+
+  test('listFactsByEntity excludes an audit-sourced row that IS reachable by entity_slug, identically on both engines', async () => {
+    // Audit rows always ship entity_slug:null in production, so a
+    // null-entity_slug seed here would pass vacuously (excluded by the
+    // entity_slug predicate alone, regardless of the source filter). Give
+    // this one a real entity_slug so the query can actually reach it and
+    // the source predicate is the thing under test.
+    const entity = 'people/audit-parity-entity-test';
+    for (const eng of [pgEngine, pgliteEngine]) {
+      await eng.insertFact(
+        { fact: 'real entity fact', kind: 'fact', entity_slug: entity, source: 'test', source_session: 'audit-parity-entity-real' },
+        { source_id: 'default' },
+      );
+      await eng.insertFact(
+        {
+          fact: 'EXTRACTION_COMPLETE',
+          kind: 'fact',
+          entity_slug: entity,
+          source: TERMINAL_AUDIT_SOURCE,
+          source_session: 'audit-parity-entity-audit',
+        },
+        { source_id: 'default' },
+      );
+    }
+    for (const eng of [pgEngine, pgliteEngine]) {
+      const rows = await eng.listFactsByEntity('default', entity);
+      expect(rows.find(r => r.source_session === 'audit-parity-entity-real')).toBeDefined();
+      expect(rows.find(r => r.source_session === 'audit-parity-entity-audit')).toBeUndefined();
+    }
+  });
+
+  test('listFactsBySession excludes audit rows identically on both engines', async () => {
+    const session = 'audit-parity-bysession-test';
+    for (const eng of [pgEngine, pgliteEngine]) {
+      await eng.insertFact(
+        { fact: 'real session fact', kind: 'fact', source: 'test', source_session: session },
+        { source_id: 'default' },
+      );
+      await eng.insertFact(
+        { fact: 'EXTRACTION_NOT_APPLICABLE', kind: 'fact', entity_slug: null, source: NON_EXTRACTABLE_AUDIT_SOURCE, source_session: session },
+        { source_id: 'default' },
+      );
+    }
+    for (const eng of [pgEngine, pgliteEngine]) {
+      const rows = await eng.listFactsBySession('default', session);
+      expect(rows.length).toBe(1);
+      expect(rows[0].fact).toBe('real session fact');
+    }
+  });
+
+  test('listSupersessions is NOT filtered — a superseded audit row is visible identically on both engines', async () => {
+    for (const eng of [pgEngine, pgliteEngine]) {
+      const audit = await eng.insertFact(
+        {
+          fact: 'EXTRACTION_COMPLETE',
+          kind: 'fact',
+          entity_slug: null,
+          source: TERMINAL_AUDIT_SOURCE,
+          source_session: 'audit-parity-supersession',
+        },
+        { source_id: 'default' },
+      );
+      const newer = await eng.insertFact(
+        { fact: 'superseder of audit row', kind: 'fact', source: 'test' },
+        { source_id: 'default' },
+      );
+      const didExpire = await eng.expireFact(audit.id, { supersededBy: newer.id });
+      expect(didExpire).toBe(true);
+
+      const supersessions = await eng.listSupersessions('default');
+      const row = supersessions.find(r => r.id === audit.id);
+      expect(row).toBeDefined();
+      expect(row!.source).toBe(TERMINAL_AUDIT_SOURCE);
+      expect(row!.superseded_by).toBe(newer.id);
     }
   });
 });
