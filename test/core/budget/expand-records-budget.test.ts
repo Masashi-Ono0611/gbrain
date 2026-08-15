@@ -1,0 +1,186 @@
+/**
+ * #4121 — expand() (query expansion) calls generateObject/generateText
+ * directly and never went through chat()'s `_recordBudget` closure, so
+ * expansion LLM spend was invisible to BudgetTracker even inside a
+ * `withBudgetTracker()` scope.
+ *
+ * Pins the fix's public contract:
+ *   - Every SUCCESSFUL expand() call site (native generateObject path,
+ *     openai-compatible structured-output generateObject path, and the
+ *     schemaless generateText fallback path) records usage on the ambient
+ *     BudgetTracker with a distinct `sub_label: 'gateway.expand'` — never
+ *     conflated with chat()'s `gateway.chat` audit rows.
+ *   - expand() outside any withBudgetTracker scope stays a budget no-op
+ *     (back-compat, mirrors gateway-budget-composition.test.ts).
+ *   - record() throwing BudgetExhausted (TX1, over-cap) is swallowed —
+ *     expand() still returns its best-effort result, matching chat()'s
+ *     fail-open posture.
+ *
+ * Hermetic: routes through __setGenerateObjectTransportForTests /
+ * __setGenerateTextTransportForTests so no network / provider / env
+ * variable is touched.
+ */
+
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  expand,
+  configureGateway,
+  resetGateway,
+  withBudgetTracker,
+  getCurrentBudgetTracker,
+  __setGenerateObjectTransportForTests,
+  __setGenerateTextTransportForTests,
+} from '../../../src/core/ai/gateway.ts';
+import {
+  BudgetTracker,
+  _resetBudgetTrackerWarningsForTest,
+} from '../../../src/core/budget/budget-tracker.ts';
+
+let tmp: string;
+let auditPath: string;
+
+beforeEach(() => {
+  tmp = mkdtempSync(join(tmpdir(), 'gbrain-expand-budget-'));
+  auditPath = join(tmp, 'budget.jsonl');
+  _resetBudgetTrackerWarningsForTest();
+});
+
+afterEach(() => {
+  __setGenerateObjectTransportForTests(null);
+  __setGenerateTextTransportForTests(null);
+  resetGateway();
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+/** Read + parse every JSONL line in the tracker's audit file. */
+function readAudit(): any[] {
+  return readFileSync(auditPath, 'utf-8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map(line => JSON.parse(line));
+}
+
+describe('expand() budget accounting — native generateObject path', () => {
+  beforeEach(() => {
+    configureGateway({
+      expansion_model: 'anthropic:claude-haiku-4-5-20251001',
+      env: { ANTHROPIC_API_KEY: 'sk-test-fake' },
+    });
+  });
+
+  test('a successful expansion records usage under the ambient tracker', async () => {
+    __setGenerateObjectTransportForTests(async () => ({
+      object: { queries: ['alt one', 'alt two'] },
+      usage: { inputTokens: 120, outputTokens: 40 },
+    }) as any);
+
+    const tracker = new BudgetTracker({ maxCostUsd: 1.0, label: 'test-expand', auditPath });
+
+    let result: string[] = [];
+    await withBudgetTracker(tracker, async () => {
+      result = await expand('original query');
+    });
+
+    expect(result).toContain('original query');
+    expect(result).toContain('alt one');
+    expect(tracker.snapshot().callsRecorded).toBe(1);
+    // Haiku pricing is non-zero, so a priced call must move totalSpent.
+    expect(tracker.totalSpent).toBeGreaterThan(0);
+
+    const rows = readAudit();
+    const recordRow = rows.find(r => r.event === 'record');
+    expect(recordRow).toBeTruthy();
+    // The core of #4121: expansion spend must carry its own sub_label, never
+    // the chat() one — that conflation is exactly what made it invisible.
+    expect(recordRow.sub_label).toBe('gateway.expand');
+    expect(recordRow.sub_label).not.toBe('gateway.chat');
+    expect(recordRow.model).toBe('anthropic:claude-haiku-4-5-20251001');
+    expect(recordRow.input_tokens).toBe(120);
+    expect(recordRow.output_tokens).toBe(40);
+  });
+
+  test('outside any withBudgetTracker scope, expand() is a budget no-op (back-compat)', async () => {
+    __setGenerateObjectTransportForTests(async () => ({
+      object: { queries: ['alt one'] },
+      usage: { inputTokens: 120, outputTokens: 40 },
+    }) as any);
+
+    expect(getCurrentBudgetTracker()).toBeNull();
+    const result = await expand('original query');
+    expect(result).toContain('original query');
+    expect(result).toContain('alt one');
+    // No tracker was ever installed — nothing to assert beyond "no throw".
+    expect(getCurrentBudgetTracker()).toBeNull();
+  });
+
+  test('BudgetExhausted from record() (TX1) is swallowed — expand() still returns its result', async () => {
+    // Tiny cap: reserve() has no pre-flight for expand() (only chat() calls
+    // reserve()), so the first record() itself pushes cumulative > cap and
+    // throws internally. recordExpansionUsage must swallow it.
+    __setGenerateObjectTransportForTests(async () => ({
+      object: { queries: ['alt one'] },
+      usage: { inputTokens: 1_000_000, outputTokens: 1_000_000 },
+    }) as any);
+
+    const tracker = new BudgetTracker({ maxCostUsd: 0.0001, label: 'tight-expand', auditPath });
+
+    let result: string[] = [];
+    let threw: unknown = null;
+    await withBudgetTracker(tracker, async () => {
+      try {
+        result = await expand('original query');
+      } catch (err) {
+        threw = err;
+      }
+    });
+
+    expect(threw).toBeNull();
+    expect(result).toContain('original query');
+    expect(tracker.totalSpent).toBeGreaterThan(0.0001);
+  });
+});
+
+describe('expand() budget accounting — openai-compatible schemaless (viaText) path', () => {
+  beforeEach(() => {
+    // litellm: requires no auth env and declares no chat.supports_structured_outputs,
+    // so recipeSupportsStructuredOutputs() is false and expand() routes straight
+    // to viaText() — the generateText fallback path, not generateObject.
+    configureGateway({
+      expansion_model: 'litellm:my-proxied-model',
+      env: {},
+    });
+  });
+
+  test('a successful viaText() expansion records usage with the same sub_label', async () => {
+    __setGenerateTextTransportForTests(async () => ({
+      text: '{"queries": ["alt one", "alt two"]}',
+      usage: { inputTokens: 80, outputTokens: 30 },
+    }) as any);
+
+    const tracker = new BudgetTracker({ label: 'test-expand-viatext', auditPath });
+
+    let result: string[] = [];
+    await withBudgetTracker(tracker, async () => {
+      result = await expand('original query');
+    });
+
+    expect(result).toContain('original query');
+    expect(result).toContain('alt one');
+    expect(tracker.snapshot().callsRecorded).toBe(1);
+
+    const rows = readAudit();
+    // litellm has no pricing entry, so this lands as record_unpriced — still
+    // proves the call site fired (this is the exact code path #4121 reported
+    // as never reaching the tracker at all).
+    const recordRow = rows.find(r => r.event === 'record' || r.event === 'record_unpriced');
+    expect(recordRow).toBeTruthy();
+    expect(recordRow.sub_label).toBe('gateway.expand');
+    expect(recordRow.model).toBe('litellm:my-proxied-model');
+    expect(recordRow.input_tokens).toBe(80);
+    expect(recordRow.output_tokens).toBe(30);
+  });
+});
