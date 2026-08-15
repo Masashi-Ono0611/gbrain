@@ -564,7 +564,7 @@ export async function probeEmbeddingReachability(deps: ProbeDeps = {}): Promise<
  *
  * Pre-fix `probeModel` hardcoded 5000ms for every provider. That's fine for
  * a plain network round-trip, but `claude-cli:` dispatches through a
- * `claude --print` subprocess (CLI cold start + user-level CLAUDE.md load),
+ * `claude -p (print mode)` subprocess (CLI cold start + user-level CLAUDE.md load),
  * which routinely takes 5-6s even when healthy — so the probe aborted on
  * every run and reported 'unknown — claude-cli adapter aborted', not
  * because the model was actually unreachable. Mirrors the reranker probe's
