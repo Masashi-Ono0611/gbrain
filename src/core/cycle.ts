@@ -605,6 +605,26 @@ export function cycleLockIdFor(sourceId?: string): string {
 }
 
 /**
+ * Non-throwing companion to `cycleLockIdFor`, for LOG LABELS only (the
+ * LockStolenError messages + the steal abort log line in runCycle).
+ *
+ * runCycle needs the label on paths that never validate `opts.sourceId`:
+ * lock-free phase selections acquire no lock at all (e.g.
+ * `gbrain dream --phase orphans --source __all__` — the `__all__` sentinel
+ * deliberately fails strict validation), and the engine-null file-lock path
+ * never routes the sourceId through `acquireDbCycleLock`. Throwing there
+ * would crash a run that never needed a lock id. NEVER use this for an
+ * actual lock acquisition — `cycleLockIdFor`'s throw IS the defense there.
+ */
+function cycleLockIdLabelFor(sourceId?: string): string {
+  try {
+    return cycleLockIdFor(sourceId);
+  } catch {
+    return `${LEGACY_CYCLE_LOCK_ID}:${String(sourceId)}`;
+  }
+}
+
+/**
  * Acquire the DB-backed cycle lock for a given source.
  *
  * Pre-v0.38 this file had its own copy of the UPSERT-with-TTL SQL for both
@@ -1931,7 +1951,11 @@ export async function runCycle(
   const cycleSignal: AbortSignal | undefined = combinedSignal
     ? combinedSignal.signal
     : (stolen?.signal ?? externalSignal);
-  const cycleLockId = cycleLockIdFor(opts.sourceId);
+  // Label only — the non-throwing variant, because this line runs even for
+  // lock-free phase selections where opts.sourceId was never validated (a
+  // `cycleLockIdFor` throw here crashed `--source __all__` runs that never
+  // needed a lock id). Real acquisition validated above via acquireDbCycleLock.
+  const cycleLockId = cycleLockIdLabelFor(opts.sourceId);
   const stopRefresher: (() => void) | undefined = lock && stolen
     ? startCycleLockRefresher(lock, stolen, cycleLockId)
     : undefined;
