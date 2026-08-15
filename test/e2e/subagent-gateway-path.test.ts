@@ -252,11 +252,91 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     expect(toolRows[0].ordinal).toBe(0);
     expect(toolRows[0].schema_version).toBe(2); // v0.38 write
     expect(String(toolRows[0].gbrain_tool_use_id)).toMatch(/^[0-9a-f-]{36}$/); // UUID v7
-    expect(toolRows[0].tool_use_id).toBe('provider-tc-1'); // provider id preserved
+    // #4155 — the stored value disambiguates with (message_idx, ordinal) so a
+    // provider that repeats ids across turns can't collide on the job-wide
+    // UNIQUE (job_id, tool_use_id) constraint; the raw provider id is still
+    // the prefix, kept for debugging per the gateway.ts doc comment.
+    expect(String(toolRows[0].tool_use_id)).toMatch(/^provider-tc-1#\d+\.\d+$/);
 
     // Token accumulation across both turns.
     expect(result.tokens.in).toBe(45); // 20 + 25
     expect(result.tokens.out).toBe(12); // 8 + 4
+  });
+
+  it('#4155 regression: two different tool calls sharing the SAME provider id persist as two rows (no UNIQUE(job_id, tool_use_id) collision)', async () => {
+    // Real-world shape: claude-cli replays a fresh subprocess per turn from
+    // an id-stripped transcript, so the model invents the SAME short id
+    // ("toolu_01") for the first tool call of every turn. Pre-fix, the second
+    // turn's INSERT collided on `uniq_subagent_tools_use_id UNIQUE (job_id,
+    // tool_use_id)` (a DIFFERENT constraint than this INSERT's own conflict
+    // target `(job_id, message_idx, ordinal)`) and threw, dead-lettering the
+    // job after 3 attempts.
+    let turn = 0;
+    __setChatTransportForTests(async () => {
+      turn++;
+      if (turn === 1) {
+        return {
+          text: '',
+          blocks: [{ type: 'tool-call', toolCallId: 'toolu_01', toolName: 'search', input: { q: 'first' } }] as ChatBlock[],
+          stopReason: 'tool_calls',
+          usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'anthropic:claude-sonnet-4-6',
+          providerId: 'anthropic',
+        } satisfies ChatResult;
+      }
+      if (turn === 2) {
+        return {
+          text: '',
+          blocks: [{ type: 'tool-call', toolCallId: 'toolu_01', toolName: 'put_page', input: { slug: 'x' } }] as ChatBlock[],
+          stopReason: 'tool_calls',
+          usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'anthropic:claude-sonnet-4-6',
+          providerId: 'anthropic',
+        } satisfies ChatResult;
+      }
+      return {
+        text: 'both done',
+        blocks: [{ type: 'text', text: 'both done' }] as ChatBlock[],
+        stopReason: 'end',
+        usage: { input_tokens: 5, output_tokens: 3, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'anthropic:claude-sonnet-4-6',
+        providerId: 'anthropic',
+      } satisfies ChatResult;
+    });
+
+    const executions: Array<{ name: string; input: unknown; ts: number }> = [];
+    const tools = makeStubTools(executions);
+    const handler = buildHandler(tools);
+    const { jobId, ctx } = await makeFakeJob({
+      prompt: 'do two things',
+      model: 'anthropic:claude-sonnet-4-6',
+      allowed_tools: ['search', 'put_page'],
+    });
+
+    const result = await handler(ctx);
+
+    expect(result.result).toBe('both done');
+    expect(result.stop_reason).toBe('end_turn');
+    expect(executions.map(e => e.name)).toEqual(['search', 'put_page']);
+
+    const toolRows = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT message_idx, tool_use_id, tool_name, status
+         FROM subagent_tool_executions
+        WHERE job_id = $1
+        ORDER BY message_idx`,
+      [jobId],
+    );
+    // Both rows persisted — the collision never threw.
+    expect(toolRows.length).toBe(2);
+    expect(toolRows[0].tool_name).toBe('search');
+    expect(toolRows[1].tool_name).toBe('put_page');
+    expect(toolRows[0].status).toBe('complete');
+    expect(toolRows[1].status).toBe('complete');
+    // Disambiguated by (message_idx, ordinal); provider id kept as the prefix
+    // for debugging. The two rows must NOT share a tool_use_id.
+    expect(String(toolRows[0].tool_use_id)).toMatch(/^toolu_01#\d+\.\d+$/);
+    expect(String(toolRows[1].tool_use_id)).toMatch(/^toolu_01#\d+\.\d+$/);
+    expect(toolRows[0].tool_use_id).not.toBe(toolRows[1].tool_use_id);
   });
 
   it('tool error path: handler persists status=failed, loop continues with error feedback', async () => {

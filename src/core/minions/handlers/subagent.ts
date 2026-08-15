@@ -1073,6 +1073,21 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
       // circuit silently breaks and the tool re-executes. Pinned by
       // test/e2e/subagent-crash-replay-multi-provider.test.ts.
       const candidateId = randomUUIDv7();
+      // #4155 — some providers (claude-cli) hand back short, repeating ids
+      // (e.g. "toolu_01" on every turn, since each `claude --print` call is a
+      // fresh subprocess replayed from an id-stripped transcript). The bare
+      // provider id is untrusted input into a column covered by the JOB-WIDE
+      // `uniq_subagent_tools_use_id UNIQUE (job_id, tool_use_id)` constraint —
+      // NOT this INSERT's own conflict target (job_id, message_idx, ordinal) —
+      // so a repeat collides and the insert throws, dead-lettering the job.
+      // Disambiguate with (messageIdx, ordinal): that pair is exactly the D11
+      // surrogate key, unique per job by construction (messageIdx is a
+      // strictly-increasing per-job counter; ordinal is 0-based within the
+      // turn) — so the composed string is unique per job regardless of how
+      // the provider names its calls. `ordinal` ALONE is not enough: it
+      // resets to 0 every turn, and a provider that repeats ids consistently
+      // (as above) would repeat "toolu_01#0" on every turn too.
+      const storedToolUseId = `${providerToolCallId}#${messageIdx}.${ordinal}`;
       const rows = await engine.executeRaw<{ gbrain_tool_use_id: string }>(
         `INSERT INTO subagent_tool_executions
            (job_id, message_idx, tool_use_id, tool_name, input, status, schema_version, ordinal, gbrain_tool_use_id, provider_id)
@@ -1080,7 +1095,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
          ON CONFLICT (job_id, message_idx, ordinal) DO UPDATE
            SET status = subagent_tool_executions.status
          RETURNING gbrain_tool_use_id::text AS gbrain_tool_use_id`,
-        [ctx.id, messageIdx, providerToolCallId, toolName, JSON.stringify(input ?? null), ordinal, candidateId, recipeIdFromModel(model)],
+        [ctx.id, messageIdx, storedToolUseId, toolName, JSON.stringify(input ?? null), ordinal, candidateId, recipeIdFromModel(model)],
       );
       const gbrainToolUseId = rows[0]?.gbrain_tool_use_id ?? candidateId;
       heartbeat('tool_called', { turn_idx: turnIdx, tool_name: toolName });
