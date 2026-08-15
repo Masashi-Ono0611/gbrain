@@ -95,9 +95,9 @@ import { writeReceipt, shortRunId } from '../core/extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../core/extract/rollup-writer.ts';
 import { ALLOWED_TYPES, type AllowedType } from '../core/facts/conversation-types.ts';
 
-// Re-exported verbatim so existing importers (this file's own helpers below,
-// doctor.ts, jobs.ts, sources.ts, the cycle backfill phase, and this file's
-// tests) keep working unchanged. Moved to
+// Re-exported verbatim so existing importers (this file's own helpers below
+// and this file's tests) keep working unchanged; doctor.ts, jobs.ts,
+// sources.ts, and the cycle backfill phase import the leaf directly. Moved to
 // src/core/facts/conversation-types.ts (see that file for why) so a
 // consumer that only needs the six values doesn't also pull in this file's
 // own CLI flag surface.

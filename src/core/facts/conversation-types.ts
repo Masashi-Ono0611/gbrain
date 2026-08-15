@@ -20,16 +20,18 @@
  * options — in the generated CLI_ONLY registry (#4135).
  *
  * `src/commands/extract-conversation-facts.ts` imports from here and
- * re-exports both names verbatim so its existing importers (this file's
- * own tests, the cycle backfill phase) keep working unchanged.
+ * re-exports both names verbatim so its remaining existing importers (its
+ * own tests) keep working unchanged; the cycle backfill phase
+ * (`src/core/cycle/conversation-facts-backfill.ts`) imports this leaf
+ * directly and is part of the drift-guarded set.
  */
-export const ALLOWED_TYPES = [
+export const ALLOWED_TYPES = Object.freeze([
   'conversation',
   'meeting',
   'slack',
   'email',
   'imessage',
   'imessage-daily',
-] as const;
+] as const);
 
 export type AllowedType = (typeof ALLOWED_TYPES)[number];

@@ -37,11 +37,21 @@
  * Guards below, mirroring test/model-pricing.test.ts:
  *   - identity/behavioral assertions where a site's resolved list is
  *     reachable at runtime (doctor.ts's backlog-check `details.types`);
- *   - source-text drift guards (mirroring model-pricing.test.ts's "no heavy
- *     import" cycle guard) for sites whose list isn't independently
- *     reachable/exported — these fail if anyone re-hardcodes a duplicate
- *     array/union literal instead of deriving from ALLOWED_TYPES, or points
- *     a site back at extract-conversation-facts.ts instead of the leaf;
+ *   - a SEMANTIC hand-copy detector (set-membership over array literals and
+ *     string-literal union chains, order- and length-insensitive) for sites
+ *     whose list isn't independently reachable/exported. An earlier version
+ *     used byte-exact canonical-order regexes, which mutation testing showed
+ *     only tripped on an exact canonical-order re-add — permuted re-adds,
+ *     subset re-adds (the harmful direction: silently dropping types), and a
+ *     narrowed jobs.ts runtime filter all passed. The detector fails on ANY
+ *     re-hardcoded conversation-type list (>=2 canonical members, code or
+ *     comment) and on pointing a site back at extract-conversation-facts.ts
+ *     instead of the leaf. The guarded set includes the cycle backfill phase
+ *     (src/core/cycle/conversation-facts-backfill.ts), where the detector
+ *     immediately caught a stale pre-#2756 four-element default in the
+ *     header comment;
+ *   - ALLOWED_TYPES itself is Object.frozen, so runtime mutation throws
+ *     instead of silently drifting every derived consumer at once;
  *   - a flag-registry regression guard pinning the exact bug this file's
  *     history hit: doctor/repos/sources must never carry
  *     extract-conversation-facts.ts's own flags.
@@ -68,16 +78,45 @@ function readSrc(relPath: string): string {
   return readFileSync(fileURLToPath(new URL(`../src/${relPath}`, import.meta.url)), 'utf8');
 }
 
-// The exact hand-copied array literal that used to live at all 5 sites
-// (whitespace-tolerant). Should appear ONLY in
-// src/core/facts/conversation-types.ts (the canonical ALLOWED_TYPES
-// definition) after the fix.
-const HARDCODED_SIX_LITERAL =
-  /\[\s*['"]conversation['"]\s*,\s*['"]meeting['"]\s*,\s*['"]slack['"]\s*,\s*['"]email['"]\s*,\s*['"]imessage['"]\s*,\s*['"]imessage-daily['"]\s*,?\s*\]/g;
+// Semantic hand-copy detector (replaces the earlier byte-exact literal/order
+// matchers, which only tripped on a canonical-order re-add — a permuted
+// re-add, a subset re-add (the harmful direction: silently dropping types),
+// and a narrowed runtime filter all sailed past them). Finds EVERY
+// conversation-type list shape regardless of order or length:
+//   - array literals of >=2 string elements (`['meeting', 'slack', ...]`)
+//   - string-literal union chains of >=2 members (`'meeting' | 'slack' | ...`)
+// and flags any whose elements intersect the canonical set in >=2 places.
+// Set-membership, not sequence match — so permutations, subsets, and
+// supersets all trip it. It deliberately scans comments too: a hand-copied
+// list in a doc comment goes stale the same way code does (adding this
+// detector immediately caught a pre-#2756 four-element default documented in
+// conversation-facts-backfill.ts's header while the code default was six).
+// The >=2 threshold keeps single-membership arrays like extract-conversation-
+// facts.ts's ALLOWED_TYPE_ALIASES values (`['slack', 'slack-dm-day', ...]`,
+// one canonical member each) from false-positiving.
+const CANONICAL_SET: ReadonlySet<string> = new Set(EXPECTED_TYPES);
+const STRING_LIT = `(?:'[^'\\n]*'|"[^"\\n]*")`;
+const ARRAY_LIST_RE = new RegExp(
+  `\\[\\s*${STRING_LIT}(?:\\s*,\\s*${STRING_LIT})+\\s*,?\\s*\\]`,
+  'g',
+);
+const UNION_LIST_RE = new RegExp(`${STRING_LIT}(?:\\s*\\|\\s*${STRING_LIT})+`, 'g');
 
-// The stale pre-#2756 four-element union type cast that drifted in jobs.ts.
-const STALE_FOUR_ELEMENT_UNION_CAST =
-  /\(\s*['"]conversation['"]\s*\|\s*['"]meeting['"]\s*\|\s*['"]slack['"]\s*\|\s*['"]email['"]\s*\)\s*\[\]/g;
+function stringElements(listText: string): string[] {
+  return [...listText.matchAll(/['"]([^'"\n]*)['"]/g)].map((m) => m[1]);
+}
+
+function findSuspectTypeLists(src: string): Array<{ snippet: string; elements: string[] }> {
+  const suspects: Array<{ snippet: string; elements: string[] }> = [];
+  for (const re of [ARRAY_LIST_RE, UNION_LIST_RE]) {
+    for (const m of src.matchAll(re)) {
+      const elements = stringElements(m[0]);
+      const canonicalHits = elements.filter((e) => CANONICAL_SET.has(e));
+      if (canonicalHits.length >= 2) suspects.push({ snippet: m[0], elements });
+    }
+  }
+  return suspects;
+}
 
 // Any import (static `from '...'` or dynamic `import('...')`) of
 // ALLOWED_TYPES (optionally aliased) from the given relative module path.
@@ -104,10 +143,22 @@ describe('ALLOWED_TYPES — canonical source of truth (leaf module)', () => {
     expect([...ALLOWED_TYPES]).toEqual([...EXPECTED_TYPES]);
   });
 
-  test('appears as a hardcoded literal exactly once, in the leaf module', () => {
+  test('is Object.frozen — runtime mutation throws instead of silently drifting every consumer', () => {
+    expect(Object.isFrozen(ALLOWED_TYPES)).toBe(true);
+    // Module code runs in strict mode, so a frozen-array write throws
+    // (it would be a silent no-op in sloppy mode — assert the throw so the
+    // guard is about behavior, not just the flag).
+    expect(() => {
+      (ALLOWED_TYPES as unknown as string[]).push('sms');
+    }).toThrow();
+    expect(ALLOWED_TYPES.length).toBe(6);
+  });
+
+  test('exactly one conversation-type list exists in the leaf module, and it is set-equal to the canonical 6', () => {
     const src = readSrc('core/facts/conversation-types.ts');
-    const matches = [...src.matchAll(HARDCODED_SIX_LITERAL)];
-    expect(matches.length).toBe(1);
+    const suspects = findSuspectTypeLists(src);
+    expect(suspects.length).toBe(1);
+    expect([...suspects[0].elements].sort()).toEqual([...EXPECTED_TYPES].sort());
   });
 
   test('the leaf module carries no CLI-flag-shaped literals of its own', () => {
@@ -120,9 +171,9 @@ describe('ALLOWED_TYPES — canonical source of truth (leaf module)', () => {
     expect([...src.matchAll(/--[a-z0-9][a-z0-9-]*/g)]).toEqual([]);
   });
 
-  test('extract-conversation-facts.ts no longer hardcodes the literal; re-exports from the leaf', () => {
+  test('extract-conversation-facts.ts no longer hand-copies any type list; re-exports from the leaf', () => {
     const src = readSrc('commands/extract-conversation-facts.ts');
-    expect([...src.matchAll(HARDCODED_SIX_LITERAL)]).toEqual([]);
+    expect(findSuspectTypeLists(src)).toEqual([]);
     expect(countAllowedTypesImportsFrom(src, '\\.\\./core/facts/conversation-types\\.ts')).toBe(1);
     expect(src).toContain('export { ALLOWED_TYPES }');
     expect(src).toContain('export type { AllowedType }');
@@ -134,17 +185,29 @@ describe('DRIFT GUARD — consumer sites derive from the leaf module (re-hardcod
     ['doctor.ts', 'commands/doctor.ts'],
     ['jobs.ts', 'commands/jobs.ts'],
     ['sources.ts', 'commands/sources.ts'],
+    ['conversation-facts-backfill.ts', 'core/cycle/conversation-facts-backfill.ts'],
   ] as const) {
-    test(`${label}: no hand-copied 6-element literal remains`, () => {
+    test(`${label}: no hand-copied conversation-type list remains (any order, any length >= 2)`, () => {
+      // Set-membership detector, NOT a canonical-order literal match: a
+      // permuted re-add, a subset re-add (dropping a type), and a widened
+      // re-add all fail here. Code and comments alike.
       const src = readSrc(relPath);
-      expect([...src.matchAll(HARDCODED_SIX_LITERAL)]).toEqual([]);
+      expect(findSuspectTypeLists(src)).toEqual([]);
     });
 
     test(`${label}: does not import ALLOWED_TYPES from extract-conversation-facts.ts`, () => {
       const src = readSrc(relPath);
-      expect(countAllowedTypesImportsFromCommandModule(src)).toBe(0);
+      expect(
+        countAllowedTypesImportsFrom(src, '\\.\\.?(?:/\\.\\.)?/commands/extract-conversation-facts\\.ts') +
+          countAllowedTypesImportsFromCommandModule(src),
+      ).toBe(0);
     });
   }
+
+  test('conversation-facts-backfill.ts: imports ALLOWED_TYPES from the leaf exactly once', () => {
+    const src = readSrc('core/cycle/conversation-facts-backfill.ts');
+    expect(countAllowedTypesImportsFrom(src, '\\.\\./facts/conversation-types\\.ts')).toBe(1);
+  });
 
   test('doctor.ts: imports ALLOWED_TYPES from the leaf exactly once (both sites reference the same binding)', () => {
     const src = readSrc('commands/doctor.ts');
@@ -153,9 +216,17 @@ describe('DRIFT GUARD — consumer sites derive from the leaf module (re-hardcod
     expect((src.match(/\bALLOWED_TYPES\b/g) ?? []).length).toBeGreaterThanOrEqual(3); // import + 2 usages
   });
 
-  test('jobs.ts: no stale 4-element union cast remains (the #2756-drift class)', () => {
+  test('jobs.ts: the extract-conversation-facts handler filters job.data.types against ALLOWED_TYPES', () => {
+    // Closes the narrowed-runtime-filter hole: the `job.data.types` filter
+    // must reference the canonical ALLOWED_TYPES binding. Together with the
+    // hand-copy detector above (no shadow list may exist anywhere in
+    // jobs.ts) and the single-leaf-import guard below, narrowing the filter
+    // requires either dropping this reference (fails here) or re-adding a
+    // hand-copied list (fails the detector). The old guard was a byte-exact
+    // match on the stale 4-element union cast, which a 4-element runtime
+    // filter re-add sailed straight past.
     const src = readSrc('commands/jobs.ts');
-    expect([...src.matchAll(STALE_FOUR_ELEMENT_UNION_CAST)]).toEqual([]);
+    expect(src).toMatch(/job\.data\.types[\s\S]{0,400}?\bALLOWED_TYPES\b/);
   });
 
   test('jobs.ts: imports ALLOWED_TYPES + AllowedType from the leaf exactly once', () => {
