@@ -38,6 +38,7 @@ import {
   BudgetTracker,
   _resetBudgetTrackerWarningsForTest,
 } from '../../../src/core/budget/budget-tracker.ts';
+import { RECIPES } from '../../../src/core/ai/recipes/index.ts';
 
 let tmp: string;
 let auditPath: string;
@@ -182,5 +183,65 @@ describe('expand() budget accounting — openai-compatible schemaless (viaText) 
     expect(recordRow.model).toBe('litellm:my-proxied-model');
     expect(recordRow.input_tokens).toBe(80);
     expect(recordRow.output_tokens).toBe(30);
+  });
+});
+
+describe('expand() budget accounting — openai-compatible structured-output (generateObject) path', () => {
+  // No built-in recipe currently opts into supports_structured_outputs (it's
+  // an opt-in per-backend capability declared in ChatTouchpoint — see
+  // recipeSupportsStructuredOutputs()'s own unit test in gateway-chat.test.ts
+  // for the same "no shipped recipe exercises this today" situation). Flip it
+  // on litellm's live recipe object for the duration of this test only, so
+  // expand() takes the SECOND generateObject call site (the one guarded by
+  // `recipeSupportsStructuredOutputs(recipe)`) through the real resolution
+  // path instead of the native-provider branch already covered above.
+  const litellmRecipe = RECIPES.get('litellm')!;
+  const originalSupportsStructuredOutputs = litellmRecipe.touchpoints.chat?.supports_structured_outputs;
+
+  beforeEach(() => {
+    litellmRecipe.touchpoints.chat!.supports_structured_outputs = true;
+    configureGateway({
+      expansion_model: 'litellm:my-proxied-model',
+      env: {},
+    });
+  });
+
+  afterEach(() => {
+    litellmRecipe.touchpoints.chat!.supports_structured_outputs = originalSupportsStructuredOutputs;
+  });
+
+  test('a successful structured-output expansion records usage — NOT via viaText()', async () => {
+    __setGenerateObjectTransportForTests(async () => ({
+      object: { queries: ['alt one', 'alt two'] },
+      usage: { inputTokens: 55, outputTokens: 22 },
+    }) as any);
+    // If the code regresses to falling through to viaText() (e.g. the
+    // try/catch around the structured call swallows a non-error condition),
+    // this transport must NOT be reached — assert it never fires.
+    let viaTextCalled = false;
+    __setGenerateTextTransportForTests(async () => {
+      viaTextCalled = true;
+      return { text: '{"queries": ["fallback"]}', usage: { inputTokens: 1, outputTokens: 1 } } as any;
+    });
+
+    const tracker = new BudgetTracker({ label: 'test-expand-structured', auditPath });
+
+    let result: string[] = [];
+    await withBudgetTracker(tracker, async () => {
+      result = await expand('original query');
+    });
+
+    expect(viaTextCalled).toBe(false);
+    expect(result).toContain('original query');
+    expect(result).toContain('alt one');
+    expect(tracker.snapshot().callsRecorded).toBe(1);
+
+    const rows = readAudit();
+    const recordRow = rows.find(r => r.event === 'record' || r.event === 'record_unpriced');
+    expect(recordRow).toBeTruthy();
+    expect(recordRow.sub_label).toBe('gateway.expand');
+    expect(recordRow.model).toBe('litellm:my-proxied-model');
+    expect(recordRow.input_tokens).toBe(55);
+    expect(recordRow.output_tokens).toBe(22);
   });
 });
