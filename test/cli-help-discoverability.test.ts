@@ -183,3 +183,31 @@ describe('#3834 — extract flags are discoverable from both help surfaces', () 
     for (const flag of implementedFlags) expect(extractHelp).toContain(flag);
   });
 });
+
+describe('sources --help reaches its own usage block instead of the circular generic stub', () => {
+  test('`gbrain sources --help` reaches detailed command help without a configured brain', () => {
+    const { stdout, stderr, status } = runCli(['sources', '--help']);
+    expect(status).toBe(0);
+    expect(stderr).toBe('');
+    expect(stdout).toContain('Subcommands:');
+    // Pre-fix output was the generic short-circuit, which itself points back
+    // at `gbrain --help` — a circular pointer, since the top-level help's own
+    // SOURCES block promises `sources --help` as the place to find these.
+    expect(stdout).not.toContain('run gbrain --help for the full command list');
+    // Subcommands the top-level `gbrain --help` SOURCES block does NOT list
+    // (it only lists list/add/remove/archive/restore/archived/purge/status)
+    // and instead defers to `sources --help` for.
+    expect(stdout).toContain('rename');
+    expect(stdout).toContain('set-cr-mode');
+    expect(stdout).toContain('federate');
+    expect(stdout).toContain('attach');
+    expect(stdout).toContain('harden');
+  });
+
+  test('`gbrain sources -h` reaches the same detailed command help', () => {
+    const { stdout, status } = runCli(['sources', '-h']);
+    expect(status).toBe(0);
+    expect(stdout).toContain('set-cr-mode');
+    expect(stdout).not.toContain('run gbrain --help for the full command list');
+  });
+});

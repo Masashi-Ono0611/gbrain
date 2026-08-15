@@ -159,6 +159,15 @@ const CLI_ONLY_SELF_HELP = new Set([
   // so `jobs work --help` prints help instead of starting a worker daemon.
   // Without this entry the generic stub hid the worker entry point entirely.
   'jobs',
+  // sources ships its own printHelp() (sources.ts, wired to `case '--help'`)
+  // covering all ~28 subcommands, but was missing from this set — so
+  // `gbrain sources --help` hit the generic one-line stub, which itself says
+  // "run gbrain --help for the full command list", and the top-level help's
+  // own SOURCES block promises `sources --help` as the place to find the
+  // long tail (rename, default, attach, current, federate, set-cr-mode,
+  // webhook, harden, ...). That made the pointer circular and those
+  // subcommands undiscoverable from the CLI in either direction.
+  'sources',
 ]);
 
 /**
@@ -180,6 +189,11 @@ const SELF_HELP_WITHOUT_ENGINE: Record<string, () => Promise<(engine: never, arg
   // runJobs accepts BrainEngine | null and its help guard returns before any
   // engine (or subcommand body) is touched.
   jobs: async () => (await import('./commands/jobs.ts')).runJobs as never,
+  // runSources's `--help`/`-h`/undefined-subcommand branch calls printHelp()
+  // without ever touching `engine` — safe to dispatch with no brain
+  // configured, matching the reader who runs `sources --help` because they
+  // have no brain yet.
+  sources: async () => (await import('./commands/sources.ts')).runSources as never,
 };
 
 /** Returns true when the command's own help was printed. */
