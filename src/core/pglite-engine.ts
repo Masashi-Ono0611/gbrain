@@ -25,6 +25,7 @@ import type {
   SourceRow,
 } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
+import { AUDIT_SOURCES } from './facts/audit-sources.ts';
 // Engine-path imports stay static unless a call site carries an explicit
 // engine-dynamic-import-ok justification. The gateway is the only current
 // exception because its local try/catch preserves a soft fallback.
@@ -5096,6 +5097,10 @@ export class PGLiteEngine implements BrainEngine {
     const params: Record<string, unknown> = { source_id };
     if (opts.activeOnly !== false) {
       whereParts.push(`expired_at IS NULL`);
+    }
+    if (opts.excludeAuditRows !== false) {
+      whereParts.push(`NOT (source = ANY($auditSources))`);
+      params.auditSources = AUDIT_SOURCES;
     }
     if (opts.kinds && opts.kinds.length > 0) {
       whereParts.push(`kind = ANY($kinds)`);

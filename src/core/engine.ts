@@ -552,6 +552,9 @@ export interface FactListOpts {
    * are returned. Remote (untrusted) callers must supply ['world'].
    */
   visibility?: FactVisibility[];
+  /** Hide internal extraction audit rows (EXTRACTION_COMPLETE / EXTRACTION_NOT_APPLICABLE,
+   *  written by extract-conversation-facts as per-page completion markers). Default true. */
+  excludeAuditRows?: boolean;
 }
 
 /** Per-source operational health snapshot consumed by `gbrain doctor`. */

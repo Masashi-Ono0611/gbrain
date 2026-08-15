@@ -14,6 +14,10 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
+import {
+  TERMINAL_AUDIT_SOURCE,
+  NON_EXTRACTABLE_AUDIT_SOURCE,
+} from '../src/core/facts/audit-sources.ts';
 
 let engine: PGLiteEngine;
 
@@ -162,6 +166,73 @@ describe('listFactsSince + listFactsBySession', () => {
     expect(a.every(r => r.source_session === 'topic-A')).toBe(true);
     expect(b.every(r => r.source_session === 'topic-B')).toBe(true);
     expect(a.find(r => r.source_session === 'topic-B')).toBeUndefined();
+  });
+});
+
+describe('listFactsSince excludeAuditRows (internal extraction audit rows)', () => {
+  // extract-conversation-facts writes per-page terminal audit rows
+  // (kind:'fact', entity_slug:null, never expired) as internal completion
+  // markers. Every non-engine caller of listFacts* is a user-facing
+  // knowledge surface (recall, entity, ambient turn-context, meta-hook,
+  // CLI recall) — none of them are diagnostic, so these rows must not leak
+  // into them by default. extract-conversation-facts' own resume logic
+  // reads them via raw SQL, not listFacts*, so this filter cannot affect
+  // resume.
+  test('audit row (TERMINAL_AUDIT_SOURCE) is NOT returned by listFactsSince by default', async () => {
+    const before = new Date();
+    await engine.insertFact(
+      {
+        fact: 'EXTRACTION_COMPLETE',
+        kind: 'fact',
+        entity_slug: null,
+        source: TERMINAL_AUDIT_SOURCE,
+        source_session: 'audit-row-filter-test-complete',
+      },
+      { source_id: 'default' },
+    );
+    const rows = await engine.listFactsSince('default', before);
+    expect(rows.find(r => r.source_session === 'audit-row-filter-test-complete')).toBeUndefined();
+  });
+
+  test('audit row IS returned when excludeAuditRows: false is passed explicitly (proves it is a filter, not a delete)', async () => {
+    const before = new Date();
+    await engine.insertFact(
+      {
+        fact: 'EXTRACTION_NOT_APPLICABLE',
+        kind: 'fact',
+        entity_slug: null,
+        source: NON_EXTRACTABLE_AUDIT_SOURCE,
+        source_session: 'audit-row-filter-test-non-applicable',
+      },
+      { source_id: 'default' },
+    );
+    const rows = await engine.listFactsSince('default', before, { excludeAuditRows: false });
+    const row = rows.find(r => r.source_session === 'audit-row-filter-test-non-applicable');
+    expect(row).toBeDefined();
+    expect(row!.source).toBe(NON_EXTRACTABLE_AUDIT_SOURCE);
+  });
+
+  test('real facts seeded alongside an audit row are still returned (filter is not over-broad)', async () => {
+    const before = new Date();
+    const session = 'audit-row-filter-test-mixed';
+    await engine.insertFact(
+      { fact: 'real user fact', kind: 'fact', source: 'test', source_session: session },
+      { source_id: 'default' },
+    );
+    await engine.insertFact(
+      {
+        fact: 'EXTRACTION_COMPLETE',
+        kind: 'fact',
+        entity_slug: null,
+        source: TERMINAL_AUDIT_SOURCE,
+        source_session: session,
+      },
+      { source_id: 'default' },
+    );
+    const rows = await engine.listFactsSince('default', before);
+    const scoped = rows.filter(r => r.source_session === session);
+    expect(scoped.length).toBe(1);
+    expect(scoped[0].fact).toBe('real user fact');
   });
 });
 
