@@ -1074,8 +1074,11 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
       // test/e2e/subagent-crash-replay-multi-provider.test.ts.
       const candidateId = randomUUIDv7();
       // #4155 — some providers (claude-cli) hand back short, repeating ids
-      // (e.g. "toolu_01" on every turn, since each `claude --print` call is a
-      // fresh subprocess replayed from an id-stripped transcript). The bare
+      // (e.g. "toolu_01" on every turn, since each `claude -p` (print mode)
+      // call is a fresh subprocess replayed from an id-stripped transcript).
+      // NOTE: spell it `-p`, not the long form — scripts/generate-flag-registry.ts
+      // harvests flag-shaped literals out of comments too, and the long form
+      // lands in the generated registry as a flag `jobs` does not accept. The bare
       // provider id is untrusted input into a column covered by the JOB-WIDE
       // `uniq_subagent_tools_use_id UNIQUE (job_id, tool_use_id)` constraint —
       // NOT this INSERT's own conflict target (job_id, message_idx, ordinal) —
