@@ -17,10 +17,18 @@
 
 import { describe, test, expect } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-function runCli(args: string[]): { stdout: string; stderr: string; status: number } {
-  const result = spawnSync('bun', ['run', 'src/cli.ts', ...args], {
-    cwd: process.cwd(),
+// Absolute path to the CLI entrypoint so `cwd` can be overridden (needed for
+// the `sources detach --help` regression test below, which must run with the
+// spawned process's cwd pointed at a scratch directory).
+const CLI_ENTRY = join(process.cwd(), 'src/cli.ts');
+
+function runCli(args: string[], opts: { cwd?: string } = {}): { stdout: string; stderr: string; status: number } {
+  const result = spawnSync('bun', ['run', CLI_ENTRY, ...args], {
+    cwd: opts.cwd ?? process.cwd(),
     encoding: 'utf8',
     env: { ...process.env, GBRAIN_HOME: '/tmp/gbrain-test-help-nonexistent' },
   });
@@ -209,5 +217,43 @@ describe('sources --help reaches its own usage block instead of the circular gen
     expect(status).toBe(0);
     expect(stdout).toContain('set-cr-mode');
     expect(stdout).not.toContain('run gbrain --help for the full command list');
+  });
+});
+
+describe('regression: nested `sources <sub> --help` must print help, not dispatch to <sub>', () => {
+  // `hasHelpFlag` in src/cli.ts matches --help/-h in ANY position, which is
+  // what routes `sources list --help` into SELF_HELP_WITHOUT_ENGINE with a
+  // placeholder null engine. Before the sources.ts guard, runSources's
+  // switch dispatched on args[0] only ('list'), so the '--help' in position
+  // 1 was silently dropped and runList(nullEngine, ['--help']) actually ran
+  // — crashing on the placeholder engine. Some subcommands (`detach`) don't
+  // even touch the engine and would perform their real, destructive action
+  // instead of crashing.
+  test('`sources list --help` prints help and does not dispatch into runList (no null-engine crash)', () => {
+    const { stdout, stderr, status } = runCli(['sources', 'list', '--help']);
+    expect(status).toBe(0);
+    expect(stdout).toContain('Subcommands:');
+    expect(stdout).not.toContain('run gbrain --help for the full command list');
+    // Pre-fix this crashed inside runList with something like
+    // "null is not an object (evaluating 'engine.executeRaw')".
+    expect(stderr).not.toContain('executeRaw');
+    expect(stderr).not.toContain('TypeError');
+  });
+
+  test('`sources detach --help` prints help and does NOT delete .gbrain-source', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-sources-detach-help-'));
+    const dotfile = join(dir, '.gbrain-source');
+    writeFileSync(dotfile, 'example-source\n');
+    try {
+      const { stdout, status } = runCli(['sources', 'detach', '--help'], { cwd: dir });
+      expect(status).toBe(0);
+      expect(stdout).toContain('Subcommands:');
+      // The regression: runDetach() takes no engine and unconditionally
+      // unlinks .gbrain-source — with no guard, `detach --help` silently
+      // deletes the caller's dotfile instead of showing usage.
+      expect(existsSync(dotfile)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

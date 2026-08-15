@@ -1463,6 +1463,25 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
   const sub = args[0];
   const rest = args.slice(1);
 
+  // Help guards run BEFORE the subcommand switch below (mirrors jobs.ts
+  // src/commands/jobs.ts:462-471 — help checked first-position, then any
+  // position, before any subcommand body runs). cli.ts routes bare `sources
+  // --help` here with a placeholder engine (SELF_HELP_WITHOUT_ENGINE): the
+  // second check is why that's safe — without it, `sources <sub> --help`
+  // would fall through to <sub>'s own handler instead of printing help,
+  // which crashes for engine-touching subcommands (the placeholder engine
+  // is not a real one) and, for engine-free subcommands like `detach`
+  // (unlinks .gbrain-source with no engine involved at all), would silently
+  // perform the destructive action instead of showing usage.
+  if (!sub || sub === '--help' || sub === '-h') {
+    printHelp();
+    return;
+  }
+  if (rest.includes('--help') || rest.includes('-h')) {
+    printHelp();
+    return;
+  }
+
   switch (sub) {
     case 'add':        return runAdd(engine, rest);
     case 'list':       return runList(engine, rest);
@@ -1496,11 +1515,8 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     // agent-bootstrap: scan-gated workspace push
     case 'push':       return runPush(engine, rest);
     case 'unharden':   { const { runUnharden } = await import('./sources-harden.ts'); return runUnharden(engine, rest); }
-    case undefined:
-    case '--help':
-    case '-h':
-      printHelp();
-      return;
+    // undefined / --help / -h are handled by the guards above, before this
+    // switch is ever reached — no case needed here.
     default:
       console.error(`Unknown sources subcommand: ${sub}`);
       printHelp();
