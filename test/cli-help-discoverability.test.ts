@@ -27,10 +27,23 @@ import { join } from 'node:path';
 const CLI_ENTRY = join(process.cwd(), 'src/cli.ts');
 
 function runCli(args: string[], opts: { cwd?: string } = {}): { stdout: string; stderr: string; status: number } {
-  const result = spawnSync('bun', ['run', CLI_ENTRY, ...args], {
+  // Hermetic no-brain environment, matching cli-help-without-brain.serial.test.ts:
+  // GBRAIN_HOME alone is not enough — loadConfig also honours GBRAIN_DATABASE_URL
+  // and DATABASE_URL, so a developer or CI runner exporting either would let the
+  // CLI connect anyway and these assertions would go inert.
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    GBRAIN_HOME: '/tmp/gbrain-test-help-nonexistent',
+  };
+  delete env.GBRAIN_DATABASE_URL;
+  delete env.DATABASE_URL;
+  // --no-env-file: bun auto-loads .env from cwd, and GBRAIN_DATABASE_URL is
+  // honored unconditionally, so a local .env would put back exactly what the
+  // deletes above removed.
+  const result = spawnSync('bun', ['--no-env-file', 'run', CLI_ENTRY, ...args], {
     cwd: opts.cwd ?? process.cwd(),
     encoding: 'utf8',
-    env: { ...process.env, GBRAIN_HOME: '/tmp/gbrain-test-help-nonexistent' },
+    env,
   });
   return {
     stdout: result.stdout ?? '',
