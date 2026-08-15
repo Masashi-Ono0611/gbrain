@@ -974,6 +974,17 @@ function formatLag(seconds: number): string {
 }
 
 // ── v0.40 sources webhook (D8) ──────────────────────────────
+// Hoisted so both runWebhook's `case '--help'` and the top-level nested-help
+// guard in runSources (`sources webhook --help`, `sources webhook <sub>
+// --help`) print the identical text without dispatching into runWebhook.
+const SOURCES_WEBHOOK_HELP = `Usage: gbrain sources webhook <subcommand> <source-id> [options]
+
+Subcommands:
+  set <id>    [--secret VAL] [--github-repo owner/name]   One-time reveal
+  show <id>                                                Metadata only
+  rotate <id>                                              New secret, reveal
+  clear <id>                                               Remove webhook config`;
+
 async function runWebhook(engine: BrainEngine, args: string[]): Promise<void> {
   const sub = args[0];
   const rest = args.slice(1);
@@ -985,13 +996,7 @@ async function runWebhook(engine: BrainEngine, args: string[]): Promise<void> {
     case undefined:
     case '--help':
     case '-h':
-      console.log(`Usage: gbrain sources webhook <subcommand> <source-id> [options]
-
-Subcommands:
-  set <id>    [--secret VAL] [--github-repo owner/name]   One-time reveal
-  show <id>                                                Metadata only
-  rotate <id>                                              New secret, reveal
-  clear <id>                                               Remove webhook config`);
+      console.log(SOURCES_WEBHOOK_HELP);
       return;
     default:
       console.error(`Unknown webhook subcommand: ${sub}`);
@@ -1478,6 +1483,17 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     return;
   }
   if (rest.includes('--help') || rest.includes('-h')) {
+    // webhook is the one sources subcommand that ships its own detailed
+    // --help (set/show/rotate/clear, in SOURCES_WEBHOOK_HELP) — print that
+    // instead of the general list so `sources webhook --help` and `sources
+    // webhook <sub> --help` reach it. Do NOT dispatch into runWebhook: that
+    // would let e.g. `sources webhook set x --help` fall through to
+    // runWebhookSet, the same destructive-dispatch class this guard exists
+    // to prevent for the rest of sources' subcommands.
+    if (sub === 'webhook') {
+      console.log(SOURCES_WEBHOOK_HELP);
+      return;
+    }
     printHelp();
     return;
   }
@@ -1564,6 +1580,9 @@ Subcommands:
                                     override (v0.40.3.0). Pass "unset" or
                                     "default" to clear (NULL falls through
                                     to the global search.mode bundle).
+  webhook <set|show|rotate|clear> <id> [options]
+                                    v0.40 — per-source webhook secret management.
+                                    Run 'sources webhook --help' for subcommand detail.
   harden <id|--all> [--pat-file <p>] [--branch <b>] [--no-cron] [--no-verify] [--dry-run] [--json]
                                     v0.42.44 — make a brain repo durable: local
                                     auto-push hook, committed commit-push helper,

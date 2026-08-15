@@ -257,3 +257,31 @@ describe('regression: nested `sources <sub> --help` must print help, not dispatc
     }
   });
 });
+
+describe('`sources webhook --help` reaches its own detailed help, not the general block or runWebhook*', () => {
+  test('`sources webhook --help` prints the webhook-specific usage (set/show/rotate/clear), not the general SOURCES block', () => {
+    const { stdout, status } = runCli(['sources', 'webhook', '--help']);
+    expect(status).toBe(0);
+    expect(stdout).toContain('Usage: gbrain sources webhook');
+    expect(stdout).toContain('rotate <id>');
+    expect(stdout).toContain('clear <id>');
+    expect(stdout).toContain('One-time reveal');
+    // The general block's opening line + a subcommand only it lists —
+    // absence of both confirms this reached SOURCES_WEBHOOK_HELP, not
+    // printHelp().
+    expect(stdout).not.toContain('gbrain sources — manage multi-source brain configuration');
+    expect(stdout).not.toContain('add <id> --path');
+  });
+
+  test('`sources webhook set x --help` prints webhook help and does NOT reach runWebhookSet', () => {
+    const { stdout, stderr, status } = runCli(['sources', 'webhook', 'set', 'x', '--help']);
+    expect(status).toBe(0);
+    expect(stdout).toContain('Usage: gbrain sources webhook');
+    // runWebhookSet's own usage-error / not-found text must never appear —
+    // its presence would mean the guard let dispatch fall through to it.
+    expect(stdout).not.toContain('Source "x" not found');
+    expect(stderr).not.toContain('Source "x" not found');
+    expect(stderr).not.toContain('--github-repo');
+    expect(stderr).not.toContain('TypeError');
+  });
+});
