@@ -38,7 +38,8 @@ import {
   BudgetTracker,
   _resetBudgetTrackerWarningsForTest,
 } from '../../../src/core/budget/budget-tracker.ts';
-import { RECIPES } from '../../../src/core/ai/recipes/index.ts';
+import { getRecipe, __setTestRecipesForTests } from '../../../src/core/ai/recipes/index.ts';
+import type { Recipe } from '../../../src/core/ai/types.ts';
 
 let tmp: string;
 let auditPath: string;
@@ -190,24 +191,35 @@ describe('expand() budget accounting — openai-compatible structured-output (ge
   // No built-in recipe currently opts into supports_structured_outputs (it's
   // an opt-in per-backend capability declared in ChatTouchpoint — see
   // recipeSupportsStructuredOutputs()'s own unit test in gateway-chat.test.ts
-  // for the same "no shipped recipe exercises this today" situation). Flip it
-  // on litellm's live recipe object for the duration of this test only, so
-  // expand() takes the SECOND generateObject call site (the one guarded by
-  // `recipeSupportsStructuredOutputs(recipe)`) through the real resolution
-  // path instead of the native-provider branch already covered above.
-  const litellmRecipe = RECIPES.get('litellm')!;
-  const originalSupportsStructuredOutputs = litellmRecipe.touchpoints.chat?.supports_structured_outputs;
+  // for the same "no shipped recipe exercises this today" situation). Rather
+  // than mutating a shipped recipe singleton, use the established synthetic-
+  // recipe seam (__setTestRecipesForTests, already used by
+  // no-batch-cap-suppression.serial.test.ts / adaptive-embed-batch.test.ts):
+  // clone litellm under a test-only id with supports_structured_outputs
+  // flipped on, so expand() takes the SECOND generateObject call site (the
+  // one guarded by recipeSupportsStructuredOutputs(recipe)) through the real
+  // resolution path instead of the native-provider branch already covered
+  // above — without touching the real `litellm` recipe object at all.
+  const baseLitellm = getRecipe('litellm')!;
+  const structuredLitellm: Recipe = {
+    ...baseLitellm,
+    id: 'synthetic-structured-litellm',
+    touchpoints: {
+      ...baseLitellm.touchpoints,
+      chat: { ...baseLitellm.touchpoints.chat!, supports_structured_outputs: true },
+    },
+  };
 
   beforeEach(() => {
-    litellmRecipe.touchpoints.chat!.supports_structured_outputs = true;
+    __setTestRecipesForTests([structuredLitellm]);
     configureGateway({
-      expansion_model: 'litellm:my-proxied-model',
+      expansion_model: 'synthetic-structured-litellm:my-proxied-model',
       env: {},
     });
   });
 
   afterEach(() => {
-    litellmRecipe.touchpoints.chat!.supports_structured_outputs = originalSupportsStructuredOutputs;
+    __setTestRecipesForTests([]);
   });
 
   test('a successful structured-output expansion records usage — NOT via viaText()', async () => {
@@ -240,7 +252,7 @@ describe('expand() budget accounting — openai-compatible structured-output (ge
     const recordRow = rows.find(r => r.event === 'record' || r.event === 'record_unpriced');
     expect(recordRow).toBeTruthy();
     expect(recordRow.sub_label).toBe('gateway.expand');
-    expect(recordRow.model).toBe('litellm:my-proxied-model');
+    expect(recordRow.model).toBe('synthetic-structured-litellm:my-proxied-model');
     expect(recordRow.input_tokens).toBe(55);
     expect(recordRow.output_tokens).toBe(22);
   });
