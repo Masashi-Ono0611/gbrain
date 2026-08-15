@@ -1,5 +1,8 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { REPAIR_SOURCE_CONFIG_SQL } from '../core/source-config-sql.ts';
+// Leaf module (no flag surface of its own) — see that file for why this
+// isn't imported from extract-conversation-facts.ts directly (#4135).
+import { ALLOWED_TYPES } from '../core/facts/conversation-types.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import * as db from '../core/db.ts';
 import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
@@ -3831,9 +3834,8 @@ export async function computeConversationFactsBacklogCheck(
     const typesRaw = await engine.getConfig(
       'cycle.conversation_facts_backfill.types',
     );
-    // Default mirrors extract-conversation-facts.ts's ALLOWED_TYPES — the
-    // single source of truth for the conversation-facts type allowlist.
-    const { ALLOWED_TYPES } = await import('./extract-conversation-facts.ts');
+    // Default mirrors ALLOWED_TYPES — the single source of truth for the
+    // conversation-facts type allowlist.
     let types: string[] = [...ALLOWED_TYPES];
     if (typesRaw) {
       try {
@@ -6277,7 +6279,7 @@ export async function buildChecks(
       const { readConversationBodyForParsing } = await import('../core/conversation-parser/body.ts');
       const { parseConversation } = await import('../core/conversation-parser/parse.ts');
       // Single source of truth for the conversation-facts type allowlist.
-      const { ALLOWED_TYPES: allowedTypes } = await import('./extract-conversation-facts.ts');
+      const allowedTypes = ALLOWED_TYPES;
       // PageFilters supports singular `type` only; iterate the allowed types
       // and cap at ~50/each to land at ~200 total max.
       const sample: import('../core/types.ts').Page[] = [];

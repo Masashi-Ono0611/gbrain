@@ -1314,7 +1314,7 @@ async function runAudit(engine: BrainEngine, args: string[]): Promise<void> {
   // bytes. Estimated per-segment Sonnet cost is a rough heuristic
   // (~2000 in + 500 out tokens at $3/MTok in + $15/MTok out ≈ $0.013).
   // Single source of truth for the conversation-facts type allowlist.
-  const { ALLOWED_TYPES: FACTS_BACKFILL_ALLOWED } = await import('./extract-conversation-facts.ts');
+  const { ALLOWED_TYPES: FACTS_BACKFILL_ALLOWED } = await import('../core/facts/conversation-types.ts');
   const FACTS_BACKFILL_CHARS_PER_SEGMENT = 6500; // matches SEGMENT_TEXT_CHAR_LIMIT
   const FACTS_BACKFILL_USD_PER_SEGMENT = 0.013;
   let factsBackfillPages = 0;
