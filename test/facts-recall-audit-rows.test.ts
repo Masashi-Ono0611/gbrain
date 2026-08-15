@@ -2,13 +2,18 @@
  * recall (MCP op) + `gbrain recall` (CLI) — audit checkpoint rows are
  * excluded from output.
  *
- * extract-conversation-facts writes durable audit checkpoint rows
- * (EXTRACTION_COMPLETE / EXTRACTION_NOT_APPLICABLE) into the facts table to
- * mark batch-run progress (see src/commands/extract-conversation-facts.ts,
- * writeTerminalAuditRow / writeNonExtractableAuditRow). Their created_at is
- * always the most recent write, so right after a batch run they dominate the
- * newest-N fetch window that trusted (remote=false / local CLI) callers hit
- * — recall returns audit rows instead of real facts.
+ * extract-conversation-facts writes durable audit checkpoint rows — source
+ * TERMINAL_AUDIT_SOURCE / NON_EXTRACTABLE_AUDIT_SOURCE
+ * (src/core/facts/audit-sources.ts) — into the facts table to mark
+ * batch-run progress. Their created_at is always the most recent write, so
+ * right after a batch run they dominate the newest-N fetch window that
+ * trusted (remote=false / local CLI) callers hit — recall returns audit
+ * rows instead of real facts.
+ *
+ * The exclusion predicate is keyed on `source` (the writer), not on the
+ * fact TEXT — a real fact whose text happens to equal one of the audit
+ * marker strings must still come back. See the 'EXTRACTION_COMPLETE'/source:
+ * 'test' row seeded in beforeAll and asserted present in every test below.
  *
  * This exercises the fix at BOTH trusted read surfaces:
  *   - the MCP `recall` op handler (src/core/operations.ts) via
@@ -29,6 +34,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { runRecall } from '../src/commands/recall.ts';
 import { withEnv, emptyHome } from './helpers/with-env.ts';
+import { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE } from '../src/core/facts/audit-sources.ts';
 
 let engine: PGLiteEngine;
 
@@ -57,13 +63,28 @@ beforeAll(async () => {
     },
     { source_id: 'default' },
   );
+  // A genuine user fact whose TEXT happens to be exactly the audit marker
+  // string, but written by a normal (non-audit) source. This is the case
+  // the OLD `fact NOT IN ('EXTRACTION_COMPLETE', ...)` predicate got wrong
+  // — it matched on fact TEXT and hid this real content. The fix keys the
+  // predicate on `source` instead, so this row must survive exclusion.
+  await engine.insertFact(
+    {
+      fact: 'EXTRACTION_COMPLETE',
+      kind: 'fact',
+      entity_slug: 'coffee-prefs',
+      source: 'test',
+      visibility: 'world',
+    },
+    { source_id: 'default' },
+  );
   for (let i = 0; i < 5; i++) {
     await engine.insertFact(
       {
         fact: 'EXTRACTION_COMPLETE',
         kind: 'fact',
         entity_slug: null,
-        source: 'cli:extract-conversation-facts:terminal:v2',
+        source: TERMINAL_AUDIT_SOURCE,
         source_session: `audit-batch-${i}`,
         notability: 'low',
       },
@@ -75,7 +96,7 @@ beforeAll(async () => {
       fact: 'EXTRACTION_NOT_APPLICABLE',
       kind: 'fact',
       entity_slug: null,
-      source: 'cli:extract-conversation-facts:non-extractable:v2',
+      source: NON_EXTRACTABLE_AUDIT_SOURCE,
       source_session: 'audit-batch-na',
       notability: 'low',
     },
@@ -102,10 +123,14 @@ describe('recall op excludes extract-conversation-facts audit rows', () => {
     );
     expect(result.isError).toBeFalsy();
     const payload = JSON.parse(result.content[0].text);
-    const facts: Array<{ fact: string }> = payload.facts;
-    expect(facts.some(f => f.fact === 'EXTRACTION_COMPLETE')).toBe(false);
-    expect(facts.some(f => f.fact === 'EXTRACTION_NOT_APPLICABLE')).toBe(false);
+    const facts: Array<{ fact: string; source: string }> = payload.facts;
+    expect(facts.some(f => f.source === TERMINAL_AUDIT_SOURCE)).toBe(false);
+    expect(facts.some(f => f.source === NON_EXTRACTABLE_AUDIT_SOURCE)).toBe(false);
     expect(facts.some(f => f.fact === 'the user prefers oat milk in their coffee')).toBe(true);
+    // The real fact whose TEXT equals the audit marker, but whose source is
+    // normal, must NOT be excluded — this is what a text-based predicate
+    // would get wrong.
+    expect(facts.some(f => f.fact === 'EXTRACTION_COMPLETE' && f.source === 'test')).toBe(true);
   });
 
   test('recall with no filter (default recent-across-source arm) excludes audit rows', async () => {
@@ -117,10 +142,11 @@ describe('recall op excludes extract-conversation-facts audit rows', () => {
     );
     expect(result.isError).toBeFalsy();
     const payload = JSON.parse(result.content[0].text);
-    const facts: Array<{ fact: string }> = payload.facts;
-    expect(facts.some(f => f.fact === 'EXTRACTION_COMPLETE')).toBe(false);
-    expect(facts.some(f => f.fact === 'EXTRACTION_NOT_APPLICABLE')).toBe(false);
+    const facts: Array<{ fact: string; source: string }> = payload.facts;
+    expect(facts.some(f => f.source === TERMINAL_AUDIT_SOURCE)).toBe(false);
+    expect(facts.some(f => f.source === NON_EXTRACTABLE_AUDIT_SOURCE)).toBe(false);
     expect(facts.some(f => f.fact === 'the user prefers oat milk in their coffee')).toBe(true);
+    expect(facts.some(f => f.fact === 'EXTRACTION_COMPLETE' && f.source === 'test')).toBe(true);
   });
 
   // Production audit rows are always written with the default (private)
@@ -136,7 +162,7 @@ describe('recall op excludes extract-conversation-facts audit rows', () => {
         fact: 'EXTRACTION_COMPLETE',
         kind: 'fact',
         entity_slug: null,
-        source: 'cli:extract-conversation-facts:terminal:v2',
+        source: TERMINAL_AUDIT_SOURCE,
         source_session: 'audit-world-visible-probe',
         notability: 'low',
         visibility: 'world',
@@ -151,9 +177,10 @@ describe('recall op excludes extract-conversation-facts audit rows', () => {
     );
     expect(result.isError).toBeFalsy();
     const payload = JSON.parse(result.content[0].text);
-    const facts: Array<{ fact: string }> = payload.facts;
-    expect(facts.some(f => f.fact === 'EXTRACTION_COMPLETE')).toBe(false);
+    const facts: Array<{ fact: string; source: string }> = payload.facts;
+    expect(facts.some(f => f.source === TERMINAL_AUDIT_SOURCE)).toBe(false);
     expect(facts.some(f => f.fact === 'the user prefers oat milk in their coffee')).toBe(true);
+    expect(facts.some(f => f.fact === 'EXTRACTION_COMPLETE' && f.source === 'test')).toBe(true);
   });
 });
 
@@ -187,9 +214,10 @@ describe('gbrain recall CLI (local, non-thin-client path) excludes audit rows', 
       process.stdout.write = origWrite;
     }
     const payload = JSON.parse(captured.trim());
-    const facts: Array<{ fact: string }> = payload.facts;
-    expect(facts.some(f => f.fact === 'EXTRACTION_COMPLETE')).toBe(false);
-    expect(facts.some(f => f.fact === 'EXTRACTION_NOT_APPLICABLE')).toBe(false);
+    const facts: Array<{ fact: string; source: string }> = payload.facts;
+    expect(facts.some(f => f.source === TERMINAL_AUDIT_SOURCE)).toBe(false);
+    expect(facts.some(f => f.source === NON_EXTRACTABLE_AUDIT_SOURCE)).toBe(false);
     expect(facts.some(f => f.fact === 'the user prefers oat milk in their coffee')).toBe(true);
+    expect(facts.some(f => f.fact === 'EXTRACTION_COMPLETE' && f.source === 'test')).toBe(true);
   });
 });

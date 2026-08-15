@@ -14,6 +14,7 @@ import type {
 } from '../engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
 import { tryParseEmbedding } from '../utils.ts';
+import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 
 /** Narrow slice of PostgresEngine the facts operations use. */
 export interface PgFactsDeps {
@@ -239,7 +240,7 @@ export async function listFactsByEntity(
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
-        ${excludeAuditRows ? sql`AND fact NOT IN ('EXTRACTION_COMPLETE', 'EXTRACTION_NOT_APPLICABLE')` : sql``}
+        ${excludeAuditRows ? sql`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sql``}
       ORDER BY valid_from DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -268,7 +269,7 @@ export async function listFactsSince(
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
-        ${excludeAuditRows ? sql`AND fact NOT IN ('EXTRACTION_COMPLETE', 'EXTRACTION_NOT_APPLICABLE')` : sql``}
+        ${excludeAuditRows ? sql`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -295,7 +296,7 @@ export async function listFactsBySession(
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
-        ${excludeAuditRows ? sql`AND fact NOT IN ('EXTRACTION_COMPLETE', 'EXTRACTION_NOT_APPLICABLE')` : sql``}
+        ${excludeAuditRows ? sql`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
