@@ -252,25 +252,23 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     expect(toolRows[0].ordinal).toBe(0);
     expect(toolRows[0].schema_version).toBe(2); // v0.38 write
     expect(String(toolRows[0].gbrain_tool_use_id)).toMatch(/^[0-9a-f-]{36}$/); // UUID v7
-    // #4155 — the stored value disambiguates with (message_idx, ordinal) so a
-    // provider that repeats ids across turns can't collide on the job-wide
-    // UNIQUE (job_id, tool_use_id) constraint; the raw provider id is still
-    // the prefix, kept for debugging per the gateway.ts doc comment.
-    expect(String(toolRows[0].tool_use_id)).toMatch(/^provider-tc-1#\d+\.\d+$/);
+    expect(toolRows[0].tool_use_id).toBe('provider-tc-1'); // raw provider id preserved (#4155)
 
     // Token accumulation across both turns.
     expect(result.tokens.in).toBe(45); // 20 + 25
     expect(result.tokens.out).toBe(12); // 8 + 4
   });
 
-  it('#4155 regression: two different tool calls sharing the SAME provider id persist as two rows (no UNIQUE(job_id, tool_use_id) collision)', async () => {
+  it('#4155 regression: two different tool calls sharing the SAME provider id persist as two rows with the raw id intact', async () => {
     // Real-world shape: claude-cli replays a fresh subprocess per turn from
     // an id-stripped transcript, so the model invents the SAME short id
     // ("toolu_01") for the first tool call of every turn. Pre-fix, the second
-    // turn's INSERT collided on `uniq_subagent_tools_use_id UNIQUE (job_id,
-    // tool_use_id)` (a DIFFERENT constraint than this INSERT's own conflict
-    // target `(job_id, message_idx, ordinal)`) and threw, dead-lettering the
-    // job after 3 attempts.
+    // turn's INSERT collided on the former job-wide `uniq_subagent_tools_use_id
+    // UNIQUE (job_id, tool_use_id)` constraint (a DIFFERENT constraint than
+    // this INSERT's own conflict target `(job_id, message_idx, ordinal)`) and
+    // threw, dead-lettering the job after 3 attempts. Migration v129 dropped
+    // that constraint; the raw provider id is stored as-is and row identity
+    // is (job_id, message_idx, ordinal).
     let turn = 0;
     __setChatTransportForTests(async () => {
       turn++;
@@ -332,11 +330,11 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     expect(toolRows[1].tool_name).toBe('put_page');
     expect(toolRows[0].status).toBe('complete');
     expect(toolRows[1].status).toBe('complete');
-    // Disambiguated by (message_idx, ordinal); provider id kept as the prefix
-    // for debugging. The two rows must NOT share a tool_use_id.
-    expect(String(toolRows[0].tool_use_id)).toMatch(/^toolu_01#\d+\.\d+$/);
-    expect(String(toolRows[1].tool_use_id)).toMatch(/^toolu_01#\d+\.\d+$/);
-    expect(toolRows[0].tool_use_id).not.toBe(toolRows[1].tool_use_id);
+    // The RAW provider id is stored on both rows — readers disambiguate by
+    // message_idx, which must differ across the two turns.
+    expect(toolRows[0].tool_use_id).toBe('toolu_01');
+    expect(toolRows[1].tool_use_id).toBe('toolu_01');
+    expect(toolRows[0].message_idx).not.toBe(toolRows[1].message_idx);
   });
 
   it('tool error path: handler persists status=failed, loop continues with error feedback', async () => {

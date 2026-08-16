@@ -5794,6 +5794,28 @@ export const MIGRATIONS: Migration[] = [
          );
     `,
   },
+  {
+    version: 129,
+    name: 'drop_job_wide_subagent_tool_use_id_unique',
+    // #4155 — tool_use_id stores the RAW provider id, and some providers
+    // legitimately reuse the same short id on every turn (claude-cli spawns a
+    // fresh subprocess per turn from an id-stripped transcript, so the model
+    // re-invents ids like "toolu_01"). The job-wide UNIQUE (job_id,
+    // tool_use_id) constraint encoded the false assumption that provider ids
+    // are unique within a job; a reuse collided (this was never any INSERT's
+    // conflict target) and dead-lettered the job. Row identity is already
+    // carried by subagent_tool_executions_stable_id UNIQUE (job_id,
+    // message_idx, ordinal); readers resolve executions by (message_idx,
+    // tool_use_id). A narrower unique (e.g. adding message_idx) would still
+    // dead-letter a turn that reuses one id twice, so no replacement
+    // constraint is added. Same SQL on both engines; DROP CONSTRAINT IF
+    // EXISTS makes re-runs a no-op (v82 pglite precedent).
+    idempotent: true,
+    sql: `
+      ALTER TABLE subagent_tool_executions
+        DROP CONSTRAINT IF EXISTS uniq_subagent_tools_use_id;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
