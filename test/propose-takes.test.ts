@@ -433,10 +433,15 @@ New prose appended here.`;
     };
     const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
 
-    expect(result.status).toBe('ok');
+    // #3044: swallowed per-page failures no longer read as a clean 'ok' —
+    // the phase continues but reports 'warn' with a warning count.
+    expect(result.status).toBe('warn');
+    expect(result.summary).toContain('(1 warning(s))');
+    expect(result.summary).not.toContain('aborted on');
     const details = result.details as Record<string, unknown>;
     expect(details.pages_scanned).toBe(2);
     expect(details.proposals_inserted).toBe(1);
+    expect(details.aborted_global_error).toBeUndefined();
     expect((details.warnings as string[]).length).toBeGreaterThan(0);
     expect((details.warnings as string[])[0]).toContain('LLM timeout');
   });
@@ -814,5 +819,90 @@ describe('deadlineAtMs threading through the phase (#4168)', () => {
     const details = result.details as Record<string, unknown>;
     expect(details.deadline_hit).toBe(true);
     expect(details.pages_scanned).toBe(1);
+  });
+});
+
+// ─── Global-error halt (#3044) ──────────────────────────────────────
+// A billing/auth/rate-limit failure is a whole-run condition: every
+// remaining page would fail identically. Pre-fix, each page swallowed
+// its failure into warnings[] and the phase completed with status 'ok'
+// and a green summary — an exhausted spend limit left zero trace.
+
+describe('runPhaseProposeTakes — global-error halt (#3044)', () => {
+  test('429 extractor error breaks the page loop: no further pages, warn status, aborted summary, halt rollup', async () => {
+    const pages = [
+      buildPage({ slug: 'wiki/a', body: 'page a prose' }),
+      buildPage({ slug: 'wiki/b', body: 'page b prose' }),
+      buildPage({ slug: 'wiki/c', body: 'page c prose' }),
+    ];
+    const { engine, captured } = buildMockEngine({ pages });
+    let extractorCalls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      extractorCalls++;
+      throw Object.assign(new Error('rate limited'), { status: 429 });
+    };
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    // Loop broke on the FIRST failure — remaining pages never called the LLM.
+    expect(extractorCalls).toBe(1);
+    const details = result.details as Record<string, unknown>;
+    expect(details.pages_scanned).toBe(1);
+    expect(details.aborted_global_error).toBe('rate_limit');
+
+    // Surfaced, not swallowed.
+    expect(result.status).toBe('warn');
+    expect(result.summary).toContain('aborted on rate_limit error after 1 page(s)');
+    expect(result.summary).toContain('warning(s)');
+    expect((details.warnings as string[]).some(w => w.includes('whole-run condition'))).toBe(true);
+
+    // Rollup records a halt, not a completed round (same posture as budget
+    // exhaustion / deadline). Params: $5 = halt delta, $8 = completed delta.
+    const rollup = captured.find(c => c.sql.includes('extract_rollup_7d'));
+    expect(rollup).toBeDefined();
+    expect(rollup!.params[4]).toBe(1); // halt_count delta
+    expect(rollup!.params[7]).toBe(0); // round_completed delta
+  });
+
+  test('claude-cli spend-limit blob halts as billing', async () => {
+    const pages = [
+      buildPage({ slug: 'wiki/a', body: 'page a prose' }),
+      buildPage({ slug: 'wiki/b', body: 'page b prose' }),
+    ];
+    const { engine } = buildMockEngine({ pages });
+    let extractorCalls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      extractorCalls++;
+      throw new Error(
+        'claude-cli exited 1: {"type":"result","subtype":"error_during_execution","api_error_status":429,"result":"you have reached your monthly spend limit"}',
+      );
+    };
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    expect(extractorCalls).toBe(1);
+    expect(result.status).toBe('warn');
+    expect((result.details as Record<string, unknown>).aborted_global_error).toBe('billing');
+    expect(result.summary).toContain('aborted on billing error');
+  });
+
+  test('non-global extractor error does NOT halt (remaining pages still processed)', async () => {
+    const pages = [
+      buildPage({ slug: 'wiki/a', body: 'page a prose' }),
+      buildPage({ slug: 'wiki/b', body: 'page b prose' }),
+    ];
+    const { engine } = buildMockEngine({ pages });
+    let extractorCalls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      extractorCalls++;
+      if (extractorCalls === 1) throw new Error('fetch failed: ECONNRESET');
+      return [];
+    };
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    expect(extractorCalls).toBe(2);
+    const details = result.details as Record<string, unknown>;
+    expect(details.pages_scanned).toBe(2);
+    expect(details.aborted_global_error).toBeUndefined();
+    expect(result.status).toBe('warn'); // still surfaced as a warning
+    expect(result.summary).not.toContain('aborted on');
   });
 });

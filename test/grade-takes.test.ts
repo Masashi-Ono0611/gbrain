@@ -321,11 +321,60 @@ describe('runPhaseGradeTakes — phase integration', () => {
       return { verdict: 'correct', confidence: 0.9, reasoning: 'second succeeded' };
     };
     const result = await runPhaseGradeTakes(buildCtx(engine), { judge });
-    expect(result.status).toBe('ok');
+    // #3044: swallowed per-take failures no longer read as a clean 'ok' —
+    // the phase continues but reports 'warn' with a warning count.
+    expect(result.status).toBe('warn');
+    expect(result.summary).toContain('(1 warning(s))');
+    expect(result.summary).not.toContain('aborted on');
     const details = result.details as Record<string, unknown>;
     expect(details.verdicts_written).toBe(1);
+    expect(details.aborted_global_error).toBeUndefined();
     expect((details.warnings as string[]).length).toBeGreaterThan(0);
     expect((details.warnings as string[])[0]).toContain('judge timeout');
+  });
+
+  test('#3044: global judge error (401) breaks the take loop and surfaces a halt', async () => {
+    const takes = [
+      buildTake({ id: 1, sinceDate: '2023-01-01' }),
+      buildTake({ id: 2, sinceDate: '2023-01-01' }),
+      buildTake({ id: 3, sinceDate: '2023-01-01' }),
+    ];
+    const { engine } = buildMockEngine({ takes });
+    let calls = 0;
+    const judge: JudgeFn = async () => {
+      calls++;
+      throw Object.assign(new Error('invalid x-api-key'), { status: 401 });
+    };
+    const result = await runPhaseGradeTakes(buildCtx(engine), { judge });
+
+    // Loop broke on the FIRST failure — remaining takes never called the judge.
+    expect(calls).toBe(1);
+    const details = result.details as Record<string, unknown>;
+    expect(details.takes_scanned).toBe(1);
+    expect(details.aborted_global_error).toBe('auth');
+    expect(details.verdicts_written).toBe(0);
+
+    expect(result.status).toBe('warn');
+    expect(result.summary).toContain('aborted on auth error after 1 take(s)');
+    expect((details.warnings as string[]).some(w => w.includes('whole-run condition'))).toBe(true);
+  });
+
+  test('#3044: rate-limit message form (no status property) also halts', async () => {
+    const takes = [
+      buildTake({ id: 1, sinceDate: '2023-01-01' }),
+      buildTake({ id: 2, sinceDate: '2023-01-01' }),
+    ];
+    const { engine } = buildMockEngine({ takes });
+    let calls = 0;
+    const judge: JudgeFn = async () => {
+      calls++;
+      throw new Error('{"type":"error","error":{"type":"rate_limit_error","message":"Too many requests"}}');
+    };
+    const result = await runPhaseGradeTakes(buildCtx(engine), { judge });
+
+    expect(calls).toBe(1);
+    expect(result.status).toBe('warn');
+    expect((result.details as Record<string, unknown>).aborted_global_error).toBe('rate_limit');
   });
 });
 

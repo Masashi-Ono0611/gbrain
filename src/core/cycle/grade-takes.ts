@@ -37,6 +37,7 @@
 import { createHash } from 'node:crypto';
 import { BaseCyclePhase, effectivePhaseDeadlineMs, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { chat as gatewayChat, getChatModel } from '../ai/gateway.ts';
+import { classifyGlobalLlmError, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { splitProviderModelId } from '../model-id.ts';
 import { GBrainError } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
@@ -249,6 +250,12 @@ export interface GradeTakesResult {
   auto_applied: number;
   too_recent: number;
   budget_exhausted: boolean;
+  /**
+   * Set when the take loop broke on a whole-run LLM failure (auth / billing /
+   * rate limit — #3044). The phase reports 'warn' so the condition can't
+   * hide behind a green summary.
+   */
+  aborted_global_error?: GlobalLlmErrorClass;
   warnings: string[];
   /** E2 ensemble (T5): count of takes where the ensemble tiebreaker fired. */
   ensemble_invoked: number;
@@ -526,13 +533,25 @@ class GradeTakesPhase extends BaseCyclePhase {
         break;
       }
 
-      // Call the single-model judge. Errors on a single take log warning + continue.
+      // Call the single-model judge. Errors on a single take log warning +
+      // continue — UNLESS they classify as a whole-run condition (auth /
+      // billing / rate limit, #3044): those fail identically on every
+      // remaining take, so the loop breaks and the phase surfaces a halt.
       let verdict: JudgeVerdict;
       try {
         verdict = await judge({ take, evidence, modelHint: judgeModelFull });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         result.warnings.push(`judge failed on take ${take.id}: ${msg}`);
+        const globalClass = classifyGlobalLlmError(err);
+        if (globalClass) {
+          result.aborted_global_error = globalClass;
+          result.warnings.push(
+            `aborting phase at take ${result.takes_scanned}/${takes.length}: ` +
+            `${globalClass} error is a whole-run condition; remaining takes would fail identically`,
+          );
+          break;
+        }
         continue;
       }
 
@@ -656,11 +675,18 @@ class GradeTakesPhase extends BaseCyclePhase {
 
     if (opts.reporter) opts.reporter.finish();
 
+    // Status folds warnings in (the extract_facts precedent from #1928): a
+    // run with swallowed per-take failures must not read as a clean 'ok'.
+    const warningCount = result.warnings.length;
     const summary =
       `grade_takes: scanned ${result.takes_scanned} takes ` +
       `(${result.too_recent} too recent, ${result.cache_hits} cached, ` +
       `${result.verdicts_written} new verdicts, ${result.auto_applied} auto-applied)` +
-      (result.deadline_hit ? ' [deadline hit — partial]' : '');
+      (result.deadline_hit ? ' [deadline hit — partial]' : '') +
+      (result.aborted_global_error
+        ? `; aborted on ${result.aborted_global_error} error after ${result.takes_scanned} take(s)`
+        : '') +
+      (warningCount > 0 ? ` (${warningCount} warning(s))` : '');
     return {
       summary,
       details: {
@@ -669,7 +695,13 @@ class GradeTakesPhase extends BaseCyclePhase {
         auto_resolve: autoResolve,
         auto_resolve_threshold: autoResolveThreshold,
       },
-      status: result.budget_exhausted || result.deadline_hit ? 'warn' : 'ok',
+      status:
+        result.budget_exhausted ||
+        result.deadline_hit ||
+        result.aborted_global_error !== undefined ||
+        warningCount > 0
+          ? 'warn'
+          : 'ok',
     };
   }
 }

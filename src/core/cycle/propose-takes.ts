@@ -41,6 +41,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { BaseCyclePhase, CYCLE_DEADLINE_RESERVE_MS, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { defaultTimeoutMsFor } from '../minions/handler-timeouts.ts';
 import { chat as gatewayChat, getChatModel, probeChatModel } from '../ai/gateway.ts';
+import { classifyGlobalLlmError, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
@@ -171,6 +172,12 @@ export interface ProposeTakesResult {
   budget_exhausted: boolean;
   /** True when the phase deadline fired before the page loop completed (partial result). */
   deadline_hit?: boolean;
+  /**
+   * Set when the page loop broke on a whole-run LLM failure (auth / billing /
+   * rate limit — #3044). The phase reports 'warn' and the rollup records a
+   * halt so the condition can't hide behind a green summary.
+   */
+  aborted_global_error?: GlobalLlmErrorClass;
   warnings: string[];
 }
 
@@ -645,7 +652,11 @@ class ProposeTakesPhase extends BaseCyclePhase {
         break;
       }
 
-      // Call the extractor. Errors on a single page log a warning but do not abort.
+      // Call the extractor. Errors on a single page log a warning but do not
+      // abort — UNLESS they classify as a whole-run condition (auth / billing
+      // / rate limit, #3044): those fail identically on every remaining page,
+      // so the loop breaks and the phase surfaces a halt instead of quietly
+      // accumulating one swallowed warning per page.
       let proposals: ProposedTake[];
       try {
         proposals = await extractor({
@@ -657,6 +668,15 @@ class ProposeTakesPhase extends BaseCyclePhase {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         result.warnings.push(`extractor failed on ${page.slug}: ${msg}`);
+        const globalClass = classifyGlobalLlmError(err);
+        if (globalClass) {
+          result.aborted_global_error = globalClass;
+          result.warnings.push(
+            `aborting phase at page ${result.pages_scanned}/${pages.length}: ` +
+            `${globalClass} error is a whole-run condition; remaining pages would fail identically`,
+          );
+          break;
+        }
         continue;
       }
 
@@ -751,8 +771,12 @@ class ProposeTakesPhase extends BaseCyclePhase {
       }
     }
     // A deadline-hit run halted mid-list the same way a budget-exhausted one
-    // does — record it as a halt, not a completed round.
-    const halted = result.budget_exhausted || result.deadline_hit === true;
+    // does — record it as a halt, not a completed round. A global-error
+    // abort (#3044) is the same posture: the round did not complete.
+    const halted =
+      result.budget_exhausted ||
+      result.deadline_hit === true ||
+      result.aborted_global_error !== undefined;
     await upsertExtractRollup(engine, {
       kind: 'takes.proposed',
       source_id: sourceIdForReceipt,
@@ -760,10 +784,18 @@ class ProposeTakesPhase extends BaseCyclePhase {
       halt_delta: halted ? 1 : 0,
     });
 
+    // Status folds warnings in (the extract_facts precedent from #1928): a
+    // run with swallowed per-page failures must not read as a clean 'ok'.
+    const warningCount = result.warnings.length;
     return {
-      summary: `propose_takes: scanned ${result.pages_scanned} pages, ${result.cache_hits} cached, ${result.proposals_inserted} new proposals, ${result.tombstones_written} empty (run ${proposalRunId})`,
+      summary:
+        `propose_takes: scanned ${result.pages_scanned} pages, ${result.cache_hits} cached, ${result.proposals_inserted} new proposals, ${result.tombstones_written} empty (run ${proposalRunId})` +
+        (result.aborted_global_error
+          ? `; aborted on ${result.aborted_global_error} error after ${result.pages_scanned} page(s)`
+          : '') +
+        (warningCount > 0 ? ` (${warningCount} warning(s))` : ''),
       details: { ...result, proposal_run_id: proposalRunId, prompt_version: promptVersion },
-      status: result.budget_exhausted || result.deadline_hit ? 'warn' : 'ok',
+      status: halted || warningCount > 0 ? 'warn' : 'ok',
     };
   }
 }
