@@ -2,7 +2,7 @@
  * Two-phase tool ledger helpers (persistToolExecPending/Complete/Failed) —
  * #4155 raw-id semantics.
  *
- * After migration v129 dropped the job-wide UNIQUE (job_id, tool_use_id),
+ * After migration v131 dropped the job-wide UNIQUE (job_id, tool_use_id),
  * tool_use_id stores the RAW provider id and may repeat both across turns and
  * (defensively) within one turn. Pinned contracts:
  *

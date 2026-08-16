@@ -1,5 +1,5 @@
 /**
- * Migration v129 (drop_job_wide_subagent_tool_use_id_unique) — #4155.
+ * Migration v131 (drop_job_wide_subagent_tool_use_id_unique) — #4155.
  *
  * tool_use_id stores the RAW provider id, and replay-style providers
  * (claude-cli spawns a fresh subprocess per turn from an id-stripped
@@ -9,15 +9,15 @@
  * Row identity is (job_id, message_idx, ordinal).
  *
  * Pinned contracts:
- * 1. v129 exists in MIGRATIONS with the canonical name, idempotent flag, and
+ * 1. v131 exists in MIGRATIONS with the canonical name, idempotent flag, and
  *    one engine-agnostic sql block (no sqlFor split).
  * 2. Fresh init: the schema no longer declares uniq_subagent_tools_use_id and
  *    two rows sharing (job_id, tool_use_id) can coexist.
  * 3. Upgrade: on a brain where the constraint still exists (positive control:
  *    the duplicate insert THROWS before the migration), a ledger rewind to
- *    128 → runMigrations applies v129, the constraint is gone, and the same
+ *    130 → runMigrations applies v131, the constraint is gone, and the same
  *    duplicate insert succeeds. Re-run applies nothing, and re-executing the
- *    v129 SQL directly is a no-op (DROP CONSTRAINT IF EXISTS).
+ *    v131 SQL directly is a no-op (DROP CONSTRAINT IF EXISTS).
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
@@ -29,7 +29,7 @@ let engine: PGLiteEngine;
 let queue: MinionQueue;
 let jobId: number;
 
-const V129_SQL = MIGRATIONS.find(m => m.version === 129)?.sql ?? '';
+const V131_SQL = MIGRATIONS.find(m => m.version === 131)?.sql ?? '';
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
@@ -66,19 +66,19 @@ async function constraintExists(): Promise<boolean> {
   return rows.length > 0;
 }
 
-describe('migration v129 — structure', () => {
+describe('migration v131 — structure', () => {
   test('exists with canonical name, idempotent flag, engine-agnostic sql', () => {
-    const v129 = MIGRATIONS.find(m => m.version === 129);
-    expect(v129).toBeDefined();
-    expect(v129?.name).toBe('drop_job_wide_subagent_tool_use_id_unique');
-    expect(v129?.idempotent).toBe(true);
-    expect(v129?.sqlFor).toBeUndefined();
-    expect(V129_SQL).toContain('DROP CONSTRAINT IF EXISTS uniq_subagent_tools_use_id');
-    expect(LATEST_VERSION).toBeGreaterThanOrEqual(129);
+    const v131 = MIGRATIONS.find(m => m.version === 131);
+    expect(v131).toBeDefined();
+    expect(v131?.name).toBe('drop_job_wide_subagent_tool_use_id_unique');
+    expect(v131?.idempotent).toBe(true);
+    expect(v131?.sqlFor).toBeUndefined();
+    expect(V131_SQL).toContain('DROP CONSTRAINT IF EXISTS uniq_subagent_tools_use_id');
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(131);
   });
 });
 
-describe('migration v129 — fresh init (PGLite)', () => {
+describe('migration v131 — fresh init (PGLite)', () => {
   test('fresh schema has no job-wide unique; duplicate raw ids across turns coexist', async () => {
     expect(await constraintExists()).toBe(false);
     await insertExec(1, 'toolu_01', 0);
@@ -91,9 +91,9 @@ describe('migration v129 — fresh init (PGLite)', () => {
   });
 });
 
-describe('migration v129 — upgrade from a pre-v129 brain (PGLite)', () => {
+describe('migration v131 — upgrade from a pre-v131 brain (PGLite)', () => {
   test('drops the constraint; duplicate insert throws before (positive control) and succeeds after', async () => {
-    // Simulate a pre-v129 brain: re-add the job-wide constraint.
+    // Simulate a pre-v131 brain: re-add the job-wide constraint.
     await engine.executeRaw(
       `ALTER TABLE subagent_tool_executions
          ADD CONSTRAINT uniq_subagent_tools_use_id UNIQUE (job_id, tool_use_id)`,
@@ -105,8 +105,8 @@ describe('migration v129 — upgrade from a pre-v129 brain (PGLite)', () => {
     await insertExec(1, 'toolu_01', 0);
     await expect(insertExec(3, 'toolu_01', 0)).rejects.toThrow();
 
-    // Apply v129 via the real migration runner (ledger rewind).
-    await engine.setConfig('version', '128');
+    // Apply v131 via the real migration runner (ledger rewind).
+    await engine.setConfig('version', '130');
     const res = await runMigrations(engine);
     expect(res.applied).toBeGreaterThanOrEqual(1);
     expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
@@ -126,7 +126,7 @@ describe('migration v129 — upgrade from a pre-v129 brain (PGLite)', () => {
 
     // SQL-level idempotency: DROP CONSTRAINT IF EXISTS on an absent
     // constraint is a no-op, not an error.
-    await engine.executeRaw(V129_SQL);
+    await engine.executeRaw(V131_SQL);
     expect(await constraintExists()).toBe(false);
   });
 });

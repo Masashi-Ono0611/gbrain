@@ -2,6 +2,320 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.46.6.0] - 2026-08-15
+
+**A busy machine can no longer make the job queue evict its own healthy
+work.** ([#4145](https://github.com/garrytan/gbrain/issues/4145)) Under
+sustained CPU load, a long-running background job (a subagent averaging
+~3 minutes) could miss one lock-renewal window and get force-evicted
+mid-inference — the queue would churn for hours while completions stayed
+near zero, and the logs read like an orphan leak. Lock renewal is now
+**verify-before-evict**: a slow or failed renewal is never treated as
+loss; the worker asks the database the one authoritative question (a
+fenced re-check) and keeps the job whenever the lease is still its own.
+
+### Added
+- **Per-job lock leases.** Long LLM handlers (subagent, autopilot-cycle,
+  embed-backfill, …) now hold a 300s lease by default instead of the
+  global 30s; single-call LLM handlers get 120s; short jobs keep 30s for
+  fast dead-worker recovery. Override per submission with
+  `gbrain jobs submit --lock-duration-ms N` (clamped to 5s–1h; also an
+  MCP `submit_job` param). Stored on the job row (migration v130), so it
+  survives worker restarts, and renewed at a `min(lease/2, 60s)` cadence.
+  The bound is enforced end-to-end — at submit, again on the resolved
+  lease at claim, and by a database range constraint — and
+  `--dry-run` echoes the clamped value that will actually be stored.
+- **Self-explaining eviction forensics.** Every renewal fault now logs and
+  audits WHY it failed (call-timeout vs refused vs fenced-lost), how late
+  the renewal timer fired vs its own cadence (the "was the worker starved
+  or was the database down?" discriminator), host load, and an
+  event-loop-delay sample scoped to the failing window. The ops runbook
+  gained a table for reading these plus the full env-knob reference
+  (`GBRAIN_LOCK_RENEWAL_*`, `GBRAIN_MINION_STALL_RECLAIM_GRACE_MS`).
+- **Stall-sweep reclaim grace.** A lease that lapsed within the last 15s
+  is not reclaimed — a just-recovered worker's own renewal wins the race
+  against the sweep instead of having its live job stolen (env-tunable,
+  capped at 10 minutes with a warn-once clamp; `0` restores the previous
+  behavior).
+
+### Changed
+- **Eviction requires evidence.** The renewal state machine aborts a job
+  only on a fenced miss (the row was genuinely reclaimed — requeued with
+  no attempt burned) or after a hard backstop (default 2× the lease)
+  during a total database outage. Wall-clock jumps can no longer distort
+  the decision (elapsed-time math runs on a monotonic clock), and a
+  renewal timeout now also cancels the in-flight query so it stops
+  holding a pool slot.
+- **`gbrain jobs get`** shows the job's lock lease alongside its
+  wall-clock budget, including the default that will stamp at claim.
+
+### Fixed
+- **The unit-suite's SIGTERM-semantics test no longer kills its own
+  shard.** A bare in-process signal broadcast could reach a leaked
+  cleanup handler from an earlier test file and exit the whole test
+  process mid-suite, misreading as an external kill; the test now fires
+  only the listeners it registered.
+- **`gbrain verify` no longer leaves probe tombstones in your brain.**
+  The end-of-run probe cleanup previously soft-deleted its two probe
+  pages; every verify run left residue visible to `include_deleted`
+  readers until the 72h purge. Cleanup now hard-deletes.
+- **Relational retrieval is deterministic on ties.** When a graph node is
+  reachable at the same depth from multiple seeds, the reported path was
+  plan/heap-order dependent (and could differ between engines); a
+  lexicographic tie-break restores the documented determinism.
+- **A worker slot can no longer lose track of a re-claimed job.** After a
+  force-evict, the stale execution's cleanup could delete the tracking
+  entry of the SAME job re-claimed by the same worker; both cleanup sites
+  now verify generation (lock token) before deleting.
+- **Developer e2e lane un-rotted.** 29 test failures across 13 files in
+  the developer-machine e2e lane (which CI does not run) were fixed:
+  ten rotted test files re-pinned to current intended behavior, plus the
+  wrapper's per-file timeout now accommodates the LLM-bound Tier-2 files
+  (`GBRAIN_E2E_FILE_TIMEOUT`).
+
+To take advantage of v0.46.6.0: upgrade and restart your worker
+(`gbrain jobs supervisor stop && gbrain jobs supervisor start --detach`).
+Existing queues need no migration steps — the new lease column defaults
+every existing row to its handler's lease at next claim. If you tuned
+around the old eviction behavior (e.g. very high `--max-stalled`), you can
+likely lower it now. Mixed fleets are safe: an old worker simply keeps the
+old 30s behavior until restarted.
+## [0.46.5.0] - 2026-08-15
+
+**CI in half, evals actually gating.** The Test workflow ran 8–9.5 minutes on
+every push; its long pole was a serial-test job that executed ~140 per-file bun
+processes strictly one-at-a-time even though the quarantine only ever required
+per-process isolation. This release pools that lane (8.5 min → ~4 min in CI,
+~2.5 min locally), wires the PGLite schema-snapshot fast-path into the CI test
+runners (it previously existed but only the local loop used it), and rebalances
+the 10-shard matrix on freshly mined weights (new files without a mined weight
+now fall back to the p75 file weight instead of the median) — a measured branch
+run landed the whole workflow at 255s. E2E stops spending real provider tokens on doc-only
+pushes (content-hash skip with nightly + manual-dispatch exemptions) and runs
+its tiers in parallel behind a fast broken-build spend gate.
+
+Retrieval quality now has a hermetic CLI canary: `gbrain eval gate` accepts a
+deterministic embedder option that drives the full hybrid/RRF pipeline with
+zero API keys, gated in CI on every run (`check:eval-canary`, alongside the new
+`check:eval-chronicle` gate) with its run ledger committed to
+`.gbrain-evals/eval-results.jsonl`. Two registered-but-never-executed guards
+came alive, a registration⇒execution coverage test closes that class for good,
+and 47 orphaned eval-harness tests joined the CI matrix behind a keyless
+allowlist. Test reliability hardening rounds it out: externally-killed serial
+files get a sequential rescue re-run (never a silent pass), machine-global
+files live on a growth-guarded exclusive lane, and the shard-balance test now
+asserts the matrix CI actually runs instead of recomputing its own inputs.
+
+**To take advantage of v0.46.5.0:** nothing to configure — CI and the local
+loops (`bun run test`, `bun run test:serial`, `bun run verify`) are just
+faster. New knobs if you need them: `GBRAIN_SERIAL_POOL=1` restores the old
+fully-sequential serial lane, `GBRAIN_VERIFY_MAX_PARALLEL` bounds verify's
+worker pool, `GBRAIN_NO_SNAPSHOT=1` opts any runner out of the snapshot
+fast-path. Run the retrieval canary yourself with
+`bun run scripts/run-eval-canary.ts` (add `--record` to append the committed
+ledger).
+## [0.46.4.0] - 2026-08-15
+
+**opencode joins the supported-client roster — at full parity from day one.**
+(opencode is opencode.ai, SST's terminal agent — not OpenClaw.) Unlike earlier
+clients that started with a manual recipe, opencode lands with every install
+lane gbrain has: the paste-in workspace bootstrap, machine-level harness
+wiring, `gbrain connect`, a claw-test runner, and a real-binary e2e door in
+CI. Every asserted flag, config shape, and quirk was observed against a
+pinned install (opencode 1.18.18), recorded in a machine-checked pin
+document, and exercised against the real binary — including the part that
+makes opencode special: its keyless anonymous free tier drives MCP tool
+calls, so the end-to-end proof needs zero secrets.
+
+### Added
+- **`gbrain bootstrap hooks --harness opencode`** — workspace-lane MCP
+  registration via direct, comment-preserving JSONC writes (never a CLI
+  exec, works offline). MCP scope is honored with a deliberately INVERTED
+  default: user-global, because opencode spawns project-config servers with
+  no trust prompt; project scope is an explicit opt-in that prints a sharing
+  warning. A structural ownership fingerprint refuses to touch entries
+  gbrain didn't write.
+- **`gbrain bootstrap harness --harness opencode`** — machine-level remote
+  MCP wiring with an inline bearer written 0600, token rotation across URL
+  changes, content-guarded rollback on failed smoke, `--status` and
+  `--remove`.
+- **`gbrain connect --agent opencode [--install]`** — env-interpolated
+  bearer (`{env:GBRAIN_REMOTE_TOKEN}`): the token never enters the config
+  file. `--force` replaces a registration whose endpoint moved.
+- **`gbrain claw-test --agent opencode`** and a split-gated real-binary e2e
+  door in CI: keyless tier (version pin, install + `mcp list` handshake,
+  spawn-gate canary, writer parity, MCP SMOKE on the free tier) plus a paid
+  Anthropic leg that model-gates before spending; npm supply-chain
+  provisioning verifies the actual downloaded tarball bytes against pinned
+  integrities; a schedule-only canary tracks the latest upstream release.
+- **Docs:** `docs/mcp/OPENCODE.md` install guide,
+  `docs/mcp/OPENCODE-CLI-PIN.md` observation pin (with a verify-time drift
+  guard and a pin-refresh cadence), roster updates across README / INSTALL /
+  bootstrap guides. opencode reads the rendered AGENTS.md pull-protocol
+  contract natively.
+
+### Changed
+- The bootstrap config writers (Claude hooks JSON, Codex TOML, opencode
+  JSONC) now share one atomic-write helper; symlinked configs — including
+  dangling dotfile-manager links — survive writes as links.
+- The door-test family (binary resolution, hermetic child envs, one-shot
+  spawns) extracted into shared factories; the hermes and grok runners were
+  ported onto them, hermes child envs gained the GitHub step-metadata scrub,
+  and the hermes installer pin was refreshed (its nightly door had gone red
+  on upstream installer drift).
+- A new pin-doc privacy guard asserts every agent pin document ships with
+  placeholder paths and no key material.
+
+### Fixed
+- Security and robustness hardening from the pre-landing cross-model review
+  pass: registration verification probes run isolated and time-bounded, and
+  a hung probe is killed instead of abandoned; global config writes
+  reconcile both opencode global filenames under the bootstrap lock; config
+  backups are unique per operation with content-guarded restore; error
+  paths never echo credentials; test-harness child processes drop CI
+  credentials before spawning third-party binaries.
+
+### To take advantage of v0.46.4.0
+opencode users: run `gbrain bootstrap hooks --harness opencode` in your
+brain workspace (or paste the standard bootstrap block into an opencode
+session). The keyless free tier is enough to verify the wiring end to end —
+`opencode mcp list` should show `✓ gbrain connected`. Existing installs:
+nothing changes; this release adds a client, it doesn't modify brain
+behavior.
+## [0.46.3.0] - 2026-08-15
+
+**ZeroEntropy is shutting down on 2026-09-04 — gbrain now gets you off it
+before that date costs you retrieval.** The provider that shipped as the
+default embedding + reranking stack from v0.36 through v0.46 is winding down
+its hosted API. This release makes the transition a guided, one-command move
+instead of a surprise outage:
+
+- **New default: Voyage.** Fresh installs land on `voyage:voyage-4` (1024d) —
+  the strongest hosted retrieval embedder on current benchmarks — and the same
+  `VOYAGE_API_KEY` powers the new `voyage:rerank-2.5` reranker (written as
+  explicit config whenever a Voyage key is present at init; keyed installs
+  without one get reranking explicitly disabled instead of inheriting a
+  fallback they can't use) and the multimodal model. One key, all three
+  touchpoints. The v4 family shares one embedding space, so you can later
+  point queries at `voyage-4-large` or `-lite` without re-indexing.
+- **Nothing changes out from under existing brains.** A brain configured for
+  ZeroEntropy (or riding the old default) keeps working exactly as before until
+  the shutdown date — this release only detects, warns, and hands you the
+  playbook. Every surface that used to steer you toward the dying provider
+  (init auto-pick, the interactive picker, `gbrain providers`, setup hints)
+  now steers you to the replacement instead, and using it prints a
+  once-per-process heads-up.
+- **The switch is one command:** `gbrain migrate embeddings --to voyage:voyage-4
+  --dim 1024 --dry-run` (cost preview), then `--yes`. Prefer OpenAI? It can
+  keep your existing column width: `--to openai:text-embedding-3-small
+  --dim 1280`. Reranker: `gbrain config set search.reranker.model
+  voyage:rerank-2.5`. Self-hosting the Apache-2.0 weights remains documented in
+  docs/guides/embedding-migration.md.
+- **Your agent gets told too.** A v0.46.3 migration checks whether your brain
+  still resolves to the sunsetting provider (embedding, reranker, or custom
+  columns), prints an ACTION REQUIRED notice with the blast radius and cost
+  estimate, and files a durable action item pointing at the agent playbook
+  (`skills/migrations/v0.46.3.0.md`). `gbrain doctor`'s provider check now
+  prints width-aware paste-ready commands, and its documented suppression
+  switch (`gbrain config set doctor.suppress_provider_sunset true`) actually
+  works now.
+- `gbrain ze-switch` no longer switches brains onto the sunsetting provider
+  (`--undo` still moves brains off it), and `gbrain migrate embeddings` refuses
+  a re-embed onto a provider with an announced shutdown — self-hosters with a
+  wire-compatible endpoint pass `--force-sunset-target`. Voyage's
+  `voyage-code-4` is available for code-heavy brains.
+- Setup fixes that ride along: init now detects provider keys stored in
+  `~/.gbrain/config.json` (file plane), not just env vars; a keyless brain
+  upgrades in place via `gbrain init --force --embedding-model voyage:voyage-4`
+  (the deferred-setup sentinel is cleared); and keyless fresh installs size the
+  embedding column at the new default width.
+
+### To take advantage of v0.46.3.0
+
+`gbrain upgrade` is enough — no schema migration.
+
+1. **Upgrade and check:**
+   ```bash
+   gbrain upgrade
+   gbrain doctor
+   ```
+2. **If the upgrade printed ACTION REQUIRED** (or doctor flags
+   `provider_sunset`): run the printed migrate command before 2026-09-04, or
+   hand your agent `skills/migrations/v0.46.3.0.md` — it walks the whole
+   switch, including the reranker and edge cases.
+3. **Things to watch:** existing brains see zero behavior change from this
+   release itself; fresh installs default to `voyage:voyage-4` at 1024
+   dimensions; reranking configured on the sunsetting provider dies with it on
+   2026-09-04 unless you set the voyage reranker (or disable reranking). If
+   anything looks wrong, file an issue with `gbrain doctor` output:
+   https://github.com/garrytan/gbrain/issues
+
+## [0.46.2.0] - 2026-08-15
+
+**Dream synthesis now triages before it spends.**
+([#4152](https://github.com/garrytan/gbrain/issues/4152)) The synthesize
+phase used to point its most expensive model at every transcript that
+cleared a yes/no check — on a busy brain that meant an unbounded queue of
+long frontier-model jobs grinding through logistics and small talk. It is
+now a two-stage cascade: a cheap scored triage reads every file first, and
+only what scores above your threshold reaches the synthesis model, which
+starts from a map of the noteworthy passages instead of hunting through raw
+transcript.
+
+### Added
+- **Scored triage gate.** Every transcript gets a 0–1 salience score,
+  content type, candidate quotes, and entity candidates from the utility-tier
+  model (one call per new file, cached in `dream_verdicts` with the judging
+  model + prompt version — migration v129). The gate
+  (`dream.triage.threshold`, default 0.5) is applied at read time: retune it
+  any time and re-gating costs **zero** new LLM calls. Provider hiccups
+  (truncation, refusal, unparseable output) are never cached as rejections —
+  those files are re-judged next cycle, and an outage reports as "triage
+  degraded", never as "everything scored low".
+- **`gbrain dream retriage`** — re-score the corpus and reconcile the queued
+  synthesis backlog. `--dry-run` previews from cached scores with zero LLM
+  calls; `--reconcile-queue` cancels queued jobs that score below the gate
+  AND converts jobs stranded in dead per-run queues so the next cycle
+  actually re-submits them; `--audit-rejects <n>` gets a frontier-model
+  second opinion on a sample of rejects (the threshold-calibration loop).
+  Every sweep prints an upfront cost estimate and asks before spending more
+  than a few dollars (`--yes` to skip, `--max-usd` for an estimate-based
+  budget stop that counts every paid call, including unreliable ones — it
+  can overshoot by up to the configured triage concurrency). Guardrails: queues
+  younger than an hour are treated as possibly-live and never touched;
+  `--cancel-unmatched` refuses to run off a truncated or empty corpus scan.
+- **Triage map in the synthesis prompt.** Passing files hand the synthesis
+  subagent their pre-extracted quotes and entities (verbatim-verified against
+  the chunk text) so it works from signal instead of re-scanning sludge.
+- **Cost knobs.** `dream.synthesize.max_turns` (default now 16, was a
+  hardcoded 30 — set it back via config if your written-page counts drop;
+  `details.synthesis.avg_turns` shows cap pressure),
+  `dream.triage.max_ms` (per-cycle triage time budget, default 5 min — a big
+  cold corpus triages across a few cycles, with deferred files labeled "not
+  yet triaged", never silently rejected), and an opt-in per-source daily
+  synthesis cap (`dream.synthesize.max_submissions_per_source_per_day`,
+  default off; 200/day is a sane value for busy deployments). The intended
+  pairing is the shipped mid-tier synthesis default — frontier-model
+  overrides are unnecessary with triage doing the reading.
+
+### Fixed
+- A run whose submissions were all skipped (cap, already-synthesized) no
+  longer starts the 12-hour cooldown, so the skipped files retry on the next
+  cycle instead of waiting half a day.
+- Synthesis jobs stranded in a dead per-run queue by a killed cycle are
+  self-healed on the next run (cancelled and re-submitted into the live
+  queue) instead of stalling the phase for the full 35-minute wait.
+- `gbrain dream retriage --help` (and richer `gbrain dream --help`) now
+  print real usage instead of the generic one-line stub, with no brain
+  configured.
+
+To take advantage of v0.46.2.0: upgrade and run `gbrain dream` as usual —
+existing verdicts are re-scored automatically on the next cycle (cheap,
+utility-tier). If you have a queued synthesis backlog, run
+`gbrain dream retriage --dry-run` to preview, then
+`gbrain dream retriage --reconcile-queue` to drain it for pennies. Tune
+`dream.triage.threshold` freely; re-gating is free.
+
 ## [0.46.1.0] - 2026-08-15
 
 **A stuck job can no longer take down your whole worker.** Field reports from

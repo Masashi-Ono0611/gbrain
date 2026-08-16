@@ -266,7 +266,7 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     // turn's INSERT collided on the former job-wide `uniq_subagent_tools_use_id
     // UNIQUE (job_id, tool_use_id)` constraint (a DIFFERENT constraint than
     // this INSERT's own conflict target `(job_id, message_idx, ordinal)`) and
-    // threw, dead-lettering the job after 3 attempts. Migration v129 dropped
+    // threw, dead-lettering the job after 3 attempts. Migration v131 dropped
     // that constraint; the raw provider id is stored as-is and row identity
     // is (job_id, message_idx, ordinal).
     let turn = 0;

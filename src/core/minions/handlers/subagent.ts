@@ -1093,7 +1093,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
       // The former job-wide `uniq_subagent_tools_use_id UNIQUE (job_id,
       // tool_use_id)` constraint encoded the false assumption that provider
       // ids are job-unique; a reuse collided (it was never this INSERT's
-      // conflict target) and dead-lettered the job. Migration v129 dropped
+      // conflict target) and dead-lettered the job. Migration v131 dropped
       // it — row identity is (job_id, message_idx, ordinal), and every
       // reader resolves an execution by (message_idx, tool_use_id) or by
       // gbrain_tool_use_id, never by tool_use_id alone.
@@ -1565,7 +1565,7 @@ async function persistToolExecPending(
   // the text→jsonb parse produce a real jsonb object.
   const jsonStr = typeof input === 'string' ? input : JSON.stringify(input);
   // Two guards replace the former job-wide ON CONFLICT (job_id, tool_use_id)
-  // DO NOTHING (that constraint was dropped in migration v129, #4155 — raw
+  // DO NOTHING (that constraint was dropped in migration v131, #4155 — raw
   // provider ids may repeat across turns):
   //   1. NOT EXISTS, restricted to LEGACY ordinal=NULL rows, preserves the
   //      DO NOTHING semantics against rows that predate ordinal stamping
@@ -1631,7 +1631,7 @@ async function persistToolExecFailed(
   // INSERT-or-UPDATE to failed — covers both "no pending row yet" (tool
   // rejected upfront) and "pending row exists" (tool threw mid-execute).
   // UPDATE-then-INSERT replaces the former ON CONFLICT (job_id, tool_use_id)
-  // upsert (that job-wide unique was dropped in migration v129, #4155).
+  // upsert (that job-wide unique was dropped in migration v131, #4155).
   // The UPDATE targets exactly ONE row (own ordinal first, then pending,
   // then legacy ordinal=NULL — never a settled same-id sibling); the INSERT
   // leg carries the stable-id ON CONFLICT backstop for the residual

@@ -166,7 +166,7 @@ describe('renderTranscript', () => {
       { type: 'tool_result', tool_use_id: 'toolu_01', content: 'second-turn-error', is_error: true },
     ]);
     // Same raw id on both rows — legal now that the job-wide unique on
-    // (job_id, tool_use_id) is gone from the schema (v129).
+    // (job_id, tool_use_id) is gone from the schema (v131).
     await insertTool(1, 'toolu_01', 'brain_search', { q: 'first' }, 'complete', { hit: 'first-turn-output' });
     await insertTool(3, 'toolu_01', 'brain_put_page', { slug: 'x' }, 'failed', null, 'second-turn-error');
 
