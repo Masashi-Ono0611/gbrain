@@ -333,7 +333,7 @@ describe('runPhaseGradeTakes — phase integration', () => {
     expect((details.warnings as string[])[0]).toContain('judge timeout');
   });
 
-  test('#3044: global judge error (401) breaks the take loop and surfaces a halt', async () => {
+  test('#3044: global judge error (401) halts on the FIRST hit, status fail (zero successes)', async () => {
     const takes = [
       buildTake({ id: 1, sinceDate: '2023-01-01' }),
       buildTake({ id: 2, sinceDate: '2023-01-01' }),
@@ -347,22 +347,32 @@ describe('runPhaseGradeTakes — phase integration', () => {
     };
     const result = await runPhaseGradeTakes(buildCtx(engine), { judge });
 
-    // Loop broke on the FIRST failure — remaining takes never called the judge.
+    // Auth is deterministic — the loop broke on the FIRST failure.
     expect(calls).toBe(1);
     const details = result.details as Record<string, unknown>;
     expect(details.takes_scanned).toBe(1);
     expect(details.aborted_global_error).toBe('auth');
     expect(details.verdicts_written).toBe(0);
+    expect(details.judge_calls_succeeded).toBe(0);
+    expect(details.judge_calls_failed).toBe(1);
+    expect(details.halted).toBe(true);
 
-    expect(result.status).toBe('warn');
+    // Zero successful judge calls → 'fail', not 'warn'.
+    expect(result.status).toBe('fail');
     expect(result.summary).toContain('aborted on auth error after 1 take(s)');
-    expect((details.warnings as string[]).some(w => w.includes('whole-run condition'))).toBe(true);
+    // Single combined warning line — no double counting.
+    expect(result.summary).toContain('(1 warning(s))');
+    expect((details.warnings as string[])).toHaveLength(1);
+    expect((details.warnings as string[])[0]).toContain('whole-run condition');
+    expect((details.warnings as string[])[0]).toContain('judge failed on take 1');
   });
 
-  test('#3044: rate-limit message form (no status property) also halts', async () => {
+  test('#3044: bare rate-limit errors halt only after 3 CONSECUTIVE takes', async () => {
     const takes = [
       buildTake({ id: 1, sinceDate: '2023-01-01' }),
       buildTake({ id: 2, sinceDate: '2023-01-01' }),
+      buildTake({ id: 3, sinceDate: '2023-01-01' }),
+      buildTake({ id: 4, sinceDate: '2023-01-01' }),
     ];
     const { engine } = buildMockEngine({ takes });
     let calls = 0;
@@ -372,9 +382,43 @@ describe('runPhaseGradeTakes — phase integration', () => {
     };
     const result = await runPhaseGradeTakes(buildCtx(engine), { judge });
 
-    expect(calls).toBe(1);
-    expect(result.status).toBe('warn');
-    expect((result.details as Record<string, unknown>).aborted_global_error).toBe('rate_limit');
+    // Takes 1-2 warn and continue; the 3rd consecutive hit halts; take 4
+    // never calls the judge.
+    expect(calls).toBe(3);
+    const details = result.details as Record<string, unknown>;
+    expect(details.takes_scanned).toBe(3);
+    expect(details.aborted_global_error).toBe('rate_limit');
+    expect(details.judge_calls_succeeded).toBe(0);
+    expect(result.status).toBe('fail');
+    expect(result.summary).toContain('aborted on rate_limit error after 3 take(s)');
+    expect((details.warnings as string[])[2]).toContain('3 consecutive rate_limit errors');
+  });
+
+  test('#3044: a successful judge call between rate limits resets the streak (no halt)', async () => {
+    const takes = [
+      buildTake({ id: 1, sinceDate: '2023-01-01' }),
+      buildTake({ id: 2, sinceDate: '2023-01-01' }),
+      buildTake({ id: 3, sinceDate: '2023-01-01' }),
+      buildTake({ id: 4, sinceDate: '2023-01-01' }),
+    ];
+    const { engine } = buildMockEngine({ takes });
+    let calls = 0;
+    const judge: JudgeFn = async () => {
+      calls++;
+      // 429, 429, success, 429 — never 3 in a row.
+      if (calls === 3) return { verdict: 'correct', confidence: 0.9, reasoning: 'ok' };
+      throw Object.assign(new Error('rate limited'), { status: 429 });
+    };
+    const result = await runPhaseGradeTakes(buildCtx(engine), { judge });
+
+    expect(calls).toBe(4);
+    const details = result.details as Record<string, unknown>;
+    expect(details.takes_scanned).toBe(4);
+    expect(details.aborted_global_error).toBeUndefined();
+    expect(details.judge_calls_succeeded).toBe(1);
+    expect(details.verdicts_written).toBe(1);
+    expect(result.status).toBe('warn'); // per-take warnings, but no halt
+    expect(result.summary).not.toContain('aborted on');
   });
 });
 

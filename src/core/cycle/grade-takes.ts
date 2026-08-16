@@ -37,7 +37,7 @@
 import { createHash } from 'node:crypto';
 import { BaseCyclePhase, effectivePhaseDeadlineMs, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { chat as gatewayChat, getChatModel } from '../ai/gateway.ts';
-import { classifyGlobalLlmError, type GlobalLlmErrorClass } from '../ai/errors.ts';
+import { classifyGlobalLlmError, RATE_LIMIT_HALT_STREAK, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { splitProviderModelId } from '../model-id.ts';
 import { GBrainError } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
@@ -251,11 +251,17 @@ export interface GradeTakesResult {
   too_recent: number;
   budget_exhausted: boolean;
   /**
-   * Set when the take loop broke on a whole-run LLM failure (auth / billing /
-   * rate limit — #3044). The phase reports 'warn' so the condition can't
-   * hide behind a green summary.
+   * Set when the take loop broke on a whole-run LLM failure (#3044):
+   * auth/billing on the first hit, rate_limit after RATE_LIMIT_HALT_STREAK
+   * consecutive hits — from the single-model judge OR a rejected ensemble
+   * judge. The phase reports 'warn' ('fail' when NO judge call succeeded)
+   * so the condition can't hide behind a green summary.
    */
   aborted_global_error?: GlobalLlmErrorClass;
+  /** Single-model judge calls that returned (cache hits don't count). */
+  judge_calls_succeeded: number;
+  /** Single-model judge calls that threw (global or per-take alike). */
+  judge_calls_failed: number;
   warnings: string[];
   /** E2 ensemble (T5): count of takes where the ensemble tiebreaker fired. */
   ensemble_invoked: number;
@@ -442,6 +448,8 @@ class GradeTakesPhase extends BaseCyclePhase {
       auto_applied: 0,
       too_recent: 0,
       budget_exhausted: false,
+      judge_calls_succeeded: 0,
+      judge_calls_failed: 0,
       warnings: [],
       ensemble_invoked: 0,
       ensemble_unanimous: 0,
@@ -467,6 +475,12 @@ class GradeTakesPhase extends BaseCyclePhase {
         status: 'warn',
       };
     }
+
+    // #3044 — consecutive rate_limit-classified LLM failures (single-model
+    // judge or ensemble rejection; counted at most once per take). A take
+    // that completes without one resets it; auth/billing never consult it
+    // (first hit halts).
+    let rateLimitStreak = 0;
 
     // Load unresolved active takes, oldest-first.
     const takes = await engine.listTakes({
@@ -533,27 +547,42 @@ class GradeTakesPhase extends BaseCyclePhase {
         break;
       }
 
-      // Call the single-model judge. Errors on a single take log warning +
-      // continue — UNLESS they classify as a whole-run condition (auth /
-      // billing / rate limit, #3044): those fail identically on every
-      // remaining take, so the loop breaks and the phase surfaces a halt.
+      // Call the single-model judge. Per-take errors log a warning and
+      // continue — UNLESS they classify as a whole-run condition (#3044):
+      // auth/billing halts on the first hit; a bare rate_limit halts only
+      // after RATE_LIMIT_HALT_STREAK consecutive hits.
+      let rateLimitedThisTake = false;
       let verdict: JudgeVerdict;
       try {
         verdict = await judge({ take, evidence, modelHint: judgeModelFull });
       } catch (err) {
+        result.judge_calls_failed += 1;
         const msg = err instanceof Error ? err.message : String(err);
-        result.warnings.push(`judge failed on take ${take.id}: ${msg}`);
+        const detail = `judge failed on take ${take.id}: ${msg}`;
         const globalClass = classifyGlobalLlmError(err);
-        if (globalClass) {
+        if (globalClass === 'auth' || globalClass === 'billing') {
           result.aborted_global_error = globalClass;
           result.warnings.push(
             `aborting phase at take ${result.takes_scanned}/${takes.length}: ` +
-            `${globalClass} error is a whole-run condition; remaining takes would fail identically`,
+            `${globalClass} error is a whole-run condition (${detail})`,
           );
           break;
         }
+        if (globalClass === 'rate_limit') {
+          rateLimitStreak += 1;
+          if (rateLimitStreak >= RATE_LIMIT_HALT_STREAK) {
+            result.aborted_global_error = 'rate_limit';
+            result.warnings.push(
+              `aborting phase at take ${result.takes_scanned}/${takes.length}: ` +
+              `${RATE_LIMIT_HALT_STREAK} consecutive rate_limit errors are a whole-run condition (${detail})`,
+            );
+            break;
+          }
+        }
+        result.warnings.push(detail);
         continue;
       }
+      result.judge_calls_succeeded += 1;
 
       // T5 — ensemble tiebreaker for borderline single-model verdicts.
       let recordedJudgeModelId = judgeModelId;
@@ -569,6 +598,52 @@ class GradeTakesPhase extends BaseCyclePhase {
         const ensembleResults = await Promise.allSettled(
           opts.ensembleJudges.map(j => j.fn({ take, evidence, modelHint: j.modelId })),
         );
+
+        // #3044: Promise.allSettled flattens judge rejections into null
+        // verdicts below, so a whole-run condition (revoked key, exhausted
+        // spend limit) inside an ensemble judge would vanish into a
+        // "(failed)" note in the reasoning string. Classify each rejection
+        // with the same two-tier policy as the single-model path:
+        // auth/billing halts immediately; rate_limit (counted at most once
+        // per take) feeds the consecutive-streak counter.
+        let ensembleHaltClass: GlobalLlmErrorClass | null = null;
+        let ensembleHaltDetail = '';
+        for (let i = 0; i < ensembleResults.length; i++) {
+          const res = ensembleResults[i];
+          if (!res || res.status !== 'rejected') continue;
+          const cls = classifyGlobalLlmError(res.reason);
+          if (!cls) continue;
+          const judgeId = opts.ensembleJudges[i]?.modelId ?? 'unknown';
+          const rmsg = res.reason instanceof Error ? res.reason.message : String(res.reason);
+          const detail = `ensemble judge ${judgeId} failed on take ${take.id}: ${rmsg}`;
+          if (cls === 'auth' || cls === 'billing') {
+            ensembleHaltClass = cls;
+            ensembleHaltDetail = detail;
+            break;
+          }
+          if (!rateLimitedThisTake) {
+            rateLimitedThisTake = true;
+            rateLimitStreak += 1;
+          }
+          if (rateLimitStreak >= RATE_LIMIT_HALT_STREAK) {
+            ensembleHaltClass = 'rate_limit';
+            ensembleHaltDetail = detail;
+            break;
+          }
+          result.warnings.push(detail);
+        }
+        if (ensembleHaltClass) {
+          result.aborted_global_error = ensembleHaltClass;
+          result.warnings.push(
+            `aborting phase at take ${result.takes_scanned}/${takes.length}: ` +
+            (ensembleHaltClass === 'rate_limit'
+              ? `${RATE_LIMIT_HALT_STREAK} consecutive rate_limit errors are a whole-run condition`
+              : `${ensembleHaltClass} error is a whole-run condition`) +
+            ` (${ensembleHaltDetail})`,
+          );
+          break;
+        }
+
         const collected: Array<{ modelId: string; verdict: JudgeVerdict | null }> = opts.ensembleJudges.map((j, i) => {
           const res = ensembleResults[i];
           if (res && res.status === 'fulfilled') return { modelId: j.modelId, verdict: res.value };
@@ -669,6 +744,12 @@ class GradeTakesPhase extends BaseCyclePhase {
         }
       }
 
+      // #3044: a take that completed without any rate_limit-classified LLM
+      // failure breaks the consecutive streak. (Cache hits / too-recent
+      // takes `continue` before the judge call and neither extend nor
+      // reset it.)
+      if (!rateLimitedThisTake) rateLimitStreak = 0;
+
       // Tally is silent — the caller surfaces it via the GradeTakesResult.
       void recordedVerdict;
     }
@@ -677,7 +758,21 @@ class GradeTakesPhase extends BaseCyclePhase {
 
     // Status folds warnings in (the extract_facts precedent from #1928): a
     // run with swallowed per-take failures must not read as a clean 'ok'.
+    // Severity split (#3044): a global halt with ZERO successful judge calls
+    // means the whole LLM lane is down — phase 'fail' (deriveStatus turns
+    // one failed phase into a 'partial' cycle; the autopilot handler
+    // deliberately does not throw on partial). A halt after some successes
+    // is a partial run → 'warn'.
     const warningCount = result.warnings.length;
+    // A deadline-hit run halted mid-list the same way a budget-exhausted one
+    // does (matches the propose_takes #4168 posture) — folded into `halted`
+    // so both the details field and the status derivation see it.
+    const halted =
+      result.budget_exhausted ||
+      result.deadline_hit === true ||
+      result.aborted_global_error !== undefined;
+    const phaseFailed =
+      result.aborted_global_error !== undefined && result.judge_calls_succeeded === 0;
     const summary =
       `grade_takes: scanned ${result.takes_scanned} takes ` +
       `(${result.too_recent} too recent, ${result.cache_hits} cached, ` +
@@ -691,17 +786,12 @@ class GradeTakesPhase extends BaseCyclePhase {
       summary,
       details: {
         ...result,
+        halted,
         prompt_version: promptVersion,
         auto_resolve: autoResolve,
         auto_resolve_threshold: autoResolveThreshold,
       },
-      status:
-        result.budget_exhausted ||
-        result.deadline_hit ||
-        result.aborted_global_error !== undefined ||
-        warningCount > 0
-          ? 'warn'
-          : 'ok',
+      status: phaseFailed ? 'fail' : halted || warningCount > 0 ? 'warn' : 'ok',
     };
   }
 }

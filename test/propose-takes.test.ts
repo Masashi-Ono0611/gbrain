@@ -829,46 +829,12 @@ describe('deadlineAtMs threading through the phase (#4168)', () => {
 // and a green summary — an exhausted spend limit left zero trace.
 
 describe('runPhaseProposeTakes — global-error halt (#3044)', () => {
-  test('429 extractor error breaks the page loop: no further pages, warn status, aborted summary, halt rollup', async () => {
+  test('claude-cli spend-limit blob halts as billing on the FIRST hit, status fail (zero successes)', async () => {
     const pages = [
       buildPage({ slug: 'wiki/a', body: 'page a prose' }),
       buildPage({ slug: 'wiki/b', body: 'page b prose' }),
-      buildPage({ slug: 'wiki/c', body: 'page c prose' }),
     ];
     const { engine, captured } = buildMockEngine({ pages });
-    let extractorCalls = 0;
-    const extractor: ProposeTakesExtractor = async () => {
-      extractorCalls++;
-      throw Object.assign(new Error('rate limited'), { status: 429 });
-    };
-    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
-
-    // Loop broke on the FIRST failure — remaining pages never called the LLM.
-    expect(extractorCalls).toBe(1);
-    const details = result.details as Record<string, unknown>;
-    expect(details.pages_scanned).toBe(1);
-    expect(details.aborted_global_error).toBe('rate_limit');
-
-    // Surfaced, not swallowed.
-    expect(result.status).toBe('warn');
-    expect(result.summary).toContain('aborted on rate_limit error after 1 page(s)');
-    expect(result.summary).toContain('warning(s)');
-    expect((details.warnings as string[]).some(w => w.includes('whole-run condition'))).toBe(true);
-
-    // Rollup records a halt, not a completed round (same posture as budget
-    // exhaustion / deadline). Params: $5 = halt delta, $8 = completed delta.
-    const rollup = captured.find(c => c.sql.includes('extract_rollup_7d'));
-    expect(rollup).toBeDefined();
-    expect(rollup!.params[4]).toBe(1); // halt_count delta
-    expect(rollup!.params[7]).toBe(0); // round_completed delta
-  });
-
-  test('claude-cli spend-limit blob halts as billing', async () => {
-    const pages = [
-      buildPage({ slug: 'wiki/a', body: 'page a prose' }),
-      buildPage({ slug: 'wiki/b', body: 'page b prose' }),
-    ];
-    const { engine } = buildMockEngine({ pages });
     let extractorCalls = 0;
     const extractor: ProposeTakesExtractor = async () => {
       extractorCalls++;
@@ -878,10 +844,115 @@ describe('runPhaseProposeTakes — global-error halt (#3044)', () => {
     };
     const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
 
+    // Billing is deterministic — the loop broke on the FIRST failure.
     expect(extractorCalls).toBe(1);
-    expect(result.status).toBe('warn');
-    expect((result.details as Record<string, unknown>).aborted_global_error).toBe('billing');
-    expect(result.summary).toContain('aborted on billing error');
+    const details = result.details as Record<string, unknown>;
+    expect(details.pages_scanned).toBe(1);
+    expect(details.aborted_global_error).toBe('billing');
+    expect(details.llm_calls_succeeded).toBe(0);
+    expect(details.llm_calls_failed).toBe(1);
+    expect(details.halted).toBe(true);
+
+    // Zero successful extractor calls → the whole LLM lane is down → 'fail'.
+    expect(result.status).toBe('fail');
+    expect(result.summary).toContain('aborted on billing error after 1 page(s)');
+    // Single combined warning line — no double counting of the same failure.
+    expect(result.summary).toContain('(1 warning(s))');
+    expect((details.warnings as string[])).toHaveLength(1);
+    expect((details.warnings as string[])[0]).toContain('whole-run condition');
+    expect((details.warnings as string[])[0]).toContain('extractor failed on wiki/a');
+
+    // Rollup records a halt, not a completed round (same posture as budget
+    // exhaustion / deadline). Params: $5 = halt delta, $8 = completed delta.
+    const rollup = captured.find(c => c.sql.includes('extract_rollup_7d'));
+    expect(rollup).toBeDefined();
+    expect(rollup!.params[4]).toBe(1); // halt_count delta
+    expect(rollup!.params[7]).toBe(0); // round_completed delta
+  });
+
+  test('bare 429s halt only after 3 CONSECUTIVE hits (transient bursts tolerated)', async () => {
+    const pages = [
+      buildPage({ slug: 'wiki/a', body: 'page a prose' }),
+      buildPage({ slug: 'wiki/b', body: 'page b prose' }),
+      buildPage({ slug: 'wiki/c', body: 'page c prose' }),
+      buildPage({ slug: 'wiki/d', body: 'page d prose' }),
+    ];
+    const { engine, captured } = buildMockEngine({ pages });
+    let extractorCalls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      extractorCalls++;
+      throw Object.assign(new Error('rate limited'), { status: 429 });
+    };
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    // Pages 1-2 warn and continue; the 3rd consecutive hit halts; page 4
+    // never calls the LLM.
+    expect(extractorCalls).toBe(3);
+    const details = result.details as Record<string, unknown>;
+    expect(details.pages_scanned).toBe(3);
+    expect(details.aborted_global_error).toBe('rate_limit');
+    expect(details.llm_calls_succeeded).toBe(0);
+    expect(result.status).toBe('fail');
+    expect(result.summary).toContain('aborted on rate_limit error after 3 page(s)');
+    // 2 per-page warnings + 1 combined abort line.
+    expect(result.summary).toContain('(3 warning(s))');
+    expect((details.warnings as string[])[2]).toContain('3 consecutive rate_limit errors');
+
+    const rollup = captured.find(c => c.sql.includes('extract_rollup_7d'));
+    expect(rollup!.params[4]).toBe(1); // halt_count delta
+    expect(rollup!.params[7]).toBe(0); // round_completed delta
+  });
+
+  test('a success between 429s resets the streak (no halt)', async () => {
+    const pages = [
+      buildPage({ slug: 'wiki/a', body: 'page a prose' }),
+      buildPage({ slug: 'wiki/b', body: 'page b prose' }),
+      buildPage({ slug: 'wiki/c', body: 'page c prose' }),
+      buildPage({ slug: 'wiki/d', body: 'page d prose' }),
+    ];
+    const { engine } = buildMockEngine({ pages });
+    let extractorCalls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      extractorCalls++;
+      // 429, 429, success, 429 — never 3 in a row.
+      if (extractorCalls === 3) return [];
+      throw Object.assign(new Error('rate limited'), { status: 429 });
+    };
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    expect(extractorCalls).toBe(4);
+    const details = result.details as Record<string, unknown>;
+    expect(details.pages_scanned).toBe(4);
+    expect(details.aborted_global_error).toBeUndefined();
+    expect(details.llm_calls_succeeded).toBe(1);
+    expect(result.status).toBe('warn'); // 3 per-page warnings, but no halt
+    expect(result.summary).not.toContain('aborted on');
+  });
+
+  test('a global halt AFTER a successful call reports warn, not fail (partial run)', async () => {
+    const pages = [
+      buildPage({ slug: 'wiki/a', body: 'page a prose' }),
+      buildPage({ slug: 'wiki/b', body: 'page b prose' }),
+      buildPage({ slug: 'wiki/c', body: 'page c prose' }),
+    ];
+    const { engine } = buildMockEngine({ pages });
+    let extractorCalls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      extractorCalls++;
+      if (extractorCalls === 1) {
+        return [{ claim_text: 'first page worked', kind: 'take', holder: 'brain', weight: 0.5 }];
+      }
+      throw Object.assign(new Error('invalid x-api-key'), { status: 401 });
+    };
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    expect(extractorCalls).toBe(2); // auth halts on the first hit
+    const details = result.details as Record<string, unknown>;
+    expect(details.aborted_global_error).toBe('auth');
+    expect(details.llm_calls_succeeded).toBe(1);
+    expect(details.proposals_inserted).toBe(1); // banked work stays
+    expect(result.status).toBe('warn'); // partial run, not a total failure
+    expect(result.summary).toContain('aborted on auth error after 2 page(s)');
   });
 
   test('non-global extractor error does NOT halt (remaining pages still processed)', async () => {

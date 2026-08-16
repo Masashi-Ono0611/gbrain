@@ -35,6 +35,22 @@ describe('classifyGlobalLlmError — positives', () => {
     expect(classifyGlobalLlmError(err)).toBe('auth');
   });
 
+  test('apiErrorStatus / api_error_status property variants are honored (typed claude-cli errors)', () => {
+    expect(classifyGlobalLlmError(Object.assign(new Error('request failed'), { apiErrorStatus: 429 }))).toBe('rate_limit');
+    expect(classifyGlobalLlmError(Object.assign(new Error('request failed'), { api_error_status: 401 }))).toBe('auth');
+  });
+
+  test('AIConfigError classifies structurally as auth (missing-key gateway errors carry no status, no phrase)', () => {
+    expect(classifyGlobalLlmError(new AIConfigError('OpenAI chat requires OPENAI_API_KEY.'))).toBe('auth');
+    expect(classifyGlobalLlmError(new AIConfigError('Anthropic chat requires ANTHROPIC_API_KEY.'))).toBe('auth');
+  });
+
+  test('structured "api_error_status" form still classifies when it lands AFTER a --- raw --- marker', () => {
+    const msg =
+      'claude-cli JSON event array had no "result" event\n--- raw ---\n{"type":"result","api_error_status":429}';
+    expect(classifyGlobalLlmError(new Error(msg))).toBe('rate_limit');
+  });
+
   test('status on the cause chain is honored (normalizeAIError wrapping)', () => {
     const inner = errWithStatus('upstream said no', 401);
     const wrapped = new AIConfigError('[chat] upstream said no', 'check key', inner);
@@ -97,6 +113,37 @@ describe('classifyGlobalLlmError — negatives (per-item errors stay per-item)',
       { status: 400 },
     );
     expect(classifyGlobalLlmError(err)).toBeNull();
+  });
+
+  test('null for an AIConfigError wrapping a status-400 request error (per-item, not whole-run)', () => {
+    const inner = Object.assign(
+      new Error("This model's maximum context length is 200000 tokens"),
+      { status: 400 },
+    );
+    const wrapped = new AIConfigError(
+      "[chat] This model's maximum context length is 200000 tokens",
+      'Check your model id + provider options match the provider API.',
+      inner,
+    );
+    expect(classifyGlobalLlmError(wrapped)).toBeNull();
+  });
+
+  test('null for phrase matches inside a --- raw --- output slice (content-dependent halts forbidden)', () => {
+    expect(
+      classifyGlobalLlmError(new Error(
+        'claude-cli output not JSON: Unexpected token\n--- raw ---\nThe provider rate limit should increase over time',
+      )),
+    ).toBeNull();
+    expect(
+      classifyGlobalLlmError(new Error(
+        'claude-cli output not JSON: Unexpected token\n--- raw ---\nan essay on authentication_error handling patterns',
+      )),
+    ).toBeNull();
+    expect(
+      classifyGlobalLlmError(new Error(
+        'claude-cli output not JSON: Unexpected token\n--- raw ---\ndiscussing the monthly spend limit feature',
+      )),
+    ).toBeNull();
   });
 
   test('null for timeouts / network errors / parse failures', () => {

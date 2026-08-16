@@ -73,6 +73,24 @@ export function normalizeAIError(err: unknown, context?: string): AIServiceError
 /** Whole-run LLM failure classes — see classifyGlobalLlmError. */
 export type GlobalLlmErrorClass = 'auth' | 'billing' | 'rate_limit';
 
+/**
+ * Consecutive rate_limit-classified failures a cycle phase tolerates before
+ * halting. auth/billing halt on the FIRST hit — a revoked key or an exhausted
+ * spend limit is deterministic — but a bare 429 can be a transient burst that
+ * clears between calls, so phases only abort after this many in a row (the
+ * same intuition as the #2894 transport streak, applied at this layer's
+ * consumers). A successful LLM call resets the streak.
+ */
+export const RATE_LIMIT_HALT_STREAK = 3;
+
+/**
+ * Request-shaped 4xx statuses that stay PER-ITEM even when wrapped in
+ * AIConfigError by normalizeAIError: context length (400), request timeout
+ * (408), payload too large (413), validation (422) can genuinely differ from
+ * one page/take to the next, so they never justify a whole-run halt.
+ */
+const PER_ITEM_HTTP_STATUSES = new Set([400, 408, 413, 422]);
+
 // Billing phrases are deliberately TIGHTER than sync-failure-ledger's
 // EMBEDDING_QUOTA regex (which matches bare /billing/): a global-error hit
 // halts an entire cycle phase, so a stray word inside a raw-output slice
@@ -107,8 +125,9 @@ function statusToClass(status: number): GlobalLlmErrorClass | null {
 /**
  * Detect whole-run LLM failure conditions — auth, billing, rate limit — that
  * make retrying the SAME call on the next item pointless: every remaining
- * page/take in a cycle phase would fail identically (#3044). Callers use a
- * non-null result to break their per-item loop and surface a phase-level
+ * page/take in a cycle phase would fail identically (#3044). Callers halt
+ * their per-item loop on 'auth'/'billing' immediately and on 'rate_limit'
+ * after RATE_LIMIT_HALT_STREAK consecutive hits, surfacing a phase-level
  * halt instead of accumulating one swallowed warning per item.
  *
  * Matching is conservative by design: numeric status properties on the error
@@ -131,18 +150,37 @@ export function classifyGlobalLlmError(err: unknown): GlobalLlmErrorClass | null
     cur = (cur as { cause?: unknown }).cause;
   }
   const message = messages.join('\n');
+  // Phrase regexes only see text BEFORE any raw-output slice: adapter errors
+  // append model output after a `--- raw ---` marker (see
+  // claude-cli-language-model.ts), and free prose in that slice ("the
+  // provider rate limit should increase") must not trip a whole-run halt.
+  // The structured form stays safe on the FULL text — a quoted
+  // `"api_error_status":NNN` JSON key cannot occur as free prose, and the
+  // claude-cli error blob it targets can land on either side of the marker.
+  const rawIdx = message.indexOf('--- raw ---');
+  const phraseText = rawIdx === -1 ? message : message.slice(0, rawIdx);
 
-  if (BILLING_MESSAGE_RE.test(message)) return 'billing';
+  if (BILLING_MESSAGE_RE.test(phraseText)) return 'billing';
   if (status !== undefined) {
     const byStatus = statusToClass(status);
     if (byStatus) return byStatus;
+  }
+  // Config-level errors are whole-run by construction — a missing/invalid
+  // key or an unknown model id fails identically on every call. The gateway
+  // throws AIConfigError directly for missing keys ("OpenAI chat requires
+  // OPENAI_API_KEY.") with NO status and NO phrase the regexes below could
+  // safely match, so classify structurally. Exception: normalizeAIError
+  // wraps ALL non-429 4xx as AIConfigError, and the request-shaped ones
+  // (PER_ITEM_HTTP_STATUSES) are genuinely per-item — they fall through.
+  if (err instanceof AIConfigError && !(status !== undefined && PER_ITEM_HTTP_STATUSES.has(status))) {
+    return 'auth';
   }
   const structured = STRUCTURED_STATUS_RE.exec(message);
   if (structured) {
     const byMessageStatus = statusToClass(Number(structured[1]));
     if (byMessageStatus) return byMessageStatus;
   }
-  if (AUTH_MESSAGE_RE.test(message)) return 'auth';
-  if (RATE_MESSAGE_RE.test(message)) return 'rate_limit';
+  if (AUTH_MESSAGE_RE.test(phraseText)) return 'auth';
+  if (RATE_MESSAGE_RE.test(phraseText)) return 'rate_limit';
   return null;
 }
