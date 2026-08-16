@@ -637,6 +637,112 @@ describe('claude-cli LanguageModel — abort + error envelopes', () => {
     });
   });
 
+  test('non-zero exit with a result envelope on stdout surfaces a typed API error', async () => {
+    // Real-world shape: on an API 429 (spend/rate limit) the CLI exits 1 but
+    // still writes the formatted result envelope to stdout. The provider must
+    // surface the status + human-readable message, not a raw blob.
+    await withStubEnv(async () => {
+      stageResponse(baseEnvelope(
+        "You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message",
+        { is_error: true, api_error_status: 429 },
+      ));
+      const failStub = [
+        '#!/bin/sh',
+        'cat > /dev/null',
+        `cat "${stubResponsePath}"`,
+        'exit 1',
+      ].join('\n');
+      writeFileSync(stubBin, failStub);
+      chmodSync(stubBin, 0o755);
+      try {
+        const { ClaudeCliLanguageModel, ClaudeCliProcessError } = await import('../src/core/ai/providers/claude-cli-language-model.ts');
+        const model = new ClaudeCliLanguageModel('claude-sonnet-4-6');
+        let caught: unknown;
+        try {
+          await model.doGenerate({ prompt: [userMessage('x')] } as LanguageModelV2CallOptions);
+        } catch (e) {
+          caught = e;
+        }
+        expect(caught).toBeInstanceOf(ClaudeCliProcessError);
+        const err = caught as InstanceType<typeof ClaudeCliProcessError>;
+        expect(err.message).toMatch(/claude-cli API error 429/);
+        expect(err.message).toContain('monthly spend limit');
+        expect(err.apiErrorStatus).toBe(429);
+        expect(err.exitCode).toBe(1);
+      } finally {
+        const fastStub = [
+          '#!/bin/sh',
+          'cat > /dev/null',
+          `cat "${stubResponsePath}"`,
+        ].join('\n');
+        writeFileSync(stubBin, fastStub);
+        chmodSync(stubBin, 0o755);
+      }
+    });
+  });
+
+  test('non-zero exit with non-JSON stdout falls back to the raw blob message', async () => {
+    await withStubEnv(async () => {
+      writeFileSync(stubResponsePath, 'segfault-ish garbage output');
+      const failStub = [
+        '#!/bin/sh',
+        'cat > /dev/null',
+        `cat "${stubResponsePath}"`,
+        'exit 1',
+      ].join('\n');
+      writeFileSync(stubBin, failStub);
+      chmodSync(stubBin, 0o755);
+      try {
+        const { ClaudeCliLanguageModel, ClaudeCliProcessError } = await import('../src/core/ai/providers/claude-cli-language-model.ts');
+        const model = new ClaudeCliLanguageModel('claude-sonnet-4-6');
+        let caught: unknown;
+        try {
+          await model.doGenerate({ prompt: [userMessage('x')] } as LanguageModelV2CallOptions);
+        } catch (e) {
+          caught = e;
+        }
+        expect(caught).toBeInstanceOf(ClaudeCliProcessError);
+        const err = caught as InstanceType<typeof ClaudeCliProcessError>;
+        expect(err.message).toMatch(/claude-cli exited 1/);
+        expect(err.message).toContain('segfault-ish garbage output');
+        expect(err.apiErrorStatus).toBeUndefined();
+        expect(err.exitCode).toBe(1);
+      } finally {
+        const fastStub = [
+          '#!/bin/sh',
+          'cat > /dev/null',
+          `cat "${stubResponsePath}"`,
+        ].join('\n');
+        writeFileSync(stubBin, fastStub);
+        chmodSync(stubBin, 0o755);
+      }
+    });
+  });
+
+  test('exit 0 + is_error + api_error_status surfaces the same typed API error', async () => {
+    await withStubEnv(async () => {
+      stageResponse({
+        ...baseEnvelope('overloaded, please retry'),
+        is_error: true,
+        api_error_status: 529,
+      });
+      const { ClaudeCliLanguageModel, ClaudeCliProcessError } = await import('../src/core/ai/providers/claude-cli-language-model.ts');
+      const model = new ClaudeCliLanguageModel('claude-sonnet-4-6');
+      let caught: unknown;
+      try {
+        await model.doGenerate({ prompt: [userMessage('x')] } as LanguageModelV2CallOptions);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(ClaudeCliProcessError);
+      const err = caught as InstanceType<typeof ClaudeCliProcessError>;
+      expect(err.message).toMatch(/claude-cli API error 529/);
+      expect(err.message).toContain('overloaded');
+      expect(err.apiErrorStatus).toBe(529);
+      expect(err.exitCode).toBe(0);
+    });
+  });
+
   test('rejects when stub reports is_error: true', async () => {
     await withStubEnv(async () => {
       stageResponse({ ...baseEnvelope('boom'), is_error: true });
