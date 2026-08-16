@@ -719,6 +719,65 @@ describe('claude-cli LanguageModel — abort + error envelopes', () => {
     });
   });
 
+  test('non-zero exit with a SUCCESS envelope falls back to the blob message with stderr', async () => {
+    // A crash after a successful API turn (envelope written, then the CLI
+    // dies) is a process failure, not an API error: the envelope path must
+    // require is_error, and the blob fallback must keep stderr (where the
+    // crash reason lives) instead of reporting a misleading API success.
+    await withStubEnv(async () => {
+      stageResponse(baseEnvelope('the model answered fine'));
+      const failStub = [
+        '#!/bin/sh',
+        'cat > /dev/null',
+        `cat "${stubResponsePath}"`,
+        'echo "boom-from-stderr" >&2',
+        'exit 1',
+      ].join('\n');
+      writeFileSync(stubBin, failStub);
+      chmodSync(stubBin, 0o755);
+      try {
+        const { ClaudeCliLanguageModel, ClaudeCliProcessError } = await import('../src/core/ai/providers/claude-cli-language-model.ts');
+        const model = new ClaudeCliLanguageModel('claude-sonnet-4-6');
+        let caught: unknown;
+        try {
+          await model.doGenerate({ prompt: [userMessage('x')] } as LanguageModelV2CallOptions);
+        } catch (e) {
+          caught = e;
+        }
+        expect(caught).toBeInstanceOf(ClaudeCliProcessError);
+        const err = caught as InstanceType<typeof ClaudeCliProcessError>;
+        expect(err.message).toMatch(/claude-cli exited 1/);
+        expect(err.message).toContain('boom-from-stderr');
+        expect(err.apiErrorStatus).toBeUndefined();
+        expect(err.exitCode).toBe(1);
+      } finally {
+        const fastStub = [
+          '#!/bin/sh',
+          'cat > /dev/null',
+          `cat "${stubResponsePath}"`,
+        ].join('\n');
+        writeFileSync(stubBin, fastStub);
+        chmodSync(stubBin, 0o755);
+      }
+    });
+  });
+
+  test('exit 0 with a JSON primitive on stdout rejects instead of crashing', async () => {
+    // JSON.parse accepts bare primitives (null / numbers / strings); none of
+    // them is a result envelope. Each must reject through the promise, never
+    // throw inside the close callback.
+    await withStubEnv(async () => {
+      for (const raw of ['null', '42', '"str"']) {
+        writeFileSync(stubResponsePath, raw);
+        const { ClaudeCliLanguageModel } = await import('../src/core/ai/providers/claude-cli-language-model.ts');
+        const model = new ClaudeCliLanguageModel('claude-sonnet-4-6');
+        await expect(
+          model.doGenerate({ prompt: [userMessage('x')] } as LanguageModelV2CallOptions),
+        ).rejects.toThrow(/claude-cli output not JSON/);
+      }
+    });
+  });
+
   test('exit 0 + is_error + api_error_status surfaces the same typed API error', async () => {
     await withStubEnv(async () => {
       stageResponse({

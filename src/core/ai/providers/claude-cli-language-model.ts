@@ -126,6 +126,12 @@ function parseResultEnvelope(stdout: string): EnvelopeParse {
     }
     parsed = resultEvent;
   }
+  // JSON.parse accepts bare primitives (null / numbers / strings); none of
+  // them is a result envelope, and letting one through would make the
+  // envelope field reads throw inside the subprocess close callback.
+  if (!parsed || typeof parsed !== 'object') {
+    return { ok: false, reason: 'not-json', error: new Error('top-level JSON value is not an object') };
+  }
   return { ok: true, envelope: parsed as ClaudeJsonResult };
 }
 
@@ -340,10 +346,12 @@ function runClaude(
         // to stdout (e.g. an API 429 arrives as {is_error:true,
         // api_error_status:429, result:"<human-readable message>", ...}).
         // Surface that as a typed error instead of burying the status inside
-        // a raw blob; fall back to the blob when stdout has no envelope.
+        // a raw blob. Only an error-reporting envelope qualifies: a SUCCESS
+        // envelope followed by a non-zero exit is a process failure whose
+        // reason lives in stderr, so it falls through to the blob fallback
+        // (as does any stdout without a parseable envelope).
         const attempt = parseResultEnvelope(stdout);
-        if (attempt.ok && attempt.envelope && typeof attempt.envelope === 'object'
-          && attempt.envelope.type === 'result') {
+        if (attempt.ok && attempt.envelope.type === 'result' && attempt.envelope.is_error === true) {
           reject(envelopeError(attempt.envelope, code ?? undefined));
           return;
         }
