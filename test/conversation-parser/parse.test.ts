@@ -303,6 +303,92 @@ describe('parseConversation — markdown-heading-turn (gbrain transcript ingest)
   });
 });
 
+// ---------------------------------------------------------------------------
+// #4136 — suspect_heading_labels: out-of-set heading folded into the
+// previous turn under markdown-heading-turn. Reproducer from the issue:
+// same three-turn body, only the middle heading's label changes.
+// ---------------------------------------------------------------------------
+
+describe('parseConversation — suspect_heading_labels (#4136)', () => {
+  const mk = (label: string) =>
+    [
+      '## User',
+      '',
+      'What is the deploy command?',
+      '',
+      `## ${label}`,
+      '',
+      'Run the deploy script from the repo root.',
+      '',
+      '## User',
+      '',
+      'Thanks.',
+      '',
+    ].join('\n');
+
+  test('an in-set label (## Assistant) parses normally with no suspect labels', () => {
+    const r = parseConversation(mk('Assistant'), { fallbackDate: '2026-08-11' });
+    expect(r.matched_pattern_id).toBe('markdown-heading-turn');
+    expect(r.phase).toBe('regex_match');
+    expect(r.messages).toHaveLength(3);
+    expect(r.messages.map((m) => m.speaker)).toEqual(['User', 'Assistant', 'User']);
+    expect(r.suspect_heading_labels).toBeUndefined();
+  });
+
+  test('an out-of-set single-word label (## Claude) is folded AND surfaced', () => {
+    const r = parseConversation(mk('Claude'), { fallbackDate: '2026-08-11' });
+    expect(r.phase).toBe('regex_match');
+    // Folded: only 2 messages, both attributed to 'User' — the bug this
+    // field surfaces (attribution is still wrong; that's out of scope here).
+    expect(r.messages).toHaveLength(2);
+    expect(r.messages.map((m) => m.speaker)).toEqual(['User', 'User']);
+    expect(r.suspect_heading_labels).toEqual([{ label: 'Claude', count: 1 }]);
+  });
+
+  test('an out-of-set multi-word label (## Assistant Bot) is folded AND surfaced', () => {
+    const r = parseConversation(mk('Assistant Bot'), { fallbackDate: '2026-08-11' });
+    expect(r.phase).toBe('regex_match');
+    expect(r.messages).toHaveLength(2);
+    expect(r.messages.map((m) => m.speaker)).toEqual(['User', 'User']);
+    expect(r.suspect_heading_labels).toEqual([
+      { label: 'Assistant Bot', count: 1 },
+    ]);
+  });
+
+  test('a repeated out-of-set label increments count instead of duplicating entries', () => {
+    const body = [
+      '## User',
+      '',
+      'one',
+      '',
+      '## Claude',
+      '',
+      'two',
+      '',
+      '## Claude',
+      '',
+      'three',
+      '',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-08-11' });
+    expect(r.suspect_heading_labels).toEqual([{ label: 'Claude', count: 2 }]);
+  });
+
+  test('does not fire for non-heading-anchored multi_line patterns (bold-time-dash)', () => {
+    // A bold-time-dash body whose continuation text happens to contain a
+    // markdown-heading-shaped line must NOT be reported as a suspect
+    // heading label — that pattern has no closed speaker set to violate.
+    const body = [
+      '**Alice Example** 09:15 — hello world',
+      '## Not a speaker turn, just body content',
+      'more body',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-08-11' });
+    expect(r.matched_pattern_id).toBe('bold-time-dash');
+    expect(r.suspect_heading_labels).toBeUndefined();
+  });
+});
+
 describe('parseConversation — multi-line continuation (D5)', () => {
   test('iMessage continuation absorbs orphan lines', () => {
     const body = [

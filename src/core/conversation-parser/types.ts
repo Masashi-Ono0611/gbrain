@@ -78,6 +78,22 @@ export interface ParseResult {
   /** Once-per-page warn from timezone_policy = utc_assumed_with_warn
    *  patterns when no frontmatter timezone is set. */
   timezone_warning?: string;
+  /**
+   * #4136: heading-shaped continuation lines (e.g. `## Claude`) that were
+   * folded into the PREVIOUS turn's body because their label fell outside
+   * a heading-anchored `multi_line` pattern's closed speaker set (e.g.
+   * `markdown-heading-turn`'s `User|Assistant|Human|System`). The closed
+   * set itself is deliberate — it is what stops ordinary `## Summary`
+   * section headings from anchoring a turn — but the fold was previously
+   * silent: `phase` still reads `regex_match` and nothing downstream
+   * declines the page even though a speaker's turn (and its heading) got
+   * absorbed into another speaker's text. This field is purely
+   * observability: populated when at least one such fold happened,
+   * `undefined` otherwise. It does NOT change acceptance — `phase` and
+   * `messages` are unaffected. One entry per distinct out-of-set label
+   * text, with `count` = how many times that exact label was folded.
+   */
+  suspect_heading_labels?: { label: string; count: number }[];
 }
 
 /**
@@ -167,6 +183,26 @@ export interface PatternEntry {
    * Requires `multi_line: true` and a `quick_reject`.
    */
   score_continuations_as_body?: boolean;
+  /**
+   * #4136: declares that this pattern anchors on a markdown `#{2,3}`
+   * heading line (e.g. `markdown-heading-turn`'s `## User` / `## Assistant`)
+   * AND that its speaker set is closed (a fixed label list, not free text).
+   * Only patterns with `heading_anchored: true` have a closed speaker set
+   * that a heading-SHAPED continuation line (any `## <label>`) can fall
+   * outside of — `bold-time-dash` and other `multi_line` +
+   * continuation-folding patterns have nothing to do with headings, so a
+   * `## Not a speaker turn` line inside their body is ordinary prose, not a
+   * suspect out-of-set label. Explicit boolean metadata rather than
+   * sniffing `quick_reject`/`regex` source text for a `^#{` prefix: a
+   * pattern's regex SHAPE is free to vary (`^#{2,3}\s+(?:...)\b`,
+   * `^(?:##|###)\s+...`, etc.) without silently losing this classification,
+   * and a future heading-anchored builtin just sets the field instead of
+   * being reverse-engineered from its regex text. Requires
+   * `multi_line: true` (checked separately by callers, per D5 — a
+   * single-line heading-anchored pattern isn't meaningful with today's
+   * fold logic).
+   */
+  heading_anchored?: boolean;
   /**
    * D11: optional cheap O(1) prefix check. If set, orchestrator runs
    * this FIRST per line; only tries `regex` if quick_reject matches.

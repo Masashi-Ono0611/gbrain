@@ -1347,6 +1347,71 @@ describe('runExtractConversationFactsCore', () => {
     });
     expect(result.pages_processed).toBe(1);
   });
+
+  test('#4136: warns to stderr when suspect_heading_labels is populated', async () => {
+    await engine.putPage('conversations/suspect-heading-example', {
+      type: 'conversation',
+      title: 'Out-of-set heading label example',
+      compiled_truth: [
+        '## User',
+        '',
+        'What is the deploy command?',
+        '',
+        '## Claude',
+        '',
+        'Run the deploy script from the repo root.',
+        '',
+        '## User',
+        '',
+        'Thanks.',
+        '',
+      ].join('\n'),
+      timeline: '',
+      frontmatter: { date: '2026-08-11' },
+    });
+    const origWrite = process.stderr.write.bind(process.stderr);
+    const lines: string[] = [];
+    (process.stderr as unknown as { write: unknown }).write = ((chunk: unknown) => {
+      lines.push(typeof chunk === 'string' ? chunk : String(chunk));
+      return true;
+    }) as unknown as typeof process.stderr.write;
+    try {
+      const result = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/suspect-heading-example',
+        dryRun: true,
+        sleepMs: 0,
+      });
+      expect(result.pages_considered).toBe(1);
+    } finally {
+      (process.stderr as unknown as { write: unknown }).write = origWrite;
+    }
+    const warnLine = lines.find(
+      (l) => l.includes('conversations/suspect-heading-example') && l.includes('Claude'),
+    );
+    expect(warnLine).toBeDefined();
+    expect(warnLine).toContain('markdown-heading-turn');
+  });
+
+  test('#4136: no stderr warning when suspect_heading_labels is absent', async () => {
+    const origWrite = process.stderr.write.bind(process.stderr);
+    const lines: string[] = [];
+    (process.stderr as unknown as { write: unknown }).write = ((chunk: unknown) => {
+      lines.push(typeof chunk === 'string' ? chunk : String(chunk));
+      return true;
+    }) as unknown as typeof process.stderr.write;
+    try {
+      await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/imessage/alice-example',
+        dryRun: true,
+        sleepMs: 0,
+      });
+    } finally {
+      (process.stderr as unknown as { write: unknown }).write = origWrite;
+    }
+    expect(lines.some((l) => l.includes('heading-shaped line'))).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

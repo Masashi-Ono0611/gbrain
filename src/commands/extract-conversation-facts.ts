@@ -907,6 +907,20 @@ async function processPage(
   if (parseResult.timezone_warning) {
     process.stderr.write(parseResult.timezone_warning + '\n');
   }
+  // #4136: fail-loud surfacing for heading-shaped continuation lines whose
+  // label fell outside a heading-anchored pattern's closed speaker set
+  // (e.g. a '## Claude' turn folded into the previous speaker's body under
+  // markdown-heading-turn). This is observability only — a decline
+  // threshold is a follow-on decision, not implemented here — so
+  // extraction proceeds on `messages` unchanged.
+  if (parseResult.suspect_heading_labels && parseResult.suspect_heading_labels.length > 0) {
+    const labelsDesc = parseResult.suspect_heading_labels
+      .map((s) => `${JSON.stringify(s.label)} x${s.count}`)
+      .join(', ');
+    process.stderr.write(
+      `[extract-conversation-facts] WARN ${page.slug}: heading-shaped line(s) outside pattern=${parseResult.matched_pattern_id}'s closed speaker set were folded into the previous turn: ${labelsDesc}\n`,
+    );
+  }
   // The fallback runs only for a true built-in miss. It never replaces or
   // polishes a deterministic parse, and it remains unreachable unless the
   // operator explicitly enables conversation_parser.llm_fallback_enabled.

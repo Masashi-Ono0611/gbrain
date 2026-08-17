@@ -692,6 +692,9 @@ export const BUILTIN_PATTERNS: readonly PatternEntry[] = [
     timezone_policy: 'utc_assumed_with_warn',
     multi_line: true,
     score_continuations_as_body: true,
+    // #4136: closed speaker set (User|Assistant|Human|System) anchored on
+    // a markdown `#{2,3}` heading — see PatternEntry.heading_anchored.
+    heading_anchored: true,
     // Narrowed to a role-prefix superset (NOT bare `/^#{2,3}\s/`): a body
     // that pastes unrelated markdown headings (e.g. a document with many
     // '## Section' headings) would otherwise inflate the D18 scorer's

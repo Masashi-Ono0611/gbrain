@@ -292,6 +292,62 @@ function buildIso(
   return null;
 }
 
+/**
+ * #4136: generic markdown-heading shape — `## <label>` / `### <label>`
+ * with a non-empty label. Used ONLY to detect a folded continuation line
+ * that LOOKS like a turn heading, independent of any single pattern's own
+ * closed-speaker-set regex (so it also catches lines that fail
+ * `quick_reject` outright, before `entry.regex` is even tried).
+ */
+const HEADING_SHAPE_RE = /^#{2,3}\s+(\S.*)$/;
+
+/**
+ * #4136: "this pattern anchors on markdown `#{2,3}` headings AND has a
+ * closed speaker set" (e.g. `markdown-heading-turn`), as opposed to other
+ * `multi_line` + continuation-folding patterns like `bold-time-dash` that
+ * have nothing to do with headings. Reads the explicit
+ * `PatternEntry.heading_anchored` metadata flag rather than sniffing
+ * `quick_reject`/`regex` source text for a `^#{` prefix: prefix-sniffing
+ * only recognizes the exact shape a pattern happens to be written in
+ * today (misses equivalent anchors like `^(?:##|###)`, and can't tell
+ * whether `quick_reject` matching that shape actually implies `regex`
+ * has a closed speaker set). The explicit flag is the single source of
+ * truth other call sites already require (D11's documented
+ * `quick_reject` ⊇ `regex` invariant), so any future heading-anchored
+ * builtin declares it directly instead of being reverse-engineered from
+ * regex text.
+ */
+function isHeadingAnchoredPattern(entry: PatternEntry): boolean {
+  return entry.heading_anchored === true;
+}
+
+/**
+ * #4136: record a heading-shaped continuation line whose label is outside
+ * a heading-anchored pattern's closed speaker set. Reaching this call
+ * already implies "out-of-set": `applyPattern` only takes the continuation
+ * path when `entry.regex` failed to match `line` as a complete anchor, and
+ * `quick_reject` is a documented strict superset of `regex` (D11 —
+ * `validatePatternEntry` requires every `test_positive` sample to pass
+ * both), so a `quick_reject` failure implies a `regex` failure too. Purely
+ * observability: does not change `phase` or `messages`.
+ *
+ * The captured text after `## `/`### ` is trimmed but otherwise recorded
+ * verbatim — NOT normalized against any single pattern's own trailing-colon
+ * tolerance (`markdown-heading-turn`'s regex treats `## User` and `## User:`
+ * as equivalent, but that's specific to its own closed set). Stripping a
+ * trailing colon here would silently collapse two distinct suspect labels
+ * (`## Claude` and `## Claude:`) into one count, breaking the "one entry per
+ * distinct out-of-set label text" contract documented on
+ * `ParseResult.suspect_heading_labels`.
+ */
+function recordSuspectHeadingLabel(line: string, out: Map<string, number>): void {
+  const m = HEADING_SHAPE_RE.exec(line);
+  if (!m) return;
+  const label = m[1].trim();
+  if (!label) return;
+  out.set(label, (out.get(label) ?? 0) + 1);
+}
+
 const MONTHS_SHORT = [
   'jan', 'feb', 'mar', 'apr', 'may', 'jun',
   'jul', 'aug', 'sep', 'oct', 'nov', 'dec',
@@ -313,11 +369,18 @@ function monthNameToIndex(name: string): number {
  * previous message's body.
  *
  * Exported for unit tests + the eval CLI debug command.
+ *
+ * `suspectHeadingLabels` (#4136) is an optional accumulator: when
+ * provided, a heading-shaped continuation line folded under a
+ * heading-anchored `multi_line` pattern increments its label's count.
+ * Omit it (as every existing caller does) to opt out with zero behavior
+ * change.
  */
 export function applyPattern(
   body: string,
   entry: PatternEntry,
   dateCtx: DateContext,
+  suspectHeadingLabels?: Map<string, number>,
 ): MatchedMessage[] {
   if (!body) return [];
   const out: MatchedMessage[] = [];
@@ -327,6 +390,11 @@ export function applyPattern(
   // while advancing a local date anchor as those headings are encountered.
   const runningCtx: DateContext = { ...dateCtx };
   const dateHeaderRe = /^#{1,4}\s+(\d{4}-\d{2}-\d{2})\s*$/;
+  // #4136: only heading-anchored multi_line patterns (e.g.
+  // markdown-heading-turn) have a closed speaker set that a folded
+  // heading-shaped line can fall outside of.
+  const trackHeadingSuspects =
+    !!suspectHeadingLabels && entry.multi_line && isHeadingAnchoredPattern(entry);
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
     const line = rawLine.trim();
@@ -342,6 +410,7 @@ export function applyPattern(
     if (entry.quick_reject && !entry.quick_reject.test(line)) {
       // Continuation handling for orphan lines.
       if (out.length > 0) {
+        if (trackHeadingSuspects) recordSuspectHeadingLabel(line, suspectHeadingLabels!);
         out[out.length - 1].text = out[out.length - 1].text
           ? `${out[out.length - 1].text}\n${line}`
           : line;
@@ -365,6 +434,7 @@ export function applyPattern(
       out.push({ speaker, timestamp: iso, text });
     } else if (out.length > 0) {
       // Continuation line.
+      if (trackHeadingSuspects) recordSuspectHeadingLabel(line, suspectHeadingLabels!);
       out[out.length - 1].text = out[out.length - 1].text
         ? `${out[out.length - 1].text}\n${line}`
         : line;
@@ -568,7 +638,11 @@ export function parseConversation(
     };
   }
 
-  const messages = applyPattern(body, top.entry, dateCtx);
+  // #4136: accumulate heading-shaped continuation lines folded outside a
+  // heading-anchored pattern's closed speaker set. Purely observational —
+  // does not affect messages/phase below.
+  const suspectHeadingLabelCounts = new Map<string, number>();
+  const messages = applyPattern(body, top.entry, dateCtx, suspectHeadingLabelCounts);
 
   // Timezone warning surface (D19).
   let timezone_warning: string | undefined;
@@ -586,6 +660,10 @@ export function parseConversation(
     matched_pattern_id: top.entry.id,
     patterns_scored: patternsScored,
     timezone_warning,
+    suspect_heading_labels:
+      suspectHeadingLabelCounts.size > 0
+        ? Array.from(suspectHeadingLabelCounts, ([label, count]) => ({ label, count }))
+        : undefined,
     unmatched_line_count: opts.diagnostic
       ? body
           .split(/\r?\n/)
