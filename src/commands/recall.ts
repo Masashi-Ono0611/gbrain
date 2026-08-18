@@ -427,11 +427,13 @@ async function fetchRowsLocal(
   }
   if (resolvedSince) {
     return engine.listFactsSince(sourceId, resolvedSince, {
+      eventTime: true,
       activeOnly: !flags.includeExpired,
       limit: flags.limit,
     });
   }
   return engine.listFactsSince(sourceId, new Date(0), {
+    eventTime: true,
     activeOnly: !flags.includeExpired,
     limit: flags.limit,
   });
