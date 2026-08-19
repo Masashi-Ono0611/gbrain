@@ -29,7 +29,7 @@ import {
   __setGenerateTextTransportForTests,
 } from '../../src/core/ai/gateway.ts';
 import { parseModelId, resolveRecipe, assertTouchpoint } from '../../src/core/ai/model-resolver.ts';
-import { AIConfigError } from '../../src/core/ai/errors.ts';
+import { AIConfigError, AITransientError, normalizeAIError } from '../../src/core/ai/errors.ts';
 import { listRecipes, getRecipe } from '../../src/core/ai/recipes/index.ts';
 import type { Recipe } from '../../src/core/ai/types.ts';
 
@@ -449,5 +449,75 @@ describe('chat touchpoint — per-part providerMetadata round trip (#4201)', () 
     expect(capturedMessages).toBeDefined();
     const assistant = (capturedMessages as any[]).find(m => m.role === 'assistant');
     expect(assistant.content[0].providerOptions).toEqual(SIG);
+  });
+});
+
+describe('chat — typed provider error status carried to the top level', () => {
+  beforeEach(() => {
+    resetGateway();
+    __setGenerateTextTransportForTests(null);
+  });
+
+  test.each([401, 403])('claude-cli %i envelope error normalizes to AIConfigError', async status => {
+    const { ClaudeCliProcessError } = await import('../../src/core/ai/providers/claude-cli-language-model.ts');
+    __setGenerateTextTransportForTests(async () => {
+      throw new ClaudeCliProcessError(
+        `claude-cli API error ${status}: access denied`,
+        { apiErrorStatus: status, exitCode: 1 },
+      );
+    });
+    configureGateway({ chat_model: 'claude-cli:claude-sonnet-4-6', env: {} });
+
+    let caught: unknown;
+    try {
+      await chat({
+        model: 'claude-cli:claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hello' }],
+      });
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(AIConfigError);
+    const err = caught as AIConfigError & { apiErrorStatus?: number };
+    expect(err.apiErrorStatus).toBe(status);
+    expect(err.cause).toBeInstanceOf(ClaudeCliProcessError);
+  });
+
+  test('snake_case api_error_status also drives normalized class selection', () => {
+    expect(normalizeAIError({ message: 'denied', api_error_status: 401 })).toBeInstanceOf(AIConfigError);
+    expect(normalizeAIError({ message: 'forbidden', api_error_status: 403 })).toBeInstanceOf(AIConfigError);
+    expect(normalizeAIError({ message: 'slow down', api_error_status: 429 })).toBeInstanceOf(AITransientError);
+  });
+
+  test('claude-cli 429 envelope error keeps apiErrorStatus readable on the normalized error', async () => {
+    // normalizeAIError wraps provider errors (here in AITransientError); the
+    // status a caller branches on must survive as a top-level property, not
+    // only inside `cause`.
+    const { ClaudeCliProcessError } = await import('../../src/core/ai/providers/claude-cli-language-model.ts');
+    __setGenerateTextTransportForTests(async () => {
+      throw new ClaudeCliProcessError(
+        'claude-cli API error 429: monthly spend limit reached',
+        { apiErrorStatus: 429, exitCode: 1 },
+      );
+    });
+    configureGateway({ chat_model: 'claude-cli:claude-sonnet-4-6', env: {} });
+
+    let caught: unknown;
+    try {
+      await chat({
+        model: 'claude-cli:claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hello' }],
+      });
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(AITransientError);
+    const err = caught as InstanceType<typeof AITransientError> & { apiErrorStatus?: number };
+    expect(err.message).toContain('claude-cli API error 429');
+    expect(err.apiErrorStatus).toBe(429);
+    // The original typed error stays reachable as the cause.
+    expect(err.cause).toBeInstanceOf(ClaudeCliProcessError);
   });
 });
