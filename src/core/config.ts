@@ -167,9 +167,9 @@ export interface GBrainConfig {
    */
   chat_model?: string;
   /**
-   * Optional silent-refusal fallback chain for `chatWithFallback()` (v0.27+).
-   * Each entry is a "provider:modelId" string. Blocked from critic/judge/
-   * synthesize flows in their respective handlers (per D13 review decision).
+   * Optional availability-failure chain for `chatWithFallback()` (v0.27+).
+   * Entries are "provider:modelId" targets tried after rate-limit or billing
+   * failures. Silent-refusal fallback is not implemented.
    */
   chat_fallback_chain?: string[];
   /** Optional base URL overrides for openai-compatible providers (keyed by recipe id). */

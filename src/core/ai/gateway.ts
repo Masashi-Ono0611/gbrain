@@ -3587,8 +3587,8 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
 
 /**
  * Map AI SDK's `finish_reason` (and provider-specific signals) to a provider-
- * neutral `stopReason`. This is the structural-signal layer that
- * `chatWithFallback` (commit 3) consults BEFORE any regex heuristic (per D8).
+ * neutral `stopReason`. Availability-only `chatWithFallback` does not consult
+ * this result; silent-refusal/content-filter fallback is not implemented.
  */
 function mapStopReason(
   finishReason: string | undefined,

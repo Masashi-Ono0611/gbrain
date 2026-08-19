@@ -21,8 +21,9 @@
  * gateway-down errors are absorbed into NULL-embedding rows.
  */
 
-import { chat, embedOne, isAvailable } from '../ai/gateway.ts';
+import { embedOne, isAvailable } from '../ai/gateway.ts';
 import { stripReasoningBlocks } from '../llm-json.ts';
+import { chatWithFallback } from '../ai/chat-fallback.ts';
 import type { ChatResult } from '../ai/gateway.ts';
 import { INJECTION_PATTERNS } from '../think/sanitize.ts';
 import { resolveModel } from '../model-config.ts';
@@ -439,7 +440,7 @@ export async function extractFactsFromTurnWithOutcome(
   // at the escalated cap — re-sending at 1x would just re-truncate.
   let effectiveMaxTokens = maxTokens;
   try {
-    result = await chat({
+    result = await chatWithFallback({
       model,
       system: extractorSystem,
       messages: [{ role: 'user', content: userContent }],
@@ -456,7 +457,7 @@ export async function extractFactsFromTurnWithOutcome(
         `(model=${model}); retrying once at ${maxTokens * 2}\n`,
       );
       effectiveMaxTokens = maxTokens * 2;
-      result = await chat({
+      result = await chatWithFallback({
         model,
         system: extractorSystem,
         messages: [{ role: 'user', content: userContent }],
@@ -495,7 +496,7 @@ export async function extractFactsFromTurnWithOutcome(
       'retrying once with an explicit JSON-only reminder\n',
     );
     try {
-      result = await chat({
+      result = await chatWithFallback({
         model,
         system: `${extractorSystem}\nThe previous attempt returned invalid JSON or an invalid facts schema. ` +
           'Return exactly one valid JSON object and no prose.',
