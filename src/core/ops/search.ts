@@ -12,6 +12,7 @@ import { expandQuery } from '../search/expansion.ts';
 import { dedupResults } from '../search/dedup.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { HybridSearchMeta } from '../types.ts';
+import type { RelationalArmMeta } from '../search/relational-recall.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { QUERY_DESCRIPTION, SEARCH_DESCRIPTION } from '../operations-descriptions.ts';
 import { OperationError } from './contract.ts';
@@ -37,7 +38,7 @@ function buildRetrievalResponseMeta(
   queryText: string,
   results: unknown[],
   meta: HybridSearchMeta | null,
-  opts: { conceptHint?: boolean } = {},
+  opts: { conceptHint?: boolean; relationalMeta?: RelationalArmMeta | null } = {},
 ): Record<string, unknown> {
   const m = meta as (HybridSearchMeta & { degraded?: unknown; retrieved_count?: number }) | null;
   const hint = opts.conceptHint && looksConceptShaped(queryText)
@@ -54,6 +55,13 @@ function buildRetrievalResponseMeta(
       ...(m.token_budget ? { token_budget: m.token_budget } : {}),
       ...(m.degraded !== undefined ? { degraded: m.degraded } : {}),
     } : {}),
+    // #3995 — surface whether the relational recall arm fired (and its
+    // seed/candidate counts) so a caller can distinguish "graph answer
+    // contributed" from "graph answer never reached fusion" without source
+    // access. Additive field on the existing `retrieval` _meta key (rule 2,
+    // docs/protocol/MCP_META_CHANNELS.md); absent when the arm never ran
+    // (relational retrieval off, or the image-similarity branch).
+    ...(opts.relationalMeta ? { relational: opts.relationalMeta } : {}),
     ...(hint ? { hint } : {}),
   };
 }
@@ -286,11 +294,23 @@ const query: Operation = {
     // search). When the param is the literal '__all__', force-allow
     // cross-source mode (matches SearchOpts.sourceId contract).
     let capturedMeta: HybridSearchMeta | null = null;
+    // #3995 — observability sink for the relational recall arm. Best-effort;
+    // stays null when the arm never runs (relational off, or a non-relational
+    // query where the intent classifier short-circuits before fanout).
+    let capturedRelationalMeta: RelationalArmMeta | null = null;
     // v0.32.x search-lite: route the query op through hybridSearchCached so
     // semantic cache + token budget + intent weighting fire automatically.
     // Plain hybridSearch remains the bare API for callers that opt out.
     const results = await hybridSearchCached(ctx.engine, queryText, {
-      limit: (p.limit as number) || 20,
+      // #3995 — omit the key entirely (rather than hard-defaulting to 20)
+      // when the caller didn't pass `limit`, so the resolved search mode's
+      // `searchLimit` (10/25/50 for conservative/balanced/tokenmax) applies
+      // through the op instead of being silently overridden. Both
+      // hybridSearch (limit = opts?.limit || resolvedMode.searchLimit) and
+      // hybridSearchCached's mode resolution treat `undefined` as "let the
+      // mode bundle decide" — an explicit numeric limit (including 0) still
+      // wins.
+      limit: typeof p.limit === 'number' ? p.limit : undefined,
       offset: (p.offset as number) || 0,
       expansion: expand,
       expandFn: expand ? expandQuery : undefined,
@@ -314,6 +334,11 @@ const query: Operation = {
       // v0.36 cross-modal routing param.
       crossModal: p.cross_modal as 'text' | 'image' | 'both' | 'auto' | undefined,
       onMeta: (m) => { capturedMeta = m; },
+      // #3995 — thread the relational-arm observability sink through so
+      // `fired`/`kind`/`seeds_resolved`/`candidates`/`errored` land in the
+      // `retrieval` response meta below instead of only being visible to
+      // source-level tracing.
+      onRelationalMeta: (m) => { capturedRelationalMeta = m; },
       // v0.36 (D15): per-call embedding column override. Resolver rejects
       // unknown names at hybrid entry with EmbeddingColumnNotRegisteredError;
       // the error surfaces back to the agent as the op error envelope.
@@ -362,7 +387,10 @@ const query: Operation = {
     }
 
     // WP2/D3: query never nudges toward itself — no concept hint here.
-    ctx.emitResponseMeta?.('retrieval', buildRetrievalResponseMeta(queryText, results, capturedMeta));
+    ctx.emitResponseMeta?.(
+      'retrieval',
+      buildRetrievalResponseMeta(queryText, results, capturedMeta, { relationalMeta: capturedRelationalMeta }),
+    );
     return results;
   },
   scope: 'read',
