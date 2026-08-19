@@ -139,7 +139,12 @@ const query: Operation = {
      *  CLI loads the file, base64-encodes, and passes through `image`). */
     image: { type: 'string', description: 'Base64-encoded image bytes for image-similarity search (CLI: --image <path>).' },
     image_mime: { type: 'string', description: 'MIME type for the image bytes (auto-derived from path on CLI; required when calling op directly).' },
-    limit: { type: 'number', description: 'Max results (default 20)' },
+    // #4356 — the image-similarity branch (`image` param) no longer hard-
+    // defaults this to 20; when omitted it now resolves from the active
+    // search mode's searchLimit, same convention as hybridSearch. The text
+    // path is a separate hardcoded-20 site tracked in #4355 (not touched
+    // here, to keep this fix's diff scoped to the image branch).
+    limit: { type: 'number', description: 'Max results. For image-similarity queries (`image` param), resolves from the active search mode when omitted (10 conservative / 25 balanced / 50 tokenmax). For text queries, currently still hard-defaults to 20 regardless of mode (tracked separately in #4355).' },
     offset: { type: 'number', description: 'Skip first N results (for pagination)' },
     expand: { type: 'boolean', description: 'Enable multi-query expansion (default: true)' },
     detail: { type: 'string', description: 'Result detail level: low (compiled truth only), medium (default, all with dedup), high (all chunks)' },
@@ -253,12 +258,28 @@ const query: Operation = {
       const [vec] = await embedMultimodal([
         { kind: 'image_base64', data: imageData, mime: imageMime },
       ]);
+      // #4356 — this branch bypasses hybridSearch entirely, so it never
+      // saw the resolved search mode's `searchLimit` and always hard-
+      // defaulted to 20 regardless of mode (10/25/50 for conservative/
+      // balanced/tokenmax). Resolve the same mode + per-key overrides
+      // hybridSearch/hybridSearchCached use (mode.ts:resolveSearchMode) so
+      // an omitted `limit` follows the active mode here too, mirroring the
+      // `opts?.limit || resolvedMode.searchLimit` pattern those call sites
+      // already use. `p.mode` is honored the same way the text path honors
+      // it (resolvePerCallMode — local/trusted callers only; remote falls
+      // through to the server-configured mode).
+      const { loadSearchModeConfig, resolveSearchMode } = await import('../search/mode.ts');
+      const imageModeInput = await loadSearchModeConfig(ctx.engine);
+      const imageResolvedMode = resolveSearchMode({
+        mode: resolvePerCallMode(ctx, p.mode) ?? imageModeInput.mode,
+        overrides: imageModeInput.overrides,
+      });
       // v0.34.1 (#861 F2 — 6th leak surface): the image path bypasses
       // hybridSearch and calls searchVector directly, so it needs its
       // own thread of the source scope. Pre-fix, this branch leaked
       // image pages across sources independent of the text path's fix.
       const results = await ctx.engine.searchVector(vec, {
-        limit: (p.limit as number) || 20,
+        limit: (p.limit as number) || imageResolvedMode.searchLimit,
         offset: (p.offset as number) || 0,
         embeddingColumn: 'embedding_image',
         ...querySourceScope,
