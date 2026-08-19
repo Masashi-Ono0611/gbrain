@@ -37,6 +37,12 @@ trap 'rm -rf "$BUILD_DIR"' EXIT
 mkdir -p "$BUILD_DIR/scripts" "$GBRAIN_HOME_DIR"
 cp -R "$REPO_ROOT/src" "$BUILD_DIR/src"
 cp "$REPO_ROOT/scripts/pglite-embedded-smoketest.ts" "$BUILD_DIR/scripts/pglite-embedded-smoketest.ts"
+# src/version.ts does `import pkg from '../package.json'` — gateway.ts (pulled
+# in transitively via embedding.ts, on PGLiteEngine's putPage embed path) now
+# imports chat-usage.ts (#3399), which imports VERSION from version.ts. That
+# edge didn't exist when this script was written, so the isolated src/-only
+# copy never needed package.json until now.
+cp "$REPO_ROOT/package.json" "$BUILD_DIR/package.json"
 ln -s "$REPO_ROOT/node_modules" "$BUILD_DIR/node_modules"
 
 # Compile a focused smoketest (imports PGLiteEngine, not the whole CLI) so the

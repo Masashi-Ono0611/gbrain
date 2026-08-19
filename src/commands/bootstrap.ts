@@ -918,6 +918,29 @@ async function runRepo(ws: string, rest: string[], home: string, runner: ExecRun
         'background persistence declined — the per-turn and session-end pushes remain the persistence backstop.',
       );
     }
+
+    // --push-now [local-only, machine-specific]: a synchronous push right
+    // after repo creation, for verification workflows (CLI-driven initial
+    // setup) that cannot wait for the SessionEnd hook backstop or a
+    // PERSIST_CRON tick. Best-effort — never fails the repo phase.
+    if (rest.includes('--push-now')) {
+      try {
+        const { workspacePush } = await import('../core/workspace-push.ts');
+        const pushResult = await workspacePush({
+          dir: ws,
+          logger: (l: string) => process.stderr.write(`[push-now] ${l}\n`),
+        });
+        console.log(
+          pushResult.ok
+            ? `push-now: ${pushResult.status}${pushResult.committed ? ' (new commit pushed)' : ' (nothing to commit)'}`
+            : `push-now: ${pushResult.status}${pushResult.reason ? ` — ${pushResult.reason}` : ''} (session-end push remains the backstop)`,
+        );
+      } catch (e) {
+        console.error(
+          `note: --push-now failed (${(e as Error).message}). The session-end push remains the persistence backstop.`,
+        );
+      }
+    }
     return 0;
   });
 }

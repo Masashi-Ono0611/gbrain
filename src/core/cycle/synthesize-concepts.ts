@@ -30,6 +30,7 @@ import { chat as gatewayChat, isAvailable } from '../ai/gateway.ts';
 // source-boost's 1.3× 'concepts/' weighting can actually reach them.
 import { importFromContent } from '../import-file.ts';
 import { serializeMarkdown } from '../markdown.ts';
+import { withChatPhase } from '../chat-usage.ts';
 import { canonicalLookup, type ModelPricing } from '../model-pricing.ts';
 
 const DEFAULT_BUDGET_USD = 1.5;
@@ -80,6 +81,15 @@ no preamble. Write in plain English, present-tense voice. Synthesize what
 the atoms collectively SAY about the concept; don't enumerate the atoms.`;
 
 export async function runPhaseSynthesizeConcepts(
+  engine: BrainEngine,
+  opts: SynthesizeConceptsOpts = {},
+): Promise<PhaseResult> {
+  // gbrain#3392 — tag every gateway.chat() call under this run with a
+  // phase label for chat_usage_log (covers concept-synthesis calls).
+  return withChatPhase('dream.synthesize_concepts', () => _runPhaseSynthesizeConceptsInner(engine, opts));
+}
+
+async function _runPhaseSynthesizeConceptsInner(
   engine: BrainEngine,
   opts: SynthesizeConceptsOpts = {},
 ): Promise<PhaseResult> {

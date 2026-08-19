@@ -68,6 +68,7 @@ import type { Page, PageType } from '../types.ts';
 import { validateSourceId } from '../utils.ts';
 import { safeSplitIndex } from '../text-safe.ts';
 import { PAGE_SLUG_SEG } from '../cjk.ts';
+import { withChatPhase } from '../chat-usage.ts';
 
 // Slug grammar from validatePageSlug — shared via PAGE_SLUG_SEG (#738).
 // Used for the orchestrator-written summary index slug. `u` flag required
@@ -337,6 +338,15 @@ export interface SynthesizePhaseOpts {
 }
 
 export async function runPhaseSynthesize(
+  engine: BrainEngine,
+  opts: SynthesizePhaseOpts,
+): Promise<PhaseResult> {
+  // gbrain#3392 — tag every gateway.chat() call under this run with a
+  // phase label for chat_usage_log (covers direct gateway.chat calls in this process; subagent-side spend is recorded at the subagent boundary itself).
+  return withChatPhase('dream.synthesize', () => _runPhaseSynthesizeInner(engine, opts));
+}
+
+async function _runPhaseSynthesizeInner(
   engine: BrainEngine,
   opts: SynthesizePhaseOpts,
 ): Promise<PhaseResult> {

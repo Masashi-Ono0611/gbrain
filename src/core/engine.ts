@@ -575,6 +575,29 @@ export interface FactListOpts {
    * are returned. Remote (untrusted) callers must supply ['world'].
    */
   visibility?: FactVisibility[];
+  /**
+   * patch 58: when true, the `since` comparison and ordering use
+   * COALESCE(valid_from, created_at) — event time — instead of creation
+   * time. Batch backfill (extract-conversation-facts) inserts many facts
+   * in one run, which makes created_at useless for "what happened
+   * yesterday" recall. Off by default; the facts meta-hook dedup path
+   * intentionally keeps creation-time semantics.
+   */
+  eventTime?: boolean;
+  /**
+   * patch 58: case-insensitive substring filter applied IN SQL (ILIKE).
+   * The op-layer used to grep client-side over the clamped fetch window
+   * (MAX_SEARCH_LIMIT=100), silently missing older matches.
+   */
+  grepText?: string;
+  /**
+   * patch 58: exclude extract-conversation-facts durable audit rows
+   * (EXTRACTION_COMPLETE / EXTRACTION_NOT_APPLICABLE) in SQL. They are
+   * checkpoints, not user facts; for trusted callers (no visibility
+   * filter) they dominate the newest-N fetch window right after a batch
+   * run and starve recall of real facts.
+   */
+  excludeAuditRows?: boolean;
 }
 
 /** Per-source operational health snapshot consumed by `gbrain doctor`. */

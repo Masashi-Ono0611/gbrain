@@ -247,7 +247,14 @@ const chronicle_backfill: Operation = {
     const updated_after = typeof p.since === 'string' ? p.since : undefined;
     const dryRun = p.dry_run === true;
     const scope = sourceScopeOpts(ctx);
-    type QueueLike = { add: (n: string, d: Record<string, unknown>) => Promise<unknown> };
+    type QueueLike = {
+      add: (
+        n: string,
+        d: Record<string, unknown>,
+        opts?: unknown,
+        trusted?: { allowProtectedSubmit?: boolean },
+      ) => Promise<unknown>;
+    };
     let queue: QueueLike | null = null;
     if (!dryRun) {
       const { MinionQueue } = await import('../minions/queue.ts');
@@ -265,7 +272,15 @@ const chronicle_backfill: Operation = {
         eligible++;
         if (dryRun || !queue) continue;
         try {
-          await queue.add('chronicle_extract', { slug: page.slug, sourceId: ctx.sourceId ?? 'default' });
+          // #2786 — chronicle_extract is PROTECTED (see protected-names.ts).
+          // chronicle_backfill is admin+localOnly, so this call is already
+          // trusted-only.
+          await queue.add(
+            'chronicle_extract',
+            { slug: page.slug, sourceId: ctx.sourceId ?? 'default' },
+            undefined,
+            { allowProtectedSubmit: true },
+          );
           enqueued++;
         } catch (e) {
           // Never swallow — surface per-page failures (the #2057 no-swallow pattern).

@@ -89,7 +89,7 @@ import type {
 } from './types.ts';
 import { validateSlug, contentHash, rowToPage, rowToStalePage, rowToChunk, rowToSearchResult, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { executeRawJsonb, type SqlValue } from './sql-query.ts';
-import { sanitizeForJsonb, buildLinkRows, buildTimelineRows } from './batch-rows.ts';
+import { sanitizeForJsonb, sanitizeText, buildLinkRows, buildTimelineRows } from './batch-rows.ts';
 import { PAGE_SORT_SQL, MIN_ENTITY_PAGES_FOR_COVERAGE } from './types.ts';
 import { finalizeLastSeen } from './chronicle/last-seen.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
@@ -1594,7 +1594,7 @@ export class PGLiteEngine implements BrainEngine {
          ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
          ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
        RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at`,
-      [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt]
+      [sourceId, slug, page.type, pageKind, sanitizeText(page.title), sanitizeText(page.compiled_truth), sanitizeText(page.timeline || ''), JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt]
     );
     // PGLite can return zero rows from INSERT ... ON CONFLICT DO UPDATE ...
     // RETURNING in no-op/trigger edge cases, which made rowToPage(undefined)
@@ -2961,7 +2961,7 @@ export class PGLiteEngine implements BrainEngine {
       if (embeddingStr) params.push(embeddingStr);
       if (embeddingImageStr) params.push(embeddingImageStr);
       params.push(
-        pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
+        pageId, chunk.chunk_index, sanitizeText(chunk.chunk_text), chunk.chunk_source,
         chunk.model || resolvedModel, chunk.token_count || null,
         chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
         chunk.start_line ?? null, chunk.end_line ?? null,

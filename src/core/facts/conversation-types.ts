@@ -27,6 +27,7 @@
  */
 export const ALLOWED_TYPES = Object.freeze([
   'conversation',
+  'transcript',
   'meeting',
   'slack',
   'email',

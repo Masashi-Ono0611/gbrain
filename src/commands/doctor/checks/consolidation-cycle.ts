@@ -7,6 +7,7 @@
 import type { BrainEngine } from '../../../core/engine.ts';
 import { resolveHoursEnv } from '../../../core/env-number.ts';
 import type { Check } from '../../doctor.ts';
+import type { ContentSanitySummary } from '../../../core/audit/content-sanity-audit.ts';
 
 /** Local alias; the shared warn-once memo lives in core so it can't fork per module. */
 const _resolveSyncFreshnessHours = resolveHoursEnv;
@@ -64,6 +65,63 @@ export async function checkSyncConsolidation(engine: BrainEngine): Promise<Check
       message: `Could not check sync consolidation: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
+}
+
+/** Distinct new-offender warn pages in the window before the check goes
+ *  warn. Same numeric threshold as the pre-#1893 raw-event rule, with the
+ *  unit corrected from events to pages so one page re-imported 10 times in
+ *  a day no longer trips it alone. */
+export const CONTENT_SANITY_NEW_PAGES_WARN_THRESHOLD = 10;
+
+/**
+ * Score the content-sanity audit stream (pure; exported for tests).
+ *
+ * Audit events are evidence, not automatically breakage. A large code
+ * source can legitimately emit many WARN events (oversize/markup-heavy)
+ * while remaining searchable and intentionally flagged. Fail on hard
+ * dispositions (content actually blocked or hidden — never routine, even
+ * when chronic); warn on NEW soft dispositions or new-offender volume.
+ *
+ * Chronic signatures — the same (page, disposition, reason) recurring
+ * across >= CHRONIC_MIN_DISTINCT_DAYS distinct days in the window — do
+ * not drive warn/fail (#1893): the ingest gate intentionally re-logs
+ * every re-import, so a corpus with standing oversized pages re-emits the
+ * same events nightly and a raw-event threshold pins the check at warn
+ * forever. Standing state is already owned, deduplicated, by the
+ * DB-backed checks (oversized_pages / flagged_pages / quarantined_pages);
+ * this check scores fresh INFLOW.
+ *
+ * v0.42 renamed the hard path: a rejected page emits `reject` and a
+ * quarantined (hidden) junk page emits `quarantine`; `hard_block` is now
+ * only the pre-v0.42 legacy alias. `flag` is a soft disposition (still
+ * searchable, agent warned on retrieval), so it joins `soft_block`.
+ */
+export function computeContentSanityAuditCheck(summary: ContentSanitySummary): Check {
+  const hardBlocked =
+    summary.by_type.hard_block + summary.by_type.reject + summary.by_type.quarantine;
+  const softBlocked = summary.by_type.soft_block + summary.by_type.flag;
+  // Bypass events always at least warn: the kill-switch is an incident-time
+  // escape hatch, and a bypassed junk page lands looking like a routine warn
+  // — chronicity must never bury a gate that is switched off.
+  const status: 'ok' | 'warn' | 'fail' =
+    hardBlocked > 0 ? 'fail' :
+      (summary.bypass_events > 0 ||
+        summary.new_soft_pages > 0 ||
+        summary.new_warn_pages >= CONTENT_SANITY_NEW_PAGES_WARN_THRESHOLD) ? 'warn' : 'ok';
+  const topPatterns = summary.top_patterns.slice(0, 3).map(p => `${p.name}=${p.count}`).join(', ');
+  const topSources = Object.entries(summary.by_source)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([s, n]) => `${s}=${n}`)
+    .join(', ');
+  const topChronic = summary.top_chronic
+    .map(c => `${c.source_id}/${c.slug} (${c.events} events/${c.days}d)`)
+    .join('; ');
+  return {
+    name: 'content_sanity_audit_recent',
+    status,
+    message: `${summary.total_events} events / ${summary.distinct_pages} page(s) (chronic=${summary.chronic_pages} new=${summary.new_pages}) (hard=${hardBlocked} [hard_block=${summary.by_type.hard_block} reject=${summary.by_type.reject} quarantine=${summary.by_type.quarantine}] soft=${softBlocked} [soft_block=${summary.by_type.soft_block} flag=${summary.by_type.flag}] warn=${summary.by_type.warn})${summary.bypass_events > 0 ? ` bypass=${summary.bypass_events}` : ''}${topPatterns ? ', patterns: ' + topPatterns : ''}${topSources ? ', sources: ' + topSources : ''}.${topChronic ? ` Top chronic: ${topChronic} — standing offenders are scored by oversized_pages/flagged_pages/quarantined_pages; this check scores new inflow.` : ''} (Local audit only — multi-host operators set GBRAIN_AUDIT_DIR.)`,
+  };
 }
 
 /**

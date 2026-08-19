@@ -15,10 +15,13 @@ import { categorizeCheck, type CheckCategory } from '../core/doctor-categories.t
 import { rankIssues, type RankedIssue } from '../core/doctor-cause-rank.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import type { DbUrlSource } from '../core/config.ts';
+import type { ContentSanitySummary } from '../core/audit/content-sanity-audit.ts';
 import { gbrainPath, loadConfig } from '../core/config.ts';
 import { dirname, join } from 'path';
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { resolveEnvNumber, resolveHoursEnv } from '../core/env-number.ts';
+import { computeEffectiveDate } from '../core/effective-date.ts';
+import { parseFrontmatter } from '../core/backfill-effective-date.ts';
 import { hnswIndexExpected, hnswMaxDimsForType } from '../core/vector-index.ts';
 import { VERSION as GBRAIN_BINARY_VERSION } from '../version.ts';
 // Peeled doctor modules (containment sprint): each is a verbatim move out of
@@ -73,6 +76,7 @@ export {
   checkSubagentHealth,
   checkVoiceGateHealth,
   checkRerankerHealth,
+  checkServeProcessAccumulation,
 } from './doctor/checks/calibration.ts';
 export {
   computeQueueHealthCheck,
@@ -125,6 +129,8 @@ export {
   computePoolBudgetCheck,
   checkPoolBudget,
   checkCycleFreshness,
+  CONTENT_SANITY_NEW_PAGES_WARN_THRESHOLD,
+  computeContentSanityAuditCheck,
 } from './doctor/checks/consolidation-cycle.ts';
 export {
   computePgliteDataDirCheck,
@@ -153,6 +159,7 @@ import {
   checkHiddenBySearchPolicy,
   checkLinkResolutionOpportunity,
   checkRerankerHealth,
+  checkServeProcessAccumulation,
 } from './doctor/checks/calibration.ts';
 import {
   computeQueueHealthCheck,
@@ -200,6 +207,7 @@ import {
 import {
   checkSyncConsolidation,
   checkCycleFreshness,
+  computeContentSanityAuditCheck,
 } from './doctor/checks/consolidation-cycle.ts';
 import {
   computePgliteDataDirCheck,
@@ -1690,6 +1698,11 @@ export async function buildChecks(
     }
   }
 
+  // serve_process_accumulation — ps scan, no DB. Runs in every mode
+  // including --fast/DB-down: pool exhaustion from leaked serves is
+  // exactly the state where doctor gets run degraded.
+  checks.push(await checkServeProcessAccumulation());
+
   // --- DB checks (skip if --fast or no engine) ---
 
   if (fastMode || !engine) {
@@ -1708,6 +1721,12 @@ export async function buildChecks(
       }
       checks.push({ name: 'connection', status: 'warn', message: msg });
     }
+    // v0.35.0.0+ reranker_health — the audit JSONL is file-based (no DB),
+    // so `--fast` and DB-down runs still surface rerank failures (#2059
+    // item 3). A null engine only costs the enabled/disabled nuance in the
+    // zero-failure message. Full runs keep their original DB-phase call
+    // site below, so check ordering + progress events are unchanged there.
+    checks.push(await checkRerankerHealth(engine));
     // Early return: caller renders the partial check list + decides exit code.
     // Pre-v0.39 this site called outputResults + process.exit directly; the
     // narrow-seam extract moved both to the runDoctor CLI wrapper.
@@ -2776,10 +2795,11 @@ export async function buildChecks(
   //   opt-in for full scan (D10 mirrors --index-audit precedent). Applies
   //   the assessor per-page on title + 2KB head-slice + frontmatter.
   // - content_sanity_audit_recent: reads ~/.gbrain/audit/content-sanity-*.jsonl
-  //   over the last 7 days, aggregates by event type + source. Caveat
-  //   (Codex r1 #14): JSONL is local-only — multi-host operators should
-  //   share GBRAIN_AUDIT_DIR. Message names this so the limitation is
-  //   visible at the doctor surface.
+  //   over the last 7 days, aggregates by event type + source and splits
+  //   chronic vs new offender signatures — only new inflow drives the
+  //   warn score (#1893). Caveat (Codex r1 #14): JSONL is local-only —
+  //   multi-host operators should share GBRAIN_AUDIT_DIR. Message names
+  //   this so the limitation is visible at the doctor surface.
   const fullContentAudit = args.includes('--content-audit');
   progress.heartbeat('oversized_pages');
   try {
@@ -2909,36 +2929,7 @@ export async function buildChecks(
       });
     } else {
       const summary = summarizeContentSanityEvents(events);
-      const topPatterns = summary.top_patterns.slice(0, 3).map(p => `${p.name}=${p.count}`).join(', ');
-      const topSources = Object.entries(summary.by_source)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 3)
-        .map(([s, n]) => `${s}=${n}`)
-        .join(', ');
-      // Audit events are evidence, not automatically breakage. A large code
-      // source can legitimately emit many WARN events (oversize/markup-heavy)
-      // while remaining searchable and intentionally flagged. Fail on hard
-      // dispositions (content actually blocked or hidden); warn on soft
-      // dispositions or volume. This keeps doctor from treating expected
-      // code-corpus telemetry as an unhealthy brain.
-      //
-      // v0.42 renamed the hard path: a rejected page emits `reject` and a
-      // quarantined (hidden) junk page emits `quarantine`; `hard_block` is now
-      // only the pre-v0.42 legacy alias. Counting `hard_block` alone let fresh
-      // junk-ingest evidence (`reject`/`quarantine`) clear as `ok` whenever
-      // fewer than 10 events landed. `flag` is a warn disposition (still
-      // searchable, agent warned on retrieval), so it joins `soft_block`.
-      const hardBlocked =
-        summary.by_type.hard_block + summary.by_type.reject + summary.by_type.quarantine;
-      const softBlocked = summary.by_type.soft_block + summary.by_type.flag;
-      const status: 'ok' | 'warn' | 'fail' =
-        hardBlocked > 0 ? 'fail' :
-          (softBlocked > 0 || events.length >= 10) ? 'warn' : 'ok';
-      checks.push({
-        name: 'content_sanity_audit_recent',
-        status,
-        message: `${events.length} events (hard=${hardBlocked} [hard_block=${summary.by_type.hard_block} reject=${summary.by_type.reject} quarantine=${summary.by_type.quarantine}] soft=${softBlocked} [soft_block=${summary.by_type.soft_block} flag=${summary.by_type.flag}] warn=${summary.by_type.warn})${topPatterns ? ', patterns: ' + topPatterns : ''}${topSources ? ', sources: ' + topSources : ''}. (Local audit only — multi-host operators set GBRAIN_AUDIT_DIR.)`,
-      });
+      checks.push(computeContentSanityAuditCheck(summary));
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -3392,32 +3383,87 @@ export async function buildChecks(
   //
   // Sample 1000 random rows by default to keep the check fast on 200K-page
   // brains. The expression index pages_coalesce_date_idx makes the future-
-  // date and pre-1990 scans cheap; the parseable-fm-date scan reads
-  // frontmatter JSONB and is the slow path.
+  // date and pre-1990 scans cheap. The "fell back despite parseable date"
+  // arm can't be a pure SQL COUNT(*) — JSONB `?` only proves a key exists,
+  // not that its value parses — so it fetches the candidate rows and
+  // re-runs computeEffectiveDate() in JS (same function `gbrain
+  // reindex-frontmatter` uses) to confirm a real date was missed.
   progress.heartbeat('effective_date_health');
   try {
     const result = await engine.executeRaw<{ kind: string; count: string }>(
       `WITH sample AS (
-         SELECT slug, frontmatter, effective_date, effective_date_source
+         SELECT effective_date
            FROM pages
           ORDER BY id DESC
           LIMIT 1000
        )
-       SELECT 'fallback_with_fm_date' AS kind, COUNT(*)::text AS count
-         FROM sample
-        WHERE effective_date_source = 'fallback'
-          AND (frontmatter ? 'event_date' OR frontmatter ? 'date' OR frontmatter ? 'published')
-       UNION ALL
-       SELECT 'future_dated', COUNT(*)::text FROM sample
+       SELECT 'future_dated' AS kind, COUNT(*)::text AS count FROM sample
         WHERE effective_date IS NOT NULL AND effective_date > NOW() + INTERVAL '1 year'
        UNION ALL
        SELECT 'pre_1990', COUNT(*)::text FROM sample
         WHERE effective_date IS NOT NULL AND effective_date < TIMESTAMPTZ '1990-01-01'`,
     );
     const counts = new Map(result.map(r => [r.kind, Number(r.count)]));
-    const fallbackWithFm = counts.get('fallback_with_fm_date') ?? 0;
     const future = counts.get('future_dated') ?? 0;
     const pre1990 = counts.get('pre_1990') ?? 0;
+
+    // `frontmatter ? 'date'` (JSONB key-existence) only proves the key is
+    // present — an empty string, null, or unparseable value still passes
+    // it, so a naive COUNT(*) on that predicate over-reports "fell back
+    // despite a parseable date". Fetch the candidate rows instead and run
+    // them through the SAME parse/range rules `gbrain reindex-frontmatter`
+    // uses (computeEffectiveDate) to confirm the frontmatter value itself
+    // is parseable. This is a ONE-DIRECTIONAL guarantee, not equivalence:
+    // every row counted here is a row reindex-frontmatter's dry run would
+    // also flag, but reindex-frontmatter's dry run additionally flags rows
+    // this arm intentionally excludes (filename-derived dates only, no
+    // parseable frontmatter — that's a different message). Two queries
+    // against the "last 1000 pages" window means this and the counts above
+    // can drift by a row or two under concurrent writes — acceptable for a
+    // sampled health check that already says "sample of last 1000 pages"
+    // in its message.
+    const candidates = await engine.executeRaw<{
+      slug: string;
+      frontmatter: unknown;
+      created_at: string;
+      updated_at: string;
+    }>(
+      `WITH sample AS (
+         SELECT slug, frontmatter, effective_date_source, created_at, updated_at
+           FROM pages
+          ORDER BY id DESC
+          LIMIT 1000
+       )
+       SELECT slug, frontmatter, created_at, updated_at
+         FROM sample
+        WHERE effective_date_source = 'fallback'
+          AND (frontmatter ? 'event_date' OR frontmatter ? 'date' OR frontmatter ? 'published')`,
+    );
+    let fallbackWithFm = 0;
+    for (const row of candidates) {
+      // filename: null — this arm asks "does the frontmatter ALONE have a
+      // parseable date", independent of whichever source wins the full
+      // precedence chain. Passing the row's real filename would let a
+      // daily/meetings-prefixed slug's filename-first precedence (see
+      // effective-date.ts) resolve to source='filename' whenever the slug
+      // also carries a YYYY-MM-DD prefix — silently hiding a genuinely
+      // parseable frontmatter date (Codex review: reproduced with
+      // `daily/2024-03-15-standup` + `{ date: '2024-04-01' }`, which
+      // reindex-frontmatter WOULD still act on). filename=null makes
+      // computeEffectiveDate fall straight through to the frontmatter
+      // fields regardless of slug prefix.
+      const recomputed = computeEffectiveDate({
+        slug: row.slug,
+        frontmatter: parseFrontmatter(row.frontmatter),
+        filename: null,
+        updatedAt: new Date(row.updated_at),
+        createdAt: new Date(row.created_at),
+      });
+      if (recomputed.source === 'event_date' || recomputed.source === 'date' || recomputed.source === 'published') {
+        fallbackWithFm++;
+      }
+    }
+
     if (fallbackWithFm > 0 || future > 0 || pre1990 > 0) {
       const parts: string[] = [];
       if (fallbackWithFm > 0) parts.push(`${fallbackWithFm} fell back to updated_at despite parseable frontmatter date`);

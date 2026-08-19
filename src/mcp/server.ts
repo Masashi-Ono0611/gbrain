@@ -84,6 +84,21 @@ export async function stdioVisibleTools(
   return surfacedOps.filter(op => !gateDisabled.has(op.name));
 }
 
+/**
+ * #2657: stdio takes-holder allow-list. Fail-closed default ['world'] (the
+ * v0.28 contract — agent-facing callers never see private hunches unless the
+ * operator opts in). GBRAIN_MCP_TAKES_HOLDERS is the env escape hatch (same
+ * pattern as GBRAIN_SOURCE): comma-separated holder list, e.g.
+ * `GBRAIN_MCP_TAKES_HOLDERS=world,brain,people/alice-example`.
+ * Empty / whitespace-only values fall back to the default (never widen).
+ */
+export function resolveStdioTakesHolders(
+  raw: string | undefined = process.env.GBRAIN_MCP_TAKES_HOLDERS,
+): string[] {
+  const parsed = (raw ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  return parsed.length > 0 ? parsed : ['world'];
+}
+
 export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpSurface; sourceGuard?: boolean } = {}) {
   const server = new Server(
     { name: 'gbrain', version: VERSION },
@@ -134,8 +149,8 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     // v0.28: stdio MCP has no per-token auth (local pipe). Default the
     // takes-holder allow-list to ['world'] so agent-facing callers don't
     // see private hunches via takes_list / takes_search / query. Operators
-    // who want stdio to see everything should call ops directly via
-    // `gbrain call <op>` (sets remote=false in src/cli.ts).
+    // widen it with GBRAIN_MCP_TAKES_HOLDERS (comma-separated, #2657) or
+    // call ops directly via `gbrain call <op>` (sets remote=false in cli.ts).
     // CX2-11: MCP carries `_meta.session_id` as a sibling of `arguments` in
     // request.params. Thread it (clamped in dispatch) into the typed
     // OperationContext.sessionId so the hot-memory metaHook's cache keys per
@@ -150,7 +165,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       // instead of throwing unknown_transport. Trust posture unchanged —
       // stdio stays remote/untrusted.
       transport: 'stdio',
-      takesHoldersAllowList: ['world'],
+      takesHoldersAllowList: resolveStdioTakesHolders(),
       ...(sessionId ? { sessionId } : {}),
       sourceId: sourceScope.sourceId,
       ...(sourceScope.localFederatedSourceIds

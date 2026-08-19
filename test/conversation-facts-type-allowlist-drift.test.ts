@@ -67,6 +67,7 @@ import { buildFlagRegistry } from '../scripts/generate-flag-registry.ts';
 
 const EXPECTED_TYPES = [
   'conversation',
+  'transcript',
   'meeting',
   'slack',
   'email',
@@ -139,7 +140,7 @@ function countAllowedTypesImportsFromCommandModule(src: string): number {
 }
 
 describe('ALLOWED_TYPES — canonical source of truth (leaf module)', () => {
-  test('has exactly the 6 expected types, in order', () => {
+  test('has exactly the 7 expected types, in order', () => {
     expect([...ALLOWED_TYPES]).toEqual([...EXPECTED_TYPES]);
   });
 
@@ -151,10 +152,10 @@ describe('ALLOWED_TYPES — canonical source of truth (leaf module)', () => {
     expect(() => {
       (ALLOWED_TYPES as unknown as string[]).push('sms');
     }).toThrow();
-    expect(ALLOWED_TYPES.length).toBe(6);
+    expect(ALLOWED_TYPES.length).toBe(7);
   });
 
-  test('exactly one conversation-type list exists in the leaf module, and it is set-equal to the canonical 6', () => {
+  test('exactly one conversation-type list exists in the leaf module, and it is set-equal to the canonical 7', () => {
     const src = readSrc('core/facts/conversation-types.ts');
     const suspects = findSuspectTypeLists(src);
     expect(suspects.length).toBe(1);

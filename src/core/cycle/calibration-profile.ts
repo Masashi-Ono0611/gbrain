@@ -38,6 +38,7 @@ import { GBrainError } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine, TakesScorecard } from '../engine.ts';
 import type { PhaseStatus, CyclePhase } from '../cycle.ts';
+import { withChatPhase } from '../chat-usage.ts';
 
 export const CALIBRATION_PROFILE_PROMPT_VERSION = 'v0.36.1.0-stub';
 
@@ -429,7 +430,9 @@ export async function runPhaseCalibrationProfile(
   ctx: OperationContext,
   opts: CalibrationProfileOpts = {},
 ) {
-  return new CalibrationProfilePhase().run(ctx, opts);
+  // gbrain#3392 — tag every gateway.chat() call made during this phase run
+  // (defaultPatternsGenerator + defaultBiasTagsGenerator) for chat_usage_log.
+  return withChatPhase('dream.calibration_profile', () => new CalibrationProfilePhase().run(ctx, opts));
 }
 
 export const __testing = {

@@ -12,6 +12,8 @@ import type { Operation } from './contract.ts';
 import { enforceClientSlugFence, sourceScopeOpts } from './context.ts';
 import { stripTakesFence } from '../takes-fence.ts';
 import { VERSION } from '../../version.ts';
+import { chatUsageRecorderFailures } from '../chat-usage.ts';
+import { unmeteredSpendPaths } from '../ai/provider-call-registry.ts';
 
 // --- Admin ---
 
@@ -49,6 +51,248 @@ const get_health: Operation = {
   },
   scope: 'admin',
   cliHints: { name: 'health' },
+};
+
+/**
+ * Attempts still 'started' after this long are counted as orphaned (the
+ * process died between opening the row and finalizing it). Chat calls carry
+ * timeouts far shorter than this, so a healthy in-flight call can't be
+ * misclassified; see chat-usage.ts for the lifecycle contract.
+ */
+const USAGE_ORPHAN_THRESHOLD_MS = 60 * 60_000;
+
+const get_usage: Operation = {
+  name: 'get_usage',
+  description:
+    'Chat LLM spend over a date range, from the provider-boundary lifecycle '
+    + 'ledger (chat_usage_log). Reports token ground truth, a cost lower '
+    + 'bound at published list rates, and an explicit coverage contract — '
+    + 'costs are labeled estimates, not invoice reconciliation (gbrain#3392).',
+  params: {
+    since: { type: 'string', description: 'ISO 8601 start (inclusive). Defaults to 7 days ago.' },
+    until: { type: 'string', description: 'ISO 8601 end (exclusive). Defaults to now.' },
+  },
+  handler: async (ctx, p) => {
+    const now = new Date();
+    const since = typeof p.since === 'string' && p.since
+      ? new Date(p.since)
+      : new Date(now.getTime() - 7 * 86_400_000);
+    const until = typeof p.until === 'string' && p.until ? new Date(p.until) : now;
+    if (Number.isNaN(since.getTime())) {
+      throw new Error(`get_usage: invalid 'since' date: ${String(p.since)}`);
+    }
+    if (Number.isNaN(until.getTime())) {
+      throw new Error(`get_usage: invalid 'until' date: ${String(p.until)}`);
+    }
+    if (since.getTime() > until.getTime()) {
+      throw new Error(`get_usage: 'since' (${since.toISOString()}) is after 'until' (${until.toISOString()})`);
+    }
+    const orphanCutoff = new Date(now.getTime() - USAGE_ORPHAN_THRESHOLD_MS);
+
+    // Observed rows (final = authoritative provider usage; partial = billed
+    // lower bound recovered from an error). Grouped by model and by phase.
+    const byModel = await ctx.engine.executeRaw<{
+      model: string | null;
+      usage_status: string;
+      calls: string;
+      input_tokens: string;
+      output_tokens: string;
+      cache_read_tokens: string;
+      cache_creation_tokens: string;
+      priced_cost_usd: string | null;
+      unpriced_calls: string;
+    }>(
+      `SELECT
+         model,
+         usage_status,
+         COUNT(*)::text AS calls,
+         COALESCE(SUM(input_tokens), 0)::text AS input_tokens,
+         COALESCE(SUM(output_tokens), 0)::text AS output_tokens,
+         COALESCE(SUM(cache_read_tokens), 0)::text AS cache_read_tokens,
+         COALESCE(SUM(cache_creation_tokens), 0)::text AS cache_creation_tokens,
+         SUM(cost_usd)::text AS priced_cost_usd,
+         COUNT(*) FILTER (WHERE cost_usd IS NULL)::text AS unpriced_calls
+       FROM chat_usage_log
+       WHERE started_at >= $1 AND started_at < $2
+         AND usage_status IN ('final', 'partial')
+       GROUP BY model, usage_status
+       ORDER BY model NULLS LAST`,
+      [since.toISOString(), until.toISOString()],
+    );
+
+    const byPhase = await ctx.engine.executeRaw<{
+      phase: string;
+      calls: string;
+      input_tokens: string;
+      output_tokens: string;
+      cache_read_tokens: string;
+      cache_creation_tokens: string;
+      priced_cost_usd: string | null;
+    }>(
+      `SELECT
+         COALESCE(cul.phase, 'job:' || mj.name, cul.boundary) AS phase,
+         COUNT(*)::text AS calls,
+         COALESCE(SUM(cul.input_tokens), 0)::text AS input_tokens,
+         COALESCE(SUM(cul.output_tokens), 0)::text AS output_tokens,
+         COALESCE(SUM(cul.cache_read_tokens), 0)::text AS cache_read_tokens,
+         COALESCE(SUM(cul.cache_creation_tokens), 0)::text AS cache_creation_tokens,
+         SUM(cul.cost_usd)::text AS priced_cost_usd
+       FROM chat_usage_log cul
+       LEFT JOIN minion_jobs mj ON cul.job_id = mj.id
+       WHERE cul.started_at >= $1 AND cul.started_at < $2
+         AND cul.usage_status IN ('final', 'partial')
+       GROUP BY 1
+       ORDER BY 1`,
+      [since.toISOString(), until.toISOString()],
+    );
+
+    // Gap census over the same window — the rows that keep this report from
+    // claiming completeness. Orphans: still 'started' past the threshold.
+    const gapRows = await ctx.engine.executeRaw<{ kind: string; calls: string }>(
+      `SELECT kind, COUNT(*)::text AS calls FROM (
+         SELECT CASE
+           WHEN usage_status = 'unknown' THEN 'usage_unknown'
+           WHEN usage_status = 'partial' THEN 'usage_partial'
+           WHEN request_status = 'started' AND started_at < $3 THEN 'orphaned_attempt'
+           WHEN request_status = 'started' THEN 'in_flight'
+           ELSE NULL
+         END AS kind
+         FROM chat_usage_log
+         WHERE started_at >= $1 AND started_at < $2
+       ) t WHERE kind IS NOT NULL
+       GROUP BY kind`,
+      [since.toISOString(), until.toISOString(), orphanCutoff.toISOString()],
+    );
+
+    const num = (v: string | null | undefined): number => {
+      const n = parseFloat(String(v ?? '0'));
+      return Number.isFinite(n) ? n : 0;
+    };
+
+    const gapCount = (kind: string): number =>
+      num(gapRows.find(r => r.kind === kind)?.calls);
+
+    const models = new Map<string, {
+      model: string;
+      final_calls: number;
+      partial_calls: number;
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_tokens: number;
+      cache_creation_tokens: number;
+      known_cost_lower_bound_usd: number;
+      unpriced_calls: number;
+    }>();
+    for (const r of byModel) {
+      const key = r.model ?? '(unresolved)';
+      const m = models.get(key) ?? {
+        model: key,
+        final_calls: 0,
+        partial_calls: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        known_cost_lower_bound_usd: 0,
+        unpriced_calls: 0,
+      };
+      if (r.usage_status === 'final') m.final_calls += num(r.calls);
+      else m.partial_calls += num(r.calls);
+      m.input_tokens += num(r.input_tokens);
+      m.output_tokens += num(r.output_tokens);
+      m.cache_read_tokens += num(r.cache_read_tokens);
+      m.cache_creation_tokens += num(r.cache_creation_tokens);
+      m.known_cost_lower_bound_usd += num(r.priced_cost_usd);
+      m.unpriced_calls += num(r.unpriced_calls);
+      models.set(key, m);
+    }
+
+    const totals = {
+      final_calls: 0, partial_calls: 0,
+      input_tokens: 0, output_tokens: 0,
+      cache_read_tokens: 0, cache_creation_tokens: 0,
+      known_cost_lower_bound_usd: 0, unpriced_calls: 0,
+    };
+    for (const m of models.values()) {
+      totals.final_calls += m.final_calls;
+      totals.partial_calls += m.partial_calls;
+      totals.input_tokens += m.input_tokens;
+      totals.output_tokens += m.output_tokens;
+      totals.cache_read_tokens += m.cache_read_tokens;
+      totals.cache_creation_tokens += m.cache_creation_tokens;
+      totals.known_cost_lower_bound_usd += m.known_cost_lower_bound_usd;
+      totals.unpriced_calls += m.unpriced_calls;
+    }
+
+    const gaps: Array<{ type: string; calls?: number; count?: number; note?: string }> = [];
+    const unknownCalls = gapCount('usage_unknown');
+    const partialCalls = gapCount('usage_partial');
+    const orphanedCalls = gapCount('orphaned_attempt');
+    const recorderFailures = chatUsageRecorderFailures();
+    if (unknownCalls > 0) gaps.push({ type: 'usage_unknown', calls: unknownCalls, note: 'terminated without provider-reported usage; may or may not have been billed' });
+    if (partialCalls > 0) gaps.push({ type: 'usage_partial', calls: partialCalls, note: 'error carried usage; counted as a billed lower bound' });
+    if (orphanedCalls > 0) gaps.push({ type: 'orphaned_attempt', calls: orphanedCalls, note: 'attempt opened but never finalized (process crash?)' });
+    const inFlightCalls = gapCount('in_flight');
+    if (inFlightCalls > 0) gaps.push({ type: 'in_flight', calls: inFlightCalls, note: 'attempt still running; its spend is not in the sums yet' });
+    if (totals.unpriced_calls > 0) gaps.push({ type: 'pricing_missing', calls: totals.unpriced_calls, note: 'tokens recorded but no verified rate; excluded from cost sums' });
+    if (recorderFailures > 0) gaps.push({ type: 'recorder_failures_this_process', count: recorderFailures, note: 'ledger writes that failed in THIS process; cross-process write failures are not observable' });
+
+    // 'complete_observed', not 'complete': completeness is judged over the
+    // rows this ledger observed. A process that failed BOTH ledger writes for
+    // an attempt leaves nothing behind for any later reader to count — an
+    // unobservable gap by construction, so the status name must not claim
+    // more than the ledger can know.
+    const complete = gaps.length === 0;
+    const totalObserved = totals.final_calls + totals.partial_calls;
+
+    return {
+      window: { since: since.toISOString(), until: until.toISOString() },
+      totals,
+      by_model: [...models.values()],
+      by_phase: byPhase.map(r => ({
+        phase: r.phase,
+        calls: num(r.calls),
+        input_tokens: num(r.input_tokens),
+        output_tokens: num(r.output_tokens),
+        cache_read_tokens: num(r.cache_read_tokens),
+        cache_creation_tokens: num(r.cache_creation_tokens),
+        known_cost_lower_bound_usd: num(r.priced_cost_usd),
+      })),
+      known_cost_lower_bound_usd: totals.known_cost_lower_bound_usd,
+      complete_calculated_cost_usd: complete ? totals.known_cost_lower_bound_usd : null,
+      in_flight_calls: inFlightCalls,
+      coverage: {
+        status: complete ? 'complete_observed' : 'partial',
+        scope: {
+          operation: 'chat',
+          boundaries: ['gateway.chat', 'subagent.legacy_anthropic'],
+        },
+        basis: 'published_rate_snapshot',
+        gaps,
+        out_of_scope: unmeteredSpendPaths(),
+        notes: [
+          'Costs use per-row rate snapshots taken at write time from '
+          + 'model-pricing.ts published list rates. Promotional, negotiated '
+          + 'and invoice-level pricing (credits, tax, tiers) are NOT modeled: '
+          + 'token counts are the ground truth, costs are labeled estimates.',
+          'complete_observed means gap-free over OBSERVED rows: an attempt '
+          + 'whose ledger writes all failed in a crashed process leaves no '
+          + 'row and cannot be counted by any reader.',
+          'SDK-internal retries are not separately metered: the boundaries '
+          + 'wrap the SDK call, so a transient failure that was billed and '
+          + 'then retried appears as one attempt carrying only the final '
+          + 'try\'s usage. Sums remain valid lower bounds.',
+          ...(totalObserved === 0
+            ? ['window contains no recorded attempts — an empty window is '
+               + 'trivially gap-free, not evidence of zero spend outside the '
+               + 'ledger\'s scope.']
+            : []),
+        ],
+      },
+    };
+  },
+  scope: 'admin',
+  cliHints: { name: 'usage' },
 };
 
 /**
@@ -220,6 +464,6 @@ const quarantine_list: Operation = {
 
 // Ops in EXACTLY the canonical `operations` array order.
 export const adminOperations: Operation[] = [
-  get_stats, get_health, run_doctor, get_versions, revert_version,
+  get_stats, get_health, get_usage, run_doctor, get_versions, revert_version,
   get_brain_identity, quarantine_list,
 ];

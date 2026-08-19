@@ -257,15 +257,21 @@ export async function listFactsSince(
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
     const entitySlug = opts?.entitySlug ?? null;
+    const eventTime = opts?.eventTime === true;
+    const excludeAudit = opts?.excludeAuditRows === true;
+    const grepText = (opts?.grepText && opts.grepText.length > 0) ? opts.grepText : null;
+    const grepPat = grepText ? '%' + grepText.replace(/[\\%_]/g, (m) => '\\' + m) + '%' : null;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
-        AND created_at >= ${since}
+        AND ${eventTime ? sql`COALESCE(valid_from, created_at)` : sql`created_at`} >= ${since}
         ${entitySlug ? sql`AND entity_slug = ${entitySlug}` : sql``}
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
-      ORDER BY created_at DESC, id DESC
+        ${grepPat ? sql`AND fact ILIKE ${grepPat}` : sql``}
+        ${excludeAudit ? sql`AND fact NOT IN ('EXTRACTION_COMPLETE','EXTRACTION_NOT_APPLICABLE')` : sql``}
+      ORDER BY ${eventTime ? sql`COALESCE(valid_from, created_at)` : sql`created_at`} DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
     return rows.map(rowToFactPg);

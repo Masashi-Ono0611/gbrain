@@ -1183,3 +1183,241 @@ describe('finalizeWriteAccounting read-error posture (CX-A3)', () => {
     expect(out.pages_attempted).toBe(0);
   });
 });
+
+describe('handler-entry capability gate on the resolved model', () => {
+  test('config-resolved models.subagent with supports_subagent_loop: false is refused at dispatch', async () => {
+    // The queue submit gate only sees explicit data.model. A job that omits
+    // data.model resolves `models.subagent` inside the handler — pre-fix that
+    // path bypassed the capability check entirely and a loop-incapable model
+    // (declared supports_subagent_loop: false) ran the loop anyway.
+    await engine.setConfig('models.subagent', 'moonshot:kimi-k2.5');
+    try {
+      const client = new FakeMessagesClient([
+        { content: [{ type: 'text', text: 'should never run' }] as any, stop_reason: 'end_turn' },
+      ]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' }); // no data.model → queue gate passes
+      await expect(handler(ctx)).rejects.toThrow(/supports_subagent_loop/);
+      expect(client.calls.length).toBe(0); // refused before any provider call
+    } finally {
+      await engine.unsetConfig('models.subagent');
+    }
+  });
+
+  test('already-terminal replay is NOT refused when config points at a loop-incapable model', async () => {
+    // #1151 precedent: a job whose last persisted message is a terminal
+    // assistant turn needs no provider call — the replay short-circuit
+    // returns the committed result. A capability refusal here (config
+    // repointed between submit and replay) would dead-letter completed work.
+    // Gateway loop ON: that's the only routing where the capability gate is
+    // the deciding check (the legacy path's Anthropic pin refuses
+    // non-Anthropic models regardless). The gateway path's terminal
+    // early-return runs before any provider client is constructed, so no
+    // API key is needed.
+    await engine.setConfig('models.subagent', 'moonshot:kimi-k2.5');
+    await engine.setConfig('agent.use_gateway_loop', 'true');
+    try {
+      const client = new FakeMessagesClient([]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      // Persist a completed transcript: seed user + terminal assistant.
+      await engine.executeRaw(
+        `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+         VALUES ($1, 0, 'user', $2::text::jsonb), ($1, 1, 'assistant', $3::text::jsonb)`,
+        [
+          ctx.id,
+          JSON.stringify([{ type: 'text', text: 'hi' }]),
+          JSON.stringify([{ type: 'text', text: 'committed answer' }]),
+        ],
+      );
+      const result = await handler(ctx);
+      expect(result.result).toBe('committed answer');
+      // Replay short-circuit: no new turns persisted beyond the 2 seeded rows
+      // (a provider call would have appended an assistant row — and would have
+      // failed anyway, since no gateway credentials are configured here).
+      const rows = await engine.executeRaw<{ count: string }>(
+        `SELECT count(*)::text AS count FROM subagent_messages WHERE job_id = $1`,
+        [ctx.id],
+      );
+      expect(parseInt(rows[0]!.count, 10)).toBe(2);
+    } finally {
+      await engine.unsetConfig('models.subagent');
+      await engine.unsetConfig('agent.use_gateway_loop');
+    }
+  });
+
+  test('non-terminal gateway replay (pending tool-call) IS still refused on a loop-incapable model', async () => {
+    // A gateway transcript persists pending dispatch as `tool-call` blocks.
+    // A replay that still needs the loop to resume on the provider must NOT
+    // slip past the capability gate via the terminal exception.
+    await engine.setConfig('models.subagent', 'moonshot:kimi-k2.5');
+    await engine.setConfig('agent.use_gateway_loop', 'true');
+    try {
+      const client = new FakeMessagesClient([]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      await engine.executeRaw(
+        `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+         VALUES ($1, 0, 'user', $2::text::jsonb), ($1, 1, 'assistant', $3::text::jsonb)`,
+        [
+          ctx.id,
+          JSON.stringify([{ type: 'text', text: 'hi' }]),
+          JSON.stringify([{ type: 'tool-call', toolCallId: 'tc_1', toolName: 'echo', input: {} }]),
+        ],
+      );
+      await expect(handler(ctx)).rejects.toThrow(/supports_subagent_loop/);
+    } finally {
+      await engine.unsetConfig('models.subagent');
+      await engine.unsetConfig('agent.use_gateway_loop');
+    }
+  });
+});
+
+
+// ── Chat-usage ledger boundary (gbrain#3392) ─────────────────
+//
+// The legacy Anthropic-direct loop is a provider boundary of its own — the
+// exact path the first cut of the usage ledger missed. These tests run the
+// REAL handler against the fake client and assert the ledger row, so
+// removing the beginChatUsageAttempt wiring in subagent.ts fails here.
+
+import {
+  setChatUsageEngine,
+  flushChatUsage,
+  __resetChatUsageForTests,
+} from '../src/core/chat-usage.ts';
+import {
+  configureGateway,
+  resetGateway,
+  __setGenerateTextTransportForTests,
+} from '../src/core/ai/gateway.ts';
+
+describe('chat-usage ledger at the subagent boundary', () => {
+  beforeEach(async () => {
+    __resetChatUsageForTests();
+    setChatUsageEngine(engine);
+    await engine.executeRaw('DELETE FROM chat_usage_log');
+  });
+
+  afterAll(() => {
+    setChatUsageEngine(null);
+  });
+
+  test('happy path writes one final row per LLM turn with the 5m cache TTL', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'hello world' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi' });
+    await handler(ctx);
+
+    await flushChatUsage();
+    const rows = await engine.executeRaw<any>(
+      'SELECT * FROM chat_usage_log ORDER BY id',
+    );
+    expect(rows.length).toBe(1);
+    const r = rows[0];
+    expect(r.boundary).toBe('subagent.legacy_anthropic');
+    expect(Number(r.job_id)).toBe(ctx.id);
+    expect(r.provider_id).toBe('anthropic');
+    expect(r.request_status).toBe('succeeded');
+    expect(r.usage_status).toBe('final');
+    expect(Number(r.input_tokens)).toBe(10);
+    expect(Number(r.output_tokens)).toBe(5);
+    expect(r.cache_write_ttl).toBe('5m');
+    // Pricing must actually land on this path (the model id spelling the
+    // handler carries — qualified or bare — must resolve via canonicalLookup;
+    // a spelling mismatch would silently leave every legacy row unpriced).
+    expect(r.model).toBeTruthy();
+    expect(r.cost_usd).not.toBeNull();
+    expect(Number(r.cost_usd)).toBeGreaterThan(0);
+    expect(r.rate_snapshot).toBeTruthy();
+  });
+
+  test('two-turn tool run writes one row per provider call', async () => {
+    const tool = makeEchoTool();
+    const client = new FakeMessagesClient([
+      {
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'echo', input: { value: 'v1' } } as any],
+        stop_reason: 'tool_use' as any,
+      },
+      { content: [{ type: 'text', text: 'done' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [tool] });
+    const ctx = await makeCtx({ prompt: 'run the tool' });
+    await handler(ctx);
+
+    await flushChatUsage();
+    const rows = await engine.executeRaw<any>(
+      `SELECT request_status, usage_status FROM chat_usage_log ORDER BY id`,
+    );
+    expect(rows.length).toBe(2);
+    for (const r of rows) {
+      expect(r.request_status).toBe('succeeded');
+      expect(r.usage_status).toBe('final');
+    }
+  });
+
+  test('success WITHOUT a usage object: unknown + all-NULL, never a fabricated $0 partial', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'ok' }] as any, stop_reason: 'end_turn', usage: undefined } as any,
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi' });
+    await handler(ctx);
+
+    await flushChatUsage();
+    const rows = await engine.executeRaw<any>('SELECT * FROM chat_usage_log');
+    expect(rows.length).toBe(1);
+    expect(rows[0].usage_status).toBe('unknown');
+    expect(rows[0].input_tokens).toBeNull();
+    expect(rows[0].cache_read_tokens).toBeNull();
+    expect(rows[0].cost_usd).toBeNull();
+  });
+
+  test('gateway-loop mode: exactly one gateway.chat row, ZERO legacy rows (no double count)', async () => {
+    // The two subagent modes are mutually exclusive provider boundaries: a
+    // refactor that let a gateway-loop run ALSO enter the legacy
+    // instrumentation would double-count every call and still pass the
+    // legacy-path tests. This pins the exclusivity.
+    await engine.setConfig('agent.use_gateway_loop', 'true');
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'fake' } });
+    __setGenerateTextTransportForTests(async () => ({
+      content: [{ type: 'text', text: 'done' }],
+      finishReason: 'stop',
+      usage: { inputTokens: 5, outputTokens: 5 },
+    }) as any);
+    try {
+      const handler = makeSubagentHandler({ engine, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      await handler(ctx);
+    } finally {
+      __setGenerateTextTransportForTests(null);
+      resetGateway();
+      await engine.unsetConfig('agent.use_gateway_loop');
+    }
+    await flushChatUsage();
+    const rows = await engine.executeRaw<any>('SELECT boundary FROM chat_usage_log ORDER BY id');
+    expect(rows.length).toBe(1);
+    expect(rows[0].boundary).toBe('gateway.chat');
+  });
+
+  test('client failure: row failed with NULL tokens, never 0', async () => {
+    const failing: MessagesClient = {
+      async create() {
+        throw new Error('provider exploded');
+      },
+    };
+    const handler = makeSubagentHandler({ engine, client: failing, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi' });
+    await expect(handler(ctx)).rejects.toThrow('provider exploded');
+
+    await flushChatUsage();
+    const rows = await engine.executeRaw<any>('SELECT * FROM chat_usage_log');
+    expect(rows.length).toBe(1);
+    expect(rows[0].request_status).toBe('failed');
+    expect(rows[0].usage_status).toBe('unknown');
+    expect(rows[0].input_tokens).toBeNull();
+    expect(rows[0].error_class).toBe('Error');
+  });
+});

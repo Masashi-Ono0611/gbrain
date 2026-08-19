@@ -191,8 +191,9 @@ export class MinionQueue {
     }
     // v0.38 (S1.7 + D6) — capability-based gate replaces the v0.31.12 Anthropic
     // pin. The subagent loop now routes through `gateway.toolLoop()` so any
-    // provider with native tool calling works. Only refuse-at-submit when
-    // the requested model literally cannot run a tool loop. The handler
+    // provider whose recipe declares tool calling AND supports_subagent_loop
+    // works. Refuse-at-submit when the requested model cannot run a tool loop
+    // (no tools, loop declared unsupported, or unknown provider). The handler
     // (`subagent.ts`) does a defense-in-depth check at dispatch time too.
     if (jobName === 'subagent' && data && typeof data === 'object') {
       const submittedModel = (data as { model?: unknown }).model;
@@ -203,7 +204,15 @@ export class MinionQueue {
           throw new Error(
             `subagent job rejected: data.model "${submittedModel}" lacks native tool calling. ` +
             `The subagent loop dispatches brain ops via tool calls — without tool support the loop has no way to run. ` +
-            `Pick a provider that supports tools (anthropic, openai, google, openrouter, litellm-proxy, deepseek, groq, together, azure-openai).`,
+            `Pick a provider that supports tools (anthropic, openai, google, litellm, deepseek, groq, together, azure-openai).`,
+          );
+        }
+        if (verdict === 'unusable:no_subagent_loop') {
+          throw new Error(
+            `subagent job rejected: data.model "${submittedModel}" comes from a provider whose recipe declares ` +
+            `supports_subagent_loop: false — its tool_call_ids are not stable enough across crashes/replays ` +
+            `to drive the subagent loop. ` +
+            `Pick a provider whose recipe declares supports_subagent_loop: true (e.g. anthropic, openai, google, deepseek, groq).`,
           );
         }
         if (verdict === 'unknown') {
@@ -1944,8 +1953,19 @@ export class MinionQueue {
     return rows.length > 0;
   }
 
-  /** Replay a completed/failed/dead job with optional data overrides. Creates a new job. */
-  async replayJob(id: number, dataOverrides?: Record<string, unknown>): Promise<MinionJob | null> {
+  /**
+   * Replay a completed/failed/dead job with optional data overrides. Creates
+   * a new job.
+   *
+   * #2786 (codex review round 10) — replaying a job re-submits it via
+   * `add()`, which rejects PROTECTED_JOB_NAMES without
+   * `{allowProtectedSubmit: true}`. Without threading `trusted` through here,
+   * a trusted local caller (CLI `gbrain jobs replay`, doctor --remediate)
+   * couldn't replay a protected job (e.g. chronicle_extract) even though
+   * they were trusted enough to submit it in the first place — same
+   * trusted-passthrough shape as retryJob's caller in operations.ts.
+   */
+  async replayJob(id: number, dataOverrides?: Record<string, unknown>, trusted?: TrustedSubmitOpts): Promise<MinionJob | null> {
     const source = await this.getJob(id);
     if (!source) return null;
     if (!['completed', 'failed', 'dead'].includes(source.status)) return null;
@@ -1961,7 +1981,7 @@ export class MinionQueue {
       backoff_type: source.backoff_type,
       backoff_delay: source.backoff_delay,
       backoff_jitter: source.backoff_jitter,
-    });
+    }, trusted);
   }
 
   /** Remove a child's dependency on its parent. */

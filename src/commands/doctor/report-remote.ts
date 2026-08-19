@@ -43,6 +43,7 @@ import {
   checkCalibrationFreshness,
   checkGradeConfidenceDrift,
   checkVoiceGateHealth,
+  checkServeProcessAccumulation,
   checkContextualRetrievalCoverage,
   checkHiddenBySearchPolicy,
   checkLinkResolutionOpportunity,
@@ -386,6 +387,11 @@ export async function doctorReportRemote(
   // search.reranker.enabled FIRST so absence-of-failures means different
   // things when reranker is on vs off.
   checks.push(await checkRerankerHealth(engine));
+
+  // 9b. serve_process_accumulation: leaked stdio serves hold DB
+  // connections — the remote/MCP surface is where accumulation-prone
+  // (MCP-heavy) operators actually look. ps scan, engine-free.
+  checks.push(await checkServeProcessAccumulation());
 
   // 9a. v0.40.4 graph_signals_coverage: when graph_signals is enabled
   // (via mode bundle default or explicit config override), surface

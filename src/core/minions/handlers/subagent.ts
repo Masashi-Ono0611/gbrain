@@ -27,6 +27,8 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { MinionJobContext, MinionJob } from '../types.ts';
 import { UnrecoverableError } from '../types.ts';
+import { beginChatUsageAttempt, isAbortError, type ChatUsageAttempt } from '../../chat-usage.ts';
+import { extractUsageFromError } from '../../budget/budget-tracker.ts';
 import type {
   ContentBlock,
   SubagentHandlerData,
@@ -325,8 +327,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     // resolveModel's explicit-key branch, which does NOT run
     // enforceSubagentCapable's silent fallback (only the inherited
     // models.default / tier / env branches do). An explicitly chosen
-    // tool-incapable model must be refused loudly here rather than silently
-    // run a loop that has no way to dispatch tools.
+    // loop-incapable model must be refused loudly here rather than silently
+    // run a loop that can't dispatch tools or can't reconcile on replay.
     // The queue.ts gate already catches explicit data.model at submit; this
     // check additionally covers config-resolved models, direct `gbrain agent
     // run` invocations, and any path that bypasses the queue's check.
@@ -335,7 +337,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     // message is a terminal assistant turn (no tool_use blocks) needs NO
     // further provider call — the path-specific replay logic below returns
     // the already-committed result. Don't let a capability refusal (e.g.
-    // config repointed to a tool-incapable model between submit and replay)
+    // config repointed to a loop-incapable model between submit and replay)
     // dead-letter completed work.
     {
       const lastRows = await engine.executeRaw<{ role: string; content_blocks: unknown }>(
@@ -377,6 +379,13 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         throw new Error(
           `subagent job rejected: ${modelSource} "${model}" lacks native tool calling. ` +
           `The subagent loop dispatches brain ops via tool calls — without tool support the loop has no way to run.`,
+        );
+      }
+      if (verdict === 'unusable:no_subagent_loop') {
+        throw new Error(
+          `subagent job rejected: ${modelSource} "${model}" comes from a provider whose recipe declares ` +
+          `supports_subagent_loop: false — its tool_call_ids are not stable enough across crashes/replays ` +
+          `to drive the subagent loop.`,
         );
       }
       if (verdict === 'unknown') {
@@ -738,6 +747,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       }
 
       let assistantMsg: Anthropic.Message;
+      let usageAttempt: ChatUsageAttempt | null = null;
       const turnIdx = assistantTurns;
       const t0 = Date.now();
       logSubagentHeartbeat({ job_id: ctx.id, event: 'llm_call_started', turn_idx: turnIdx });
@@ -854,8 +864,67 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         };
 
         const combinedSignal = mergeSignals(mergeSignals(ctx.signal, ctx.shutdownSignal), leaseLost.signal);
+        // Lifecycle ledger (gbrain#3392): this direct-SDK call is a provider
+        // boundary of its own — the default subagent path never reaches
+        // gateway.chat(), which is exactly how the first cut of the usage
+        // ledger missed half of real spend. Cache TTL is the 5m ephemeral
+        // default (every cache_control in this file is `{type:'ephemeral'}`).
+        usageAttempt = beginChatUsageAttempt({
+          boundary: 'subagent.legacy_anthropic',
+          modelRaw: model,
+          model,
+          providerId: 'anthropic',
+          cacheWriteTtl: '5m',
+          jobId: ctx.id,
+        });
         assistantMsg = await client.create(params, { signal: combinedSignal });
+        // Ledger finish IMMEDIATELY after the provider returns — nothing may
+        // sit between a billed response and its ledger row (a throw in the
+        // bookkeeping below must not relabel real spend as failed/unknown).
+        // Anthropic Message.usage carries input/output always; cache fields
+        // are absent-means-zero on this SDK shape.
+        if (usageAttempt) {
+          // Cache counters are absent-means-zero ONLY when the base usage was
+          // reported at all — a response with no usage object must land as
+          // 'unknown' with all NULLs, not as a fabricated $0 'partial'.
+          const baseReported = assistantMsg.usage?.input_tokens !== undefined
+            || assistantMsg.usage?.output_tokens !== undefined;
+          void usageAttempt.finish({
+            requestStatus: 'succeeded',
+            usageStatus: 'final',
+            usage: {
+              input_tokens: assistantMsg.usage?.input_tokens ?? null,
+              output_tokens: assistantMsg.usage?.output_tokens ?? null,
+              cache_read_tokens: baseReported
+                ? (assistantMsg.usage as any)?.cache_read_input_tokens ?? 0
+                : null,
+              cache_creation_tokens: baseReported
+                ? (assistantMsg.usage as any)?.cache_creation_input_tokens ?? 0
+                : null,
+            },
+          });
+          usageAttempt = null;
+        }
       } catch (err) {
+        // Ledger FIRST — before any cleanup I/O: a hung lease release or a
+        // mid-cleanup crash must not leave a known-failed attempt 'started'.
+        // Per-field: only what the error actually carried; fields the probe
+        // did not find stay NULL (unobserved, not free).
+        if (usageAttempt) {
+          const probed = extractUsageFromError(err, { inputTokens: -1, outputTokens: -1 });
+          void usageAttempt.finish({
+            requestStatus: isAbortError(err) ? 'aborted' : 'failed',
+            usageStatus: 'partial',
+            usage: {
+              input_tokens: probed.inputTokens === -1 ? null : probed.inputTokens,
+              output_tokens: probed.outputTokens === -1 ? null : probed.outputTokens,
+              cache_read_tokens: null,
+              cache_creation_tokens: null,
+            },
+            errorClass: err instanceof Error ? err.name : typeof err,
+          });
+          usageAttempt = null;
+        }
         // Release lease eagerly on error so we don't starve capacity.
         clearInterval(leaseRenewTimer);
         await releaseLease(engine, lease.leaseId!).catch(() => {});

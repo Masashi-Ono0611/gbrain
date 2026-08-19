@@ -28,6 +28,7 @@ import { resolveModel } from '../model-config.ts';
 import { normalizeModelId } from '../model-id.ts';
 import type { BrainEngine, NewFact, FactKind } from '../engine.ts';
 import { normalizeMetricLabel } from './extract-from-fence.ts';
+import { withChatPhase } from '../chat-usage.ts';
 
 /**
  * v0.31 (D15): kill-switch for fact extraction.
@@ -271,6 +272,14 @@ export class FactsExtractionError extends Error {
 
 /** Strict extraction contract for callers that persist completion authority. */
 export async function extractFactsFromTurnWithOutcome(
+  input: ExtractInput,
+): Promise<ExtractFactsOutcome> {
+  // gbrain#3392 — tag every gateway.chat() call under this run with a
+  // phase label for chat_usage_log (covers extractFactsFromTurn too, which just calls this).
+  return withChatPhase('facts.extract', () => _extractFactsFromTurnWithOutcomeInner(input));
+}
+
+async function _extractFactsFromTurnWithOutcomeInner(
   input: ExtractInput,
 ): Promise<ExtractFactsOutcome> {
   if (input.isDreamGenerated) return { ok: true, facts: [] };

@@ -555,12 +555,176 @@ export async function checkVoiceGateHealth(engine: BrainEngine): Promise<Check> 
 }
 
 /**
+ * serve_process_accumulation doctor check (#1163 visibility).
+ *
+ * Counts live `gbrain serve` STDIO processes on this host. MCP clients that
+ * die without closing stdin — SSH half-open sessions, slept laptops, crashed
+ * hosts — leak servers that sit on ~100MB RSS and a held DB connection each,
+ * and over days exhaust the session pool (#1163). The `--stdio-idle-timeout`
+ * escape hatch exists (#446) but ships default-OFF, so operators only learn
+ * about it after the pool is already wedged. This check is the signpost.
+ *
+ * Detection is a `ps` scan (POSIX only; Windows returns ok/not-applicable).
+ * `serve --http` daemons are excluded — a long-lived HTTP server is the
+ * intended topology, not a leak. Fail-open: any ps/parse error returns ok
+ * (informational check; must never fail doctor on an exotic ps).
+ *
+ * Threshold: warn at >=3 concurrent stdio serves. 1-2 is normal multi-window
+ * use; 3+ concurrent editors on one brain is rare enough that the more likely
+ * explanation is accumulation. Live observation that motivated the check:
+ * 5 concurrent serves, oldest 1d9h, every client long gone.
+ */
+export interface ServeProcessRow {
+  pid: number;
+  uid: number;
+  /** ps ELAPSED format: [[dd-]hh:]mm:ss */
+  etime: string;
+  command: string;
+}
+
+/**
+ * Parse `ps -axww -o pid=,uid=,etime=,command=` output into serve rows (pure).
+ * When `ownUid` is given, rows belonging to other users are dropped — three
+ * teammates each running one legitimate serve on a shared host is not
+ * accumulation (codex P2). `-ww` is load-bearing: without it procps may clip
+ * COMMAND at 80 columns when output is redirected, truncating long
+ * bun-install paths BEFORE the `serve` token and silently undercounting.
+ */
+export function parseServeProcesses(psOutput: string, ownUid?: number): ServeProcessRow[] {
+  const rows: ServeProcessRow[] = [];
+  for (const line of psOutput.split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+    if (!m) continue;
+    const uid = parseInt(m[2]!, 10);
+    if (ownUid !== undefined && uid !== ownUid) continue;
+    const command = m[4]!;
+    // Token-boundary match: "…/gbrain serve" or "gbrain serve", tolerating
+    // flag tokens between them (`gbrain --quiet serve`) — but not
+    // `serve --http` (legit daemon) and not unrelated argv mentioning the
+    // words (e.g. an editor open on serve.ts). ps gives flat text, not
+    // argv, so this stays a heuristic; the check is informational.
+    if (!/(^|[/\s])gbrain(\s+--?[\w-]+)*\s+serve(\s|$)/.test(command)) continue;
+    if (/--http(\s|$)/.test(command)) continue;
+    rows.push({ pid: parseInt(m[1]!, 10), uid, etime: m[3]!, command });
+  }
+  return rows;
+}
+
+/** ps ELAPSED ([[dd-]hh:]mm:ss) → seconds; -1 when unparseable (pure). */
+export function parseEtimeSeconds(etime: string): number {
+  const m = etime.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  if (!m) return -1;
+  const [, dd, hh, mm, ss] = m;
+  return (
+    (dd ? parseInt(dd, 10) * 86400 : 0) +
+    (hh ? parseInt(hh, 10) * 3600 : 0) +
+    parseInt(mm!, 10) * 60 +
+    parseInt(ss!, 10)
+  );
+}
+
+const SERVE_ACCUMULATION_WARN_THRESHOLD = 3;
+
+/** Threshold + message logic, split from the ps scan for direct testing (pure). */
+export function computeServeAccumulationCheck(rows: ServeProcessRow[]): Check {
+  if (rows.length < SERVE_ACCUMULATION_WARN_THRESHOLD) {
+    return {
+      name: 'serve_process_accumulation',
+      status: 'ok',
+      message: `${rows.length} gbrain serve stdio process(es) running`,
+    };
+  }
+  const sorted = [...rows].sort(
+    (a, b) => parseEtimeSeconds(b.etime) - parseEtimeSeconds(a.etime),
+  );
+  const oldest = sorted[0]!;
+  const pidList = sorted.map((r) => `${r.pid} (up ${r.etime})`).join(', ');
+  return {
+    name: 'serve_process_accumulation',
+    status: 'warn',
+    message:
+      `${rows.length} concurrent gbrain serve stdio processes: ${pidList}. ` +
+      `Clients that die without closing stdin (SSH half-open, slept laptop) leak servers ` +
+      `that each hold a DB connection; if these are all live editor sessions, ignore. ` +
+      `Fix: launch with \`gbrain serve --stdio-idle-timeout <seconds>\` so abandoned ` +
+      `servers exit on their own, and \`kill\` the stale PIDs above (oldest: ${oldest.pid}).`,
+  };
+}
+
+/**
+ * Test seam — inject a fake ps runner. Production uses execFile('ps', …).
+ * `_setServePsRunnerForTests` is the module-level override used by the
+ * buildChecks/doctorReportRemote surface tests (same pattern as
+ * `__setRerankTransportForTests`) so orchestrator tests never shell out.
+ */
+export type PsRunner = () => Promise<string>;
+let _servePsRunnerForTests: PsRunner | null = null;
+export function _setServePsRunnerForTests(fn: PsRunner | null): void {
+  _servePsRunnerForTests = fn;
+}
+
+/**
+ * 30s memo for the production scan. Remote `run_doctor` has no request
+ * rate limit, so without a cap concurrent admin calls could each spawn a
+ * `ps` child (codex P3). Injected runners bypass the cache (test seam).
+ */
+let _serveScanCache: { at: number; check: Check } | null = null;
+const SERVE_SCAN_CACHE_MS = 30_000;
+
+export async function checkServeProcessAccumulation(psRunner?: PsRunner): Promise<Check> {
+  const injected = psRunner ?? _servePsRunnerForTests ?? undefined;
+  if (process.platform === 'win32' && !injected) {
+    return {
+      name: 'serve_process_accumulation',
+      status: 'ok',
+      message: 'Not applicable on Windows (ps scan is POSIX-only)',
+    };
+  }
+  if (!injected && _serveScanCache && Date.now() - _serveScanCache.at < SERVE_SCAN_CACHE_MS) {
+    return _serveScanCache.check;
+  }
+  try {
+    const runPs: PsRunner =
+      injected ??
+      (async () => {
+        const { execFile } = await import('node:child_process');
+        return await new Promise<string>((resolve, reject) => {
+          execFile(
+            'ps',
+            ['-axww', '-o', 'pid=,uid=,etime=,command='],
+            { timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
+            (err, stdout) => (err ? reject(err) : resolve(stdout)),
+          );
+        });
+      });
+    const ownUid =
+      typeof process.getuid === 'function' ? process.getuid() : undefined;
+    const check = computeServeAccumulationCheck(
+      parseServeProcesses(await runPs(), injected ? undefined : ownUid),
+    );
+    if (!injected) _serveScanCache = { at: Date.now(), check };
+    return check;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      name: 'serve_process_accumulation',
+      status: 'ok',
+      message: `Skipped (ps scan unavailable: ${msg})`,
+    };
+  }
+}
+
+/**
  * v0.35.0.0+ reranker_health doctor check.
  *
  * Logic (post-CDX2 review):
- *   1) Read `search.reranker.enabled` first. When disabled and no
- *      failures in window → 'ok: reranker disabled'. Avoids interpreting
- *      "no events" as "broken" when reranker is simply not in use.
+ *   1) Resolve effective reranker enablement through the mode-bundle chain
+ *      (per-key `search.reranker.enabled` override > `search.mode` bundle >
+ *      balanced fallback — the same resolution hybridSearch uses). When
+ *      disabled and no failures in window → 'ok: reranker disabled'. Avoids
+ *      interpreting "no events" as "broken" when reranker is simply not in
+ *      use — and avoids claiming "disabled" on a default balanced-mode brain
+ *      where the bundle enables it (the raw key is unset there).
  *   2) Walk last 7 days of `~/.gbrain/audit/rerank-failures-*.jsonl`.
  *   3) Auth failures: ANY single one warns (config-time problem doctor's
  *      own probe should have caught — surface it).
@@ -571,20 +735,38 @@ export async function checkVoiceGateHealth(engine: BrainEngine): Promise<Check> 
  *   6) Budget/pricing failures: warn at >=1 with the rerank pricing surface
  *      and --max-cost escape hatch.
  *
- * Engine-agnostic (file-based + one config-key read).
+ * Engine-agnostic (file-based + config reads). Accepts a null engine
+ * (`--fast` / DB-down): the audit JSONL needs no DB, so failure counts still
+ * surface; only the zero-failure message loses the enabled/disabled nuance
+ * (issue #2059 item 3 — the check used to be silently skipped in exactly the
+ * degraded states where its signal matters most).
+ *
+ * Config-read failures fail open BY DESIGN: `loadSearchModeConfig` swallows
+ * `getConfig` errors and falls back to bundle defaults (its documented
+ * contract; hybridSearch relies on the same). The audit file is this check's
+ * core signal — a broken config table must not mask real failure counts, and
+ * "disabled" can only ever be claimed from a successfully-read explicit
+ * override, never from a failure. (Pre-mode-resolution, a throwing getConfig
+ * made the whole check warn "Could not check reranker audit" even with a
+ * perfectly readable audit file — that was the wrong shape.)
  */
-export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
+export async function checkRerankerHealth(engine: BrainEngine | null): Promise<Check> {
   try {
     const { readRecentRerankFailures } = await import('../../../core/rerank-audit.ts');
-    const cfg = await engine.getConfig('search.reranker.enabled');
-    const rerankerEnabled = cfg === 'true' || cfg === '1';
+    let rerankerEnabled = false;
+    if (engine) {
+      const { loadSearchModeConfig, resolveSearchMode } = await import('../../../core/search/mode.ts');
+      rerankerEnabled = resolveSearchMode(await loadSearchModeConfig(engine)).reranker_enabled;
+    }
 
     const failures = readRecentRerankFailures(7);
     if (failures.length === 0) {
+      // Without an engine the enabled/disabled nuance is unknowable — don't
+      // claim "disabled" from a config key we never read.
       return {
         name: 'reranker_health',
         status: 'ok',
-        message: rerankerEnabled
+        message: engine === null || rerankerEnabled
           ? 'No rerank failures in last 7 days'
           : 'Reranker disabled — no failures expected',
       };

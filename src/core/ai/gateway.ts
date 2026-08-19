@@ -36,6 +36,7 @@ import {
   extractUsageFromError as _extractUsageFromError,
   type BudgetKind,
 } from '../budget/budget-tracker.ts';
+import { beginChatUsageAttempt, setChatUsageEngine, sanitizeTokenCount, isAbortError } from '../chat-usage.ts';
 
 import type {
   AIGatewayConfig,
@@ -592,6 +593,11 @@ export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise
   _config = { ...cfg, expansion_model: expansionFull, chat_model: chatFull };
   _modelCache.clear();
   _shrinkState.clear();
+  // Wire the chat-usage ledger (gbrain#3392) to this engine. Every
+  // DB-connected process passes through here, so both chat boundaries
+  // (gateway.chat and the legacy subagent loop) get a write path without
+  // threading the engine through call signatures.
+  setChatUsageEngine(engine);
   return _config;
 }
 
@@ -3428,6 +3434,37 @@ function deepMergeRecords(
   return out;
 }
 
+/**
+ * Read the Anthropic-style extended-thinking budget configured for a model
+ * via `provider_chat_options` (`<provider>.thinking.budgetTokens`, provider-
+ * or model-scoped). The Anthropic API requires `max_tokens` to exceed
+ * `thinking.budgetTokens`, so callers that cap output tightly (the
+ * `gbrain models doctor` reachability probe) must widen their cap above this
+ * budget or the provider rejects the request outright — falsely failing a
+ * reachable model. Returns undefined when no budget is configured, the model
+ * string is malformed, or the gateway is unconfigured. Read-only, never throws.
+ *
+ * @internal exported for the doctor probe + tests; not part of the public gateway API.
+ */
+export function getConfiguredThinkingBudget(modelStr: string): number | undefined {
+  try {
+    if (!_config) return undefined;
+    // Mirror chat()'s resolution (resolveChatProvider → resolveRecipe): map
+    // recipe aliases to the canonical model id BEFORE the model-scoped
+    // provider_chat_options lookup, so a request made under a stale alias
+    // still sees the budget configured under the canonical id.
+    const { parsed, recipe } = resolveRecipe(modelStr);
+    const merged: Record<string, any> = {};
+    applyConfiguredChatProviderOptions(merged, _config, recipe.id, parsed.modelId);
+    const budget = merged[recipe.id]?.thinking?.budgetTokens;
+    return typeof budget === 'number' && Number.isFinite(budget) && budget > 0
+      ? budget
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function applyConfiguredChatProviderOptions(
   providerOptions: Record<string, any>,
   cfg: AIGatewayConfig,
@@ -3706,6 +3743,17 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       }
     : opts.system;
 
+  // Lifecycle ledger (gbrain#3392): open the attempt row BEFORE the provider
+  // call so failures/aborts land in the ledger too. The request-level cache
+  // TTL is captured here because a single request carries one TTL for all
+  // its breakpoints (cacheControlValue is derived once and reused above).
+  const usageAttempt = beginChatUsageAttempt({
+    boundary: 'gateway.chat',
+    modelRaw: modelStr,
+    model: `${recipe.id}:${modelId}`,
+    providerId: recipe.id,
+    cacheWriteTtl: cacheControlValue ? (cacheControlValue.ttl ?? '5m') : null,
+  });
   try {
     const result = await _generateTextTransport({
       model,
@@ -3719,6 +3767,37 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       providerOptions: Object.keys(providerOptions).length > 0 ? providerOptions : undefined,
       ...(requestHeaders ? { headers: requestHeaders } : {}),
     });
+
+    // Ledger finish runs IMMEDIATELY after the provider returns — before
+    // block normalization — so a post-response parsing throw can't turn a
+    // billed, provider-confirmed call into a 'failed/unknown' row. Field
+    // presence is honored per-field: an SDK route that omits usage entirely
+    // lands as 'unknown' with NULL tokens (finish() enforces this), never as
+    // "final, 0 tokens, $0". Cache fields are absent-means-zero ONLY when
+    // the base usage was reported at all — Anthropic/OpenAI-compat routes
+    // omit cache counters when no caching occurred.
+    {
+      const u = (result as any).usage ?? {};
+      const pm = (result as any).providerMetadata as Record<string, any> | undefined;
+      const ac = pm?.anthropic ?? {};
+      const inObs = sanitizeTokenCount(u.inputTokens ?? u.promptTokens);
+      const outObs = sanitizeTokenCount(u.outputTokens ?? u.completionTokens);
+      const baseReported = inObs !== null || outObs !== null;
+      void usageAttempt.finish({
+        requestStatus: 'succeeded',
+        usageStatus: 'final',
+        usage: {
+          input_tokens: inObs,
+          output_tokens: outObs,
+          cache_read_tokens: baseReported
+            ? sanitizeTokenCount(ac.cacheReadInputTokens ?? ac.cache_read_input_tokens ?? u.cachedInputTokens) ?? 0
+            : null,
+          cache_creation_tokens: baseReported
+            ? sanitizeTokenCount(ac.cacheCreationInputTokens ?? ac.cache_creation_input_tokens) ?? 0
+            : null,
+        },
+      });
+    }
 
     // Normalize blocks. Vercel SDK gives us `result.content` (an array of typed
     // parts) for v6+; fall back to text + toolCalls for older shapes.
@@ -3764,20 +3843,78 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     const anthropicCache = providerMetadata?.anthropic ?? {};
 
     const { inputTokens: inTok, outputTokens: outTok } = normalizeSdkUsage(usage);
+    // Raw (pre-normalization) values kept separately so the omitted-usage
+    // check below can tell "usage genuinely absent" from "usage present but
+    // zero" — normalizeSdkUsage always returns finite numbers (defaulting
+    // absent fields to 0), which would collapse that distinction.
+    const rawInTok = usage.inputTokens ?? usage.promptTokens;
+    const rawOutTok = usage.outputTokens ?? usage.completionTokens;
+    const cacheReadTok = Number(anthropicCache.cacheReadInputTokens ?? anthropicCache.cache_read_input_tokens ?? usage.cachedInputTokens ?? 0);
+    const cacheCreateTok = Number(anthropicCache.cacheCreationInputTokens ?? anthropicCache.cache_creation_input_tokens ?? 0);
+
+    const stopReason = mapStopReason((result as any).finishReason, providerMetadata);
+    const text = blocks
+      .filter(b => b.type === 'text')
+      .map(b => (b as { type: 'text'; text: string }).text)
+      .join('');
+
+    // A completion with no usable content must not report success (#3217).
+    // The check is on the CONTENT (text / tool-call blocks), never on reported
+    // usage — providers commonly normalize omitted usage to zero, so a
+    // usage-based gate would wave empty responses through as "free" successes
+    // that silently propagate no result to every chat() caller. Refusal and
+    // content-filter stops stay non-throwing: they are meaningful terminal
+    // signals callers branch on (toolLoop surfaces each as its own stop
+    // reason). A length stop with no content is classified distinctly — the
+    // output budget was exhausted before any text was emitted (thinking
+    // models spend it on internal reasoning first), which is deterministic
+    // for the same call, so it gets a config error with an actionable fix
+    // instead of a futile retry.
+    if (
+      text.trim().length === 0 &&
+      !blocks.some(b => b.type === 'tool-call') &&
+      stopReason !== 'refusal' &&
+      stopReason !== 'content_filter'
+    ) {
+      const label = `chat(${recipe.id}:${modelId})`;
+      const emptyErr =
+        stopReason === 'length'
+          ? new AIConfigError(
+              `${label}: output budget exhausted before any content was emitted (maxOutputTokens=${maxOutputTokens})`,
+              'Raise maxTokens for this call (or the configured max output tokens). Thinking models spend output budget on internal reasoning before emitting text.',
+            )
+          : new AITransientError(
+              `${label}: provider returned an empty completion (stopReason=${stopReason}, output_tokens=${outTok}) — no text and no tool calls`,
+            );
+      // Carry the real usage on the error so the catch-path budget record
+      // charges actual tokens instead of the pessimistic ceiling — but only
+      // the fields the provider actually reported. When usage was omitted
+      // entirely, attach nothing so _extractUsageFromError keeps its
+      // pessimistic fallback (attaching a synthesized {0,0} would record the
+      // spend as free).
+      const reportedUsage: Record<string, number> = {};
+      if (typeof rawInTok === 'number' && Number.isFinite(rawInTok)) reportedUsage.input_tokens = rawInTok;
+      if (typeof rawOutTok === 'number' && Number.isFinite(rawOutTok)) reportedUsage.output_tokens = rawOutTok;
+      if (Object.keys(reportedUsage).length > 0) {
+        (emptyErr as { usage?: unknown }).usage = reportedUsage;
+      }
+      throw emptyErr;
+    }
+
     _recordBudget(`${recipe.id}:${modelId}`, inTok, outTok);
 
     return {
-      text: blocks.filter(b => b.type === 'text').map(b => (b as { type: 'text'; text: string }).text).join(''),
+      text,
       blocks,
-      stopReason: mapStopReason((result as any).finishReason, providerMetadata),
+      stopReason,
       usage: {
         input_tokens: inTok,
         output_tokens: outTok,
         // `usage.cachedInputTokens` is the AI SDK's provider-neutral cache-read
         // count — it's how OpenAI-compatible routes (OpenRouter's
         // prompt_tokens_details.cached_tokens) surface cache hits.
-        cache_read_tokens: Number(anthropicCache.cacheReadInputTokens ?? anthropicCache.cache_read_input_tokens ?? usage.cachedInputTokens ?? 0),
-        cache_creation_tokens: Number(anthropicCache.cacheCreationInputTokens ?? anthropicCache.cache_creation_input_tokens ?? 0),
+        cache_read_tokens: cacheReadTok,
+        cache_creation_tokens: cacheCreateTok,
       },
       model: `${recipe.id}:${modelId}`,
       providerId: recipe.id,
@@ -3791,7 +3928,39 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       outputTokens: maxOutputTokens,
     });
     _recordBudget(`${recipe.id}:${modelId}`, fallback.inputTokens, fallback.outputTokens);
+    // Ledger (gbrain#3392): the budget tracker above deliberately charges a
+    // worst-case CEILING (its job is enforcement), but the ledger must not
+    // present ceilings as observations. Probe the error with a sentinel: if
+    // it carried real provider-reported usage, record it as a billed lower
+    // bound ('partial'); otherwise tokens stay NULL ('unknown') — a
+    // timed-out call may or may not have been billed, and 0 would be
+    // fabricated data.
+    const probed = _extractUsageFromError(err, { inputTokens: -1, outputTokens: -1 });
+    void usageAttempt.finish({
+      requestStatus: isAbortError(err) ? 'aborted' : 'failed',
+      usageStatus: 'partial',
+      // Per-field: only what the error actually carried. Fields the probe
+      // did not find stay null (unobserved ≠ free) — cache counters are
+      // never surfaced on errors, so they stay null too. finish() downgrades
+      // an all-null observation to 'unknown' with no usage.
+      usage: {
+        input_tokens: probed.inputTokens === -1 ? null : sanitizeTokenCount(probed.inputTokens),
+        output_tokens: probed.outputTokens === -1 ? null : sanitizeTokenCount(probed.outputTokens),
+        cache_read_tokens: null,
+        cache_creation_tokens: null,
+      },
+      errorClass: err instanceof Error ? err.name : typeof err,
+    });
     throw normalizeAIError(err, `chat(${recipe.id}:${modelId})`);
+  } finally {
+    // Backstop: if any path above escaped without finalizing (finish is
+    // idempotent — this is a no-op on the normal paths), never leave the
+    // row as a permanent 'started' orphan when the process survived.
+    void usageAttempt.finish({
+      requestStatus: 'failed',
+      usageStatus: 'unknown',
+      errorClass: 'unfinalized_attempt',
+    });
   }
 }
 

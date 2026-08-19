@@ -261,8 +261,16 @@ export async function listFactsSince(
     since: Date,
     opts?: FactListOpts & { entitySlug?: string },
   ): Promise<FactRow[]> {
-    const where: string[] = [`created_at >= $since`];
+    const tsExpr = opts?.eventTime === true ? 'COALESCE(valid_from, created_at)' : 'created_at';
+    const where: string[] = [`${tsExpr} >= $since`];
     const params: Record<string, unknown> = { since };
+    if (opts?.excludeAuditRows === true) {
+      where.push(`fact NOT IN ('EXTRACTION_COMPLETE','EXTRACTION_NOT_APPLICABLE')`);
+    }
+    if (opts?.grepText && opts.grepText.length > 0) {
+      where.push(`fact ILIKE $grepPat`);
+      params.grepPat = '%' + opts.grepText.replace(/[\\%_]/g, (m) => '\\' + m) + '%';
+    }
     if (opts?.entitySlug) {
       where.push(`entity_slug = $entitySlug`);
       params.entitySlug = opts.entitySlug;
@@ -271,7 +279,7 @@ export async function listFactsSince(
       ...opts,
       whereClauses: where,
       whereParams: params,
-      order: 'created_at DESC, id DESC',
+      order: `${tsExpr} DESC, id DESC`,
     });
   }
 

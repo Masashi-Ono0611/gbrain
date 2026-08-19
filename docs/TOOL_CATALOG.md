@@ -4,7 +4,7 @@
 <!-- Regenerate: bun run scripts/generate-tool-catalog.ts -->
 <!-- Freshness-guarded by scripts/check-tool-catalog-fresh.sh (bun run verify). -->
 
-Every non-localOnly operation on the MCP surface: 115 tools across 22 areas. **Starter** marks membership in the ~27-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
+Every non-localOnly operation on the MCP surface: 117 tools across 23 areas. **Starter** marks membership in the ~27-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
 
 ## admin
 
@@ -141,6 +141,13 @@ Every non-localOnly operation on the MCP surface: 115 tools across 22 areas. **S
 | `ontology_dimensions` | Life Chronicle meta-ontology: which dimensions the brain tracks across entities, with entity + observation counts. | read |  |  |
 | `ontology_get` | Life Chronicle: the current resolved per-entity ontology (dimension → value) at `asof` (default now), with provenance + confidence + validity. | read |  |  |
 | `ontology_propose` | Life Chronicle: record one ontology observation (entity has dimension=value), sourced + confidence-weighted + bi-temporal. | write |  |  |
+
+## other
+
+| Tool | Description | Scope | Starter | Gate |
+|---|---|---|---|---|
+| `get_usage` | Chat LLM spend over a date range, from the provider-boundary lifecycle ledger (chat_usage_log). | admin |  |  |
+| `takes_proposals_list` | List take proposals from the propose_takes review queue (default: pending). | read |  |  |
 
 ## pages
 

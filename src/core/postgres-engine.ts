@@ -39,7 +39,7 @@ import type {
 } from './types.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { executeRawJsonb, type SqlValue } from './sql-query.ts';
-import { sanitizeForJsonb, buildLinkRows, buildTimelineRows } from './batch-rows.ts';
+import { sanitizeForJsonb, sanitizeText, buildLinkRows, buildTimelineRows } from './batch-rows.ts';
 import { runMigrations } from './migrate.ts';
 import { SCHEMA_SQL } from './schema-embedded.ts';
 import { verifySchema } from './schema-verify.ts';
@@ -1177,6 +1177,17 @@ export class PostgresEngine implements BrainEngine {
       };
       return await fn(conn);
     } finally {
+      // patch 26 (#3189, local port 2026-08-16): reset session-level GUCs a
+      // caller may have SET (reserved connections can't SET LOCAL) before the
+      // backend returns to the pool — without this, a caller that shortened
+      // statement_timeout leaks it into the next reserver of the same direct
+      // backend. Only bites in dual-pool mode (shared DDL backends); the
+      // single-pool localhost default never re-shares this way. Best-effort.
+      try {
+        await reserved.unsafe('RESET statement_timeout');
+      } catch {
+        // Non-fatal — some managed Postgres restricts this GUC.
+      }
       // Counter/gauge decrements run regardless of release() throwing
       // (double-release or socket error must not permanently leak a permit
       // of the small direct-reserve budget — data-migration review).
@@ -1312,7 +1323,7 @@ export class PostgresEngine implements BrainEngine {
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date() : null;
     const rows = await sql`
       INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
-      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, ${MARKDOWN_CHUNKER_VERSION}), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
+      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${sanitizeText(page.title)}, ${sanitizeText(page.compiled_truth)}, ${sanitizeText(page.timeline || '')}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, ${MARKDOWN_CHUNKER_VERSION}), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
       ON CONFLICT (source_id, slug) DO UPDATE SET
         type = EXCLUDED.type,
         page_kind = EXCLUDED.page_kind,
@@ -2755,7 +2766,7 @@ export class PostgresEngine implements BrainEngine {
       if (embeddingStr) params.push(embeddingStr);
       if (embeddingImageStr) params.push(embeddingImageStr);
       params.push(
-        pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
+        pageId, chunk.chunk_index, sanitizeText(chunk.chunk_text), chunk.chunk_source,
         chunk.model || resolvedModel, chunk.token_count || null,
         chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
         chunk.start_line ?? null, chunk.end_line ?? null,

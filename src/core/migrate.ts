@@ -5905,6 +5905,105 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE session_context_state ADD COLUMN IF NOT EXISTS checkpoint_manifest JSONB NOT NULL DEFAULT '[]'::jsonb;
     `,
   },
+  {
+    // NOTE (macmini local stack, renumbered 2026-08-18 for the v0.46.18.0
+    // rebase): this migration is local-only (never upstream — fork-permanent
+    // per PR #3399's default-close). It previously ran as v129 on the live
+    // macmini install, back when v126-128 were the highest upstream slots.
+    // v0.46.7.0-v0.46.18.0 claimed 129-132 for genuine upstream migrations
+    // (dream_verdicts_triage_v1_columns, drop_job_wide_subagent_tool_use_id_
+    // unique, session_context_state_checkpoint_manifest, +1), so this moves
+    // to the next free slot, 133. `idempotent: true` + `CREATE TABLE IF NOT
+    // EXISTS` make this safe on the live DB too: its `version` watermark is
+    // currently 129 (from the old numbering) but the table itself already
+    // exists — deploying this tree runs the genuine 130/131/132 migrations
+    // for the first time (correct — this DB has never run v0.46.18.0 before)
+    // and then this migration re-runs as v133, no-ops on the already-present
+    // table, and correctly advances the watermark past it.
+    version: 133,
+    name: 'chat_usage_log',
+    // gbrain#3392/#3425: provider-boundary lifecycle ledger for chat LLM
+    // spend (see src/core/chat-usage.ts for the full design contract).
+    // One row per provider attempt, opened before the call ('started' /
+    // 'pending') and finalized in finally. Token columns are NULL when the
+    // provider never reported usage — never 0, never an estimate: a
+    // timed-out call may still have been billed, and 0 would be fabricated
+    // data. cost_usd is NULL for unpriced rows (no pricing entry, or cache
+    // tokens on a provider whose cache billing semantics are unverified).
+    //
+    // Volume: one row per LLM call — hundreds/day on an active brain, so
+    // growth is modest; the started_at index covers the get_usage window
+    // scan. Same shape on both engines.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS chat_usage_log (
+        id SERIAL PRIMARY KEY,
+        attempt_id TEXT NOT NULL UNIQUE,
+        boundary TEXT NOT NULL,
+        operation TEXT NOT NULL DEFAULT 'chat',
+        phase TEXT,
+        job_id BIGINT,
+        model_raw TEXT,
+        model TEXT,
+        provider_id TEXT,
+        request_status TEXT NOT NULL DEFAULT 'started'
+          CHECK (request_status IN ('started','succeeded','failed','aborted')),
+        usage_status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (usage_status IN ('pending','final','partial','unknown')),
+        cache_write_ttl TEXT CHECK (cache_write_ttl IN ('5m','1h')),
+        input_tokens BIGINT CHECK (input_tokens IS NULL OR input_tokens >= 0),
+        output_tokens BIGINT CHECK (output_tokens IS NULL OR output_tokens >= 0),
+        cache_read_tokens BIGINT CHECK (cache_read_tokens IS NULL OR cache_read_tokens >= 0),
+        cache_creation_tokens BIGINT CHECK (cache_creation_tokens IS NULL OR cache_creation_tokens >= 0),
+        rate_source TEXT,
+        rate_version TEXT,
+        rate_snapshot JSONB,
+        cost_usd DOUBLE PRECISION CHECK (cost_usd IS NULL OR cost_usd >= 0),
+        error_class TEXT,
+        started_at TIMESTAMPTZ NOT NULL,
+        completed_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS idx_chat_usage_log_started
+        ON chat_usage_log (started_at);
+      CREATE INDEX IF NOT EXISTS idx_chat_usage_log_phase_started
+        ON chat_usage_log (phase, started_at);
+    `,
+    sqlFor: {
+      pglite: `
+        CREATE TABLE IF NOT EXISTS chat_usage_log (
+          id SERIAL PRIMARY KEY,
+          attempt_id TEXT NOT NULL UNIQUE,
+          boundary TEXT NOT NULL,
+          operation TEXT NOT NULL DEFAULT 'chat',
+          phase TEXT,
+          job_id BIGINT,
+          model_raw TEXT,
+          model TEXT,
+          provider_id TEXT,
+          request_status TEXT NOT NULL DEFAULT 'started'
+          CHECK (request_status IN ('started','succeeded','failed','aborted')),
+          usage_status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (usage_status IN ('pending','final','partial','unknown')),
+          cache_write_ttl TEXT CHECK (cache_write_ttl IN ('5m','1h')),
+          input_tokens BIGINT CHECK (input_tokens IS NULL OR input_tokens >= 0),
+          output_tokens BIGINT CHECK (output_tokens IS NULL OR output_tokens >= 0),
+          cache_read_tokens BIGINT CHECK (cache_read_tokens IS NULL OR cache_read_tokens >= 0),
+          cache_creation_tokens BIGINT CHECK (cache_creation_tokens IS NULL OR cache_creation_tokens >= 0),
+          rate_source TEXT,
+          rate_version TEXT,
+          rate_snapshot JSONB,
+          cost_usd DOUBLE PRECISION CHECK (cost_usd IS NULL OR cost_usd >= 0),
+          error_class TEXT,
+          started_at TIMESTAMPTZ NOT NULL,
+          completed_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_usage_log_started
+          ON chat_usage_log (started_at);
+        CREATE INDEX IF NOT EXISTS idx_chat_usage_log_phase_started
+          ON chat_usage_log (phase, started_at);
+      `,
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

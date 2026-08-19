@@ -167,6 +167,9 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
       'get_recent_transcripts',
       'code_traversal_cache_clear',
       'migrate_embeddings',
+      // #1467: accept writes markdown into the local brain repo (with a
+      // caller-supplied dir) — must never be exposed over HTTP MCP.
+      'takes_proposal_resolve',
     ];
     const lookup = new Map(operations.map(op => [op.name, op] as const));
     for (const name of KNOWN_LOCAL_ONLY) {

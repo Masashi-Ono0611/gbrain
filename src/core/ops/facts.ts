@@ -140,7 +140,7 @@ const recall: Operation = {
     include_expired: { type: 'boolean', description: 'When true, include expired_at IS NOT NULL rows. Default false.' },
     supersessions: { type: 'boolean', description: 'When true, return only the supersession audit log (expired_at + superseded_by both set).' },
     limit: { type: 'number', description: 'Per-arm cap: max fact rows AND max search results. Default 50, cap 100.' },
-    grep: { type: 'string', description: 'Substring filter on fact text (case-insensitive). Applied client-side after recall.' },
+    grep: { type: 'string', description: 'Substring filter on fact text (case-insensitive). Pushed into the SQL query for the since/no-filter arms; applied client-side for the entity/session arms.' },
     include_pending: { type: 'boolean', description: 'v0.32: when true, response includes pending_consolidation_count (facts not yet promoted to takes by the dream-cycle consolidate phase). One round trip; backward-compatible (field omitted when false).' },
   },
   scope: 'read',
@@ -241,6 +241,9 @@ const recall: Operation = {
         rows = mergeNewest(
           await Promise.all(factSources.map(src =>
             ctx.engine.listFactsSince(src, since, {
+              eventTime: true,
+              grepText: grep ?? undefined,
+              excludeAuditRows: true,
               activeOnly: !includeExpired,
               limit,
               visibility,
@@ -254,6 +257,9 @@ const recall: Operation = {
       rows = mergeNewest(
         await Promise.all(factSources.map(src =>
           ctx.engine.listFactsSince(src, new Date(0), {
+            eventTime: true,
+            grepText: grep ?? undefined,
+            excludeAuditRows: true,
             activeOnly: !includeExpired,
             limit,
             visibility,
@@ -263,6 +269,19 @@ const recall: Operation = {
       );
     }
 
+    // patch 58: extract-conversation-facts writes durable audit outcome rows
+    // (EXTRACTION_COMPLETE / EXTRACTION_NOT_APPLICABLE) into the facts table;
+    // they are checkpoints, not user facts. excludeAuditRows above filters
+    // them server-side for the since/no-filter arms (which run through
+    // listFactsSince); the entity/session arms don't take that option, so
+    // filter defensively here too — cheap on the already-limited row set.
+    rows = rows.filter(
+      (r) => r.fact !== 'EXTRACTION_COMPLETE' && r.fact !== 'EXTRACTION_NOT_APPLICABLE',
+    );
+    // grep now also runs server-side (grepText, since/no-filter arms) but the
+    // entity/session arms don't take it — keep the client-side filter as the
+    // universal fallback so `grep` behaves the same regardless of which arm
+    // resolved the rows.
     if (grep) rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
 
     // v0.32: optional pending-consolidation count piggy-backed on the recall

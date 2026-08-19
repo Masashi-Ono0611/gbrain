@@ -42,12 +42,14 @@ import { BaseCyclePhase, CYCLE_DEADLINE_RESERVE_MS, type ScopedReadOpts, type Ba
 import { defaultTimeoutMsFor } from '../minions/handler-timeouts.ts';
 import { chat as gatewayChat, getChatModel, probeChatModel } from '../ai/gateway.ts';
 import { normalizeModelId } from '../model-id.ts';
+import { resolveModel } from '../model-config.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { GBrainError } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseStatus, CyclePhase } from '../cycle.ts';
+import { withChatPhase } from '../chat-usage.ts';
 
 /**
  * Bump when the extractor prompt or the JSON output shape changes. Old
@@ -500,7 +502,14 @@ class ProposeTakesPhase extends BaseCyclePhase {
     const phaseStartMs = Date.now();
     const proposalRunId = `propose-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${randomUUID().slice(0, 8)}`;
 
-    const modelId = opts.model ?? getChatModel();
+    // #1467: model resolution — explicit opts.model > `models.propose_takes`
+    // config (alias-aware via resolveModel, so `sonnet` works) > the gateway
+    // default chat model (pre-#1467 behavior, and the fallback resolveModel
+    // lands on when neither key nor models.default/GBRAIN_MODEL is set).
+    const modelId = opts.model ?? await resolveModel(engine, {
+      configKey: 'models.propose_takes',
+      fallback: getChatModel(),
+    });
 
     // With the default (gateway) extractor, skip cheaply when the resolved
     // model's provider can't run — same probe semantics as patterns.ts /
@@ -652,7 +661,10 @@ class ProposeTakesPhase extends BaseCyclePhase {
           pagePath: page.slug,
           pageBody: body,
           existingTakes,
-          modelHint: opts.model,
+          // #1467: pass the RESOLVED model so a `models.propose_takes` config
+          // actually routes the LLM call (pre-fix only the explicit opts.model
+          // reached the extractor; budget check and call could disagree).
+          modelHint: modelId,
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -776,7 +788,9 @@ export async function runPhaseProposeTakes(
   ctx: OperationContext,
   opts: ProposeTakesOpts = {},
 ) {
-  return new ProposeTakesPhase().run(ctx, opts);
+  // gbrain#3392 — tag every gateway.chat() call made during this phase run
+  // (defaultExtractor's per-page extraction calls) for chat_usage_log.
+  return withChatPhase('dream.propose_takes', () => new ProposeTakesPhase().run(ctx, opts));
 }
 
 /** Test-only access to the class for subclassing in tests. */

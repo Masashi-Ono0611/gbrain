@@ -69,6 +69,7 @@ import {
   type CheckpointCross,
 } from './checkpoint.ts';
 import { resolveOwnerHolder } from '../owner-holder.ts';
+import { withChatPhase } from '../chat-usage.ts';
 
 export { BudgetExhausted };
 
@@ -562,7 +563,13 @@ async function runBrainstormImpl(
     label: `brainstorm.${opts.profile?.label ?? 'brainstorm'}`,
     maxCostUsd: opts.maxCostUsd ?? 5,
   });
-  return withBudgetTracker(_runTracker, () => _runBrainstormInner(engine, config, opts));
+  // gbrain#3392 — tag every gateway.chat() call inside the run with its
+  // ideation mode for chat_usage_log. Same mode distinction the tracker
+  // label above already uses.
+  const chatPhase = opts.profile?.label === 'lsd' ? 'lsd' : 'brainstorm';
+  return withBudgetTracker(_runTracker, () =>
+    withChatPhase(chatPhase, () => _runBrainstormInner(engine, config, opts)),
+  );
 }
 
 async function _runBrainstormInner(
