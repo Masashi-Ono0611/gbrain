@@ -151,11 +151,13 @@ const query: Operation = {
      *  CLI loads the file, base64-encodes, and passes through `image`). */
     image: { type: 'string', description: 'Base64-encoded image bytes for image-similarity search (CLI: --image <path>).' },
     image_mime: { type: 'string', description: 'MIME type for the image bytes (auto-derived from path on CLI; required when calling op directly).' },
-    // #3995 — the op no longer hard-defaults this to 20; when omitted the
-    // resolved search mode's searchLimit applies (10/25/50 for
-    // conservative/balanced/tokenmax on a cache miss). Documenting the
-    // actual resolved defaults here rather than a single stale number.
-    limit: { type: 'number', description: 'Max results. When omitted, resolves from the active search mode (10 conservative / 25 balanced / 50 tokenmax on a cache miss).' },
+    // #3995 — the op no longer hard-defaults this to 20 on the text/hybrid
+    // path; when omitted the resolved search mode's searchLimit applies
+    // (10/25/50 for conservative/balanced/tokenmax on a cache miss). The
+    // image-similarity path (`image` param) is unaffected by this change
+    // and still hard-defaults to 20 regardless of mode — out of scope here,
+    // tracked separately.
+    limit: { type: 'number', description: 'Max results. For text queries, resolves from the active search mode when omitted (10 conservative / 25 balanced / 50 tokenmax on a cache miss). For image-similarity queries (`image` param), always defaults to 20 regardless of mode.' },
     offset: { type: 'number', description: 'Skip first N results (for pagination)' },
     expand: { type: 'boolean', description: 'Enable multi-query expansion (default: true)' },
     detail: { type: 'string', description: 'Result detail level: low (compiled truth only), medium (default, all with dedup), high (all chunks)' },
