@@ -59,8 +59,12 @@ function buildRetrievalResponseMeta(
     // seed/candidate counts) so a caller can distinguish "graph answer
     // contributed" from "graph answer never reached fusion" without source
     // access. Additive field on the existing `retrieval` _meta key (rule 2,
-    // docs/protocol/MCP_META_CHANNELS.md); absent when the arm never ran
-    // (relational retrieval off, or the image-similarity branch).
+    // docs/protocol/MCP_META_CHANNELS.md); absent when the arm never ran on
+    // THIS invocation (relational retrieval off, the image-similarity
+    // branch, OR a semantic-cache hit — the cache-hit branch in hybrid.ts
+    // returns without invoking `onRelationalMeta`, so a cached result set
+    // originally produced with relational recall still reports no
+    // `relational` here; see docs/protocol/MCP_META_CHANNELS.md).
     ...(opts.relationalMeta ? { relational: opts.relationalMeta } : {}),
     ...(hint ? { hint } : {}),
   };
@@ -147,7 +151,11 @@ const query: Operation = {
      *  CLI loads the file, base64-encodes, and passes through `image`). */
     image: { type: 'string', description: 'Base64-encoded image bytes for image-similarity search (CLI: --image <path>).' },
     image_mime: { type: 'string', description: 'MIME type for the image bytes (auto-derived from path on CLI; required when calling op directly).' },
-    limit: { type: 'number', description: 'Max results (default 20)' },
+    // #3995 — the op no longer hard-defaults this to 20; when omitted the
+    // resolved search mode's searchLimit applies (10/25/50 for
+    // conservative/balanced/tokenmax on a cache miss). Documenting the
+    // actual resolved defaults here rather than a single stale number.
+    limit: { type: 'number', description: 'Max results. When omitted, resolves from the active search mode (10 conservative / 25 balanced / 50 tokenmax on a cache miss).' },
     offset: { type: 'number', description: 'Skip first N results (for pagination)' },
     expand: { type: 'boolean', description: 'Enable multi-query expansion (default: true)' },
     detail: { type: 'string', description: 'Result detail level: low (compiled truth only), medium (default, all with dedup), high (all chunks)' },
@@ -294,22 +302,29 @@ const query: Operation = {
     // search). When the param is the literal '__all__', force-allow
     // cross-source mode (matches SearchOpts.sourceId contract).
     let capturedMeta: HybridSearchMeta | null = null;
-    // #3995 — observability sink for the relational recall arm. Best-effort;
-    // stays null when the arm never runs (relational off, or a non-relational
-    // query where the intent classifier short-circuits before fanout).
+    // #3995 — observability sink for the relational recall arm. Stays null
+    // when the callback itself never fires: relational retrieval off for
+    // the resolved mode, or a semantic-cache hit (see the cache-hit note on
+    // `buildRetrievalResponseMeta` below — the arm can still be non-null
+    // with `fired: false` when relational retrieval is on but this query's
+    // intent didn't classify as relational; `fired` is what distinguishes
+    // "arm ran and found nothing to do" from "arm didn't run at all").
     let capturedRelationalMeta: RelationalArmMeta | null = null;
     // v0.32.x search-lite: route the query op through hybridSearchCached so
     // semantic cache + token budget + intent weighting fire automatically.
     // Plain hybridSearch remains the bare API for callers that opt out.
     const results = await hybridSearchCached(ctx.engine, queryText, {
-      // #3995 — omit the key entirely (rather than hard-defaulting to 20)
-      // when the caller didn't pass `limit`, so the resolved search mode's
-      // `searchLimit` (10/25/50 for conservative/balanced/tokenmax) applies
-      // through the op instead of being silently overridden. Both
-      // hybridSearch (limit = opts?.limit || resolvedMode.searchLimit) and
-      // hybridSearchCached's mode resolution treat `undefined` as "let the
-      // mode bundle decide" — an explicit numeric limit (including 0) still
-      // wins.
+      // #3995 — pass `undefined` (rather than hard-defaulting to 20) when
+      // the caller didn't pass a numeric `limit`, so the resolved search
+      // mode's `searchLimit` (10/25/50 for conservative/balanced/tokenmax)
+      // applies through the op instead of being silently overridden.
+      // hybridSearch does `opts?.limit || resolvedMode.searchLimit`
+      // (hybrid.ts), so this is a `||`, not `??`, downstream: `0` (and any
+      // other falsy numeric limit) still falls back to the mode default,
+      // same as omitting `limit` entirely. That fallback is inherited from
+      // `hybridSearch`'s existing contract, not something this change
+      // controls — only a positive numeric `limit` is guaranteed to be
+      // honored end-to-end.
       limit: typeof p.limit === 'number' ? p.limit : undefined,
       offset: (p.offset as number) || 0,
       expansion: expand,
