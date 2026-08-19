@@ -40,7 +40,8 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { BaseCyclePhase, CYCLE_DEADLINE_RESERVE_MS, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { defaultTimeoutMsFor } from '../minions/handler-timeouts.ts';
-import { chat as gatewayChat, getChatModel, probeChatModel } from '../ai/gateway.ts';
+import { getChatModel, probeChatModel } from '../ai/gateway.ts';
+import { chatWithFallback as gatewayChat } from '../ai/chat-fallback.ts';
 import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
