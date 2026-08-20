@@ -34,7 +34,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { runRecall } from '../src/commands/recall.ts';
 import { withEnv, emptyHome } from './helpers/with-env.ts';
-import { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE } from '../src/core/facts/audit-sources.ts';
+import { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE, LEGACY_TERMINAL_AUDIT_SOURCE } from '../src/core/facts/audit-sources.ts';
 
 let engine: PGLiteEngine;
 
@@ -219,5 +219,52 @@ describe('gbrain recall CLI (local, non-thin-client path) excludes audit rows', 
     expect(facts.some(f => f.source === NON_EXTRACTABLE_AUDIT_SOURCE)).toBe(false);
     expect(facts.some(f => f.fact === 'the user prefers oat milk in their coffee')).toBe(true);
     expect(facts.some(f => f.fact === 'EXTRACTION_COMPLETE' && f.source === 'test')).toBe(true);
+  });
+});
+
+// Post-review fix: AUDIT_ROW_SOURCES omitted the pre-`:v2` spelling of
+// TERMINAL_AUDIT_SOURCE. src/core/migrate.ts's doctor-backlog-index comment
+// and test/extract-conversation-facts.test.ts ("legacy terminal rows do not
+// suppress strict v2 replay") both reference this exact legacy string, so
+// brains upgraded through the pre-v2 checkpoint scheme can still carry rows
+// under it — and those rows crowded out real facts the same way the current
+// spelling did before this PR's fix, because the recall-side exclusion never
+// matched them.
+describe('post-review fix: legacy (pre-v2) terminal audit rows are also excluded', () => {
+  let engine2: PGLiteEngine;
+
+  beforeAll(async () => {
+    engine2 = new PGLiteEngine();
+    await engine2.connect({});
+    await engine2.initSchema();
+
+    await engine2.insertFact(
+      { fact: 'the user prefers oat milk in their coffee', kind: 'preference', entity_slug: 'coffee-prefs', source: 'test', visibility: 'world' },
+      { source_id: 'default' },
+    );
+    for (let i = 0; i < 5; i++) {
+      await engine2.insertFact(
+        { fact: 'EXTRACTION_COMPLETE', kind: 'fact', entity_slug: null, source: LEGACY_TERMINAL_AUDIT_SOURCE, source_session: `legacy-audit-batch-${i}`, notability: 'low' },
+        { source_id: 'default' },
+      );
+    }
+  });
+
+  afterAll(async () => {
+    await engine2.disconnect();
+  });
+
+  test('legacy-source audit rows do not crowd out the real fact (recall op, since arm)', async () => {
+    const result = await dispatchToolCall(
+      engine2,
+      'recall',
+      { since: '1 hour ago', limit: 3 },
+      { remote: false, sourceId: 'default' },
+    );
+    expect(result.isError).toBeFalsy();
+    const payload = JSON.parse(result.content[0].text);
+    const facts: Array<{ fact: string; source: string }> = payload.facts;
+    expect(facts.some(f => f.source === LEGACY_TERMINAL_AUDIT_SOURCE)).toBe(false);
+    expect(facts.some(f => f.fact === 'the user prefers oat milk in their coffee')).toBe(true);
   });
 });
