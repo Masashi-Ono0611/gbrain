@@ -20,6 +20,7 @@ import { dedupResults } from '../search/dedup.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { HybridSearchMeta } from '../types.ts';
+import type { RelationalArmMeta } from '../search/relational-recall.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
@@ -66,7 +67,7 @@ function buildRetrievalResponseMeta(
   queryText: string,
   results: unknown[],
   meta: HybridSearchMeta | null,
-  opts: { conceptHint?: boolean } = {},
+  opts: { conceptHint?: boolean; relationalMeta?: RelationalArmMeta | null } = {},
 ): Record<string, unknown> {
   const m = meta as (HybridSearchMeta & { degraded?: unknown; retrieved_count?: number }) | null;
   const hint = opts.conceptHint && looksConceptShaped(queryText)
@@ -83,6 +84,17 @@ function buildRetrievalResponseMeta(
       ...(m.token_budget ? { token_budget: m.token_budget } : {}),
       ...(m.degraded !== undefined ? { degraded: m.degraded } : {}),
     } : {}),
+    // #3995 (local-only, not submitted upstream — see patch 84 rationale)
+    // — surface whether the relational recall arm fired (and its
+    // seed/candidate counts) so a caller can distinguish "graph answer
+    // contributed" from "graph answer never reached fusion" without source
+    // access. Additive field on the existing `retrieval` _meta key; absent
+    // when the arm never ran on THIS invocation (relational retrieval off,
+    // the image-similarity branch, OR a semantic-cache hit — the cache-hit
+    // branch in hybrid.ts returns without invoking `onRelationalMeta`, so a
+    // cached result set originally produced with relational recall still
+    // reports no `relational` here).
+    ...(opts.relationalMeta ? { relational: opts.relationalMeta } : {}),
     ...(hint ? { hint } : {}),
   };
 }
@@ -466,6 +478,13 @@ const query: Operation = {
     // search). When the param is the literal '__all__', force-allow
     // cross-source mode (matches SearchOpts.sourceId contract).
     let capturedMeta: HybridSearchMeta | null = null;
+    // #3995 (local-only) — observability sink for the relational recall
+    // arm. Stays null when the callback itself never fires: relational
+    // retrieval off for the resolved mode, or a semantic-cache hit (the
+    // cache-hit branch in hybrid.ts returns before invoking
+    // onRelationalMeta). `fired` on a non-null value is what distinguishes
+    // "arm ran and found nothing to do" from "arm didn't run at all".
+    let capturedRelationalMeta: RelationalArmMeta | null = null;
     // v0.32.x search-lite: route the query op through hybridSearchCached so
     // semantic cache + token budget + intent weighting fire automatically.
     // Plain hybridSearch remains the bare API for callers that opt out.
@@ -506,6 +525,11 @@ const query: Operation = {
       // v0.36 cross-modal routing param.
       crossModal: p.cross_modal as 'text' | 'image' | 'both' | 'auto' | undefined,
       onMeta: (m) => { capturedMeta = m; },
+      // #3995 (local-only) — thread the relational-arm observability sink
+      // through so `fired`/`kind`/`seeds_resolved`/`candidates`/`errored`
+      // land in the `retrieval` response meta below instead of only being
+      // visible to source-level tracing.
+      onRelationalMeta: (m) => { capturedRelationalMeta = m; },
       // v0.36 (D15): per-call embedding column override. Resolver rejects
       // unknown names at hybrid entry with EmbeddingColumnNotRegisteredError;
       // the error surfaces back to the agent as the op error envelope.
@@ -680,7 +704,7 @@ const query: Operation = {
     // WP2/D3: query never nudges toward itself — no concept hint here.
     // #1663: the CRAG grade rides the same retrieval meta channel.
     ctx.emitResponseMeta?.('retrieval', {
-      ...buildRetrievalResponseMeta(queryText, results, capturedMeta),
+      ...buildRetrievalResponseMeta(queryText, results, capturedMeta, { relationalMeta: capturedRelationalMeta }),
       crag,
     });
     // #3800: cap AFTER capture/meta/CRAG so every internal consumer graded
