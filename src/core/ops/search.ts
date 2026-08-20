@@ -30,6 +30,7 @@ import { dedupResults } from '../search/dedup.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { HybridSearchMeta, SearchResult } from '../types.ts';
+import type { RelationalArmMeta } from '../search/relational-recall.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS, resultChunkCap } from '../search/snippet-cap.ts';
 import { scoresFollowRank } from '../search/score-contract.ts';
@@ -459,7 +460,7 @@ async function buildRetrievalResponseMeta(
   queryText: string,
   results: unknown[],
   meta: HybridSearchMeta | null,
-  opts: { conceptHint?: boolean; types?: string[]; typeFilterNotice?: string; declarations?: DeclarationMemo; feedbackOp?: 'query' | 'search'; entity?: ResolvedEntity; filterHintFor?: { op: 'search' | 'query'; p: Record<string, unknown> }; timings?: SearchTimings } = {},
+  opts: { conceptHint?: boolean; types?: string[]; typeFilterNotice?: string; declarations?: DeclarationMemo; feedbackOp?: 'query' | 'search'; entity?: ResolvedEntity; relationalMeta?: RelationalArmMeta | null; filterHintFor?: { op: 'search' | 'query'; p: Record<string, unknown> }; timings?: SearchTimings } = {},
 ): Promise<Record<string, unknown>> {
   // Each concurrent read below is reported in `overlapped_ms` under its own `meta_*` label.
   const timed = <T>(label: string, work: T | Promise<T>): Promise<T> => opts.timings ? opts.timings.overlap(`meta_${label}`, Promise.resolve(work)) : Promise.resolve(work);
@@ -546,6 +547,17 @@ async function buildRetrievalResponseMeta(
     ...(heldFiles.length ? { held_files: heldFiles } : {}),
     ...(coverage ? { coverage } : {}),
     ...(freshness.length ? { freshness } : {}),
+    // #3995 (local-only, not submitted upstream — see patch 84 rationale)
+    // — surface whether the relational recall arm fired (and its
+    // seed/candidate counts) so a caller can distinguish "graph answer
+    // contributed" from "graph answer never reached fusion" without source
+    // access. Additive field on the existing `retrieval` _meta key; absent
+    // when the arm never ran on THIS invocation (relational retrieval off,
+    // the image-similarity branch, OR a semantic-cache hit — the cache-hit
+    // branch in hybrid.ts returns without invoking `onRelationalMeta`, so a
+    // cached result set originally produced with relational recall still
+    // reports no `relational` here).
+    ...(opts.relationalMeta ? { relational: opts.relationalMeta } : {}),
     ...(hint || readinessHint ? { hint: [hint, readinessHint].filter(Boolean).join(' ') } : {}),
     ...(opts.feedbackOp ? await (opts.timings ? opts.timings.part('response', 'feedback', () => searchAnswerFeedback(ctx, opts.feedbackOp!, results as SearchResult[])) : searchAnswerFeedback(ctx, opts.feedbackOp, results as SearchResult[])) : {}),
   };
@@ -1037,6 +1049,13 @@ const query: Operation = {
     types = typeFilter.types;
     let capturedMeta: HybridSearchMeta | null = null; let queryEmbedding: Float32Array | null = null; const resolving = startEntityResolution(ctx, queryText, { ...querySourceScope, excludePrivate });
     const explainPrep = await setup(() => prepareExplainTarget(ctx, p, querySourceScope, excludePrivate, 'query'));
+    // #3995 (local-only) — observability sink for the relational recall
+    // arm. Stays null when the callback itself never fires: relational
+    // retrieval off for the resolved mode, or a semantic-cache hit (the
+    // cache-hit branch in hybrid.ts returns before invoking
+    // onRelationalMeta). `fired` on a non-null value is what distinguishes
+    // "arm ran and found nothing to do" from "arm didn't run at all".
+    let capturedRelationalMeta: RelationalArmMeta | null = null;
     // v0.32.x search-lite: route the query op through hybridSearchCached so
     // token budget and intent weighting apply at the operation boundary.
     // Semantic cache reuse is suspended in the wrapper.
@@ -1080,6 +1099,11 @@ const query: Operation = {
       // v0.36 cross-modal routing param.
       crossModal: p.cross_modal as 'text' | 'image' | 'both' | 'auto' | undefined,
       onMeta: (m) => { capturedMeta = m; }, onQueryEmbedding: (e) => { queryEmbedding = e; },
+      // #3995 (local-only) — thread the relational-arm observability sink
+      // through so `fired`/`kind`/`seeds_resolved`/`candidates`/`errored`
+      // land in the `retrieval` response meta below instead of only being
+      // visible to source-level tracing.
+      onRelationalMeta: (m) => { capturedRelationalMeta = m; },
       // v0.36 (D15): per-call embedding column override. Resolver rejects
       // unknown names at hybrid entry with EmbeddingColumnNotRegisteredError;
       // the error surfaces back to the agent as the op error envelope.
@@ -1144,6 +1168,7 @@ const query: Operation = {
           // the config reads only run on the rare escalation path.
           const effectiveLimit = await resolveEffectiveLimit(ctx, p);
           let escalatedMeta: HybridSearchMeta | null = null;
+          let escalatedRelationalMeta: RelationalArmMeta | null = null;
           const escalated = await hybridSearchCached(ctx.engine, queryText, {
             excludePrivate,
             requireSafeChunks: ctx.remote !== false,
@@ -1171,6 +1196,7 @@ const query: Operation = {
             crossModal: p.cross_modal as 'text' | 'image' | 'both' | 'auto' | undefined,
             embeddingColumn: embeddingColumnParam,
             onMeta: (m) => { escalatedMeta = m; }, _timings: timings,
+            onRelationalMeta: (m) => { escalatedRelationalMeta = m; },
           });
           // Grade the FULL escalated sweep (rank-1 is what the grader reads),
           // then adopt only the caller-visible window. #4610: the re-run is
@@ -1184,6 +1210,7 @@ const query: Operation = {
           if (confidenceRank(regraded.level) > confidenceRank(grade.level)) {
             results = escalated.slice(0, effectiveLimit);
             capturedMeta = escalatedMeta;
+            capturedRelationalMeta = escalatedRelationalMeta;
             grade = regraded;
             crag.confidence = regraded.level;
             crag.reason = regraded.reason;
@@ -1263,7 +1290,7 @@ const query: Operation = {
     // #3800: cap AFTER capture/meta/CRAG so every internal consumer graded
     // and recorded the real payload; only the returned envelope is snipped.
     return evidenceOutput(ctx, p, results, plan, { ...querySourceScope, excludePrivate, detail }, capturedMeta, snippetCap, timings,
-      async rows => withExplainTarget({ ...(await buildRetrievalResponseMeta(ctx, querySourceScope, queryText, rows, capturedMeta, { types, typeFilterNotice: typeFilter.notice, declarations, feedbackOp: 'query', entity: fanned.entity, filterHintFor: { op: 'query', p }, timings })), crag, ...(fanned.fanout ? { fanout: fanned.fanout } : {}) }, finishExplainTarget(ctx, p, explainPrep, results, 'query')));
+      async rows => withExplainTarget({ ...(await buildRetrievalResponseMeta(ctx, querySourceScope, queryText, rows, capturedMeta, { types, typeFilterNotice: typeFilter.notice, declarations, feedbackOp: 'query', entity: fanned.entity, filterHintFor: { op: 'query', p }, relationalMeta: capturedRelationalMeta, timings })), crag, ...(fanned.fanout ? { fanout: fanned.fanout } : {}) }, finishExplainTarget(ctx, p, explainPrep, results, 'query')));
   },
   scope: 'read', mutating: false,
   cliHints: { name: 'query', positional: ['query'] },
