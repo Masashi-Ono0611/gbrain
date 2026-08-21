@@ -263,12 +263,14 @@ describe('#3707 — out_of_scope must never cross a remote caller\'s grant', () 
       expect(Object.keys(result as object).sort()).toEqual(['count', 'ready', 'status', 'symbol', edgesKey].sort());
       expect((result as { status: string }).status).toBe('not_built');
 
-      // Positive control: prove the HANDLER's own internal call to
-      // resolveCodeReadiness genuinely computes out_of_scope: true for this
-      // exact scenario (same engine state, same scope) — not just that the
-      // bare helper can return true in isolation. Otherwise the assertion
-      // above could pass vacuously because the dangerous state never got
-      // computed on this code path in the first place.
+      // Positive control: a SEPARATE call to resolveCodeReadiness, using the
+      // same engine state and the same scope the handler resolved to,
+      // confirms out_of_scope genuinely evaluates true for this exact
+      // fixture — not just that the helper can return true for some
+      // unrelated input. This does not inspect the handler's own internal
+      // call (that's opaque from outside); it establishes the scenario
+      // itself is a real trigger, so the assertion above isn't vacuously
+      // passing because the dangerous state could never arise here.
       const { resolveCodeReadiness } = await import('../../src/core/code-graph-readiness.ts');
       const direct = await resolveCodeReadiness(engine, { kind: 'edge', count: 0, sourceId: 'source-a' });
       expect(direct.out_of_scope).toBe(true);
