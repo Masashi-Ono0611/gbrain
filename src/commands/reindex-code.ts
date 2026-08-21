@@ -186,15 +186,26 @@ async function estimateReindexCost(
   return { totalTokens, totalPages };
 }
 
-async function promptYesNo(question: string): Promise<boolean> {
+/**
+ * #4318: `rl.close()` emits `'close'` synchronously, so the `rl.on('close', ...)`
+ * fallback below would otherwise win the race against the real answer (a
+ * Promise only honors its first resolution). Resolve with the typed answer
+ * BEFORE closing, and guard the close listener so it only supplies the false
+ * default on a genuine EOF/Ctrl-D with no answer given.
+ */
+export async function promptYesNo(question: string): Promise<boolean> {
   return new Promise((resolve) => {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
+    let answered = false;
     rl.question(question, (answer) => {
-      rl.close();
+      answered = true;
       const a = answer.trim().toLowerCase();
       resolve(a === 'y' || a === 'yes');
+      rl.close();
     });
-    rl.on('close', () => resolve(false));
+    rl.on('close', () => {
+      if (!answered) resolve(false);
+    });
   });
 }
 

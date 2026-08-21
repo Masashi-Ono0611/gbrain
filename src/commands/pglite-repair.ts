@@ -100,7 +100,7 @@ function emitError(jsonOutput: boolean, code: string, message: string): void {
   }
 }
 
-async function promptYesNo(question: string): Promise<boolean> {
+export async function promptYesNo(question: string): Promise<boolean> {
   // W0 fix-wave (Tier-1 #15): non-interactive stdin (CI, pipes, spawned
   // agents) must resolve to the safe default instead of hanging forever —
   // this prompt had no TTY guard and no close/EOF handler, so a piped or
@@ -109,10 +109,18 @@ async function promptYesNo(question: string): Promise<boolean> {
   // Prompt on stderr: stdout stays clean for --json payloads.
   const rl = createInterface({ input: process.stdin, output: process.stderr });
   return new Promise((resolve) => {
-    rl.on('close', () => resolve(false)); // EOF (^D) = decline, never hang
+    // #4318: `rl.close()` emits `'close'` synchronously, so this fallback
+    // must be guarded — otherwise it wins the race against the real typed
+    // answer below (a Promise only honors its first resolution). Only
+    // supply the false default on a genuine EOF/Ctrl-D with no answer given.
+    let answered = false;
+    rl.on('close', () => {
+      if (!answered) resolve(false); // EOF (^D) = decline, never hang
+    });
     rl.question(`${question} [y/N] `, (answer) => {
-      rl.close();
+      answered = true;
       resolve(/^y(es)?$/i.test(answer.trim()));
+      rl.close();
     });
   });
 }

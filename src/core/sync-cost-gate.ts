@@ -314,15 +314,27 @@ async function resolveBackfillCapUsd(engine: BrainEngine): Promise<number> {
   }
 }
 
-/** Interactive [y/N] prompt. Resolves false on non-y answers or EOF. */
-async function promptYesNo(question: string): Promise<boolean> {
+/**
+ * Interactive [y/N] prompt. Resolves false on non-y answers or EOF.
+ *
+ * #4318: `rl.close()` emits `'close'` synchronously, so the `rl.on('close', ...)`
+ * fallback below would otherwise win the race against the real answer (a
+ * Promise only honors its first resolution). Resolve with the typed answer
+ * BEFORE closing, and guard the close listener so it only supplies the false
+ * default on a genuine EOF/Ctrl-D with no answer given.
+ */
+export async function promptYesNo(question: string): Promise<boolean> {
   return new Promise((resolve) => {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
+    let answered = false;
     rl.question(question, (answer) => {
-      rl.close();
+      answered = true;
       resolve(answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes');
+      rl.close();
     });
-    rl.on('close', () => resolve(false));
+    rl.on('close', () => {
+      if (!answered) resolve(false);
+    });
   });
 }
 
