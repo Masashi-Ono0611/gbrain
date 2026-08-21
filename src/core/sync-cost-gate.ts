@@ -314,15 +314,27 @@ async function resolveBackfillCapUsd(engine: BrainEngine): Promise<number> {
   }
 }
 
+interface PromptReadline {
+  question(question: string, callback: (answer: string) => void): void;
+  close(): void;
+  on(event: 'close', listener: () => void): unknown;
+}
+
+type PromptReadlineFactory = () => PromptReadline;
+
 /** Interactive [y/N] prompt. Resolves false on non-y answers or EOF. */
-async function promptYesNo(question: string): Promise<boolean> {
+export async function promptYesNo(
+  question: string,
+  createReadline: PromptReadlineFactory = () =>
+    createInterface({ input: process.stdin, output: process.stdout }),
+): Promise<boolean> {
   return new Promise((resolve) => {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes');
-    });
+    const rl = createReadline();
     rl.on('close', () => resolve(false));
+    rl.question(question, (answer) => {
+      resolve(answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes');
+      rl.close();
+    });
   });
 }
 
