@@ -2211,13 +2211,25 @@ export async function hybridSearchCached(
   // now-relative timestamp, which a persisted cache row can't express.
   const dateFiltered =
     Boolean(opts?.since ?? opts?.afterDate) || Boolean(opts?.until ?? opts?.beforeDate);
+  // #4358: paginated (offset!=0) requests skip the cache. The write side
+  // (bare hybridSearch) stores `returnPool.slice(offset, offset + limit)` —
+  // already offset-sliced — so the hit path below re-slicing that stored
+  // page with the SAME offset double-applies it and returns too few (or the
+  // wrong) rows. offset is also not part of knobsHash, so two different
+  // offsets could collide on one cache row. Skipping any nonzero offset
+  // (negative included — Array.prototype.slice treats a negative offset as
+  // "from the end", which the same double-apply bug still corrupts)
+  // sidesteps both bugs until the cache can store the pre-offset pool and
+  // key on offset too.
+  const offsetPaginated = (opts?.offset ?? 0) !== 0;
   const skipCache =
     !cache.isEnabled() ||
     (opts?.walkDepth ?? 0) > 0 ||
     Boolean(opts?.nearSymbol) ||
     isNonDefaultColumn ||
     adaptiveReturnOn ||
-    dateFiltered;
+    dateFiltered ||
+    offsetPaginated;
 
   let cacheStatus: 'hit' | 'miss' | 'disabled' = skipCache ? 'disabled' : 'miss';
   let cacheSimilarity: number | undefined;

@@ -859,7 +859,18 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // expects the floor) — same contamination class as ac=/acj=. The PR
 // authored this as v=16; master had already reached 18, so it sequences
 // here per the D8 convention. Same one-time global cold-miss pattern.
-export const KNOBS_HASH_VERSION = 19;
+//
+// bump 19→20 (#4358): pure invalidation bump, no new key part. `offset`
+// isn't folded into the hash (see hybrid.ts's `hybridSearchCached`
+// skipCache), so pre-fix rows written for an offset>0 request keyed
+// identically to an offset=0 request on the same (source_id, knobsHash,
+// embedding) — and stored an already offset-sliced page. Post-fix,
+// offset>0 requests always skip the cache, but a stale pre-fix row could
+// still be looked up by a NEW offset=0 request and silently serve the
+// wrong page (the old offset>0 slice). Bumping makes every pre-fix row
+// unreachable (one-time global cold-miss, refills within
+// cache.ttl_seconds).
+export const KNOBS_HASH_VERSION = 20;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The

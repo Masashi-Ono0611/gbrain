@@ -8,7 +8,10 @@
  *     on BOTH the miss and the hit path (the spread-carry rebuild can
  *     never silently drop a key again — the adaptive_return drop class)
  *   - cache-hit stamping: `cache.status === 'hit'`, degraded carried from
- *     the stored row; hit-with-offset stays labeled 'hit'
+ *     the stored row
+ *   - #4358: offset>0 requests never consult the cache (`cache.status ===
+ *     'disabled'`), so an offset-paginated lookup can never double-slice an
+ *     already offset-sliced stored page — see hybrid.ts's `skipCache`
  *   - cache_prestamp: a row whose stored meta lacks the degradation stamp
  *     surfaces degraded:[{stage:'cache_prestamp'}], never a clean claim
  *   - D14.2 short TTL: a degraded (but embeddable) result set is written
@@ -157,14 +160,19 @@ describe('cache-hit stamping', () => {
     expect(typeof hitMeta.retrieved_count).toBe('number');
   });
 
-  test('hit-with-offset stays labeled hit (never a clean-miss mislabel)', async () => {
+  test('#4358: offset>0 always skips the cache — never labeled hit', async () => {
+    // Pre-#4358 this asserted the OPPOSITE: an offset>0 lookup was served
+    // from the offset=0 stored row and stayed labeled 'hit'. That's exactly
+    // the double-slice bug (offset isn't part of knobsHash, and the hit
+    // path re-sliced an already offset-sliced stored page). The fix skips
+    // the cache entirely for offset>0, so this now asserts 'disabled'.
     const { results: missResults } = await cachedRun('builder', { limit: 5 });
     expect(missResults.length).toBeGreaterThan(0);
     await awaitPendingSearchCacheWrites();
 
     const { results, meta } = await cachedRun('builder', { limit: 5, offset: 50 });
-    expect(results).toHaveLength(0); // offset past the stored set
-    expect(meta.cache?.status).toBe('hit');
+    expect(results).toHaveLength(0); // offset past the small fixture set
+    expect(meta.cache?.status).toBe('disabled');
     expect(meta.retrieved_count).toBe(0); // pre-budget count for THIS page
   });
 });
