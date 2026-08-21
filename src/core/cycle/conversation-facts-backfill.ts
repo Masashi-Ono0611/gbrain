@@ -237,6 +237,16 @@ export async function runPhaseConversationFactsBackfill(
             // per-source worker count. Default 1 — opt-in concurrency
             // for cycle paths.
             workers: cfg.workers,
+            // #3627: per-source caps (cycle.conversation_facts_backfill.
+            // max_walltime_min / max_cost_usd) were parsed into `cfg` above
+            // but never threaded into the core call, so they were dead
+            // config — the ONLY effective bound was the brain-wide walltime
+            // check between sources, which with a single source evaluates
+            // once at ~elapsed 0 and never again. Wire them through so a
+            // misbehaving single source can't drag the whole cycle into the
+            // autopilot's outer-timeout SIGKILL.
+            maxWalltimeMin: cfg.maxWalltimeMin,
+            perSourceMaxCostUsd: cfg.maxCostUsd,
           }, opts.signal);
           perSourceResults[src.id] = result;
           if (result.budget_exhausted) {

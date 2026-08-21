@@ -322,6 +322,30 @@ export interface ExtractConversationFactsCoreOpts {
    * dedup → provenance all execute THIS production pipeline with zero LLM calls.
    */
   extractor?: (input: ExtractInput) => Promise<ExtractedFact[]>;
+  /**
+   * #3627: per-invocation wall-clock cap (minutes). Checked between page
+   * batches (same granularity as the brain-wide walltime check the cycle
+   * phase already does between sources). Distinct from the cycle phase's
+   * `maxTotalWalltimeMin` — that one bounds the whole multi-source run and,
+   * with a single source, only evaluates once at ~elapsed 0 and never again,
+   * so it never actually bounds a single source's runtime. Unset = no cap
+   * (back-compat; CLI/Minion callers that never set this see no behavior
+   * change).
+   */
+  maxWalltimeMin?: number;
+  /**
+   * #3627: per-invocation cost cap (USD), enforced independently of
+   * `opts.maxCostUsd`/`opts.budgetTracker`'s own cap. Only meaningful when
+   * `opts.budgetTracker` is set (a caller-managed, possibly brain-wide
+   * tracker) — reads `budgetTracker.totalSpent` (public getter) and checks
+   * the delta since this invocation started, so a single source can't
+   * exhaust a shared multi-source budget alone before other sources get a
+   * turn. Does NOT create or wrap a tracker (the caller-managed-tracker
+   * contract above is unchanged). No-op when `budgetTracker` is absent —
+   * the owned-tracker branch already gets its own hard cap via
+   * `opts.maxCostUsd`.
+   */
+  perSourceMaxCostUsd?: number;
 }
 
 export interface ExtractConversationFactsResult {
@@ -368,6 +392,12 @@ export interface ExtractConversationFactsResult {
   facts_inserted: number;
   budget_exhausted?: boolean;
   spent_usd?: number;
+  /**
+   * #3627: set when `opts.maxWalltimeMin` or `opts.perSourceMaxCostUsd` was
+   * exceeded and the enumeration loop halted early (partial run, same
+   * "halt cleanly, don't crash" posture as `budget_exhausted`).
+   */
+  halted_by_source_cap?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1332,6 +1362,17 @@ export async function runExtractConversationFactsCore(
     llmFallbackModel,
   };
 
+  // #3627: per-invocation caps, checked between page batches below (same
+  // "yield cleanly at its own budget" posture the issue asked for). Both
+  // read-only: sourceStartedAt is a fresh Date.now() for THIS call, and
+  // budgetTrackerSpentAtStart snapshots the caller-managed tracker's public
+  // totalSpent so the per-source cost delta can be checked without creating
+  // or wrapping a tracker (that would violate the caller-managed-tracker
+  // contract documented on `opts.budgetTracker` above).
+  const sourceStartedAt = Date.now();
+  const budgetTrackerSpentAtStart = opts.budgetTracker?.totalSpent ?? 0;
+  let haltedBySourceCap = false;
+
   // Run body. Either inside the externally-provided tracker scope (no
   // wrap; opts.budgetTracker is in scope upstream OR caller passes it
   // explicitly via withBudgetTracker), or inside a fresh local wrap.
@@ -1451,6 +1492,23 @@ export async function runExtractConversationFactsCore(
         while (true) {
           if (signal?.aborted) throw new Error('aborted');
           if (opts.limit && processedPagesCount >= opts.limit) break pageLoop;
+          // #3627: per-source caps, checked between batches (same
+          // granularity the aborted/limit checks above already use).
+          if (
+            opts.maxWalltimeMin !== undefined &&
+            Date.now() - sourceStartedAt > opts.maxWalltimeMin * 60_000
+          ) {
+            haltedBySourceCap = true;
+            break pageLoop;
+          }
+          if (
+            opts.perSourceMaxCostUsd !== undefined &&
+            opts.budgetTracker !== undefined &&
+            opts.budgetTracker.totalSpent - budgetTrackerSpentAtStart > opts.perSourceMaxCostUsd
+          ) {
+            haltedBySourceCap = true;
+            break pageLoop;
+          }
 
           const batch = await engine.listPages({
             type,
@@ -1568,6 +1626,10 @@ export async function runExtractConversationFactsCore(
     throw err;
   }
 
+  if (haltedBySourceCap) {
+    result.halted_by_source_cap = true;
+  }
+
   // gateway.chat preserves a successful provider result when the final
   // tracker.record() discovers an underestimated overage. Usually the next
   // reserve surfaces it, but a fallback that yields fewer than two messages
@@ -1593,7 +1655,7 @@ export async function runExtractConversationFactsCore(
       engine,
       sourceId,
       result,
-      /* halted */ result.budget_exhausted === true,
+      /* halted */ result.budget_exhausted === true || result.halted_by_source_cap === true,
     );
   }
 

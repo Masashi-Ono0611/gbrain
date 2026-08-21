@@ -18,7 +18,7 @@ src/core/search/hybrid.ts	2703	ratchet	grown v0.46.25.0 fix waves: cache scope i
 src/core/engine.ts	2415	ratchet	grown v0.46.25.0 fix waves: timeline dedup contract + registry write contract (#3827 #1262)
 src/commands/autopilot.ts	2349	ratchet	grown v0.46.25.0 fix waves: positional validation (#1525) + liveness takeover (#4300)
 src/commands/extract.ts	2066	ratchet	lowered: timeline extractor hoisted to core/timeline-extract.ts (module-cycle fix)
-src/commands/extract-conversation-facts.ts	2045	ratchet	grown v0.46.x per-provider gateway-unavailable copy
+src/commands/extract-conversation-facts.ts	2105	ratchet	grown v0.46.x per-provider gateway-unavailable copy; #3627 per-source maxWalltimeMin/perSourceMaxCostUsd caps in the enumeration loop
 src/core/import-file.ts	2016	ratchet	grown v0.46.24.0 overnight wave: embedding_plane_split named error (#4287)
 src/core/cycle/synthesize.ts	2702	ratchet	merged: five-issue wave + dream-wave C7 peel + C8 manifest + C9 mode/telemetry/backfill + adversarial fix batches
 src/commands/embed.ts	2046	ratchet	grown v0.46.25.0 delegated wave (#3971)

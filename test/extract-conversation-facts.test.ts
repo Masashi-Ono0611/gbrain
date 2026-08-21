@@ -21,6 +21,7 @@ import {
   __setChatTransportForTests,
   __setEmbedTransportForTests,
   resetGateway,
+  withBudgetTracker,
   type ChatResult,
 } from '../src/core/ai/gateway.ts';
 import {
@@ -43,7 +44,7 @@ import {
   ALLOWED_TYPE_ALIASES,
 } from '../src/commands/extract-conversation-facts.ts';
 import { _resetLlmCacheForTests } from '../src/core/conversation-parser/llm-base.ts';
-import { BudgetExhausted } from '../src/core/budget/budget-tracker.ts';
+import { BudgetExhausted, BudgetTracker } from '../src/core/budget/budget-tracker.ts';
 
 // ---------------------------------------------------------------------------
 // pageTypesForAllowed — logical→concrete page-type expansion.
@@ -1210,6 +1211,109 @@ describe('runExtractConversationFactsCore', () => {
     });
     expect(result.pages_failed).toBe(1);
     expect(result.pages_processed).toBe(0);
+  });
+
+  test('#3627: maxWalltimeMin already exceeded at call start halts before any page is fetched', async () => {
+    // A negative cap guarantees the very FIRST check trips deterministically
+    // (elapsed ms since call start is always >= 0 > any negative bound), so
+    // this test has no timing dependency. It proves the check exists and
+    // halts cleanly (zero pages touched) — the between-batches placement is
+    // covered separately below.
+    await engine.putPage('conversations/walltime-cap-immediate', {
+      type: 'slack',
+      title: 'Walltime cap immediate fixture',
+      compiled_truth: SAMPLE_BODY,
+      timeline: '',
+      frontmatter: {},
+    });
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      types: ['slack'],
+      maxWalltimeMin: -1,
+      sleepMs: 0,
+    });
+    expect(result.halted_by_source_cap).toBe(true);
+    expect(result.pages_processed).toBe(0);
+    expect(result.pages_considered).toBe(0);
+  });
+
+  test('#3627: maxWalltimeMin trips BETWEEN batches, after batch 1 is fully processed', async () => {
+    // PAGE_LIST_BATCH is 10 — seed 11 so the loop must fetch a SECOND
+    // batch, which is where the between-batches walltime check actually
+    // lives (distinct from the immediate-trip case above). Deterministic
+    // without a fake clock: sleepMs fires a REAL `await sleep()` once per
+    // segment (line ~1160), so processing batch 1 (10 pages x >=1 segment
+    // each) accumulates >= 1000ms of genuine elapsed time before the loop
+    // loops back to check the cap again — while the FIRST check (before
+    // batch 1 is even fetched, just after a couple of fast local PGLite
+    // reads) has to stay under the 500ms cap. That's a wide margin on both
+    // sides specifically so this isn't flaky on a loaded CI runner (a
+    // Codex review round flagged a tighter 150ms/300ms version as
+    // timing-sensitive); it's still not as airtight as an injectable
+    // clock, which this file has no existing seam for.
+    for (let i = 0; i < 11; i++) {
+      await engine.putPage(`conversations/walltime-cap-${i}`, {
+        type: 'slack',
+        title: `Walltime cap fixture ${i}`,
+        compiled_truth: SAMPLE_BODY,
+        timeline: '',
+        frontmatter: {},
+      });
+    }
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      types: ['slack'],
+      maxWalltimeMin: 500 / 60_000,
+      sleepMs: 100,
+    });
+    expect(result.halted_by_source_cap).toBe(true);
+    expect(result.pages_processed).toBe(10);
+  });
+
+  test('#3627: perSourceMaxCostUsd halts the enumeration loop after the first batch exceeds a caller-managed tracker\'s per-source delta', async () => {
+    // Same 11-page/2-batch shape as the walltime test above, but this cap
+    // reads BudgetTracker.totalSpent (public getter) rather than wall-clock,
+    // so it needs a real spend to accrue during the call. Route all 11
+    // pages through the LLM fallback (unparseable "novel" separator format)
+    // with an oversized per-call usage so batch 1 alone blows well past a
+    // $1 per-source cap; batch 2 must never be fetched.
+    for (let i = 0; i < 11; i++) {
+      await engine.putPage(`conversations/cost-cap-${i}`, {
+        type: 'conversation',
+        title: `Cost cap fixture ${i}`,
+        compiled_truth: [
+          'Alpha Example ~~ 09:00 ~~ first',
+          'Beta Example ~~ 09:05 ~~ second',
+        ].join('\n'),
+        timeline: '',
+        frontmatter: { date: '2026-06-02' },
+      });
+    }
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'true');
+    fallbackUsage = { input_tokens: 10_000_000, output_tokens: 1_000_000 };
+    const tracker = new BudgetTracker({ label: 'test:3627-cost-cap' });
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      const result = await withBudgetTracker(tracker, () =>
+        runExtractConversationFactsCore(engine, {
+          sourceId: 'default',
+          types: ['conversation'],
+          budgetTracker: tracker,
+          perSourceMaxCostUsd: 1,
+          sleepMs: 0,
+        }),
+      );
+      expect(result.halted_by_source_cap).toBe(true);
+      // Batch 1 (10 pages, identical body) processed via fallback; the
+      // 11th page in batch 2 was never fetched because the cap tripped
+      // first. Only the first page makes a REAL LLM call — the other 9
+      // hit conversation_parser_llm_cache (content-keyed), so fallbackCalls
+      // stays at 1 even though all 10 pages get facts. The oversized
+      // per-call usage still pushes that single real call's cost well past
+      // the $1 cap, which is what this test is actually exercising.
+      expect(result.pages_processed).toBe(10);
+      expect(fallbackCalls).toBeGreaterThanOrEqual(1);
+      expect(tracker.totalSpent).toBeGreaterThan(1);
+    });
   });
 
   test('content identity reopens a page even when updated_at is unchanged', async () => {
