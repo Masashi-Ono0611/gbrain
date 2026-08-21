@@ -99,15 +99,25 @@ async function runStaleExtraction(
     catchUp: false,
   });
 
+  // #3737: extractStaleFromDB no longer throws on an unwritable timeline
+  // entry (e.g. a summary too large for idx_timeline_dedup's btree) — it
+  // skips + counts the offending row instead. Surface that count here too,
+  // same as `gbrain extract --stale`'s own summary, so `gbrain maintain`
+  // doesn't silently report a clean "applied" over a dropped entry.
+  const failureNote = result.timelineWriteFailures > 0
+    ? ` (${result.timelineWriteFailures} timeline entr${result.timelineWriteFailures === 1 ? 'y' : 'ies'} could not be written — see 'gbrain extract --stale' for details)`
+    : '';
+
   return {
     name: 'extract_stale',
     status: 'applied',
-    message: `Processed ${result.pagesProcessed} stale page(s); ${result.staleRemaining} remain.`,
+    message: `Processed ${result.pagesProcessed} stale page(s); ${result.staleRemaining} remain.${failureNote}`,
     details: {
       links_created: result.linksCreated,
       timeline_created: result.timelineCreated,
       pages_processed: result.pagesProcessed,
       stale_remaining: result.staleRemaining,
+      timeline_write_failures: result.timelineWriteFailures,
     },
   };
 }

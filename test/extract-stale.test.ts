@@ -17,6 +17,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runExtract, extractStaleFromDB } from '../src/commands/extract.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../src/core/link-extraction.ts';
+import { currentExitCode, _resetCliExitVerdictForTests } from '../src/core/cli-force-exit.ts';
 import type { PageInput } from '../src/core/types.ts';
 
 let engine: PGLiteEngine;
@@ -266,6 +267,101 @@ describe('gbrain extract --stale', () => {
     expect((await engine.getLinks('companies/acme')).some(l => l.to_slug === 'people/alice')).toBe(true);
     expect(await stampOf('companies/acme')).not.toBeNull();
     expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+  });
+
+  // ─── #3737: idx_timeline_dedup's unique btree covers unbounded TEXT
+  // (page_id, date, summary, source). A sufficiently long, low-compressibility
+  // summary exceeds Postgres's ~2704-byte btree entry-size cap and the insert
+  // is rejected — structurally, not transiently. Pre-fix this aborted the
+  // WHOLE flush chunk (and, propagating past extractStaleFromDB, the whole
+  // `--stale` run), leaving every page in the batch — including healthy
+  // siblings — unprocessed and unstamped, with no indication of which page or
+  // entry was at fault. ─────────────────────────────────────────────────────
+
+  // Deterministic low-compressibility ~3000-byte string. Mirrors the issue's
+  // own repro (md5-hash concatenation defeats btree key compression the way
+  // `repeat('a', N)` does not).
+  function unindexableSummary(): string {
+    const crypto = require('node:crypto') as typeof import('node:crypto');
+    return Array.from({ length: 94 }, (_, i) =>
+      crypto.createHash('md5').update(`${i}`).digest('hex'),
+    ).join('');
+  }
+
+  test('REGRESSION (#3737): an unwritable timeline entry is skipped-and-warned, not fatal to the sweep', async () => {
+    const bigSummary = unindexableSummary();
+    await engine.putPage('meetings/poison', {
+      type: 'meeting' as any, title: 'Poison Meeting', compiled_truth: 'A meeting page.',
+      timeline: `## Timeline\n- **2026-06-04** | ${bigSummary}\n`,
+    });
+    await engine.putPage('people/alice', personPage('Alice'));
+    await engine.putPage('companies/acme', companyPage('Acme', '[Alice](people/alice) advises [Acme](companies/acme).'));
+
+    _resetCliExitVerdictForTests();
+    const origErr = console.error;
+    let warnings = '';
+    console.error = (m?: unknown) => { warnings += String(m) + '\n'; };
+    try {
+      await runExtract(engine, ['--stale']); // must NOT throw
+    } finally {
+      console.error = origErr;
+    }
+
+    // The healthy pages in the SAME batch are unaffected: link created, both
+    // stamped, nothing left stale.
+    const links = await engine.getLinks('companies/acme');
+    expect(links.some(l => l.to_slug === 'people/alice')).toBe(true);
+    expect(await stampOf('people/alice')).not.toBeNull();
+    expect(await stampOf('companies/acme')).not.toBeNull();
+
+    // The poisoned page WAS processed (extraction ran; the page just has one
+    // unwritable timeline entry) and is stamped like any other processed page
+    // — consistent with the existing "every processed page is stamped, incl.
+    // zero-link" invariant. The unwritable entry itself never lands in
+    // timeline_entries.
+    expect(await stampOf('meetings/poison')).not.toBeNull();
+    const rows = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM timeline_entries te
+         JOIN pages p ON p.id = te.page_id WHERE p.slug = 'meetings/poison'`,
+    );
+    expect(rows[0].n).toBe('0');
+
+    // Backlog is unblocked, not stuck forever (the core #3737 complaint).
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+
+    // Surfaced, not silent: the page is named in a stderr warning, and the
+    // exit code is non-zero instead of a clean success.
+    expect(warnings).toContain('meetings/poison');
+    expect(warnings).toContain('idx_timeline_dedup');
+    expect(currentExitCode()).toBe(1);
+  });
+
+  test('REGRESSION (#3737): --json summary reports timeline_write_failures instead of a clean success', async () => {
+    const bigSummary = unindexableSummary();
+    await engine.putPage('meetings/poison-json', {
+      type: 'meeting' as any, title: 'Poison Meeting JSON', compiled_truth: 'A meeting page.',
+      timeline: `## Timeline\n- **2026-06-05** | ${bigSummary}\n`,
+    });
+
+    _resetCliExitVerdictForTests();
+    const origLog = console.error;
+    console.error = () => {}; // silence the per-row warning for this assertion
+    const origWrite = process.stdout.write.bind(process.stdout);
+    let out = '';
+    (process.stdout as unknown as { write: unknown }).write = (chunk: unknown) => { out += String(chunk); return true; };
+    try {
+      await runExtract(engine, ['--stale', '--json']);
+    } finally {
+      console.error = origLog;
+      (process.stdout as unknown as { write: unknown }).write = origWrite;
+    }
+
+    const parsed = JSON.parse(out.trim().split('\n').pop()!);
+    expect(parsed.action).toBe('extract_stale_done');
+    expect(parsed.timeline_write_failures).toBe(1);
+    expect(typeof parsed.first_timeline_write_error).toBe('string');
+    expect(parsed.first_timeline_write_error).toContain('idx_timeline_dedup');
+    expect(currentExitCode()).toBe(1);
   });
 
   test('D4 race: a concurrent edit landing during the sweep is NOT masked', async () => {

@@ -823,13 +823,20 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
     }
     const sidIdx = args.indexOf('--source-id');
     const staleSourceId = (sidIdx >= 0 && sidIdx + 1 < args.length) ? args[sidIdx + 1] : undefined;
-    await extractStaleFromDB(engine, {
+    const staleResult = await extractStaleFromDB(engine, {
       dryRun: args.includes('--dry-run'),
       jsonMode: args.includes('--json'),
       includeFrontmatter: args.includes('--include-frontmatter'),
       sourceIdFilter: staleSourceId,
       catchUp: args.includes('--catch-up'),
     });
+    // #3737: a run that skipped unwritable timeline entries is NOT a clean
+    // success — surface it via the exit code (same convention as the
+    // extract-timeline-from-meetings batch_errors handling above) instead of
+    // reporting exit 0 over silently-dropped entries.
+    if (staleResult.timelineWriteFailures > 0) {
+      setCliExitVerdict(1);
+    }
     return;
   }
 
@@ -1884,7 +1891,10 @@ export async function extractStaleFromDB(
      */
     timeBudgetMs?: number;
   },
-): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number; skippedMissingTarget?: number }> {
+): Promise<{
+  linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number;
+  skippedMissingTarget?: number; timelineWriteFailures: number; firstTimelineWriteError?: string;
+}> {
   const { dryRun, jsonMode, includeFrontmatter, sourceIdFilter, catchUp } = opts;
   const timeBudgetMs = opts.timeBudgetMs ?? STALE_TIME_BUDGET_MS;
   const versionTs = LINK_EXTRACTOR_VERSION_TS;
@@ -1897,11 +1907,11 @@ export async function extractStaleFromDB(
     } else {
       console.log(`(dry run) ${totalStale} page(s) need link/timeline extraction. Run without --dry-run to extract.`);
     }
-    return { linksCreated: 0, timelineCreated: 0, pagesProcessed: 0, staleRemaining: totalStale };
+    return { linksCreated: 0, timelineCreated: 0, pagesProcessed: 0, staleRemaining: totalStale, timelineWriteFailures: 0 };
   }
   if (totalStale === 0) {
     if (!jsonMode) console.log('No stale pages — extraction is up to date.');
-    return { linksCreated: 0, timelineCreated: 0, pagesProcessed: 0, staleRemaining: 0 };
+    return { linksCreated: 0, timelineCreated: 0, pagesProcessed: 0, staleRemaining: 0, timelineWriteFailures: 0 };
   }
 
   // Resolver + cross-source resolution map built ONCE before the loop (the
@@ -1943,6 +1953,13 @@ export async function extractStaleFromDB(
   // persisted. Counted so a dropped reference is observable in the summary
   // instead of vanishing silently (the failure mode that hid bug 2).
   let skippedMissingTarget = 0;
+  // #3737: a timeline entry that fails to WRITE (e.g. a summary too large
+  // for idx_timeline_dedup's btree — see the row-level fallback below).
+  // Counted + named on stderr, same shape as skippedMissingTarget, so a
+  // structurally-unindexable entry surfaces instead of silently blocking
+  // the rest of the backlog.
+  let timelineWriteFailures = 0;
+  let firstTimelineWriteError: string | undefined;
 
   for (;;) {
     const rows = await engine.listStalePagesForExtraction({
@@ -2008,8 +2025,35 @@ export async function extractStaleFromDB(
     for (let i = 0; i < linkRows.length; i += BATCH_SIZE) {
       linksCreated += await engine.addLinksBatch(linkRows.slice(i, i + BATCH_SIZE), { auditSite: 'extract.stale' }); // gbrain-allow-direct-insert: gbrain extract --stale — canonical link reconciliation from markdown body
     }
+    // #3737: unlike links above, a timeline chunk can contain a row that is
+    // STRUCTURALLY unwritable — a summary long enough to blow
+    // idx_timeline_dedup's btree entry-size limit (Postgres caps a unique
+    // btree tuple at ~2704 bytes; an unbounded-TEXT summary can exceed it).
+    // That row will NEVER succeed on retry, so letting its throw propagate
+    // (the old CDX-4 behavior) aborted the ENTIRE chunk — including every
+    // healthy sibling row and, by extension, every page in this keyset batch
+    // — with no indication of which page was at fault (gbrain#3737). Isolate
+    // instead: on a chunk failure, retry row-by-row so only the genuinely
+    // unwritable row(s) are skipped; healthy rows still land. Skipped rows
+    // are counted + named (page slug + date) on stderr and flip the exit
+    // code non-zero (see the summary block below) instead of reporting a
+    // clean "N entries" success over a dropped entry.
     for (let i = 0; i < timelineRows.length; i += BATCH_SIZE) {
-      timelineCreated += await engine.addTimelineEntriesBatch(timelineRows.slice(i, i + BATCH_SIZE), { auditSite: 'extract.stale' });
+      const chunk = timelineRows.slice(i, i + BATCH_SIZE);
+      try {
+        timelineCreated += await engine.addTimelineEntriesBatch(chunk, { auditSite: 'extract.stale' });
+      } catch {
+        for (const row of chunk) {
+          try {
+            timelineCreated += await engine.addTimelineEntriesBatch([row], { auditSite: 'extract.stale' });
+          } catch (rowErr) {
+            timelineWriteFailures++;
+            const msg = rowErr instanceof Error ? rowErr.message : String(rowErr);
+            if (!firstTimelineWriteError) firstTimelineWriteError = msg;
+            console.error(`[extract.stale] skipping unwritable timeline entry on page "${row.slug}" (${row.date}): ${msg}`);
+          }
+        }
+      }
     }
     // Stamp LAST, directly (not the swallowing stampExtracted) so a stamp
     // failure surfaces instead of looping forever.
@@ -2030,6 +2074,13 @@ export async function extractStaleFromDB(
     if (skippedMissingTarget > 0) {
       console.log(`Skipped ${skippedMissingTarget} candidate(s) whose target page doesn't exist (references to non-pages are never persisted).`);
     }
+    if (timelineWriteFailures > 0) {
+      console.log(
+        `Skipped ${timelineWriteFailures} timeline entr${timelineWriteFailures === 1 ? 'y' : 'ies'} that couldn't be written` +
+        (firstTimelineWriteError ? ` (first error: ${firstTimelineWriteError})` : '') +
+        ` — see the "[extract.stale] skipping" warnings above for the affected page(s). Their page(s) were still marked extracted.`,
+      );
+    }
     if (budgetHit && staleRemaining > 0) {
       console.log(`Time budget reached — ${staleRemaining} page(s) still stale. Re-run 'gbrain extract --stale' (or pass --catch-up) to continue.`);
     }
@@ -2038,9 +2089,14 @@ export async function extractStaleFromDB(
       action: 'extract_stale_done', links_created: linksCreated, timeline_created: timelineCreated,
       pages_processed: pagesProcessed, stale_remaining: staleRemaining, budget_hit: budgetHit,
       skipped_missing_target: skippedMissingTarget,
+      timeline_write_failures: timelineWriteFailures,
+      first_timeline_write_error: firstTimelineWriteError,
     }) + '\n');
   }
-  return { linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget };
+  return {
+    linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget,
+    timelineWriteFailures, firstTimelineWriteError,
+  };
 }
 
 /**
