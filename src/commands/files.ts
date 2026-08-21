@@ -1,11 +1,12 @@
 import { readFileSync, readdirSync, statSync, lstatSync, existsSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
 import { join, relative, extname, basename, dirname } from 'path';
 import { createHash } from 'crypto';
-import type { BrainEngine } from '../core/engine.ts';
+import type { BrainEngine, FileSpec } from '../core/engine.ts';
 import { sqlQueryForEngine, executeRawJsonb } from '../core/sql-query.ts';
 import { humanSize } from '../core/file-resolver.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
+import { resolvePageWriteTarget } from '../core/write-through.ts';
 
 /** Size threshold: files >= 100 MB use TUS resumable upload */
 const SIZE_THRESHOLD = 100 * 1024 * 1024;
@@ -181,10 +182,12 @@ async function uploadFile(engine: BrainEngine, args: string[]) {
  * Smart upload with size routing and .redirect.yaml pointer creation.
  *
  * Size routing:
- *   < 100 MB text/PDF  → stays in git (brain repo), no cloud upload
+ *   < 100 MB text/PDF  → copied into the brain repo as a `.raw/` sidecar
+ *                         next to the page, no cloud upload (#2297)
  *   >= 100 MB OR media  → upload to cloud storage, create .redirect.yaml pointer
  *
- * The .redirect.yaml pointer stays in the brain repo so git tracks what was stored.
+ * Both branches persist a `files` row AND write into the brain repo, so
+ * neither silently reports success without actually persisting the file.
  */
 async function uploadRaw(engine: BrainEngine, args: string[]) {
   const filePath = args.find(a => !a.startsWith('--'));
@@ -204,13 +207,83 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
   const needsCloud = stat.size >= SIZE_THRESHOLD || isMedia;
 
   if (!needsCloud) {
-    // Small text/PDF files stay in git
+    // Small text/PDF files are copied into the brain repo as a `.raw/`
+    // sidecar directory alongside the page (matches
+    // skills/_brain-filing-rules.md's documented convention) and recorded
+    // in the `files` table (#2297). Previously this branch printed
+    // `success: true` and returned WITHOUT copying anything or inserting a
+    // row — every small "raw" upload silently vanished while the command
+    // reported success.
+    const content = readFileSync(filePath);
+    const hash = createHash('sha256').update(content).digest('hex');
+
+    // Read-only lookup: getPage(slug) with no opts matches the slug in ANY
+    // source (first match). Used ONLY to discover which source owns the
+    // page — the write below is pinned to that SAME source, so the read
+    // and write never disagree about scope.
+    const owningPage = pageSlug ? await engine.getPage(pageSlug) : null;
+    const sourceId = owningPage?.source_id ?? 'default';
+
+    let repoRoot: string;
+    let sidecarPath: string;
+    if (pageSlug) {
+      const target = await resolvePageWriteTarget(engine, pageSlug, sourceId);
+      if (!target.ok) {
+        console.error(JSON.stringify({
+          success: false,
+          storage: 'git',
+          reason: target.skipped,
+          message: `Could not persist the raw upload: no brain-repo location for page "${pageSlug}" (${target.skipped}).`,
+        }));
+        process.exit(1);
+      }
+      repoRoot = target.writeRoot;
+      const pageDir = dirname(target.filePath);
+      const pageName = basename(target.filePath, extname(target.filePath));
+      sidecarPath = join(pageDir, '.raw', pageName, filename);
+    } else {
+      // No --page given: fall back to the default source's repo root,
+      // mirroring the cloud branch's existing `unsorted/` convention below.
+      const configuredRoot = await engine.getConfig('sync.repo_path');
+      if (!configuredRoot || !existsSync(configuredRoot)) {
+        console.error(JSON.stringify({
+          success: false,
+          storage: 'git',
+          reason: 'no_repo_configured',
+          message: 'No brain repo path configured (sync.repo_path) — cannot persist a raw upload without --page or a configured repo.',
+        }));
+        process.exit(1);
+      }
+      repoRoot = configuredRoot;
+      sidecarPath = join(repoRoot, 'unsorted', '.raw', `${hash.slice(0, 8)}-${filename}`);
+    }
+
+    mkdirSync(dirname(sidecarPath), { recursive: true });
+    writeFileSync(sidecarPath, content);
+
+    const storagePath = relative(repoRoot, sidecarPath);
+    const fileSpec: FileSpec = {
+      source_id: sourceId,
+      page_slug: pageSlug,
+      page_id: owningPage?.id ?? null,
+      filename,
+      storage_path: storagePath,
+      mime_type: mimeType,
+      size_bytes: stat.size,
+      content_hash: `sha256:${hash}`,
+      metadata: { type: fileType, upload_method: 'git' },
+    };
+    const { id: fileId } = await engine.upsertFile(fileSpec);
+
     console.log(JSON.stringify({
       success: true,
       storage: 'git',
-      path: filePath,
+      path: sidecarPath,
+      storage_path: storagePath,
       size: stat.size,
       size_human: humanSize(stat.size),
+      hash: `sha256:${hash}`,
+      file_id: fileId,
     }));
     return;
   }
