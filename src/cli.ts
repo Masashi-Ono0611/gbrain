@@ -193,6 +193,19 @@ const CLI_ONLY_SELF_HELP = new Set([
   // ZE interim cleanup: the retired ze-switch shim ships truthful help
   // (sunset refusal + canonical migration command); the generic stub hid it.
   'ze-switch',
+  // #3686: eval already parses '--help'/'-h' into opts.help and has its own
+  // printHelp() (14 subcommands' worth of usage) — both unreachable behind
+  // the generic short-circuit. Same "sources" pattern (#4133).
+  // #3686 also named `storage` and `reindex`, but neither has a real --help
+  // path to route to today: runStorage's only real subcommand is `status`,
+  // with no help renderer (an unrecognized subcommand exits 1 with an
+  // error, so adding it here would turn `--help` into an error+exit1 —
+  // worse than today's stub); reindex has no --help handling anywhere in
+  // its dispatch chain, so `--help` would fall through and actually START
+  // a reindex run. Both need real help text written first — a different,
+  // larger fix than routing around this short-circuit — so they're left
+  // out of this PR.
+  'eval',
 ]);
 
 /**

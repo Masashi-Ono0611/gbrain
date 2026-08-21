@@ -51,6 +51,13 @@ const STILL_NEEDS_A_BRAIN = [
   'brainstorm',
   'config',
   'embed',
+  // #3686: eval's `case 'eval':` in cli.ts receives an already-connected
+  // `engine` (connectEngine() runs earlier in main(), unconditionally for
+  // any CLI_ONLY command not registered in SELF_HELP_WITHOUT_ENGINE), so
+  // `eval --help` still needs a brain even though eval.ts's own printHelp()
+  // is now reachable once one exists. Making it brainless too would mean
+  // wiring eval into SELF_HELP_WITHOUT_ENGINE — a bigger, separate change.
+  'eval',
   'lsd',
   'migrate',
   'pages',

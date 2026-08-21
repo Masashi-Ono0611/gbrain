@@ -15,9 +15,9 @@
  * cli.ts internals).
  */
 
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -297,4 +297,118 @@ describe('`sources webhook --help` reaches its own detailed help, not the genera
     expect(stderr).not.toContain('--github-repo');
     expect(stderr).not.toContain('TypeError');
   });
+});
+
+describe('#3686 — eval --help reaches its own detailed usage instead of the circular generic stub', () => {
+  // Unlike `sources` (#4133), `eval` still needs a brain to reach this point
+  // at all — `case 'eval':` in cli.ts receives an already-connected engine
+  // (see test/cli-help-without-brain.serial.test.ts's STILL_NEEDS_A_BRAIN
+  // entry for that half). This describe block tests the OTHER half: once
+  // runEvalCommand IS reached (with any engine — the help path never
+  // dereferences it, verified by reading eval.ts's dispatch chain), does
+  // `opts.help` actually reach printHelp()'s full 14-subcommand-adjacent
+  // usage instead of the generic one-line stub the issue reported. Cheaper
+  // and more direct than a subprocess spawn against a real PGLite brain.
+  test('runEvalCommand(engine, ["--help"]) prints the detailed usage block, not the generic stub', async () => {
+    const { runEvalCommand } = await import('../src/commands/eval.ts');
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (msg?: unknown) => { logs.push(String(msg)); };
+    try {
+      // The help path (opts.help check, line ~124-127 of eval.ts) runs
+      // before `engine` is ever touched — confirmed by reading every `if
+      // (sub === ...)` branch above it, none of which match '--help'.
+      await runEvalCommand({} as never, ['--help']);
+    } finally {
+      console.log = originalLog;
+    }
+    const out = logs.join('\n');
+    expect(out).toContain('gbrain eval — measure and compare retrieval quality');
+    expect(out).toContain('--qrels <path|json>');
+    expect(out).toContain('QRELS FORMAT');
+    expect(out).toContain('--rrf-k <n>');
+    // The generic short-circuit's stub text must never appear — its
+    // presence would mean this test is exercising the OLD unreached path.
+    expect(out).not.toContain('run gbrain --help for the full command list');
+  });
+
+  test('runEvalCommand(engine, ["-h"]) reaches the same detailed usage', async () => {
+    const { runEvalCommand } = await import('../src/commands/eval.ts');
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (msg?: unknown) => { logs.push(String(msg)); };
+    try {
+      await runEvalCommand({} as never, ['-h']);
+    } finally {
+      console.log = originalLog;
+    }
+    expect(logs.join('\n')).toContain('gbrain eval — measure and compare retrieval quality');
+  });
+});
+
+describe('#3686 — `gbrain eval --help` end-to-end through the real dispatcher (with a brain)', () => {
+  // Codex review flagged that the two unit tests above call runEvalCommand
+  // directly — they'd pass even without the CLI_ONLY_SELF_HELP change,
+  // since eval.ts's own --help parsing was already correct before this fix;
+  // they only prove eval.ts's half. This block proves the OTHER half: that
+  // `gbrain eval --help`, spawned as the real CLI entrypoint, actually
+  // reaches that code instead of the dispatcher's generic short-circuit.
+  //
+  // Needs a brain (unlike this file's other tests, which use runCli's fixed
+  // nonexistent GBRAIN_HOME) — same lightweight setup as
+  // test/ambient-recall-cli.test.ts: hand-write config.json pointing at a
+  // PGLite path and let the first real CLI invocation run initSchema, no
+  // full `gbrain init` subprocess needed.
+  let home: string;
+
+  function runWithBrain(args: string[]): { stdout: string; stderr: string; status: number } {
+    const r = spawnSync('bun', ['--no-env-file', 'run', 'src/cli.ts', ...args], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GBRAIN_HOME: home,
+        DATABASE_URL: '',
+        GBRAIN_DATABASE_URL: '',
+        GBRAIN_SKIP_STARTUP_HOOKS: '1',
+      },
+      timeout: 60_000,
+    });
+    return { stdout: r.stdout ?? '', stderr: r.stderr ?? '', status: r.status ?? -1 };
+  }
+
+  beforeAll(() => {
+    home = mkdtempSync(join(tmpdir(), 'gbrain-eval-help-'));
+    mkdirSync(join(home, '.gbrain'), { recursive: true });
+    writeFileSync(
+      join(home, '.gbrain', 'config.json'),
+      JSON.stringify({ engine: 'pglite', database_path: join(home, '.gbrain', 'brain.pglite') }),
+    );
+    // Warm the brain once (pays initSchema/migrations here, not in the
+    // timed assertions below).
+    const warm = runWithBrain(['status', '--json']);
+    expect(warm.status).toBe(0);
+  }, 60_000);
+
+  afterAll(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test('`gbrain eval --help` exits 0 with the detailed usage, not the generic one-line stub', () => {
+    const { stdout, status } = runWithBrain(['eval', '--help']);
+    expect(status).toBe(0);
+    expect(stdout).toContain('gbrain eval — measure and compare retrieval quality');
+    expect(stdout).toContain('QRELS FORMAT');
+    // This exact phrase is printCliOnlyHelp's stub text (src/cli.ts). Its
+    // presence would mean the dispatcher never reached CLI_ONLY_SELF_HELP's
+    // new 'eval' entry and this test would be exercising the pre-fix path.
+    expect(stdout).not.toContain('run gbrain --help for the full command list');
+    expect(stdout).not.toBe('Usage: gbrain eval\n\ngbrain eval - run gbrain --help for the full command list.\n');
+  }, 60_000);
+
+  test('`gbrain eval -h` reaches the same detailed usage', () => {
+    const { stdout, status } = runWithBrain(['eval', '-h']);
+    expect(status).toBe(0);
+    expect(stdout).toContain('gbrain eval — measure and compare retrieval quality');
+  }, 60_000);
 });
