@@ -32,6 +32,7 @@ import { AIConfigError } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
 import { parseTemporalWindow } from './temporal-window.ts';
+import { addTakeToPage, resolveTakesRepoDir, TakesWriteError } from '../takes-write.ts';
 
 /** Anthropic Messages client interface — same shape used by subagent.ts so test stubs can be shared. */
 export interface ThinkLLMClient {
@@ -861,6 +862,121 @@ export async function persistSynthesis(
 
   const persisted = await persistCitations(engine, page.id, result.citations);
   return { slug, evidenceInserted: persisted.inserted, warnings: persisted.warnings };
+}
+
+// ─── --take persistence [#2556] ──────────────────────────────────────────
+// `RunThinkOpts.take` was declared and documented ("--take appends a take
+// row to the anchor page") but nothing in runThink ever consumed it: the
+// CLI/MCP `think` op both validated + threaded the flag through and only
+// implemented the --save path, so a successful `think --take` run exited 0,
+// printed the synthesis, and wrote zero take rows — no error, no hint.
+
+/** Holder stamped on `think --take` rows: this is the BRAIN's own synthesized
+ * belief (an LLM's multi-hop conclusion), not literally something the
+ * account owner said or believes — so it is filed under the 'brain' holder
+ * rather than resolveOwnerHolder's 'self' default (see the holder
+ * conventions documented in src/core/ops/takes.ts). */
+const THINK_TAKE_HOLDER = 'brain';
+const THINK_TAKE_SOURCE = 'gbrain think';
+/** Takes fence cells are single-line (assertSafeCellText in takes-write.ts
+ * rejects control characters, newlines included) and unbounded synthesis
+ * answers shouldn't blow up a fence row — flattenAnswerForTakeClaim bounds
+ * at this length and reports TAKE_CLAIM_TRUNCATED when it had to cut. */
+export const THINK_TAKE_CLAIM_MAX_CHARS = 2000;
+
+/**
+ * Flatten a synthesis answer into a single-line take claim: strip the
+ * "## Gaps" section (that's carried separately on `ThinkResult.gaps`, not
+ * part of the claim), collapse every run of whitespace/control characters
+ * (newlines included) to a single space, and bound the length.
+ */
+export function flattenAnswerForTakeClaim(answer: string): { claim: string; truncated: boolean } {
+  const stripped = stripGapsSection(answer);
+  // Avoid a regex character class of raw control bytes (fragile to carry
+  // through tooling/copy-paste) — walk code points and blank out C0/DEL
+  // controls directly, then collapse the resulting whitespace runs.
+  let noControls = '';
+  for (const ch of stripped) {
+    const code = ch.codePointAt(0) ?? 0;
+    noControls += (code < 0x20 || code === 0x7f) ? ' ' : ch;
+  }
+  const flat = noControls.replace(/\s+/g, ' ').trim();
+  if (flat.length > THINK_TAKE_CLAIM_MAX_CHARS) {
+    return { claim: flat.slice(0, THINK_TAKE_CLAIM_MAX_CHARS), truncated: true };
+  }
+  return { claim: flat, truncated: false };
+}
+
+export interface PersistThinkTakeResult {
+  /** Row number on the anchor page's takes fence, or null when nothing was written. */
+  rowNum: number | null;
+  /** The anchor slug the row was written to, or null when nothing was written. */
+  slug: string | null;
+  warnings: string[];
+}
+
+/**
+ * Persist a `--take` row on the anchor page (#2556 fix). Mirrors
+ * persistSynthesis's shape: never throws for an expected non-write (empty
+ * synthesis, missing anchor, no writable markdown repo) — it returns a
+ * warning code instead, so the CLI can exit non-zero with a clear message
+ * and the MCP op can fold the warning into `ThinkResult.warnings` without
+ * turning a read op's write-adjacent flag into a hard error envelope.
+ *
+ * Routes through `addTakeToPage` (src/core/takes-write.ts) — the SAME
+ * markdown-first + DB-mirror writer `gbrain takes add` and the `takes_add`
+ * MCP op use — rather than calling `engine.addTakesBatch` directly. Markdown
+ * is canonical for takes (see takes-write.ts's header): a DB-only insert
+ * would be silently clobbered by the next sync/extract reconcile, which is
+ * why a naive direct-`addTakesBatch` fix isn't safe here.
+ */
+export async function persistThinkTake(
+  engine: BrainEngine,
+  result: ThinkResult,
+  opts: {
+    anchor?: string;
+    sourceId?: string;
+    allowList?: readonly string[] | null;
+    lockTimeoutMs?: number;
+  },
+): Promise<PersistThinkTakeResult> {
+  // Same persistence gate as persistSynthesis: `=== false` so pre-existing/
+  // test ThinkResult literals without the field still persist (back-compat).
+  if (result.synthesisOk === false) {
+    return { rowNum: null, slug: null, warnings: ['TAKE_SYNTHESIS_EMPTY_NOT_PERSISTED'] };
+  }
+  if (!opts.anchor) {
+    return { rowNum: null, slug: null, warnings: ['TAKE_REQUIRES_ANCHOR'] };
+  }
+
+  const brainDir = await resolveTakesRepoDir(engine);
+  if (!brainDir) {
+    return { rowNum: null, slug: null, warnings: ['TAKE_MIRROR_UNAVAILABLE'] };
+  }
+
+  const { claim, truncated } = flattenAnswerForTakeClaim(result.answer);
+  const warnings: string[] = truncated ? ['TAKE_CLAIM_TRUNCATED'] : [];
+
+  try {
+    const { rowNum } = await addTakeToPage(
+      {
+        engine,
+        slug: opts.anchor,
+        brainDir,
+        sourceId: opts.sourceId,
+        allowList: opts.allowList ?? null,
+        ...(opts.lockTimeoutMs !== undefined ? { lockTimeoutMs: opts.lockTimeoutMs } : {}),
+      },
+      { claim, kind: 'take', holder: THINK_TAKE_HOLDER, source: THINK_TAKE_SOURCE },
+    );
+    return { rowNum, slug: opts.anchor, warnings };
+  } catch (err) {
+    if (err instanceof TakesWriteError) {
+      warnings.push(`TAKE_WRITE_FAILED:${err.code}`);
+      return { rowNum: null, slug: null, warnings };
+    }
+    throw err;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────

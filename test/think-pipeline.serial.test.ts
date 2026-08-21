@@ -1,10 +1,17 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operationsByName } from '../src/core/operations.ts';
-import { runThink, persistSynthesis, type ThinkLLMClient } from '../src/core/think/index.ts';
+import {
+  runThink, persistSynthesis, persistThinkTake, flattenAnswerForTakeClaim,
+  THINK_TAKE_CLAIM_MAX_CHARS, type ThinkLLMClient,
+} from '../src/core/think/index.ts';
 import { sanitizeTakeForPrompt, renderTakesBlock } from '../src/core/think/sanitize.ts';
 import { resolveCitations, parseInlineCitations, normalizeStructuredCitations } from '../src/core/think/cite-render.ts';
 import { runGather, renderPagesBlock } from '../src/core/think/gather.ts';
+import { parseTakesFence } from '../src/core/takes-fence.ts';
 import { withoutAnthropicKey } from './helpers/no-anthropic-key.ts';
 
 let engine: PGLiteEngine;
@@ -612,5 +619,196 @@ describe('think MCP op — #1698 C3 + #10', () => {
     const res: any = await withoutAnthropicKey(() => op.handler(baseCtx(false) as any, { question: 'op empty save test', save: true }));
     expect(res.saved_slug).toBeNull();
     expect(res.warnings).toContain('SYNTHESIS_EMPTY_NOT_PERSISTED');
+  });
+});
+
+// #2556: `RunThinkOpts.take` was declared and documented ("--take appends a
+// take row to the anchor page") but nothing consumed it — a successful
+// `think --take` run (CLI and MCP alike) exited 0, printed the synthesis,
+// and silently wrote zero take rows. persistThinkTake is the fix; these
+// tests exercise it directly (the shared function both the CLI and the
+// think MCP op now call) plus the op-level gating/wiring around it.
+describe('flattenAnswerForTakeClaim', () => {
+  test('short single-line answer passes through unchanged', () => {
+    const { claim, truncated } = flattenAnswerForTakeClaim('Alice is CEO of Acme.');
+    expect(claim).toBe('Alice is CEO of Acme.');
+    expect(truncated).toBe(false);
+  });
+
+  test('multi-line answer collapses to one line and drops the Gaps section', () => {
+    const answer = [
+      'Alice founded Acme in 2019.',
+      '',
+      'She has since raised two rounds of funding.',
+      '',
+      '## Gaps',
+      '',
+      '- Unclear headcount',
+    ].join('\n');
+    const { claim, truncated } = flattenAnswerForTakeClaim(answer);
+    expect(claim).not.toContain('\n');
+    expect(claim).not.toContain('Gaps');
+    expect(claim).not.toContain('Unclear headcount');
+    expect(claim).toBe('Alice founded Acme in 2019. She has since raised two rounds of funding.');
+    expect(truncated).toBe(false);
+  });
+
+  test('bounds at THINK_TAKE_CLAIM_MAX_CHARS and reports truncation', () => {
+    const long = 'x'.repeat(THINK_TAKE_CLAIM_MAX_CHARS + 500);
+    const { claim, truncated } = flattenAnswerForTakeClaim(long);
+    expect(claim.length).toBe(THINK_TAKE_CLAIM_MAX_CHARS);
+    expect(truncated).toBe(true);
+  });
+});
+
+describe('persistThinkTake — #2556 fix', () => {
+  let repo: string;
+  let danaPageId: number;
+  const DANA_SLUG = 'people/dana-example';
+
+  function danaMd(): string {
+    return readFileSync(join(repo, `${DANA_SLUG}.md`), 'utf-8');
+  }
+
+  beforeAll(async () => {
+    repo = mkdtempSync(join(tmpdir(), 'gbrain-think-take-repo-'));
+    await engine.setConfig('sync.repo_path', repo);
+    const dana = await engine.putPage(DANA_SLUG, {
+      title: 'Dana', type: 'person', compiled_truth: 'Dana leads platform engineering.',
+    });
+    danaPageId = dana.id;
+    mkdirSync(join(repo, 'people'), { recursive: true });
+    writeFileSync(join(repo, `${DANA_SLUG}.md`), `# ${DANA_SLUG}\n\nDana leads platform engineering.\n`, 'utf-8');
+  });
+
+  afterAll(async () => {
+    await engine.unsetConfig('sync.repo_path');
+  });
+
+  test('writes a take row to BOTH the markdown fence (canonical) and the DB mirror', async () => {
+    const stubClient: ThinkLLMClient = {
+      create: async () => ({
+        id: 'msg_take_stub', type: 'message', role: 'assistant', model: 'stub',
+        stop_reason: 'end_turn', stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, server_tool_use: null, service_tier: null },
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            answer: 'Dana is the strongest platform engineer on the team.',
+            citations: [], gaps: [],
+          }),
+        }],
+      }),
+    };
+    const result = await runThink(engine, { question: 'take test', anchor: DANA_SLUG, client: stubClient });
+    expect(result.synthesisOk).toBe(true);
+
+    const persisted = await persistThinkTake(engine, result, { anchor: DANA_SLUG });
+    expect(persisted.warnings).toEqual([]);
+    expect(persisted.slug).toBe(DANA_SLUG);
+    expect(persisted.rowNum).not.toBeNull();
+    const rowNum = persisted.rowNum as number;
+
+    // Markdown is canonical: the fence on disk carries the row.
+    const fence = parseTakesFence(danaMd());
+    expect(fence.takes.length).toBe(1);
+    expect(fence.takes[0].claim).toBe('Dana is the strongest platform engineer on the team.');
+    expect(fence.takes[0].kind).toBe('take');
+    expect(fence.takes[0].holder).toBe('brain');
+
+    // DB mirror carries the same row (this is what `SELECT count(*) FROM
+    // takes` — the reporter's exact repro check — now finds instead of 0).
+    const rows = await engine.listTakes({ page_id: danaPageId, active: true });
+    expect(rows.length).toBe(1);
+    expect(rows[0].row_num).toBe(rowNum);
+    expect(rows[0].holder).toBe('brain');
+    expect(rows[0].source).toBe('gbrain think');
+  });
+
+  test('refuses (no throw) when synthesis produced no real answer', async () => {
+    const result = await withoutAnthropicKey(() => runThink(engine, { question: 'take empty test', anchor: DANA_SLUG }));
+    expect(result.synthesisOk).toBe(false);
+    const persisted = await persistThinkTake(engine, result, { anchor: DANA_SLUG });
+    expect(persisted.rowNum).toBeNull();
+    expect(persisted.slug).toBeNull();
+    expect(persisted.warnings).toContain('TAKE_SYNTHESIS_EMPTY_NOT_PERSISTED');
+  });
+
+  test('refuses when no anchor is supplied (take needs a target page)', async () => {
+    const stubClient: ThinkLLMClient = {
+      create: async () => ({
+        id: 'msg_take_noanchor', type: 'message', role: 'assistant', model: 'stub',
+        stop_reason: 'end_turn', stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, server_tool_use: null, service_tier: null },
+        content: [{ type: 'text', text: JSON.stringify({ answer: 'An answer with no anchor.', citations: [], gaps: [] }) }],
+      }),
+    };
+    const result = await runThink(engine, { question: 'no anchor test', client: stubClient });
+    expect(result.synthesisOk).toBe(true);
+    const persisted = await persistThinkTake(engine, result, {});
+    expect(persisted.rowNum).toBeNull();
+    expect(persisted.warnings).toContain('TAKE_REQUIRES_ANCHOR');
+  });
+
+  test('refuses when the brain has no writable markdown repo configured', async () => {
+    await engine.unsetConfig('sync.repo_path');
+    try {
+      const stubClient: ThinkLLMClient = {
+        create: async () => ({
+          id: 'msg_take_nomirror', type: 'message', role: 'assistant', model: 'stub',
+          stop_reason: 'end_turn', stop_sequence: null,
+          usage: { input_tokens: 5, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, server_tool_use: null, service_tier: null },
+          content: [{ type: 'text', text: JSON.stringify({ answer: 'No mirror configured.', citations: [], gaps: [] }) }],
+        }),
+      };
+      const result = await runThink(engine, { question: 'no mirror test', anchor: DANA_SLUG, client: stubClient });
+      const persisted = await persistThinkTake(engine, result, { anchor: DANA_SLUG });
+      expect(persisted.rowNum).toBeNull();
+      expect(persisted.warnings).toContain('TAKE_MIRROR_UNAVAILABLE');
+    } finally {
+      await engine.setConfig('sync.repo_path', repo);
+    }
+  });
+});
+
+describe('think MCP op — --take wiring (#2556)', () => {
+  const baseCtx = (remote: boolean) => ({
+    engine, config: {} as any, dryRun: false, remote,
+    logger: { info() {}, warn() {}, error() {}, debug() {} } as any,
+  });
+  let repo: string;
+  const ERIN_SLUG = 'people/erin-example';
+
+  beforeAll(async () => {
+    repo = mkdtempSync(join(tmpdir(), 'gbrain-think-take-op-repo-'));
+    await engine.setConfig('sync.repo_path', repo);
+    await engine.putPage(ERIN_SLUG, { title: 'Erin', type: 'person', compiled_truth: 'Erin runs growth.' });
+    mkdirSync(join(repo, 'people'), { recursive: true });
+    writeFileSync(join(repo, `${ERIN_SLUG}.md`), `# ${ERIN_SLUG}\n\nErin runs growth.\n`, 'utf-8');
+  });
+
+  afterAll(async () => {
+    await engine.unsetConfig('sync.repo_path');
+  });
+
+  test('local caller: --take requested but no synthesis → take_row_num null + warning surfaced', async () => {
+    const op = operationsByName['think'];
+    const res: any = await withoutAnthropicKey(() =>
+      op.handler(baseCtx(false) as any, { question: 'op empty take test', anchor: ERIN_SLUG, take: true }),
+    );
+    expect(res.take_row_num).toBeNull();
+    expect(res.warnings).toContain('TAKE_SYNTHESIS_EMPTY_NOT_PERSISTED');
+  });
+
+  test('remote caller: --take is server-gated — blocked flag set, nothing written', async () => {
+    const op = operationsByName['think'];
+    const before = await engine.listTakes({ page_slug: ERIN_SLUG, active: true });
+    const res: any = await withoutAnthropicKey(() =>
+      op.handler(baseCtx(true) as any, { question: 'op remote take test', anchor: ERIN_SLUG, take: true }),
+    );
+    expect(res.take_row_num).toBeNull();
+    expect(res.remote_persisted_blocked).toBe(true);
+    const after = await engine.listTakes({ page_slug: ERIN_SLUG, active: true });
+    expect(after.length).toBe(before.length);
   });
 });

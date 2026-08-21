@@ -6,7 +6,7 @@
  * degrades to gather-only output with a warning if missing.
  */
 import type { BrainEngine } from '../core/engine.ts';
-import { runThink, persistSynthesis, stripGapsSection } from '../core/think/index.ts';
+import { runThink, persistSynthesis, persistThinkTake, stripGapsSection } from '../core/think/index.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
 import { canonicalLookup } from '../core/model-pricing.ts';
@@ -65,6 +65,11 @@ the synthesis page is persisted AND printed. If --save is given but no synthesis
 was produced (no LLM available, or empty result), nothing is saved and the command
 exits non-zero.
 
+--take appends the synthesized answer as a take row (kind=take, holder=brain)
+on the anchor page. If --take is given but no synthesis was produced, or the
+brain has no writable markdown repo configured, nothing is written and the
+command exits non-zero.
+
 Set ANTHROPIC_API_KEY (or run: gbrain config set anthropic_api_key ...) to run
 real synthesis. Without it AND without --save, the gather phase still runs and
 prints what would have been the input (exit 0).
@@ -114,6 +119,7 @@ prints what would have been the input (exit 0).
   let result: any;
   let savedSlug: string | undefined;
   let evidenceInserted = 0;
+  let takeRowNum: number | undefined;
   const cfg = loadConfig();
   if (isThinClient(cfg)) {
     if (save || take) {
@@ -160,6 +166,20 @@ prints what would have been the input (exit 0).
           process.exit(1);
         }
       }
+
+      // Persist if --take (#2556: this used to reach runThink and vanish —
+      // opts.take was declared and documented but nothing consumed it).
+      if (take) {
+        const persistedTake = await persistThinkTake(engine, result, { anchor });
+        takeRowNum = persistedTake.rowNum ?? undefined;
+        for (const w of persistedTake.warnings) result.warnings.push(w);
+        if (persistedTake.rowNum === null) {
+          console.error(
+            `think: --take requested but no take row was written (${persistedTake.warnings.join(', ') || 'unknown reason'}).`,
+          );
+          process.exit(1);
+        }
+      }
     } catch (e) {
       // #1698: an unresolvable explicit --model throws here. Clean non-zero exit
       // with the actionable message, not a stack trace.
@@ -179,6 +199,7 @@ prints what would have been the input (exit 0).
       cost_usd: costUsd ?? null,
       saved_slug: savedSlug ?? null,
       evidence_inserted: evidenceInserted,
+      take_row_num: takeRowNum ?? null,
     }, null, 2));
     return;
   }
@@ -197,6 +218,9 @@ prints what would have been the input (exit 0).
   console.log(`Model: ${result.modelUsed} | Pages: ${result.pagesGathered} | Takes: ${result.takesGathered} | Graph: ${result.graphHits} | Citations: ${result.citations.length}${costSuffix}`);
   if (savedSlug) {
     console.log(`Saved: ${savedSlug} (${evidenceInserted} evidence rows)`);
+  }
+  if (takeRowNum !== undefined) {
+    console.log(`Take: ${anchor}#${takeRowNum}`);
   }
   if (result.warnings.length > 0) {
     console.error(`Warnings: ${result.warnings.join(', ')}`);

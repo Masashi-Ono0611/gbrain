@@ -204,7 +204,7 @@ const think: Operation = {
     // forwards to findTrajectory. CLI callers don't go through this op
     // and get default scope + remote=false from runThink's CLI path.
     const thinkScope = thinkSourceScopeOpts(ctx);
-    const { runThink, persistSynthesis } = await import('../think/index.ts');
+    const { runThink, persistSynthesis, persistThinkTake } = await import('../think/index.ts');
     const result = await runThink(ctx.engine, {
       question: String(p.question),
       anchor: p.anchor ? String(p.anchor) : undefined,
@@ -234,12 +234,27 @@ const think: Operation = {
       for (const w of persisted.warnings) result.warnings.push(w);
     }
 
+    // Persist if --take was passed locally (#2556: this used to be a no-op —
+    // the flag reached here and nothing consumed it). local-only per safeTake
+    // above, so allowList stays null (unfenced trusted-CLI write).
+    let takeRowNum: number | null = null;
+    if (safeTake) {
+      const persistedTake = await persistThinkTake(ctx.engine, result, {
+        anchor: p.anchor ? String(p.anchor) : undefined,
+        sourceId: thinkScope.sourceId,
+        allowList: null,
+      });
+      takeRowNum = persistedTake.rowNum;
+      for (const w of persistedTake.warnings) result.warnings.push(w);
+    }
+
     return {
       ...result,
       // #1698 (#10): the persist-skip signal returns slug '' — map it (and any
       // falsy) to null so callers never see an empty-string "slug".
       saved_slug: savedSlug || null,
       evidence_inserted: evidenceInserted,
+      take_row_num: takeRowNum,
       remote_persisted_blocked: remote && (Boolean(p.save) || Boolean(p.take)),
     };
   },
