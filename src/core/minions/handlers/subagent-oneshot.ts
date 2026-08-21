@@ -538,8 +538,9 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
   // In-batch forward references (page A → page B written later) were dropped
   // by A's own auto-link run because B did not exist yet. Re-run ONLY for
   // pages that actually reference an in-batch sibling — re-running for every
-  // page would double the auto-link work (full slug scan + tx each) for the
-  // common no-forward-refs case. Gated + best-effort inside the wrapper.
+  // page would double the auto-link work (targeted slugsExist lookup + tx
+  // each — #2544) for the common no-forward-refs case. Gated + best-effort
+  // inside the wrapper.
   for (let i = 0; i < parsed.pages.length; i++) {
     const ref = writtenRefs[i];
     if (!ref || ref.status !== 'complete') continue;

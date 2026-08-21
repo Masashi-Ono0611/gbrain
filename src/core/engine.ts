@@ -919,6 +919,26 @@ export interface BrainEngine {
   getAllSlugs(opts?: { sourceId?: string }): Promise<Set<string>>;
 
   /**
+   * Targeted batch existence check: `SELECT slug FROM pages WHERE slug =
+   * ANY($1) AND source_id = $2`. Returns the subset of `slugs` that exist
+   * (order undefined). Slugs absent from the DB are simply absent from the
+   * result set — there is no error/null entry per miss.
+   *
+   * (#2544) Companion to `getAllSlugs`, for callers that only need to know
+   * whether a SMALL, known set of candidate slugs exist rather than the
+   * full brain-wide slug index. `runAutoLink` (src/core/ops/pages.ts) uses
+   * this to validate a page's own wikilink targets without pulling every
+   * slug in the source on every `put_page` call.
+   *
+   * SINGLE-BATCH PRIMITIVE, same convention as `deletePages` /
+   * `resolveSlugsByPaths`: caller chunks to `<= DELETE_BATCH_SIZE` entries.
+   * `sourceId` is REQUIRED (mirrors those two, not the optional/union
+   * fallback on `getAllSlugs`). Empty `slugs` short-circuits to an empty
+   * Set without touching the DB.
+   */
+  slugsExist(slugs: string[], opts: { sourceId: string }): Promise<Set<string>>;
+
+  /**
    * v0.32.8: cross-source page enumeration. Returns one row per (slug,
    * source_id) pair across the brain, ordered by (source_id, slug) for
    * deterministic iteration on large brains. Used by extract-takes,

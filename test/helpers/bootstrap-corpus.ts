@@ -12,9 +12,10 @@
  *     population — bare engine.putPage would skip those post-hooks. Pages are
  *     loaded in TWO passes: pass 1 creates every row; pass 2 re-runs the
  *     idempotent auto-link reconciler now that every wikilink target exists
- *     (runAutoLink filters candidates to slugs present in getAllSlugs, so a
- *     forward reference in a cyclic graph only resolves once its target row
- *     is present). Returns the loaded slugs.
+ *     (runAutoLink filters candidates to slugs its targeted `engine.slugsExist`
+ *     check confirms exist — #2544, formerly a brain-wide `getAllSlugs` scan —
+ *     so a forward reference in a cyclic graph only resolves once its target
+ *     row is present). Returns the loaded slugs.
  *   - loadCorpusBeliefs inserts each belief via engine.insertFact honoring its
  *     declared visibility ('world' | 'private') so a visibility-fence recall
  *     test can assert the private ones never surface. Returns the count.

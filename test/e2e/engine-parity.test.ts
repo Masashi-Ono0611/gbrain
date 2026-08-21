@@ -704,6 +704,48 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     expect(pgliteMap.get('wiki/rsp-missing.md')).toBeUndefined();
   });
 
+  test('#2544 slugsExist parity: same existing-subset Set on both engines, scoped by source', async () => {
+    // A source-exclusive slug ('wiki/se-only-in-other', only in 'se-other')
+    // plus two 'default'-only slugs — proves the sourceId scope isn't
+    // accidentally global (the getAllSlugs full-scan bug this replaces had
+    // an unscoped union-across-sources branch; the targeted primitive must
+    // not resurrect that for the scoped call).
+    for (const eng of [pgEngine, pgliteEngine]) {
+      await eng.executeRaw(
+        `INSERT INTO sources (id, name) VALUES ('se-other', 'se-other') ON CONFLICT DO NOTHING`,
+      );
+      await eng.putPage('wiki/se-1', { type: 'note', title: 't', compiled_truth: 'b', timeline: '' }, { sourceId: 'default' });
+      await eng.putPage('wiki/se-2', { type: 'note', title: 't', compiled_truth: 'b', timeline: '' }, { sourceId: 'default' });
+      await eng.putPage('wiki/se-only-in-other', { type: 'note', title: 't', compiled_truth: 'b', timeline: '' }, { sourceId: 'se-other' });
+    }
+
+    const query = ['wiki/se-1', 'wiki/se-2', 'wiki/se-only-in-other', 'wiki/se-ghost'];
+    const pgFound = await pgEngine.slugsExist(query, { sourceId: 'default' });
+    const pgliteFound = await pgliteEngine.slugsExist(query, { sourceId: 'default' });
+
+    const expected = new Set(['wiki/se-1', 'wiki/se-2']);
+    expect(pgFound).toEqual(expected);
+    expect(pgliteFound).toEqual(expected);
+
+    // The cross-source slug and the ghost slug are both absent — neither
+    // engine leaks the 'se-other' row into a 'default'-scoped query.
+    expect(pgFound.has('wiki/se-only-in-other')).toBe(false);
+    expect(pgliteFound.has('wiki/se-only-in-other')).toBe(false);
+
+    // Scoping the same query to 'se-other' picks up the other-source row
+    // instead, confirming this is genuine per-source scoping, not a fluke
+    // of the 'default' source happening to match.
+    const pgOther = await pgEngine.slugsExist(query, { sourceId: 'se-other' });
+    const pgliteOther = await pgliteEngine.slugsExist(query, { sourceId: 'se-other' });
+    expect(pgOther).toEqual(new Set(['wiki/se-only-in-other']));
+    expect(pgliteOther).toEqual(new Set(['wiki/se-only-in-other']));
+
+    // Empty input short-circuits without touching the DB (documented
+    // contract, mirrors resolveSlugsByPaths/deletePages).
+    expect(await pgEngine.slugsExist([], { sourceId: 'default' })).toEqual(new Set());
+    expect(await pgliteEngine.slugsExist([], { sourceId: 'default' })).toEqual(new Set());
+  });
+
   // v0.41.29.0 — findOrphanPages source scoping parity. Real Postgres
   // coverage for the postgres.js `sql` scalar fragment + `= ANY(${arr}::text[])`
   // array binding (a documented footgun class — the jsonb double-encode saga).

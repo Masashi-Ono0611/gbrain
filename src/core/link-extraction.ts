@@ -113,8 +113,9 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
  * is NO LONGER a drop-gate for markdown links, bare-slug prose refs, or
  * slash-shaped wikilinks — those now match ANY_DIR_SEGMENT and rely on the
  * downstream page-existence checks that every persist path already runs
- * (resolveCandidateSources in extract.ts, the allSlugs filter in put_page
- * auto-link, and addLinksBatch's INNER JOINs as the final backstop). The
+ * (resolveCandidateSources in extract.ts, put_page auto-link's targeted
+ * `engine.slugsExist` filter — #2544, formerly a brain-wide `getAllSlugs`
+ * scan — and addLinksBatch's INNER JOINs as the final backstop). The
  * whitelist survives only as the typed fast-path for pass-2b wikilinks;
  * non-whitelisted `[[dir/...]]` get equivalent treatment in pass 2c.
  */

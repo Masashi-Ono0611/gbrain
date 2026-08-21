@@ -179,3 +179,49 @@ describe('withScopedReadTransaction / flag on', () => {
     });
   });
 });
+
+describe('slugsExist (#2544) — routes through withScopedReadTransaction like getAllSlugs', () => {
+  function makeRealEngine(fake: ReturnType<typeof makeFakeSql>): PostgresEngine {
+    const e = new PostgresEngine();
+    (e as unknown as { _sql: unknown })._sql = fake.sql;
+    (e as unknown as { _connectionStyle: string })._connectionStyle = 'instance';
+    return e;
+  }
+
+  test('flag OFF (default): no begin, no set_config — matches getAllSlugs\'s pass-through', async () => {
+    await withEnv({ GBRAIN_RLS_SCOPE_BINDING: undefined }, async () => {
+      const fake = makeFakeSql();
+      const engine = makeRealEngine(fake);
+      const found = await engine.slugsExist(['people/alice'], { sourceId: 'src-a' });
+      expect(found).toEqual(new Set());
+      expect(fake.beginCalls()).toBe(0);
+      expect(setConfigQueries(fake.queries)).toHaveLength(0);
+    });
+  });
+
+  test('flag ON: emits set_config(\'app.scopes\', [sourceId]) inside a transaction before the SELECT', async () => {
+    await withEnv({ GBRAIN_RLS_SCOPE_BINDING: '1' }, async () => {
+      const fake = makeFakeSql();
+      const engine = makeRealEngine(fake);
+      await engine.slugsExist(['people/alice', 'companies/acme'], { sourceId: 'src-a' });
+      expect(fake.beginCalls()).toBe(1);
+      const sc = setConfigQueries(fake.queries);
+      expect(sc).toHaveLength(1);
+      expect(sc[0].params).toEqual(['src-a']);
+      // set_config ran before the SELECT — the transaction's first query.
+      expect(fake.queries[0]).toBe(sc[0]);
+      expect(fake.queries[1].text).toContain('SELECT slug FROM pages');
+    });
+  });
+
+  test('empty input short-circuits without touching the DB, even with the flag on', async () => {
+    await withEnv({ GBRAIN_RLS_SCOPE_BINDING: '1' }, async () => {
+      const fake = makeFakeSql();
+      const engine = makeRealEngine(fake);
+      const found = await engine.slugsExist([], { sourceId: 'src-a' });
+      expect(found).toEqual(new Set());
+      expect(fake.beginCalls()).toBe(0);
+      expect(fake.queries).toHaveLength(0);
+    });
+  });
+});

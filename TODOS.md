@@ -1675,11 +1675,14 @@ master before starting, several fixes landed independently).
   guard. Decide the intended surface alongside PR #2509 (whoknows --explain
   per-result factor breakdown) and delete whichever lane loses. Where:
   `src/cli.ts`, `src/commands/whoknows.ts`, PR #2509.
-- [ ] **P3 — #2544 second half: per-put_page `getAllSlugs` full scan.** The
+- [x] **P3 — #2544 second half: per-put_page `getAllSlugs` full scan.** The
   getChunks egress half shipped in this wave (explicit non-vector column
-  list). The remaining Postgres-egress cost is put_page's per-call
-  `getAllSlugs` table scan — needs a targeted existence probe or cached slug
-  set. Where: `src/core/operations.ts` put_page path, both engines.
+  list). The remaining Postgres-egress cost was put_page's per-call
+  `getAllSlugs` table scan — fixed via a targeted existence probe
+  (`BrainEngine.slugsExist`, both engines) queried against just the page's
+  own candidate slugs instead of every slug in the source. Where:
+  `src/core/ops/pages.ts` `runAutoLink`, `src/core/engine.ts`,
+  `src/core/postgres-engine.ts`, `src/core/pglite-engine.ts`.
 - [ ] **P3 — #1558 admin-UI register form.** The `/admin/api/register-client`
   API now accepts `source` + `federatedRead` (this wave, PR #2016 absorbed);
   the admin SPA form fields + `/admin/api/sources` picker are the UI layer.

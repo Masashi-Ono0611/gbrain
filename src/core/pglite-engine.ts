@@ -2009,6 +2009,26 @@ export class PGLiteEngine implements BrainEngine {
     return (rows as Record<string, unknown>[]).map(rowToPage);
   }
 
+  /**
+   * (#2544) Batch existence check, scoped to a small candidate slug set.
+   * Parity implementation with PostgresEngine.slugsExist. No `deleted_at`
+   * filter — matches getAllSlugs's existing (pre-#2544) visibility
+   * semantics unchanged.
+   */
+  async slugsExist(slugs: string[], opts: { sourceId: string }): Promise<Set<string>> {
+    if (slugs.length === 0) return new Set();
+    if (slugs.length > DELETE_BATCH_SIZE) {
+      throw new Error(
+        `slugsExist: input size ${slugs.length} exceeds DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}. Caller must chunk.`,
+      );
+    }
+    const { rows } = await this.db.query<{ slug: string }>(
+      'SELECT slug FROM pages WHERE slug = ANY($1::text[]) AND source_id = $2',
+      [slugs, opts.sourceId],
+    );
+    return new Set(rows.map(r => r.slug));
+  }
+
   async getAllSlugs(opts?: { sourceId?: string }): Promise<Set<string>> {
     // v0.31.8 (D12): when opts.sourceId is set, return only that source's
     // slugs (used by reconcileLinks so wikilink resolution doesn't span

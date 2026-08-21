@@ -5,7 +5,7 @@
 # Columns: path	max_lines	policy	note
 src/commands/doctor.ts	4366	ratchet	grown v0.46.25.0 fix waves: sunset-aware search-mode check, dead-check pruning (#3626 #1871 #4382)
 src/core/operations.ts	303	ratchet	peel target: containment sprint C4-C7
-src/core/postgres-engine.ts	5989	ratchet	grown v0.46.25.0 fix waves: registry plane + timeline honesty + think temporal windows (#1262 #3827 #4389)
+src/core/postgres-engine.ts	6013	ratchet	grown: targeted slugsExist batch-existence primitive replacing runAutoLink's per-put_page getAllSlugs full scan, now RLS-scope-bound like getAllSlugs (#2544)
 src/core/pglite-engine.ts	5971	ratchet	grown v0.46.24.0 overnight wave: registry-aware writes + stale/invalidate plane unification (#1262); peeled cjk-search (#4299)
 src/core/migrate.ts	668	region-exempt	append-only MIGRATIONS array grows freely; runner logic is ratcheted
 src/commands/sync.ts	4334	ratchet	grown v0.46.25.0 fix waves: delete-slug resolver + msys healing (#3942 #2955)
@@ -15,7 +15,7 @@ src/core/cycle.ts	3099	ratchet	grown v0.46.25.0 fix waves: refresher abort gatin
 src/commands/serve-http.ts	3294	ratchet	grown v0.46.25.0 D2: /mcp per-request teardown (#2844)
 src/commands/jobs.ts	3041	ratchet	grown v0.46.25.0 fix waves: jobs list/get --json (#3685)
 src/core/search/hybrid.ts	2703	ratchet	grown v0.46.25.0 fix waves: cache scope isolation + pool floor + offset bypass (#3871 #3002)
-src/core/engine.ts	2415	ratchet	grown v0.46.25.0 fix waves: timeline dedup contract + registry write contract (#3827 #1262)
+src/core/engine.ts	2435	ratchet	grown: slugsExist batch-existence contract for BrainEngine (#2544)
 src/commands/autopilot.ts	2349	ratchet	grown v0.46.25.0 fix waves: positional validation (#1525) + liveness takeover (#4300)
 src/commands/extract.ts	2066	ratchet	lowered: timeline extractor hoisted to core/timeline-extract.ts (module-cycle fix)
 src/commands/extract-conversation-facts.ts	2045	ratchet	grown v0.46.x per-provider gateway-unavailable copy
@@ -31,7 +31,7 @@ src/core/minions/handlers/subagent.ts	1825	ratchet	merged: master v131 settle re
 src/commands/bootstrap.ts	2010	ratchet	grandfathered at merge (grew past the 1500 cap on master); raised for #4066 HOME_WORKSPACE_GUARD_EXEMPT (status/uninstall/harness)
 src/core/minions/worker.ts	1560	ratchet	grandfathered at merge (grew past the 1500 cap on master, #4170); grown v0.46.11.0 five-issue wave
 src/commands/sources.ts	1790	ratchet	grown v0.46.22.0 phone wave: github source kind (#4104)
-src/core/link-extraction.ts	1467	ratchet	grown v0.46.25.0 delegated wave (#3939 #3723); lowered: stripCodeBlocks + citation loop peeled to markdown-code.ts/timeline-citations.ts (#3892 adoption)
+src/core/link-extraction.ts	1468	ratchet	grown v0.46.25.0 delegated wave (#3939 #3723); lowered: stripCodeBlocks + citation loop peeled to markdown-code.ts/timeline-citations.ts (#3892 adoption); +1 comment-wording fix (#2544)
 src/core/embedding-migration.ts	1545	ratchet	new row: crossed 1500 in v0.46.25.0 fix waves (#4305 #4306 chunk-model truth helpers)
 src/core/github-source.ts	1560	ratchet	new row: crossed the 1500 unlisted cap in v0.46.23.0 review fix wave (scope-state gating, client hardening, symlink containment)
 src/core/bootstrap/harness.ts	1947	ratchet

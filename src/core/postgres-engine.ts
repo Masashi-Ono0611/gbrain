@@ -1624,6 +1624,30 @@ export class PostgresEngine implements BrainEngine {
     });
   }
 
+  /**
+   * (#2544) Batch existence check, scoped to a small candidate slug set.
+   * See BrainEngine.slugsExist JSDoc. No `deleted_at` filter — matches
+   * getAllSlugs's existing (pre-#2544) visibility semantics unchanged.
+   * RLS scope binding (opt-in via GBRAIN_RLS_SCOPE_BINDING) — same pattern
+   * as the scoped `getAllSlugs` branch immediately above, since this is a
+   * source-scoped read of the same table.
+   */
+  async slugsExist(slugs: string[], opts: { sourceId: string }): Promise<Set<string>> {
+    if (slugs.length === 0) return new Set();
+    if (slugs.length > DELETE_BATCH_SIZE) {
+      throw new Error(
+        `slugsExist: input size ${slugs.length} exceeds DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}. Caller must chunk.`,
+      );
+    }
+    return await this.withScopedReadTransaction(undefined, opts.sourceId, async (tx) => {
+      const rows = await tx<{ slug: string }[]>`
+        SELECT slug FROM pages
+         WHERE slug = ANY(${slugs}::text[]) AND source_id = ${opts.sourceId}
+      `;
+      return new Set(rows.map(r => r.slug));
+    });
+  }
+
   async listAllPageRefs(): Promise<Array<{ slug: string; source_id: string }>> {
     // v0.32.8: cross-source page enumeration. ORDER BY (source_id, slug) for
     // deterministic iteration (F11) — same-slug-different-source pages stay

@@ -22,6 +22,7 @@ import { getContentFlag } from '../quarantine.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { isValidSourceId, ALL_SOURCES } from '../source-id.ts';
 import { LIST_PAGES_DESCRIPTION, CAPTURE_DESCRIPTION } from '../operations-descriptions.ts';
+import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
 import { OperationError } from './contract.ts';
 import type { Operation, OperationContext } from './contract.ts';
 import {
@@ -665,7 +666,8 @@ export function autoLinkLockKey(sourceId: string | undefined, slug: string): str
  * #4216 post-batch auto-link reconciliation for the oneshot runner.
  *
  * Within one oneshot batch, page A can wikilink page B that is written LATER
- * in the same batch: at A's put_page, runAutoLink's getAllSlugs filter
+ * in the same batch: at A's put_page, runAutoLink's existence filter (#2544:
+ * targeted `engine.slugsExist`, formerly a brain-wide `getAllSlugs` scan)
  * silently drops the A→B edge (B doesn't exist yet). The content keeps the
  * wikilink; only the links-table edge is missing. This wrapper re-runs the
  * reconciliation for a written page AFTER the whole batch landed, so
@@ -717,10 +719,13 @@ async function runAutoLink(
   // v0.31.8 (codex OV-2): thread sourceId through every read + write inside
   // reconcileLinks. Without this the FS walker reads cross-source links/slugs
   // but writes scoped to one source — phantom stale-deletions and duplicate
-  // inserts. runAutoLink has exactly ONE caller (the put_page handler) and
-  // ctx.sourceId is a REQUIRED string there, so opts.sourceId is always set in
-  // practice; the omitted-opts branches below (and the `?? ''` in
-  // autoLinkLockKey) are belt-and-braces only, not a live back-compat path.
+  // inserts. runAutoLink has two callers (the put_page handler above and
+  // #4216's autoLinkWrittenPage below). ctx.sourceId is a REQUIRED string on
+  // the put_page handler; autoLinkWrittenPage's opts.sourceId is optional at
+  // the type level but its one real caller (subagent-oneshot.ts) always
+  // passes it. So opts.sourceId is always set in practice; the omitted-opts
+  // branches below (and the `?? ''` in autoLinkLockKey) are belt-and-braces
+  // only, not a live back-compat path.
   const sourceOpts = opts?.sourceId ? { sourceId: opts.sourceId } : {};
   const linkSourceOpts = opts?.sourceId
     ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
@@ -745,10 +750,37 @@ async function runAutoLink(
   );
 
   // Resolve which targets exist (skip refs to non-existent pages to avoid FK
-  // violation churn in addLink). One getAllSlugs call upfront, O(1) lookup.
-  // v0.31.8 (D12): scoped to the source when opts.sourceId is set so wikilink
-  // resolution doesn't span unrelated sources.
-  const allSlugs = await engine.getAllSlugs(sourceOpts);
+  // violation churn in addLink). O(1) lookup via a Set built from a TARGETED
+  // existence check (#2544) — engine.slugsExist queried against just this
+  // page's own candidate slugs, not a getAllSlugs() brain-wide scan. The
+  // prior unconditional getAllSlugs() call ran once per put_page regardless
+  // of how many links the page actually had, making it the largest single
+  // egress line on a hosted-Postgres brain (N_pages x N_ingested rows over a
+  // bulk ingest). v0.31.8 (D12): scoped to the source when opts.sourceId is
+  // set so wikilink resolution doesn't span unrelated sources.
+  const candidateSlugSet = new Set<string>();
+  for (const c of candidates) {
+    candidateSlugSet.add(c.targetSlug);
+    if (c.fromSlug) candidateSlugSet.add(c.fromSlug);
+  }
+  const allSlugs = new Set<string>();
+  if (candidateSlugSet.size > 0) {
+    // sourceId is REQUIRED on slugsExist (mirrors deletePages /
+    // resolveSlugsByPaths); default to 'default' to match putPage's own
+    // default when opts.sourceId is unset (belt-and-braces — see the
+    // "ctx.sourceId is a REQUIRED string" note above).
+    const existSourceId = opts?.sourceId ?? 'default';
+    const candidateSlugs = Array.from(candidateSlugSet);
+    // SINGLE-BATCH PRIMITIVE: chunk to DELETE_BATCH_SIZE, same convention as
+    // resolveSlugsForRemovedPaths (src/core/sync-git.ts).
+    for (let i = 0; i < candidateSlugs.length; i += DELETE_BATCH_SIZE) {
+      const found = await engine.slugsExist(
+        candidateSlugs.slice(i, i + DELETE_BATCH_SIZE),
+        { sourceId: existSourceId },
+      );
+      for (const s of found) allSlugs.add(s);
+    }
+  }
   const valid = candidates.filter(c =>
     allSlugs.has(c.targetSlug) && (!c.fromSlug || allSlugs.has(c.fromSlug))
   );
