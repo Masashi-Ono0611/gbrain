@@ -413,9 +413,10 @@ export async function runExtractFacts(
     // page that only happens to mention the BEGIN marker text in passing
     // doesn't false-trigger the guard. This is a narrowing, not a full
     // guarantee — prose that quotes a complete begin+end marker pair
-    // verbatim would still match — but a false positive here only costs an
-    // extra warning-and-preserve cycle, never data loss, so the tradeoff
-    // favors the cheaper check.
+    // verbatim would still match, and would keep matching every cycle
+    // (blocking the page's empty-fence reconcile until the text is edited
+    // out of the timeline) — but it never causes data loss, so the
+    // tradeoff favors the cheaper check over a full markdown-table parse.
     const timeline = page.timeline ?? '';
     const timelineBeginIdx = timeline.indexOf(FACTS_FENCE_BEGIN);
     const hasTimelineFence = timelineBeginIdx !== -1
