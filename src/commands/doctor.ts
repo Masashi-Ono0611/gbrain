@@ -1694,6 +1694,10 @@ export async function buildChecks(
     }
   }
 
+  // v0.42 self_upgrade_health: mode, whether behind, recent failures.
+  // File-plane only (no engine) — keep in parity with doctorReportRemote.
+  checks.push(checkSelfUpgradeHealth());
+
   // --- DB checks (skip if --fast or no engine) ---
 
   if (fastMode || !engine) {

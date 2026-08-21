@@ -1,12 +1,30 @@
-import { describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { doctorSource } from './helpers/doctor-source.ts';
 import { withEnv } from './helpers/with-env.ts';
-import { checkSelfUpgradeHealth } from '../src/commands/doctor.ts';
+import {
+  buildChecks,
+  checkSelfUpgradeHealth,
+  doctorReportRemote,
+} from '../src/commands/doctor.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { writeUpdateCache } from '../src/core/self-upgrade.ts';
 import { logSelfUpgrade } from '../src/core/audit/self-upgrade-audit.ts';
 import { VERSION } from '../src/version.ts';
+
+let engine: PGLiteEngine;
+
+beforeAll(async () => {
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+});
+
+afterAll(async () => {
+  await engine.disconnect();
+});
 
 async function withHome<T>(fn: (home: string) => T | Promise<T>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), 'gbrain-doctor-su-'));
@@ -77,5 +95,26 @@ describe('checkSelfUpgradeHealth', () => {
       expect(c.message).toContain('known-bad');
       expect(c.message).toContain('0.50.0');
     });
+  });
+});
+
+describe('self_upgrade_health doctor registry parity', () => {
+  test('buildChecks() includes the check against a live engine', async () => {
+    await withHome(async () => {
+      const checks = await buildChecks(engine, ['--scope=brain']);
+      expect(checks.map((check) => check.name)).toContain('self_upgrade_health');
+    });
+  });
+
+  test('doctorReportRemote() still includes the check', async () => {
+    await withHome(async () => {
+      const report = await doctorReportRemote(engine);
+      expect(report.checks.map((check) => check.name)).toContain('self_upgrade_health');
+    });
+  });
+
+  test('check-building call stays wired into both doctor surfaces', () => {
+    const matches = doctorSource().match(/checks\.push\(checkSelfUpgradeHealth\(\)\)/g) ?? [];
+    expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 });
