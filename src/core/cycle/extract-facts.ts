@@ -282,6 +282,25 @@ export async function runExtractFacts(
       `fence backfill: \`gbrain apply-migrations --force-retry 0.32.2\` then ` +
       `\`gbrain apply-migrations --yes\`. Or drain individual rows via \`forget_fact\`.`,
     );
+    // #3683: this early return used to skip the ONLY upsertExtractRollup
+    // call for 'facts.fence' (down at the bottom of the function, guarded
+    // by `!opts.dryRun && result.factsInserted > 0` for the receipt and
+    // `!opts.dryRun` for the rollup) — so a guard-triggered run left no
+    // trace in extract_rollup_7d and doctor's extract_health check could
+    // never see halt_count > 0 for this kind. Book the halt here, on the
+    // guard-triggered exit path, so the 7-day aggregate reflects reality.
+    // No receipt: the existing receipt write below is already conditioned
+    // on `result.factsInserted > 0`, which is always 0 on this path (the
+    // guard never touches `facts`), so it's a no-op here regardless.
+    if (!opts.dryRun) {
+      await upsertExtractRollup(engine, {
+        kind: 'facts.fence',
+        source_id: sourceId,
+        cost_delta: 0,
+        round_completed_delta: 0,
+        halt_delta: 1,
+      });
+    }
     return result;
   }
 

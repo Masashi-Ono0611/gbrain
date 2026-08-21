@@ -31,6 +31,11 @@ beforeEach(async () => {
   await (engine as any).db.query('DELETE FROM facts');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await (engine as any).db.query('DELETE FROM pages');
+  // #3683: extract_rollup_7d accumulates deltas per (kind, source_id, day)
+  // via UPSERT — clear it so each test's rollup assertions read only what
+  // that test wrote, not accumulated deltas from earlier tests in this file.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  await (engine as any).db.query("DELETE FROM extract_rollup_7d WHERE kind = 'facts.fence'");
   // #2763: the legacy-row guard only counts rows the v0_32_2 Phase B
   // backfill could actually fence, which requires the source to carry a
   // local_path. The guard tests here simulate a migrated v0.31 brain,
@@ -361,6 +366,57 @@ describe('runExtractFacts — empty-fence guard (Codex R2-#7)', () => {
     expect(rows.rows[0].fact).toBe('legacy claim');
   });
 
+  test('#3683: guard-triggered run books halt_delta=1 into extract_rollup_7d', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
+                          valid_from, source, confidence)
+       VALUES ('default', 'people/alice', 'legacy claim', 'fact', 'private', 'medium',
+               now(), 'mcp:put_page', 1.0)`,
+    );
+    await putPage('people/alice', FACT_FENCE(
+      `| 1 | new fact | fact | 1.0 | world | high | 2026-01-01 |  | s |  |`,
+    ));
+
+    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
+    expect(r.guardTriggered).toBe(true);
+
+    // Before the fix, the early return above skipped the function's only
+    // upsertExtractRollup call, so this row never existed and doctor's
+    // extract_health check could never observe the halt.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rollup = await (engine as any).db.query(
+      `SELECT halt_count, round_completed_count FROM extract_rollup_7d
+        WHERE kind = 'facts.fence' AND source_id = 'default'`,
+    );
+    expect(rollup.rows).toHaveLength(1);
+    expect(Number(rollup.rows[0].halt_count)).toBe(1);
+    expect(Number(rollup.rows[0].round_completed_count)).toBe(0);
+  });
+
+  test('#3683: guard-triggered run in dry-run mode does not write a rollup row', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
+                          valid_from, source, confidence)
+       VALUES ('default', 'people/alice', 'legacy claim', 'fact', 'private', 'medium',
+               now(), 'mcp:put_page', 1.0)`,
+    );
+    await putPage('people/alice', FACT_FENCE(
+      `| 1 | new fact | fact | 1.0 | world | high | 2026-01-01 |  | s |  |`,
+    ));
+
+    const r = await runExtractFacts(engine, { slugs: ['people/alice'], dryRun: true });
+    expect(r.guardTriggered).toBe(true);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rollup = await (engine as any).db.query(
+      `SELECT 1 FROM extract_rollup_7d
+        WHERE kind = 'facts.fence' AND source_id = 'default'`,
+    );
+    expect(rollup.rows).toHaveLength(0);
+  });
+
   test('guard releases when all legacy rows have been backfilled', async () => {
     // Seed a backfilled (v51) row — row_num + source_markdown_slug set.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -379,6 +435,19 @@ describe('runExtractFacts — empty-fence guard (Codex R2-#7)', () => {
     expect(r.guardTriggered).toBe(false);
     expect(r.legacyRowsPending).toBe(0);
     expect(r.factsInserted).toBe(1);
+
+    // #3683 regression guard: the healthy (non-guard) path's rollup write
+    // at the bottom of the function must still book round_completed_delta=1
+    // / halt_delta=0 exactly as before the fix — the new guard-path write
+    // is additive (a separate early-return branch), not a replacement.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rollup = await (engine as any).db.query(
+      `SELECT halt_count, round_completed_count FROM extract_rollup_7d
+        WHERE kind = 'facts.fence' AND source_id = 'default'`,
+    );
+    expect(rollup.rows).toHaveLength(1);
+    expect(Number(rollup.rows[0].halt_count)).toBe(0);
+    expect(Number(rollup.rows[0].round_completed_count)).toBe(1);
   });
 
   test('soft-expired legacy rows do NOT trigger the guard (#2646 — forget_fact drains the backlog)', async () => {
