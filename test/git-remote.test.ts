@@ -323,10 +323,13 @@ describe('cloneRepo', () => {
 // ---------------------------------------------------------------------------
 
 describe('pullRepo', () => {
-  test('happy path: invokes git -C path with GIT_SSRF_FLAGS + pull --ff-only', async () => {
+  test('default path: invokes git -C path with file transport blocked + pull --ff-only', async () => {
     const repo = join(FAKE_GIT_DIR, 'pull-target');
     mkdirSync(repo, { recursive: true });
-    await withEnv({ PATH: fakePath() }, async () => {
+    await withEnv({
+      PATH: fakePath(),
+      GBRAIN_GIT_ALLOW_FILE_TRANSPORT: undefined,
+    }, async () => {
       pullRepo(repo);
     });
     const argv = readArgvLog()[0];
@@ -474,7 +477,7 @@ describe('#1315 — stderr-first GitOperationError (real git, file-origin repo)'
 
   /** Upstream repo + a mirror cloned via plain git (origin = local file path),
    *  so pullRepo/fetchRemote deterministically fail on protocol.file.allow=never. */
-  function mkFileOriginMirror(): string {
+  function mkFileOriginMirror(): { upstream: string; mirror: string } {
     const upstream = join(SANDBOX, `upstream-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     mkdirSync(upstream, { recursive: true });
     writeFileSync(join(upstream, 'a.md'), '# a');
@@ -485,17 +488,19 @@ describe('#1315 — stderr-first GitOperationError (real git, file-origin repo)'
     execFileSync('git', ['-C', upstream, 'commit', '-q', '-m', 'initial']);
     const mirror = `${upstream}-mirror`;
     execFileSync('git', ['clone', '-q', upstream, mirror]);
-    return mirror;
+    return { upstream, mirror };
   }
 
-  test('pullRepo message leads with the real git stderr, not the Command-failed envelope', () => {
-    const mirror = mkFileOriginMirror();
+  test('pullRepo keeps file transport blocked when the escape hatch is unset', async () => {
+    const { mirror } = mkFileOriginMirror();
     let threw: GitOperationError | undefined;
-    try {
-      pullRepo(mirror);
-    } catch (e) {
-      threw = e as GitOperationError;
-    }
+    await withEnv({ GBRAIN_GIT_ALLOW_FILE_TRANSPORT: undefined }, async () => {
+      try {
+        pullRepo(mirror);
+      } catch (e) {
+        threw = e as GitOperationError;
+      }
+    });
     expect(threw).toBeInstanceOf(GitOperationError);
     const msg = threw!.message;
     expect(msg).toContain('git pull failed in');
@@ -507,8 +512,21 @@ describe('#1315 — stderr-first GitOperationError (real git, file-origin repo)'
     expect(threw!.cause).toBeDefined();
   });
 
+  test('pullRepo allows a local-filesystem remote only with the explicit escape hatch', async () => {
+    const { upstream, mirror } = mkFileOriginMirror();
+    writeFileSync(join(upstream, 'from-origin.md'), '# from origin');
+    execFileSync('git', ['-C', upstream, 'add', 'from-origin.md']);
+    execFileSync('git', ['-C', upstream, 'commit', '-q', '-m', 'advance origin']);
+
+    await withEnv({ GBRAIN_GIT_ALLOW_FILE_TRANSPORT: '1' }, async () => {
+      pullRepo(mirror);
+    });
+
+    expect(readFileSync(join(mirror, 'from-origin.md'), 'utf8')).toBe('# from origin');
+  });
+
   test('fetchRemote message is stderr-first too', () => {
-    const mirror = mkFileOriginMirror();
+    const { mirror } = mkFileOriginMirror();
     let threw: GitOperationError | undefined;
     try {
       fetchRemote(mirror, 'master');
@@ -518,5 +536,24 @@ describe('#1315 — stderr-first GitOperationError (real git, file-origin repo)'
     expect(threw).toBeInstanceOf(GitOperationError);
     expect(threw!.message.slice(0, 200)).toMatch(/fatal:/);
     expect(threw!.message).not.toContain('Command failed');
+  });
+
+  test('fetchRemote allows a local-filesystem remote only with the explicit escape hatch (must match pullRepo — #3836 review: the cost-estimator fetch-first path would otherwise underprice a file-origin sync)', async () => {
+    const { upstream, mirror } = mkFileOriginMirror();
+    const branch = execFileSync('git', ['-C', upstream, 'rev-parse', '--abbrev-ref', 'HEAD']).toString().trim();
+    writeFileSync(join(upstream, 'from-origin.md'), '# from origin');
+    execFileSync('git', ['-C', upstream, 'add', 'from-origin.md']);
+    execFileSync('git', ['-C', upstream, 'commit', '-q', '-m', 'advance origin']);
+
+    await withEnv({ GBRAIN_GIT_ALLOW_FILE_TRANSPORT: undefined }, () => {
+      expect(() => fetchRemote(mirror, branch)).toThrow(GitOperationError);
+    });
+
+    await withEnv({ GBRAIN_GIT_ALLOW_FILE_TRANSPORT: '1' }, async () => {
+      fetchRemote(mirror, branch);
+    });
+    const remoteSha = execFileSync('git', ['-C', mirror, 'rev-parse', `origin/${branch}`]).toString().trim();
+    const upstreamSha = execFileSync('git', ['-C', upstream, 'rev-parse', branch]).toString().trim();
+    expect(remoteSha).toBe(upstreamSha);
   });
 });

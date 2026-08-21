@@ -6,8 +6,12 @@
  * IPv6 loopback, IPv4-mapped IPv6, metadata hostnames, hex/octal bypass,
  * and CGNAT 100.64/10).
  *
- * cloneRepo and pullRepo both spread GIT_SSRF_FLAGS so a future flag added
- * to one path lands on both — single source of truth.
+ * cloneRepo spreads the immutable GIT_SSRF_FLAGS (initial externally supplied,
+ * HTTPS-validated URLs). pullRepo and fetchRemote both resolve
+ * durableSsrfFlags() at call time so the explicit local-filesystem escape
+ * hatch works for sync — and for the sync cost-estimator's fetch-first path,
+ * which must match pullRepo or a file-origin sync would underprice (#3836) —
+ * while retaining the same secure defaults.
  *
  * Tailscale 100.64/10 trips the integrations.ts allowlist (CGNAT line in
  * url-safety.ts isPrivateIpv4). For self-hosted internal git servers
@@ -258,9 +262,9 @@ export function cloneRepo(url: string, destDir: string, opts: CloneOpts = {}): v
   }
 }
 
-/** Pull a repo with --ff-only and the same SSRF-defensive flags as cloneRepo. */
+/** Pull a repo with --ff-only and SSRF-defensive flags (file transport is explicit opt-in). */
 export function pullRepo(repoPath: string, opts: { timeoutMs?: number } = {}): void {
-  const args: string[] = ['-C', repoPath, ...GIT_SSRF_FLAGS, 'pull', ...GIT_SSRF_SUBCOMMAND_FLAGS, '--ff-only'];
+  const args: string[] = ['-C', repoPath, ...durableSsrfFlags(), 'pull', ...GIT_SSRF_SUBCOMMAND_FLAGS, '--ff-only'];
   try {
     execFileSync('git', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -278,14 +282,16 @@ export function pullRepo(repoPath: string, opts: { timeoutMs?: number } = {}): v
 
 /**
  * Fetch a single remote branch with the SAME SSRF-defensive flags + no-prompt
- * env as cloneRepo/pullRepo (GIT_SSRF_FLAGS, --no-recurse-submodules,
- * GIT_TERMINAL_PROMPT=0). Used by the sync cost-estimator's fetch-first path
+ * env as pullRepo (durableSsrfFlags(), --no-recurse-submodules,
+ * GIT_TERMINAL_PROMPT=0) — including the GBRAIN_GIT_ALLOW_FILE_TRANSPORT
+ * escape hatch (#3836). Used by the sync cost-estimator's fetch-first path
  * (#2139) so a cost preview / dry-run never hits a remote through a
- * less-protected route than real sync. Throws GitOperationError on failure;
- * the estimator catches and falls back to local HEAD.
+ * less-protected (or, with a mismatched escape hatch, a more-restrictive and
+ * therefore underpricing) route than real sync. Throws GitOperationError on
+ * failure; the estimator catches and falls back to local HEAD.
  */
 export function fetchRemote(repoPath: string, branch: string, opts: { timeoutMs?: number } = {}): void {
-  const args: string[] = ['-C', repoPath, ...GIT_SSRF_FLAGS, 'fetch', ...GIT_SSRF_SUBCOMMAND_FLAGS, 'origin', branch];
+  const args: string[] = ['-C', repoPath, ...durableSsrfFlags(), 'fetch', ...GIT_SSRF_SUBCOMMAND_FLAGS, 'origin', branch];
   try {
     execFileSync('git', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -430,8 +436,8 @@ export function hasTrackedContent(path: string): boolean {
 // to the strict read-only `pullRepo` (which stays `--ff-only` for `sync.ts`).
 
 /**
- * Global SSRF flags for the durability fetch/pull/push paths. Identical to
- * GIT_SSRF_FLAGS except `protocol.file.allow` honors the env escape hatch
+ * Global SSRF flags for pullRepo and the durability fetch/pull/push paths.
+ * Identical to GIT_SSRF_FLAGS except `protocol.file.allow` honors the env escape hatch
  * `GBRAIN_GIT_ALLOW_FILE_TRANSPORT=1` (mirrors GBRAIN_ALLOW_PRIVATE_REMOTES) so
  * self-hosted local-filesystem remotes — and the test suite — can use the file
  * transport. Default stays `never`. These ops act on an ALREADY-validated origin
