@@ -757,6 +757,6 @@ async function listSources(engine: BrainEngine, sourceId?: string): Promise<Sour
     return rows;
   }
   return engine.executeRaw<SourceRow>(
-    `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL ORDER BY id`,
+    `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE ORDER BY id`,
   );
 }

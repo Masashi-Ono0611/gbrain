@@ -128,6 +128,11 @@ export async function resolveSourceId(
   // 4. Registered source whose local_path contains CWD.
   //    Uses longest-prefix match so nested-path configurations (e.g.
   //    gstack at ~/gstack + plans at ~/gstack/plans) pick the deepest.
+  //    Deliberately NOT filtering archived here (#3880): an archived source
+  //    must still win the longest-prefix match so assertSourceExists()
+  //    below throws its "archived" error — filtering it out of this SELECT
+  //    would make cwd resolution silently fall through past it to a parent
+  //    path or the brain default instead of failing closed.
   const registered = await engine.executeRaw<{ id: string; local_path: string }>(
     `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL`,
   );
@@ -409,6 +414,9 @@ export async function resolveSourceWithTier(
   }
 
   // 4. Registered source whose local_path contains CWD.
+  //    Deliberately NOT filtering archived here (#3880) — see the matching
+  //    comment in resolveSourceId: assertSourceExists() below must see the
+  //    archived match to fail closed instead of falling through silently.
   const registered = await engine.executeRaw<{ id: string; local_path: string }>(
     `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL`,
   );

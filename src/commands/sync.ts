@@ -3368,7 +3368,7 @@ See also:
     // Both columns predate v0.41 (writeSyncAnchor / writeChunkerVersion); no
     // schema migration needed.
     const sources = await engine.executeRaw<{ id: string; name: string; local_path: string | null; config: Record<string, unknown>; last_commit: string | null; chunker_version: string | null }>(
-      `SELECT id, name, local_path, config, last_commit, chunker_version FROM sources WHERE local_path IS NOT NULL`,
+      `SELECT id, name, local_path, config, last_commit, chunker_version FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
     );
     if (!sources || sources.length === 0) {
       console.log('No sources with local_path configured. Use `gbrain sources add <id> --path <path>` first.');

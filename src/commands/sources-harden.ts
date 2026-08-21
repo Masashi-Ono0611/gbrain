@@ -40,9 +40,10 @@ function configHost(config: unknown): string | null {
   return null;
 }
 
-async function loadSourceRows(engine: BrainEngine, id: string | undefined, all: boolean): Promise<SourceRow[]> {
+/** @internal Exported for live-engine source-selection regression coverage. */
+export async function loadSourceRows(engine: BrainEngine, id: string | undefined, all: boolean): Promise<SourceRow[]> {
   if (all) {
-    return engine.executeRaw<SourceRow>(`SELECT id, local_path, config FROM sources WHERE local_path IS NOT NULL ORDER BY id`);
+    return engine.executeRaw<SourceRow>(`SELECT id, local_path, config FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE ORDER BY id`);
   }
   if (!id) throw new Error('Usage: gbrain sources harden <id|--all> [--pat-file <p>] [--branch <b>] [--no-cron] [--no-verify] [--dry-run] [--json]');
   return engine.executeRaw<SourceRow>(`SELECT id, local_path, config FROM sources WHERE id = $1`, [id]);

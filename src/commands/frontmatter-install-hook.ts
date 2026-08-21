@@ -63,7 +63,7 @@ interface SourceRow {
   local_path: string | null;
 }
 
-export async function runFrontmatterInstallHook(args: string[]): Promise<void> {
+export async function runFrontmatterInstallHook(args: string[], engineOverride?: BrainEngine): Promise<void> {
   let force = false;
   let uninstall = false;
   let sourceId: string | undefined;
@@ -82,13 +82,13 @@ export async function runFrontmatterInstallHook(args: string[]): Promise<void> {
     return;
   }
 
-  const config = loadConfig();
-  if (!config) {
+  const config = engineOverride ? null : loadConfig();
+  if (!engineOverride && !config) {
     throw new Error('No brain configured. Run: gbrain init');
   }
-  const engineConfig = toEngineConfig(config);
-  const engine = await createEngine(engineConfig);
-  await engine.connect(engineConfig);
+  const engineConfig = config ? toEngineConfig(config) : null;
+  const engine = engineOverride ?? await createEngine(engineConfig!);
+  if (!engineOverride) await engine.connect(engineConfig!);
   try {
     const sources = await listSources(engine, sourceId);
     if (sources.length === 0) {
@@ -134,7 +134,7 @@ export async function runFrontmatterInstallHook(args: string[]): Promise<void> {
 
     console.log(`\nDone. ${installed} ${uninstall ? 'removed' : 'installed/updated'}, ${skipped} skipped.`);
   } finally {
-    await engine.disconnect();
+    if (!engineOverride) await engine.disconnect();
   }
 }
 
@@ -158,7 +158,7 @@ async function listSources(engine: BrainEngine, sourceId?: string): Promise<Sour
   if (sourceId) {
     return engine.executeRaw<SourceRow>(`SELECT id, local_path FROM sources WHERE id = $1`, [sourceId]);
   }
-  return engine.executeRaw<SourceRow>(`SELECT id, local_path FROM sources WHERE local_path IS NOT NULL ORDER BY id`);
+  return engine.executeRaw<SourceRow>(`SELECT id, local_path FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE ORDER BY id`);
 }
 
 function isGitRepo(dir: string): boolean {
