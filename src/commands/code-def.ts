@@ -44,6 +44,10 @@ export const DEF_TYPES = [
   'table', 'view', 'index', 'procedure', 'schema', 'database', 'trigger',
   'method declaration', 'method definition', 'constructor declaration',
   'field declaration', 'field definition', 'struct specifier', 'protocol declaration',
+  // #3789: same fallthrough — C#/Kotlin property_declaration → 'property
+  // declaration', Java/C# record_declaration → 'record declaration'. Without
+  // these, code-def is blind to every C# property and every Java/C# record.
+  'property declaration', 'record declaration',
   // Dart: normalizeSymbolType has no rule for these four, so they arrive as
   // the node type with underscores replaced. class_definition/enum_declaration/
   // type_alias/function_signature already normalize into the list above.

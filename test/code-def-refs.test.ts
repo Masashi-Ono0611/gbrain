@@ -184,6 +184,98 @@ describe('findCodeDef', () => {
   });
 });
 
+describe('findCodeDef — #3789 property_declaration / record_declaration', () => {
+  let repoEngine: PGLiteEngine;
+
+  beforeAll(async () => {
+    repoEngine = new PGLiteEngine();
+    await repoEngine.connect({});
+    await repoEngine.initSchema();
+
+    // Java: record_declaration is already a top-level chunk in
+    // normalizeSymbolType's fallthrough ("record declaration") AND the
+    // chunker already extracts symbol_name for it correctly end-to-end —
+    // this is a real, reachable repro of #3789's residual gap after PR
+    // #1628 fixed method/constructor/field/struct/protocol.
+    const javaSrc = `package com.acme.widgets;
+
+/**
+ * Immutable configuration record describing how many times a widget
+ * refresh should be retried before giving up. Validates its own
+ * invariants in a compact canonical constructor so every call site gets
+ * the same guarantee without duplicating the check.
+ */
+public record WidgetRecord(String name, int retryCount) {
+    public WidgetRecord {
+        if (name == null || name.isEmpty()) {
+            throw new IllegalArgumentException("name must not be blank");
+        }
+        if (retryCount < 0) {
+            throw new IllegalArgumentException("retryCount must be >= 0, got " + retryCount);
+        }
+        if (retryCount > 100) {
+            throw new IllegalArgumentException("retryCount must be <= 100, got " + retryCount);
+        }
+        System.out.println("constructed WidgetRecord " + name + " with retryCount " + retryCount);
+    }
+
+    public WidgetRecord withRetryCount(int newRetryCount) {
+        return new WidgetRecord(name, newRetryCount);
+    }
+}
+`;
+    await importCodeFile(repoEngine, 'src/WidgetRecord.java', javaSrc, { noEmbed: true });
+
+    // C#: property_declaration hits the same normalizeSymbolType
+    // fallthrough ("property declaration"), but C# properties only ever
+    // appear nested inside a class body — and unlike java/typescript/etc,
+    // c_sharp has no NESTED_EMIT_CONFIG entry, so the chunker never emits
+    // a class's members as their own top-level chunks (a separate,
+    // pre-existing chunker limitation outside this fix's scope). Seed a
+    // content_chunks row directly, the same shape importCodeFile would
+    // write, to isolate exactly what DEF_TYPES controls: whether
+    // findCodeDef's WHERE ... symbol_type IN (...) filter admits
+    // "property declaration" rows that are already indexed.
+    await repoEngine.putPage('src-widgetoptions-cs', {
+      type: 'code',
+      page_kind: 'code',
+      title: 'src/WidgetOptions.cs',
+      compiled_truth: 'public int RetryCount { get; set; }',
+      frontmatter: { language: 'c_sharp', file: 'src/WidgetOptions.cs' },
+    });
+    await repoEngine.upsertChunks('src-widgetoptions-cs', [{
+      chunk_index: 0,
+      chunk_text: '[C#] src/WidgetOptions.cs:3-3\n\npublic int RetryCount { get; set; }',
+      chunk_source: 'compiled_truth',
+      language: 'c_sharp',
+      symbol_name: 'RetryCount',
+      symbol_type: 'property declaration',
+      start_line: 3,
+      end_line: 3,
+    }]);
+  });
+
+  afterAll(async () => {
+    await repoEngine.disconnect();
+  });
+
+  test('finds a Java record declaration', async () => {
+    const results = await findCodeDef(repoEngine, 'WidgetRecord');
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    const match = results.find((r) => r.slug === 'src-widgetrecord-java');
+    expect(match).toBeDefined();
+    expect(match!.symbol_type).toBe('record declaration');
+  });
+
+  test('finds an indexed C# property declaration', async () => {
+    const results = await findCodeDef(repoEngine, 'RetryCount');
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    const match = results.find((r) => r.slug === 'src-widgetoptions-cs');
+    expect(match).toBeDefined();
+    expect(match!.symbol_type).toBe('property declaration');
+  });
+});
+
 describe('findCodeRefs', () => {
   test('finds multiple usage sites across files', async () => {
     const results = await findCodeRefs(engine, 'BrainEngine');
