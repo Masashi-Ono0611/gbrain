@@ -47,10 +47,19 @@ afterAll(() => {
   try { if (_tmpHome) rmSync(_tmpHome, { recursive: true, force: true }); } catch { /* best-effort */ }
 });
 
-function makeCtx(opts: { remote?: boolean } = {}): OperationContext {
+interface TestContextOpts {
+  remote?: boolean;
+  storage?: unknown;
+}
+
+function makeCtx(opts: TestContextOpts = {}): OperationContext {
   return {
     engine: getEngine(),
-    config: { engine: 'postgres', database_url: process.env.DATABASE_URL! },
+    config: {
+      engine: 'postgres',
+      database_url: process.env.DATABASE_URL!,
+      ...(opts.storage ? { storage: opts.storage } : {}),
+    },
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     dryRun: false,
     // Default: trusted local invocation (matches `gbrain call` semantics).
@@ -59,10 +68,10 @@ function makeCtx(opts: { remote?: boolean } = {}): OperationContext {
   };
 }
 
-async function callOp(name: string, params: Record<string, unknown> = {}) {
+async function callOp(name: string, params: Record<string, unknown> = {}, ctxOpts: TestContextOpts = {}) {
   const op = operationsByName[name];
   if (!op) throw new Error(`Unknown operation: ${name}`);
-  return op.handler(makeCtx(), params);
+  return op.handler(makeCtx(ctxOpts), params);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -635,15 +644,19 @@ describeE2E('E2E: Files', () => {
     // Create a temp file
     const tmpDir = mkdtempSync(join(tmpdir(), 'gbrain-e2e-'));
     const tmpFile = join(tmpDir, 'test-doc.pdf');
+    const storageDir = join(tmpDir, 'storage');
     writeFileSync(tmpFile, 'fake pdf content');
 
     try {
       const result = await callOp('file_upload', {
         path: tmpFile,
         page_slug: 'people/sarah-chen',
+      }, {
+        storage: { backend: 'local', bucket: 'test', localPath: storageDir },
       }) as any;
       expect(result.status).toBe('uploaded');
       expect(result.storage_path).toContain('sarah-chen');
+      expect(readFileSync(join(storageDir, result.storage_path), 'utf8')).toBe('fake pdf content');
 
       // Verify file_list
       const files = await callOp('file_list', {}) as any[];

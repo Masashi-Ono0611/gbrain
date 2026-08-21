@@ -53,6 +53,12 @@ const file_upload: Operation = {
   localOnly: true,
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'file_upload', path: p.path };
+    if (!ctx.config.storage) {
+      throw new OperationError(
+        'storage_error',
+        'No storage backend configured. Run `gbrain init` with storage settings.',
+      );
+    }
 
     const { readFileSync, statSync } = await import('fs');
     const { basename, extname } = await import('path');
@@ -90,15 +96,12 @@ const file_upload: Operation = {
       return { status: 'already_exists', storage_path: storagePath };
     }
 
-    // Upload to storage backend if configured
-    if (ctx.config.storage) {
-      const { createStorage } = await import('../storage.ts');
-      const storage = await createStorage(ctx.config.storage as any);
-      try {
-        await storage.upload(storagePath, content, mimeType || undefined);
-      } catch (uploadErr) {
-        throw new OperationError('storage_error', `Upload failed: ${uploadErr instanceof Error ? uploadErr.message : String(uploadErr)}`);
-      }
+    const { createStorage } = await import('../storage.ts');
+    const storage = await createStorage(ctx.config.storage as any);
+    try {
+      await storage.upload(storagePath, content, mimeType || undefined);
+    } catch (uploadErr) {
+      throw new OperationError('storage_error', `Upload failed: ${uploadErr instanceof Error ? uploadErr.message : String(uploadErr)}`);
     }
 
     try {
@@ -112,13 +115,9 @@ const file_upload: Operation = {
       `;
     } catch (dbErr) {
       // Rollback: clean up storage if DB write failed
-      if (ctx.config.storage) {
-        try {
-          const { createStorage } = await import('../storage.ts');
-          const storage = await createStorage(ctx.config.storage as any);
-          await storage.delete(storagePath);
-        } catch { /* best effort cleanup */ }
-      }
+      try {
+        await storage.delete(storagePath);
+      } catch { /* best effort cleanup */ }
       throw dbErr;
     }
 
