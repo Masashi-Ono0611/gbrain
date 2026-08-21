@@ -155,7 +155,16 @@ describe('chatWithFallback', () => {
     __setGenerateTextTransportForTests(async (args: any) => {
       const target = targetOf(args);
       called.push(target);
-      if (target === OPENAI_FALLBACK) throw statusError(418);
+      // 400 is a PER_ITEM_HTTP_STATUSES member (errors.ts) — normalizeAIError
+      // still wraps it as AIConfigError, but classifyGlobalLlmError's
+      // per-item exclusion keeps it OUT of the auth bucket, so it falls
+      // through every check to null (genuinely unclassified). A non-per-item
+      // 4xx like 418 does NOT get that exclusion and classifies as 'auth'
+      // (rank 3, the HIGHEST terminal-error priority) — the opposite of what
+      // this test needs to exercise, and what an earlier version of this
+      // test used by mistake (caught by the patch-stack rebase's full-suite
+      // run: it deterministically failed, not a flake).
+      if (target === OPENAI_FALLBACK) throw statusError(400);
       throw statusError(429, ` from ${target}`);
     });
     configure(
