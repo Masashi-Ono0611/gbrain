@@ -189,7 +189,7 @@ command -v gbrain || { echo "gbrain not on PATH. Install, then retry."; exit 1; 
 #    (Supervisor is Postgres-only. PGLite's exclusive file lock blocks the
 #    separate worker process. If `config.engine === 'pglite'` the CLI rejects
 #    with a clear error.)
-gbrain doctor --fast --json | jq '.checks[] | select(.name=="db_connectivity")'
+gbrain doctor --fast --json | jq '.checks[] | select(.name=="connection")'
 
 # 3. Schema is up to date. If version=0 or status=="fail":
 #    gbrain apply-migrations --yes
@@ -423,8 +423,10 @@ gbrain jobs list --status active --limit 10
 # Dead-lettered jobs.
 gbrain jobs list --status dead --limit 10
 
-# Shell handler registered? (check supervisor audit log or worker stderr.)
-gbrain jobs supervisor status --json | jq '.worker_config.allow_shell_jobs'
+# Shell handler registered in unguarded mode? `jobs supervisor status --json`
+# has no such field — check the worker's own startup line on stderr instead:
+#   "shell handler enabled (GBRAIN_ALLOW_SHELL_JOBS=1)"        → unguarded
+#   "shell handler registered in guarded mode ..."             → guarded (default)
 ```
 
 ## Uninstall

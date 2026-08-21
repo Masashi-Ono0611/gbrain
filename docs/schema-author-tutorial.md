@@ -17,22 +17,21 @@ That's it. No API keys required for this tutorial — every step works against t
 ## Step 1: See what pack is active today
 
 ```bash
-gbrain schema active --json
+gbrain schema active
 ```
 
 You'll see something like:
 
-```json
-{
-  "pack_name": "gbrain-base",
-  "version": "1.0.0",
-  "sha8": "...",
-  "page_types_count": 22,
-  "source_tier": "default"
-}
+```
+Active pack: gbrain-base v1.0.0
+Source: default
+Pack identity: gbrain-base@1.0.0+a1b2c3d4
+Page types: 22
+Link verbs: 14
+Takes kinds: proposal, decision, fact
 ```
 
-`source_tier: "default"` means you haven't customized anything — you're on the bundled pack. `page_types_count: 22` is the universal starter (person, company, meeting, note, etc.).
+`Source: default` means you haven't customized anything — you're on the bundled pack. `Page types: 22` is the universal starter (person, company, meeting, note, etc.). (`--json` is currently accepted but ignored by this command — it prints the same human-readable text either way. Structured JSON is available over MCP via the `get_active_schema_pack` op.)
 
 **You can't mutate bundled packs directly.** Step 2 forks it so you have something writable.
 
@@ -54,7 +53,7 @@ gbrain schema use mine
 
 Output: `Pack: mine (json) ... Active.`
 
-Run `gbrain schema active --json` again to confirm `pack_name` is now `mine` and `source_tier` is `home-config` (read from `~/.gbrain/config.json`).
+Run `gbrain schema active` again to confirm the first line now reads `Active pack: mine v1.0.0` and `Source: home-config` (read from `~/.gbrain/config.json`).
 
 **You've already accomplished something visible** — the active pack changed, and any future query will route through your fork. The next four steps add a custom type and prove it works.
 
@@ -214,7 +213,7 @@ gbrain schema lint --with-db
 
 **For agents (MCP):** the same operations are reachable over HTTPS MCP as schema ops. Register an admin-scope OAuth client and `schema_apply_mutations` lets a remote agent compose multi-step refactors as one atomic batch. The batched MCP op + per-pack lock + audit log are the load-bearing primitives that make remote schema authoring safe. See [`skills/schema-author/SKILL.md`](../skills/schema-author/SKILL.md) for the agent dispatcher.
 
-**Undo a mistake.** Every mutation primitive has an inverse (`remove-type`, `remove-alias`, `remove-prefix`, `remove-link-type`, `set-extractable false`, etc.). If you fork twice and want to revert, `gbrain schema downgrade` restores the previous active pack from `~/.gbrain/schema-pack-history.jsonl`.
+**Undo a mistake.** Every mutation primitive has an inverse (`remove-type`, `remove-alias`, `remove-prefix`, `remove-link-type`, `set-extractable false`, etc.). If you fork twice and want to revert, use `gbrain schema downgrade --to <pack>` to restore a named pack explicitly. (The automatic previous-pack lookup reads `~/.gbrain/schema-pack-history.jsonl`, but nothing currently writes that file, so it's always empty on a fresh install — always pass `--to` rather than relying on the bare command.)
 
 ## Related docs
 

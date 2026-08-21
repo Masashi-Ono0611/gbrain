@@ -39,9 +39,11 @@ pass:
    `ctx.remote === true` (MCP callers). Independent of the env flag. Remote
    agents can never submit shell jobs. `MinionQueue.add('shell', ...)` has its
    own guard too, so an in-process handler can't programmatically bypass this.
-2. **Env flag.** The worker only registers the shell handler when
-   `GBRAIN_ALLOW_SHELL_JOBS=1` is set on the worker process. Default: off. Your
-   agent opts in per-host.
+2. **Env flag.** The shell handler is always registered on every worker; the
+   guard lives inside the handler itself. When `GBRAIN_ALLOW_SHELL_JOBS=1` is
+   NOT set on the worker process (the default), a claimed shell job fails
+   immediately with an unrecoverable error instead of running. Your agent
+   opts in per-host.
 
 **What the env allowlist does AND does not do.** Shell jobs run with a minimal
 env: `PATH, HOME, USER, LANG, TZ, NODE_ENV`. Your secrets like `OPENAI_API_KEY`
@@ -244,9 +246,14 @@ gbrain jobs get 42
 # Submission audit log (operator trail, not forensic)
 cat ~/.gbrain/audit/shell-jobs-*.jsonl | jq '.'
 
-# First-time failure mode: submitted without env flag on the worker
-gbrain jobs list --status waiting --name shell
-# If rows pile up here, no worker with GBRAIN_ALLOW_SHELL_JOBS=1 is running.
+# First-time failure mode: submitted without env flag on the worker.
+# The shell handler is always registered, but the guard inside it rejects
+# the job immediately (UnrecoverableError) when no worker has
+# GBRAIN_ALLOW_SHELL_JOBS=1 set — so it goes straight to `dead`, not `waiting`.
+gbrain jobs list --status dead --name shell
+# If jobs land here right after submission, no worker with
+# GBRAIN_ALLOW_SHELL_JOBS=1 is running; `gbrain jobs get <id>` shows the
+# rejection message in error_text.
 ```
 
 ---
