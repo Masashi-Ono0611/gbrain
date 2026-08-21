@@ -10,8 +10,10 @@ already drives for ZeroEntropy's hosted reranker. The
 
 Two flavors of "local" this recipe covers:
 
-- **Qwen3-Reranker** (0.6B / 4B / 8B) — open-weight cross-encoder; pull
-  the GGUF from HuggingFace and serve.
+- **Qwen3-Reranker** (0.6B / 4B / 8B) — open-weight cross-encoder. Qwen
+  publishes official GGUFs for its embedding models but not for the
+  rerankers — pull a community GGUF conversion instead (see step 2)
+  and serve.
 - **Self-hosted ZeroEntropy** (`zerank-2`, `zerank-1-small`) — the
   weights are on HuggingFace too. GGUF-convert them and serve them the
   same way. **Quality is not guaranteed to match ZE-hosted:** GGUF
@@ -48,14 +50,25 @@ across releases. The recipe sends to `/v1/rerank`.
 
 ### 2. Pull a reranker GGUF
 
-For Qwen3-Reranker-4B (quantized Q4_K_M is the sweet spot for CPU):
+Qwen doesn't publish an official reranker GGUF, so grab a community
+conversion. `mradermacher` mirrors all three Qwen3-Reranker sizes with
+consistent naming (community-maintained, not Qwen-published — pin your
+own eval per [docs/eval-bench.md](../eval-bench.md) if this feeds
+production retrieval):
 
 ```bash
 # Pick a quant level — Q4_K_M is the usual CPU sweet spot.
 huggingface-cli download \
-  Qwen/Qwen3-Reranker-4B-GGUF qwen3-reranker-4b-q4_k_m.gguf \
+  mradermacher/Qwen3-Reranker-4B-GGUF Qwen3-Reranker-4B.Q4_K_M.gguf \
   --local-dir ./models
 ```
+
+For the 0.6B or 8B variant, swap the size in both the repo
+(`mradermacher/Qwen3-Reranker-<size>-GGUF`) and the file
+(`Qwen3-Reranker-<size>.Q4_K_M.gguf`). Any other community conversion,
+or `convert_hf_to_gguf.py` run against the real `Qwen/Qwen3-Reranker-<size>`
+weights, works too — just match step 3's `--model` path to whatever
+file you end up with.
 
 For self-hosted ZeroEntropy weights, find a community GGUF conversion
 or convert from the HuggingFace weights yourself (out of scope of this
@@ -65,7 +78,7 @@ doc — see llama.cpp's `convert_hf_to_gguf.py`).
 
 ```bash
 ./build/bin/llama-server \
-  --model ./models/qwen3-reranker-4b-q4_k_m.gguf \
+  --model ./models/Qwen3-Reranker-4B.Q4_K_M.gguf \
   --alias qwen3-reranker-4b \
   --reranking \
   --port 8081
