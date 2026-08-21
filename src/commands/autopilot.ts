@@ -25,6 +25,7 @@ import { execSync } from 'child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadPreferences } from '../core/preferences.ts';
 import { loadConfig, loadConfigFileOnly, saveConfig, gbrainPath as gbrainHomePath } from '../core/config.ts';
+import { hasAnthropicKey } from '../core/ai/anthropic-key.ts';
 import {
   classifyAutopilotLockHolder,
   type AutopilotLockProbeDeps,
@@ -1227,7 +1228,8 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
             const cfgField = HOSTED_EMBED_KEY_CONFIG[envVar];
             return !!(process.env[envVar] || (cfgField ? embedKeyCfg[cfgField] : undefined));
           }),
-          hasChatApiKey: !!(process.env.ANTHROPIC_API_KEY || await engine.getConfig('anthropic_api_key')),
+          // #3944: shared resolver (was a DB-plane probe that drifted from context.ts's file-plane one).
+          hasChatApiKey: hasAnthropicKey(),
         };
         // v0.41.18.0 (A5 + A19 + A22, T15): consult onboard recommendations
         // ALONGSIDE doctor's brain-score recommendations. Onboard's 4 new

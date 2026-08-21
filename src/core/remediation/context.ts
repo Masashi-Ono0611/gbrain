@@ -8,6 +8,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import type { RecommendationContext } from '../brain-score-recommendations.ts';
+import { hasAnthropicKey } from '../ai/anthropic-key.ts';
 
 // Re-export so consumers can `import { RecommendationContext } from '../remediation'`
 // — the canonical RecommendationContext type still lives in
@@ -84,7 +85,12 @@ export async function loadRecommendationContext(
     embeddingModel,
     embeddingDimensions,
     embeddingProviderConfigured: embeddingConfigured,
-    hasChatApiKey: !!(process.env.ANTHROPIC_API_KEY || fileCfg?.anthropic_api_key),
+    // #3944: use the single shared chat-key probe (src/core/ai/anthropic-key.ts)
+    // instead of hand-rolling env||fileCfg here — the autopilot.ts call site
+    // used to hand-roll env||DB and the two drifted apart. hasAnthropicKey()
+    // is the same env → gateway-snapshot → file-plane resolution every other
+    // chat-key consumer in the codebase already uses.
+    hasChatApiKey: hasAnthropicKey(),
     nullSignatureCohort,
   };
 }
