@@ -10,7 +10,7 @@ src/core/pglite-engine.ts	5971	ratchet	grown v0.46.24.0 overnight wave: registry
 src/core/migrate.ts	668	region-exempt	append-only MIGRATIONS array grows freely; runner logic is ratcheted
 src/commands/sync.ts	4334	ratchet	grown v0.46.25.0 fix waves: delete-slug resolver + msys healing (#3942 #2955)
 src/core/ai/gateway.ts	4441	ratchet	grown v0.46.25.0 D2: env-key snapshot stash (#2119)
-src/cli.ts	3628	ratchet	grown v0.46.25.0 D2: stdout interposer install (#4383)
+src/cli.ts	3641	ratchet	grown #3688: GBRAIN_GUARDRAIL_MODULE boot-hook call in main()
 src/core/cycle.ts	3123	ratchet	grown v0.46.25.0 fix waves (#4309 #2821) + v0.46.26.0: cycle-start orphan recovery
 src/commands/serve-http.ts	3294	ratchet	grown v0.46.25.0 D2: /mcp per-request teardown (#2844)
 src/commands/jobs.ts	3093	ratchet	grown v0.46.25.0 (--json #3685) + v0.46.26.0: maybeRunWorkerStartupRecovery extraction + stats gating + help text

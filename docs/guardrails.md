@@ -68,8 +68,45 @@ registerGuardrailProvider({
 });
 ```
 
-Register once at process init (e.g. from a plugin entry or an operator boot
-hook). Registration is idempotent by `id`, so a re-init won't double-fire.
+Registration is idempotent by `id`, so a re-init won't double-fire. What
+"process init" means depends on whether you're embedding `gbrain` as a
+package or running the `gbrain` CLI/`gbrain serve`:
+
+### Registering from an embedding process (library consumers)
+
+If your process constructs the `gbrain` package itself (a custom server, a
+test harness, another CLI), import `registerGuardrailProvider` from
+`gbrain/core/guardrails` and call it yourself before invoking any operation
+that could reach a guardrail hook — the code block above is the whole thing.
+
+### Registering in the `gbrain` CLI process (operators)
+
+Operators who run the `gbrain` binary directly (not as a library) can't add
+an import — there's no process to embed into. Point `GBRAIN_GUARDRAIL_MODULE`
+at the **absolute path** of a local file that calls `registerGuardrailProvider`
+(the same code block above, saved to a file):
+
+```bash
+export GBRAIN_GUARDRAIL_MODULE=/etc/gbrain/guardrails/my-firewall.ts
+gbrain import ./notes
+```
+
+`gbrain` imports that module once, early in `main()`, before dispatching any
+command — including `gbrain serve` — so it's live for the very first
+ingest/chat/tool-input hit in that process. If the module also exports a
+`default` function, it's awaited after import (for setup that needs to be
+async); the common case — a top-level `registerGuardrailProvider(...)` call,
+exactly like the code block above — needs nothing further.
+
+`GBRAIN_GUARDRAIL_MODULE` is unset by default, so the OSS distribution still
+ships inert. An unset env var is silent; a *set but broken* one (relative
+path, missing file, an import that throws) prints one `[guardrail-boot] ...`
+line to stderr and the command proceeds anyway — fail-open, the same
+invariant `runGuardrails` itself guarantees. `GBRAIN_GUARDRAIL_MODULE` is
+operator-owned, already-trusted local code, not a downloaded skillpack — it
+carries none of `GBRAIN_PLUGIN_PATH`'s defs-only trust boundary
+(`docs/guides/plugin-authors.md`), because it's the operator's own file, not
+third-party code discovered off a manifest.
 
 ### Provider responsibilities
 

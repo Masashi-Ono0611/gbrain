@@ -411,6 +411,19 @@ async function main() {
   // GBRAIN_SKIP_STARTUP_HOOKS for their children. Runs for every real command.
   maybeEmitUpdateMarker(command);
 
+  // #3688: operator guardrail boot hook. GBRAIN_GUARDRAIL_MODULE points at an
+  // operator-owned local module that registers guardrail provider(s) via
+  // registerGuardrailProvider() (docs/guardrails.md) before this process runs
+  // any command. Runs for every real command — including `serve` — so the
+  // very first ingest/chat/tool-input hit in this process is covered. No-op
+  // and zero-cost when unset (fail-open; matches every other guardrail
+  // default-inert invariant).
+  if (process.env.GBRAIN_GUARDRAIL_MODULE) {
+    const { loadGuardrailBootModule } = await import('./core/guardrail-boot.ts');
+    const { warning } = await loadGuardrailBootModule();
+    if (warning) console.error(warning);
+  }
+
   const subArgs = args.slice(1);
 
   // DX alias: `ask` is a natural-language alias for `query`

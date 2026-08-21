@@ -54,6 +54,11 @@ const EXPECTED_EXPORTS: ExpectedExport[] = [
   { subpath: 'gbrain/extract', canary: [] },
   { subpath: 'gbrain/ingestion', canary: ['INGESTION_SOURCE_API_VERSION', 'validateIngestionEvent', 'computeContentHash'] },
   { subpath: 'gbrain/ingestion/test-harness', canary: ['IngestionTestHarness', 'expectEvent'] },
+  // #3688: docs/guardrails.md documents `import { registerGuardrailProvider }
+  // from 'gbrain/core/guardrails'` but the subpath was missing from the
+  // exports map, so the documented specifier hard-failed for every package
+  // consumer (ERR_PACKAGE_PATH_NOT_EXPORTED).
+  { subpath: 'gbrain/core/guardrails', canary: ['registerGuardrailProvider', 'runGuardrails', 'hasGuardrails'] },
 ];
 
 function readPackageExports(): Record<string, string> {
@@ -69,7 +74,7 @@ describe('public exports — package.json exports map', () => {
     // Adding new exports: increment this + add to EXPECTED_EXPORTS below.
     // Removing exports: see CLAUDE.md "Removing any of these is a
     // breaking change going forward" — bump minor and update this count.
-    expect(count).toBe(21);
+    expect(count).toBe(22);
   });
 
   test('EXPECTED_EXPORTS list matches the exports map exactly (no drift)', () => {
