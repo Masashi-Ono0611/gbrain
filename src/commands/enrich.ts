@@ -179,6 +179,15 @@ export function enrichFingerprint(opts: {
   order: EnrichOrder;
   thinThreshold: number;
   model: string;
+  /** #3629: durable skip markers now survive across clean runs (see
+   *  runEnrichCore), so a `minContextChars` change MUST mint a new
+   *  fingerprint — otherwise a page durably skip-marked under a strict
+   *  threshold stays wrongly suppressed after the caller relaxes it, since
+   *  `minContextChars` is exactly what assessGrounding's pre-LLM gate
+   *  decides against. Optional + defaulted (not required) so existing call
+   *  sites that never pass it keep resolving to the same fingerprint
+   *  runEnrichCore already computes for its own default. */
+  minContextChars?: number;
 }): string {
   return fingerprint({
     sourceId: opts.sourceId,
@@ -186,6 +195,7 @@ export function enrichFingerprint(opts: {
     order: opts.order,
     thinThreshold: opts.thinThreshold,
     model: opts.model,
+    minContextChars: opts.minContextChars ?? MIN_CONTEXT_CHARS,
   });
 }
 
@@ -195,6 +205,33 @@ function checkpointKey(fp: string): OpCheckpointKey {
 
 function completedKey(sourceId: string, slug: string): string {
   return `${sourceId}|${slug}`;
+}
+
+/**
+ * #3629: a distinct marker (stored alongside, never instead of, the plain
+ * `completedKey`) for a page whose grounding was judged genuinely
+ * insufficient — the pre-LLM `assessGrounding` gate, or an explicit
+ * model-side SKIP verdict. It is intentionally NOT written for a blank/
+ * unparseable synthesis output (`pages_empty_output`): that's a synthesis
+ * FAILURE shape (transient — a flaky call, malformed output), not a
+ * grounding verdict, and durably suppressing retries for it would trade one
+ * bug (re-billing a permanently-insufficient page) for a different one
+ * (never retrying a page that failed for an unrelated, possibly transient,
+ * reason). `pending` filtering (below) only ever checks the plain
+ * `completedKey`, so this marker's sole job is answering "does the
+ * checkpoint currently believe ANY candidate is durably insufficient?" —
+ * the signal `runEnrichCore` uses to decide whether a clean run's checkpoint
+ * is safe to clear. Checking the full persisted `done` set (loaded via
+ * `loadOpCheckpoint`, unbounded by this tick's `LIMIT`ed candidate window)
+ * rather than only this tick's freshly-processed pages is what makes the
+ * fix correct when a permanently-insufficient page falls outside the
+ * current tick's ranked/limited candidate window (a higher-priority page
+ * occupies the slot instead) — see #3629 for the field repro.
+ */
+const SKIP_MARK_PREFIX = 'skip:';
+
+function skipMarkerKey(sourceId: string, slug: string): string {
+  return `${SKIP_MARK_PREFIX}${completedKey(sourceId, slug)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +398,10 @@ async function enrichOneLocked(ctx: EnrichOneCtx, candidate: EnrichCandidate): P
   if (!grounding.grounded) {
     ctx.result.pages_skipped_insufficient++;
     ctx.result.pages_skipped_pre_llm = (ctx.result.pages_skipped_pre_llm ?? 0) + 1;
-    if (!ctx.dryRun) ctx.done.add(completedKey(sourceId, slug));
+    if (!ctx.dryRun) {
+      ctx.done.add(completedKey(sourceId, slug));
+      ctx.done.add(skipMarkerKey(sourceId, slug)); // #3629: durable — never re-billed until --force
+    }
     return;
   }
 
@@ -392,12 +432,18 @@ async function enrichOneLocked(ctx: EnrichOneCtx, candidate: EnrichCandidate): P
     // #2085 split: an explicit SKIP is a grounding verdict; blank output (or a
     // body that strips to nothing) is a synthesis failure shape. parseSynthesis
     // reports skip=true for blank raw too, so discriminate on the raw text.
+    let isModelSkip = false;
     if (parsed.skip && (raw ?? '').trim().length > 0) {
       ctx.result.pages_model_skip = (ctx.result.pages_model_skip ?? 0) + 1;
+      isModelSkip = true;
     } else {
       ctx.result.pages_empty_output = (ctx.result.pages_empty_output ?? 0) + 1;
     }
     ctx.done.add(completedKey(sourceId, slug));
+    // #3629: only an explicit model SKIP is a durable grounding verdict — a
+    // blank/unparseable output is a synthesis failure shape (see the
+    // skipMarkerKey doc comment) and stays eligible for retry next tick.
+    if (isModelSkip) ctx.done.add(skipMarkerKey(sourceId, slug));
     return;
   }
 
@@ -491,11 +537,16 @@ export async function runEnrichCore(
   result.candidates_considered = candidates.length;
   if (candidates.length === 0) return result;
 
-  const fp = enrichFingerprint({ sourceId, types, order, thinThreshold, model });
+  const fp = enrichFingerprint({ sourceId, types, order, thinThreshold, model, minContextChars });
   const cpKey = checkpointKey(fp);
 
   const body = async () => {
-    if (opts.force) await clearOpCheckpoint(engine, cpKey);
+    // #3629: force-clearing must still respect dryRun's "no checkpoint
+    // advance" contract (see EnrichCoreOpts.dryRun doc) — `--dry-run --force`
+    // together previously wiped a REAL checkpoint (including durable skip
+    // markers from a prior real run) as an unintended side effect of a
+    // preview-only invocation.
+    if (opts.force && !dryRun) await clearOpCheckpoint(engine, cpKey);
     const done = new Set<string>(opts.force ? [] : await loadOpCheckpoint(engine, cpKey));
 
     // Filter out already-completed candidates (resume).
@@ -546,10 +597,37 @@ export async function runEnrichCore(
 
     if (!dryRun) {
       await recordCompleted(engine, cpKey, [...done]);
-      // Clear the checkpoint only on a clean, complete run so an immediate
-      // re-run starts fresh (enriched pages drop out of the thin set anyway).
       if (!pool.aborted && !signal?.aborted) {
-        await clearOpCheckpoint(engine, cpKey);
+        // #3629: a clean, complete run resets the checkpoint to ONLY its
+        // durable skip markers (plus each marker's paired plain completedKey,
+        // which is what `pending` actually checks), dropping everything else
+        // — enriched successes (harmless: they've stopped being thin and
+        // fall out of `candidates` on their own) AND blank/empty-output
+        // completions (NOT harmless to keep: #2085 already classifies a
+        // blank/unparseable model response as a synthesis-failure shape, not
+        // a grounding verdict, so it must stay eligible for retry next tick —
+        // an earlier version of this fix cleared the WHOLE checkpoint or
+        // NONE of it, so a single durable skip anywhere in the run made every
+        // blank-output completion permanent too, by accident).
+        //
+        // `done` here is the FULL persisted set (loaded via `loadOpCheckpoint`
+        // at the top of `body()`, not bounded by this tick's `limit`), so a
+        // skip banked in an earlier tick survives being reset even when the
+        // page it belongs to isn't in this tick's `candidates`/`pending` at
+        // all (a higher-priority candidate occupying the LIMITed window
+        // instead) — the #3629 field repro this fix targets.
+        const skipMarkers = [...done].filter((k) => k.startsWith(SKIP_MARK_PREFIX));
+        if (skipMarkers.length === 0) {
+          await clearOpCheckpoint(engine, cpKey);
+        } else {
+          // recordCompleted is REPLACE (not append) semantics — see its own
+          // doc comment — so re-recording just the trimmed `keep` set here
+          // overwrites the full `completed_keys` array in one UPSERT; no
+          // separate clearOpCheckpoint round-trip needed first.
+          const durableSlugKeys = new Set(skipMarkers.map((k) => k.slice(SKIP_MARK_PREFIX.length)));
+          const keep = [...done].filter((k) => durableSlugKeys.has(k) || k.startsWith(SKIP_MARK_PREFIX));
+          await recordCompleted(engine, cpKey, keep);
+        }
       }
     }
   };

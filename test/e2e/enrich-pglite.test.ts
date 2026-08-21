@@ -239,6 +239,48 @@ describe('runEnrichCore', () => {
     expect(page!.compiled_truth.trim()).toBe(STUB);
   }, 30000);
 
+  test('#3629: relaxing --min-context after a durable pre-LLM skip re-evaluates the page', async () => {
+    // A durable skip marker (see enrichFingerprint's minContextChars doc
+    // comment) must not outlive the very knob that produced it. A page
+    // rejected by assessGrounding under a strict threshold, then re-run with
+    // a relaxed threshold and no --force, must be evaluated fresh — because
+    // minContextChars is part of enrichFingerprint, the relaxed run computes
+    // a DIFFERENT checkpoint fingerprint, so it never even sees the strict
+    // run's durable marker.
+    await seedStub('people/thin-context', 'Thin Context', 'person');
+    await seedLinkInto('people/thin-context', 'meetings/tc1', RICH_CONTEXT);
+    let calls = 0;
+    const synth: SynthesizeFn = async () => { calls++; return goodSynth({ system: '', user: '', model: 'test:model' }); };
+
+    const strict = await runEnrichCore(engine, {
+      sourceId: 'default',
+      types: ['person'],
+      order: 'inbound-links',
+      thinThreshold: 400,
+      model: 'test:model',
+      minContextChars: 100_000, // impossibly strict — pre-LLM gate always rejects
+      synthesizeFn: synth,
+    });
+    expect(strict.pages_skipped_insufficient).toBe(1);
+    expect(strict.pages_skipped_pre_llm).toBe(1);
+    expect(calls).toBe(0); // pre-LLM gate — no billing either way
+
+    const relaxed = await runEnrichCore(engine, {
+      sourceId: 'default',
+      types: ['person'],
+      order: 'inbound-links',
+      thinThreshold: 400,
+      model: 'test:model',
+      minContextChars: 1, // relaxed — same page now passes grounding
+      synthesizeFn: synth,
+    });
+    expect(calls).toBe(1); // re-evaluated under the new threshold, not suppressed
+    expect(relaxed.pages_enriched).toBe(1);
+
+    const page = await engine.getPage('people/thin-context', { sourceId: 'default' });
+    expect(page!.compiled_truth).toContain('## Overview');
+  }, 30000);
+
   test('model returns SKIP → skipped, no write', async () => {
     await seedStub('people/erin-example', 'Erin Example', 'person');
     await seedLinkInto('people/erin-example', 'meetings/sync', RICH_CONTEXT);
@@ -254,6 +296,218 @@ describe('runEnrichCore', () => {
     expect(r.pages_skipped_insufficient).toBe(1);
     const page = await engine.getPage('people/erin-example', { sourceId: 'default' });
     expect(page!.compiled_truth.trim()).toBe(STUB);
+  }, 30000);
+
+  test('#3629: model SKIP verdict is durable across clean ticks — no re-billing', async () => {
+    // Reproduces the autopilot's enrich_thin tick loop: same source/fingerprint,
+    // called repeatedly (every 600s in production). A page with rich enough
+    // context to pass the pre-LLM assessGrounding gate, but whose model call
+    // ALWAYS answers SKIP, must be billed exactly once — not once per tick.
+    await seedStub('people/permanently-thin', 'Permanently Thin', 'person');
+    await seedLinkInto('people/permanently-thin', 'meetings/sync', RICH_CONTEXT);
+    let calls = 0;
+    const alwaysSkip: SynthesizeFn = async () => { calls++; return 'SKIP'; };
+
+    const runOpts = {
+      sourceId: 'default',
+      types: ['person'],
+      order: 'inbound-links' as const,
+      thinThreshold: 400,
+      model: 'test:model',
+      synthesizeFn: alwaysSkip,
+    };
+
+    const tick1 = await runEnrichCore(engine, runOpts);
+    expect(calls).toBe(1); // billed once — grounding gate passed, model call made
+    expect(tick1.pages_skipped_insufficient).toBe(1);
+    expect(tick1.pages_enriched).toBe(0);
+
+    const tick2 = await runEnrichCore(engine, runOpts);
+    // Pre-fix: clearOpCheckpoint wiped the SKIP verdict on tick 1's clean exit,
+    // so tick 2 re-selected + re-billed the same permanently-insufficient page.
+    expect(calls).toBe(1); // NOT re-billed
+    expect(tick2.pages_enriched).toBe(0);
+    expect(tick2.pages_skipped_insufficient).toBe(0); // nothing processed — filtered by checkpoint
+
+    const tick3 = await runEnrichCore(engine, runOpts);
+    expect(calls).toBe(1); // still not re-billed on a third tick
+
+    const page = await engine.getPage('people/permanently-thin', { sourceId: 'default' });
+    expect(page!.compiled_truth.trim()).toBe(STUB); // never written
+  }, 30000);
+
+  test('#3629: a clean run with no skips still clears the checkpoint (no regression)', async () => {
+    // The old "immediate re-run starts fresh" behavior must survive for the
+    // ordinary happy path: a run that enriches everything with zero
+    // insufficient-context skips clears its checkpoint exactly as before.
+    await seedStub('people/alice-example', 'Alice Example', 'person');
+    await seedLinkInto('people/alice-example', 'meetings/2026-summit', RICH_CONTEXT);
+
+    const fpOpts = {
+      sourceId: 'default',
+      types: ['person'],
+      order: 'inbound-links' as const,
+      thinThreshold: 400,
+      model: 'test:model',
+    };
+    const r = await runEnrichCore(engine, { ...fpOpts, synthesizeFn: goodSynth });
+    expect(r.pages_enriched).toBe(1);
+    expect(r.pages_skipped_insufficient).toBe(0);
+
+    const fp = enrichFingerprint(fpOpts);
+    const done = await loadOpCheckpoint(engine, { op: CHECKPOINT_OP, fingerprint: fp });
+    expect(done).toEqual([]); // cleared on clean, all-enriched completion
+  }, 30000);
+
+  test('#3629: a permanently-SKIP page outside this tick\'s LIMIT window is still not re-billed', async () => {
+    // Deeper regression than the "durable across ticks" test above: here the
+    // permanently-insufficient page falls OUTSIDE the current tick's ranked +
+    // LIMITed candidate window (a higher-priority page occupies the one slot
+    // instead), so `pages_skipped_insufficient` reads 0 and the page is absent
+    // from BOTH `candidates` and `pending` for that tick. A fix that infers
+    // "any carried-forward skip?" from `candidates.length > pending.length`
+    // (bounded by this tick's LIMIT) misses this — the checkpoint gets
+    // cleared anyway and the page is re-billed once it re-enters the window.
+    // The fix must key off the FULL persisted checkpoint instead.
+    await seedStub('people/never-grounds', 'Never Grounds', 'person');
+    await seedLinkInto('people/never-grounds', 'meetings/ng1', RICH_CONTEXT); // 1 inbound
+    await seedStub('people/late-riser', 'Late Riser', 'person'); // 0 inbound — ranks below
+
+    const calls: Record<string, number> = { 'never-grounds': 0, 'late-riser': 0 };
+    const synth: SynthesizeFn = async ({ user }) => {
+      if (user.includes('Never Grounds')) { calls['never-grounds']++; return 'SKIP'; }
+      calls['late-riser']++;
+      return '## Overview\nLate Riser joined the team. [Source: meetings/lr1]';
+    };
+
+    const runOpts = {
+      sourceId: 'default',
+      types: ['person'],
+      order: 'inbound-links' as const,
+      thinThreshold: 400,
+      limit: 1, // forces the LIMIT-window race: only the top-ranked candidate is queried
+      model: 'test:model',
+      synthesizeFn: synth,
+    };
+
+    // Tick 1: never-grounds (1 inbound) outranks late-riser (0 inbound) → the
+    // only candidate this tick. It gets a model SKIP verdict — billed once.
+    const tick1 = await runEnrichCore(engine, runOpts);
+    expect(tick1.candidates_considered).toBe(1);
+    expect(calls['never-grounds']).toBe(1);
+    expect(calls['late-riser']).toBe(0);
+
+    // Promote late-riser above never-grounds (2 inbound > 1) and give it
+    // enough context to pass grounding, so it wins the LIMIT=1 slot next tick
+    // and never-grounds isn't even returned by listEnrichCandidates.
+    await seedLinkInto('people/late-riser', 'meetings/lr1', RICH_CONTEXT);
+    await seedLinkInto('people/late-riser', 'meetings/lr2', RICH_CONTEXT);
+
+    // Tick 2: late-riser occupies the single slot and enriches successfully.
+    // never-grounds is outside this tick's candidate window entirely.
+    const tick2 = await runEnrichCore(engine, runOpts);
+    expect(tick2.candidates_considered).toBe(1);
+    expect(calls['never-grounds']).toBe(1); // not queried this tick — can't be re-billed here
+    expect(calls['late-riser']).toBe(1);
+    expect(tick2.pages_enriched).toBe(1);
+
+    // Tick 3: late-riser is no longer thin (enriched) and drops out of the
+    // candidate query entirely, so never-grounds is the only candidate again.
+    // The money assertion: it must NOT be re-billed — the durable skip marker
+    // from tick 1 must have survived tick 2's clean, all-enriched completion.
+    const tick3 = await runEnrichCore(engine, runOpts);
+    expect(tick3.candidates_considered).toBe(1);
+    expect(calls['never-grounds']).toBe(1); // still exactly once across 3 ticks
+    expect(tick3.pages_enriched).toBe(0);
+
+    const page = await engine.getPage('people/never-grounds', { sourceId: 'default' });
+    expect(page!.compiled_truth.trim()).toBe(STUB); // never written
+  }, 30000);
+
+  test('#3629: a durable skip elsewhere in the checkpoint does not permanently suppress an unrelated blank-output page', async () => {
+    // A blank/unparseable synthesis response is a synthesis-FAILURE shape
+    // (#2085 splits it from an explicit model SKIP — see pages_empty_output
+    // vs pages_model_skip), not a grounding verdict, so it must stay eligible
+    // for retry next tick. An earlier version of this fix made the
+    // clear-vs-keep decision checkpoint-WIDE (all-or-nothing): as soon as ANY
+    // page in the run got a durable skip marker, the entire checkpoint
+    // stopped clearing — which accidentally made every OTHER page's plain
+    // completedKey permanent too, including blank-output pages that were
+    // never meant to be durably suppressed.
+    await seedStub('people/never-grounds', 'Never Grounds', 'person');
+    await seedLinkInto('people/never-grounds', 'meetings/ng1', RICH_CONTEXT);
+    await seedStub('people/flaky-output', 'Flaky Output', 'person');
+    await seedLinkInto('people/flaky-output', 'meetings/fo1', RICH_CONTEXT);
+
+    let flakyCalls = 0;
+    const synth: SynthesizeFn = async ({ user }) => {
+      if (user.includes('Never Grounds')) return 'SKIP'; // durable
+      flakyCalls++;
+      return flakyCalls === 1 ? '' : goodSynth({ system: '', user: '', model: 'test:model' }); // blank once, then recovers
+    };
+
+    const runOpts = {
+      sourceId: 'default',
+      types: ['person'],
+      order: 'inbound-links' as const,
+      thinThreshold: 400,
+      model: 'test:model',
+      synthesizeFn: synth,
+    };
+
+    const tick1 = await runEnrichCore(engine, runOpts);
+    expect(tick1.pages_model_skip).toBe(1); // never-grounds — durable
+    expect(tick1.pages_empty_output).toBe(1); // flaky-output — NOT durable
+    expect(flakyCalls).toBe(1);
+
+    // Tick 2: flaky-output must be retried (its blank-output completedKey was
+    // dropped, not carried forward with never-grounds's durable skip marker)
+    // and this time succeeds.
+    const tick2 = await runEnrichCore(engine, runOpts);
+    expect(flakyCalls).toBe(2); // retried
+    expect(tick2.pages_enriched).toBe(1);
+    const flaky = await engine.getPage('people/flaky-output', { sourceId: 'default' });
+    expect(flaky!.compiled_truth).toContain('## Overview');
+
+    // never-grounds must still be untouched by all of this — its own skip
+    // marker survived tick 1 → tick 2 unaffected by flaky-output's retry.
+    const never = await engine.getPage('people/never-grounds', { sourceId: 'default' });
+    expect(never!.compiled_truth.trim()).toBe(STUB);
+  }, 30000);
+
+  test('#3629: dry-run + force must not clear a real checkpoint (no destructive preview)', async () => {
+    // EnrichCoreOpts.dryRun is documented as "no checkpoint advance". Before
+    // this fix, `if (opts.force) await clearOpCheckpoint(...)` ran BEFORE the
+    // dryRun check — a `--dry-run --force` preview silently destroyed a REAL
+    // checkpoint (including durable skip markers), re-exposing an already-
+    // resolved permanently-insufficient page to billing on the next real run.
+    await seedStub('people/never-grounds', 'Never Grounds', 'person');
+    await seedLinkInto('people/never-grounds', 'meetings/ng1', RICH_CONTEXT);
+    const skipSynth: SynthesizeFn = async () => 'SKIP';
+
+    const fpOpts = {
+      sourceId: 'default',
+      types: ['person'],
+      order: 'inbound-links' as const,
+      thinThreshold: 400,
+      model: 'test:model',
+    };
+    await runEnrichCore(engine, { ...fpOpts, synthesizeFn: skipSynth });
+    const fp = enrichFingerprint(fpOpts);
+    const beforeDryRun = await loadOpCheckpoint(engine, { op: CHECKPOINT_OP, fingerprint: fp });
+    expect(beforeDryRun.length).toBeGreaterThan(0); // the real run's skip marker is persisted
+
+    let dryRunCalled = false;
+    await runEnrichCore(engine, {
+      ...fpOpts,
+      dryRun: true,
+      force: true,
+      synthesizeFn: async () => { dryRunCalled = true; return 'should not run'; },
+    });
+    expect(dryRunCalled).toBe(false); // dryRun's "no LLM call" contract holds even under --force
+
+    const afterDryRun = await loadOpCheckpoint(engine, { op: CHECKPOINT_OP, fingerprint: fp });
+    expect(afterDryRun).toEqual(beforeDryRun); // untouched by the dry-run + force preview
   }, 30000);
 
   test('resume: pre-seeded checkpoint skips an already-completed page', async () => {
