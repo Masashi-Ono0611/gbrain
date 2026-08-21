@@ -282,14 +282,14 @@ export function decideLockAcquisition(
 
   const holderPid = Number.parseInt(raw, 10);
   const holder = classifyAutopilotLockHolder(holderPid, currentPid, deps);
-
-  if (holder.state === 'alive-autopilot' || holder.state === 'alive-unknown') {
+  if (holder.state === 'alive-autopilot') {
     return { action: 'exit', holderPid };
   }
-  if (holder.state === 'alive-foreign') {
+  if (holder.state === 'alive-foreign' || holder.state === 'alive-unknown') {
     const lockAgeMs = autopilotLockAgeMs(lockPath);
     if (lockAgeMs !== null && lockAgeMs >= AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS) {
-      return { action: 'takeover', reason: `foreign pid ${raw || '<empty>'} with stale lock` };
+      const identity = holder.state === 'alive-foreign' ? 'foreign' : 'unknown';
+      return { action: 'takeover', reason: `${identity} pid ${raw || '<empty>'} with stale lock` };
     }
     return { action: 'exit', holderPid };
   }

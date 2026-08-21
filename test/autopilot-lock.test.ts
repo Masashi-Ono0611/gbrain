@@ -7,7 +7,10 @@ import {
   decideLockAcquisition,
   isPidAlive,
 } from '../src/commands/autopilot.ts';
-import { looksLikeGbrainAutopilotCommand } from '../src/core/autopilot-lock.ts';
+import {
+  looksLikeGbrainAutopilotCommand,
+  readProcessCommand,
+} from '../src/core/autopilot-lock.ts';
 
 let tmp: string;
 let lockPath: string;
@@ -81,7 +84,7 @@ describe('decideLockAcquisition', () => {
     });
   });
 
-  test('keeps a live lock when process identity cannot be inspected', () => {
+  test('keeps a fresh live lock when process identity cannot be inspected', () => {
     writeFileSync(lockPath, '1234');
     expect(decideLockAcquisition(lockPath, process.pid, {
       isPidAlive: (pid) => pid === 1234,
@@ -92,11 +95,80 @@ describe('decideLockAcquisition', () => {
     });
   });
 
+  test('takes over a stale lock when process identity cannot be inspected', () => {
+    writeFileSync(lockPath, '1234');
+    const stale = new Date(Date.now() - AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS - 1000);
+    utimesSync(lockPath, stale, stale);
+    expect(decideLockAcquisition(lockPath, process.pid, {
+      isPidAlive: (pid) => pid === 1234,
+      readProcessCommand: () => null,
+    })).toEqual({
+      action: 'takeover',
+      reason: 'unknown pid 1234 with stale lock',
+    });
+  });
+
+  test('grace-period boundary: exits just before the threshold, takes over at/after it (unknown identity)', () => {
+    writeFileSync(lockPath, '1234');
+    const deps = {
+      isPidAlive: (pid: number) => pid === 1234,
+      readProcessCommand: () => null,
+    };
+
+    const justUnderGrace = new Date(Date.now() - AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS + 1000);
+    utimesSync(lockPath, justUnderGrace, justUnderGrace);
+    expect(decideLockAcquisition(lockPath, process.pid, deps)).toEqual({
+      action: 'exit',
+      holderPid: 1234,
+    });
+
+    const atGrace = new Date(Date.now() - AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS);
+    utimesSync(lockPath, atGrace, atGrace);
+    expect(decideLockAcquisition(lockPath, process.pid, deps).action).toBe('takeover');
+  });
+
   test('takes over malformed and empty locks', () => {
     writeFileSync(lockPath, 'not-a-pid');
     expect(decideLockAcquisition(lockPath, process.pid).action).toBe('takeover');
     writeFileSync(lockPath, '');
     expect(decideLockAcquisition(lockPath, process.pid).action).toBe('takeover');
+  });
+});
+
+describe('readProcessCommand', () => {
+  test('reads Linux procfs cmdline without spawning ps', () => {
+    let psCalls = 0;
+    expect(readProcessCommand(1234, {
+      platform: 'linux',
+      readFileSync: (path, encoding) => {
+        expect(path).toBe('/proc/1234/cmdline');
+        expect(encoding).toBe('utf8');
+        return 'bun\0/usr/local/bin/gbrain\0autopilot\0--repo\0repo\0';
+      },
+      execFileSync: () => {
+        psCalls++;
+        return 'unexpected';
+      },
+    })).toBe('bun /usr/local/bin/gbrain autopilot --repo repo');
+    expect(psCalls).toBe(0);
+  });
+
+  test('falls back to ps on hosts without Linux procfs', () => {
+    let procReads = 0;
+    expect(readProcessCommand(1234, {
+      platform: 'darwin',
+      readFileSync: () => {
+        procReads++;
+        return 'unexpected';
+      },
+      execFileSync: (file, args, options) => {
+        expect(file).toBe('ps');
+        expect(args).toEqual(['-p', '1234', '-o', 'args=']);
+        expect(options.timeout).toBe(1000);
+        return 'gbrain autopilot --repo repo\n';
+      },
+    })).toBe('gbrain autopilot --repo repo');
+    expect(procReads).toBe(0);
   });
 });
 
