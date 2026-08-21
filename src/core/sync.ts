@@ -262,7 +262,14 @@ function isMultimodalEnabled(): boolean {
 }
 
 function isAllowedByStrategy(path: string, strategy: SyncStrategy): boolean {
-  if (strategy === 'markdown') return isMarkdownFilePath(path);
+  // #2683: the 'markdown' branch must admit images under the same multimodal
+  // gate as 'auto' — otherwise incremental sync's default strategy silently
+  // excludes changed image files from the diff (never even attempted, no
+  // failure recorded) while `sync --full`'s walker (isCollectibleForWalker in
+  // commands/import.ts) DOES admit them for the same default strategy. That
+  // full/incremental mismatch is what stranded images: the source anchor
+  // still advances past a commit whose image was never considered syncable.
+  if (strategy === 'markdown') return isMarkdownFilePath(path) || (isMultimodalEnabled() && isImageFilePath(path));
   if (strategy === 'code') return isCodeFilePath(path);
   // 'auto' / default: markdown + code, plus images when multimodal is on.
   return (

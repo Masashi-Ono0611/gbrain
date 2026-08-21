@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync, statSync, realpathSync } from 
 import { join, relative } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
-import { importFile } from '../core/import-file.ts';
+import { importFile, importImageFile, isImageFilePath } from '../core/import-file.ts';
 import { collectSyncableFiles } from './import.ts';
 import {
   isSyncable,
@@ -1788,7 +1788,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       let importResult: Awaited<ReturnType<typeof importFile>> | undefined;
       if (existsSync(filePath) && isPathSafe(filePath, gitContextRoot)) {
         try {
-          const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
+          // #2683: image dispatch, same as the adds/modifies loop below.
+          const result = isImageFilePath(to) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
+            ? await importImageFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId })
+            : await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
           importResult = result;
           noteTypeWarning(result.type_warning);
           if (result.status === 'imported') chunksCreated += result.chunks;
@@ -1796,8 +1799,8 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             // Informational skip — a bracket/control-char filename can never
             // import; counting it as a failure would gate the bookmark forever.
             serr(`  Skipped (malformed filename): ${sanitizePathForDisplay(to)}`);
-          } else if (result.status === 'skipped' && (result as { error?: string }).error) {
-            failedFiles.push({ path: to, error: String((result as { error?: string }).error) });
+          } else if (result.error && result.error !== 'unchanged') {
+            failedFiles.push({ path: to, error: String(result.error) });
           }
         } catch (e: unknown) {
           failedFiles.push({ path: to, error: e instanceof Error ? e.message : String(e) });
@@ -2059,8 +2062,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         // / addLink) target (sourceId, slug). Pre-fix the schema DEFAULT
         // 'default' was applied even for non-default sources, fabricating
         // duplicate rows that crashed bare-slug subqueries with Postgres 21000.
+        // #2683: image dispatch, mirroring commands/import.ts's processFile.
         const result = await observed(pacer, () =>
-          importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack }));
+          isImageFilePath(path) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
+            ? importImageFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId })
+            : importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack }));
         noteTypeWarning(result.type_warning);
         if (result.status === 'imported') {
           chunksCreated += result.chunks;
@@ -2081,8 +2087,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           // resumed sync doesn't re-attempt it forever.
           serr(`  Skipped (malformed filename — rename to import): ${sanitizePathForDisplay(path)}`);
           await markCompleted(path);
-        } else if (result.status === 'skipped' && (result as any).error) {
-          failedFiles.push({ path, error: String((result as any).error) });
+        } else if (result.error && result.error !== 'unchanged') {
+          // #2683: was `status === 'skipped' && ...` — importImageFile can
+          // return status:'error', which used to fall through to "unchanged"
+          // and get checkpointed despite never importing.
+          failedFiles.push({ path, error: String(result.error) });
         } else {
           // status 'skipped' with no error == content_hash short-circuit
           // (already imported, unchanged). It IS done for checkpoint purposes,
