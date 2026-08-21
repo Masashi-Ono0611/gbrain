@@ -69,6 +69,30 @@ export const PROPOSE_TAKES_PROMPT_VERSION = 'v0.36.1.0-tuned-cat15';
 export const EMPTY_EXTRACTION_TOMBSTONE_TEXT = '(no gradeable claims)';
 
 /**
+ * Sentinel claim_text for the tombstone row written when the extractor's
+ * output survives a bounded retry (see `defaultExtractor`) and is STILL not
+ * parseable (#3763). Without this, a model whose output consistently fails
+ * to parse (e.g. a mandatory-reasoning model that spends its whole token
+ * cap on `<think>` before ever emitting JSON — the root cause #2113 fixed
+ * for facts/extract.ts) reproduces the exact idle-cost loop the
+ * #2106/#2136 empty-array tombstone was meant to close, except at 100% of
+ * pages instead of the zero-claim subset: no row is ever recorded, so the
+ * idempotency lookup misses forever and every cycle re-spends an LLM call
+ * on unchanged, un-parseable prose.
+ *
+ * Distinct from EMPTY_EXTRACTION_TOMBSTONE_TEXT on purpose — a clean `[]` is
+ * unambiguous positive evidence ("the model looked and found nothing"),
+ * safe to memoize on the FIRST occurrence. An unparseable response is
+ * ambiguous (flaky output vs. a model that can never satisfy the output
+ * contract), so it is only written after `defaultExtractor`'s own retry
+ * ALSO fails — never on the first failure — and the distinct sentinel keeps
+ * it identifiable in `take_proposals` (and out of any pending-review query,
+ * same as the empty tombstone) so an operator or a later cycle can tell
+ * "genuinely nothing to grade" apart from "gave up parsing."
+ */
+export const UNPARSEABLE_EXTRACTION_TOMBSTONE_TEXT = '(extractor output unparseable after retry)';
+
+/**
  * Tuned extractor prompt, validated against the hand-labeled synthetic
  * corpus at test/fixtures/calibration/. Measured F1 on first live run
  * via gbrain-evals cat15 (claude-sonnet-4-6 extractor, claude-haiku-4-5
@@ -169,6 +193,16 @@ export interface ProposeTakesResult {
   proposals_inserted: number;
   /** Idempotency rows written for pages that extracted zero claims. */
   tombstones_written: number;
+  /**
+   * Idempotency rows written for pages whose extractor output was still
+   * unparseable after `defaultExtractor`'s bounded retry (#3763). Reported
+   * separately from `tombstones_written` (the clean-empty-array case) — a
+   * nonzero count here is a signal worth investigating (the extractor is
+   * consistently failing to produce valid JSON, e.g. a mandatory-reasoning
+   * model truncating on every call), unlike a clean empty extraction, which
+   * is often a legitimate "nothing to grade on this page" result.
+   */
+  unparseable_tombstones_written: number;
   budget_exhausted: boolean;
   /** True when the phase deadline fired before the page loop completed (partial result). */
   deadline_hit?: boolean;
@@ -286,10 +320,45 @@ export function extractExistingTakesForDedup(pageBody: string): Array<{
 /** Per-call wall-clock timeout for the extractor LLM call. */
 const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
 
+/** Base token cap for one extractor call. Doubled on a length-truncated
+ *  retry (see `defaultExtractor`) — parity with facts/extract.ts's #2113
+ *  fix for the same mandatory-reasoning-model truncation cause. */
+const EXTRACTOR_MAX_TOKENS = 2048;
+
+/**
+ * Thrown by `defaultExtractor` when its own bounded retry ALSO fails to
+ * parse — i.e. two calls in a row against the SAME page content produced
+ * unparseable output. Distinguished from an ordinary `Error` (network blip,
+ * 5xx, timeout, auth, rate limit — all ordinary failures that stay
+ * ordinary `Error`s and keep retrying every cycle, as before) so the phase
+ * loop can recognize it as a page-level dead end and write the
+ * UNPARSEABLE_EXTRACTION_TOMBSTONE_TEXT tombstone (#3763) instead of
+ * re-spending an identical LLM call on it forever.
+ */
+export class UnparseableExtractorOutputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UnparseableExtractorOutputError';
+  }
+}
+
 /**
  * Production extractor — calls gateway.chat with the EXTRACT_TAKES_PROMPT
- * and parses the JSON array output. Returns [] on parse failure (logged as
- * warning, not thrown — one bad page must not abort the phase).
+ * and parses the JSON array output.
+ *
+ * #3763: a single unparseable response is not assumed to be a deterministic
+ * model failure — it gets ONE bounded retry before this gives up. Mirrors
+ * the parity fix `facts/extract.ts:270-292` (#2113) already ships for the
+ * same root cause: a mandatory-reasoning model spends its whole token cap
+ * on `<think>` before ever emitting JSON, so the response comes back
+ * truncated (`stopReason: 'length'`) and fails to parse. When the failing
+ * call WAS truncated, the retry doubles the token cap (the fix that
+ * actually recovers most of these); otherwise it re-asks with an explicit
+ * "JSON only" reminder, since a non-truncation malformed response can also
+ * be one-off model flakiness. Only when the retry ALSO fails to parse does
+ * this throw `UnparseableExtractorOutputError` — the phase loop's signal
+ * that this page is a dead end worth memoizing rather than a transient blip
+ * worth retrying every cycle.
  *
  * Stub-prompt note: the v0.36.1.0 ship-state prompt is a placeholder. Real
  * extractor lands when T19 corpus build produces the tuned prompt. Until
@@ -306,25 +375,42 @@ export async function defaultExtractor(
   // Bound each call so one stalled provider socket can't pin the phase for the
   // full gateway default (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) x pageLimit. The
   // caller already catches per-page errors, logs a warning, and continues.
-  const result = await gatewayChat({
-    messages: [{ role: 'user', content: prompt }],
-    ...(input.modelHint ? { model: input.modelHint } : {}),
-    maxTokens: 2048,
-    abortSignal: AbortSignal.timeout(EXTRACTOR_CALL_TIMEOUT_MS),
-  });
+  const callExtractor = (maxTokens: number, system?: string) =>
+    gatewayChat({
+      messages: [{ role: 'user', content: prompt }],
+      ...(input.modelHint ? { model: input.modelHint } : {}),
+      ...(system ? { system } : {}),
+      maxTokens,
+      abortSignal: AbortSignal.timeout(EXTRACTOR_CALL_TIMEOUT_MS),
+    });
 
+  let result = await callExtractor(EXTRACTOR_MAX_TOKENS);
   // ChatResult.text is already the concatenated text content.
-  const takes = parseExtractorOutput(result.text);
+  let takes = parseExtractorOutput(result.text);
+
   // A parse-level `[]` is AMBIGUOUS: it means either "the model genuinely
   // found no gradeable claims" OR "the model returned malformed/prose/
-  // truncated output we couldn't parse." The caller memoizes empty
-  // extractions with a tombstone, so a transient parse failure would
-  // PERMANENTLY suppress a page that actually has claims. Only a cleanly
-  // parsed empty array is a real "no claims" result worth memoizing; treat
-  // anything else as a transient error and throw, so the phase's catch
-  // retries the page next cycle (writing no tombstone).
+  // truncated output we couldn't parse." Only a cleanly parsed empty array
+  // is a real "no claims" result; anything else gets the bounded retry
+  // below before this is treated as a page-level parse failure.
   if (takes.length === 0 && !isWellFormedEmptyExtraction(result.text)) {
-    throw new Error('propose_takes extractor: no parseable takes JSON (transient — retry)');
+    const truncated = result.stopReason === 'length';
+    if (truncated) {
+      process.stderr.write(
+        `[propose_takes] WARN: extractor output truncated at maxTokens=${EXTRACTOR_MAX_TOKENS} ` +
+        `(model=${input.modelHint ?? getChatModel()}); retrying once at ${EXTRACTOR_MAX_TOKENS * 2}\n`,
+      );
+    }
+    result = await callExtractor(
+      truncated ? EXTRACTOR_MAX_TOKENS * 2 : EXTRACTOR_MAX_TOKENS,
+      truncated ? undefined : 'Return ONLY a valid JSON array. No prose, no commentary, no markdown fence.',
+    );
+    takes = parseExtractorOutput(result.text);
+    if (takes.length === 0 && !isWellFormedEmptyExtraction(result.text)) {
+      throw new UnparseableExtractorOutputError(
+        `propose_takes extractor: no parseable takes JSON after retry (stopReason=${result.stopReason})`,
+      );
+    }
   }
   return takes;
 }
@@ -566,6 +652,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
           cache_misses: 0,
           proposals_inserted: 0,
           tombstones_written: 0,
+          unparseable_tombstones_written: 0,
           budget_exhausted: false,
           warnings: [],
         },
@@ -580,6 +667,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
       cache_misses: 0,
       proposals_inserted: 0,
       tombstones_written: 0,
+      unparseable_tombstones_written: 0,
       budget_exhausted: false,
       llm_calls_succeeded: 0,
       llm_calls_failed: 0,
@@ -693,6 +781,40 @@ class ProposeTakesPhase extends BaseCyclePhase {
           break;
         }
         result.warnings.push(detail);
+        // #3763 — an UnparseableExtractorOutputError means the SAME page
+        // content just produced garbage TWICE in a row (defaultExtractor's
+        // own bounded retry already ran and also failed to parse) — a
+        // page-level dead end, not a request-level blip. Memoize it the
+        // same way the successful-empty-array case is memoized below, but
+        // with the distinct UNPARSEABLE_EXTRACTION_TOMBSTONE_TEXT sentinel
+        // so it stays identifiable apart from a genuine "no claims" result.
+        // Every OTHER per-page failure (network, timeout, 5xx, an injected
+        // test extractor's plain Error, ...) is untouched here — those stay
+        // genuinely transient and keep retrying every cycle, as before.
+        if (err instanceof UnparseableExtractorOutputError) {
+          await engine.executeRaw(
+            `INSERT INTO take_proposals
+               (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
+                claim_text, kind, holder, weight, domain, dedup_against_fence_rows, model_id, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'rejected')
+             ON CONFLICT (source_id, page_slug, content_hash, prompt_version, md5(claim_text)) DO NOTHING`,
+            [
+              sourceId,
+              page.slug,
+              ch,
+              promptVersion,
+              proposalRunId,
+              UNPARSEABLE_EXTRACTION_TOMBSTONE_TEXT,
+              'fact',
+              'brain',
+              0,
+              null,
+              JSON.stringify(existingTakes),
+              modelId,
+            ],
+          );
+          result.unparseable_tombstones_written += 1;
+        }
         continue;
       }
       result.llm_calls_succeeded += 1;
@@ -815,6 +937,9 @@ class ProposeTakesPhase extends BaseCyclePhase {
     return {
       summary:
         `propose_takes: scanned ${result.pages_scanned} pages, ${result.cache_hits} cached, ${result.proposals_inserted} new proposals, ${result.tombstones_written} empty (run ${proposalRunId})` +
+        (result.unparseable_tombstones_written > 0
+          ? `, ${result.unparseable_tombstones_written} unparseable`
+          : '') +
         (result.aborted_global_error
           ? `; aborted on ${result.aborted_global_error} error after ${result.pages_scanned} page(s)`
           : '') +

@@ -25,13 +25,22 @@ import {
   isWellFormedEmptyExtraction,
   PROPOSE_TAKES_PROMPT_VERSION,
   EMPTY_EXTRACTION_TOMBSTONE_TEXT,
+  UNPARSEABLE_EXTRACTION_TOMBSTONE_TEXT,
+  UnparseableExtractorOutputError,
+  defaultExtractor,
   resolveProposeTakesDeadlineMs,
   PROPOSE_TAKES_FALLBACK_DEADLINE_MS,
   MIN_PROPOSE_TAKES_BUDGET_MS,
   type ProposeTakesExtractor,
   type ProposedTake,
 } from '../src/core/cycle/propose-takes.ts';
-import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
+import {
+  configureGateway,
+  resetGateway,
+  __setChatTransportForTests,
+  type ChatOpts,
+  type ChatResult,
+} from '../src/core/ai/gateway.ts';
 import { BudgetMeter } from '../src/core/cycle/budget-meter.ts';
 import { CYCLE_DEADLINE_RESERVE_MS } from '../src/core/cycle/base-phase.ts';
 import type { OperationContext } from '../src/core/operations.ts';
@@ -715,7 +724,237 @@ describe('runPhaseProposeTakes — empty extraction memoization', () => {
     const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
 
     expect((result.details as Record<string, unknown>).tombstones_written).toBe(0);
+    expect((result.details as Record<string, unknown>).unparseable_tombstones_written).toBe(0);
     expect(captured.filter(c => c.sql.includes('INSERT INTO take_proposals'))).toHaveLength(0);
+  });
+});
+
+// ─── Unparseable-output memoization (#3763) ──────────────────────────
+// #2106/#2136 memoized a page that CLEANLY parsed to zero claims. They did
+// NOT memoize a page whose extractor output failed to PARSE — so a model
+// whose output consistently fails to parse (e.g. a mandatory-reasoning
+// model truncating on every call, #3763's reported root cause) reproduces
+// the exact idle-cost loop at 100% of pages instead of the zero-claim
+// subset. `defaultExtractor` now gives a failing page ONE bounded retry
+// (covered separately below) before throwing UnparseableExtractorOutputError;
+// this block covers the phase loop's response to that specific error type.
+
+describe('runPhaseProposeTakes — unparseable-output memoization (#3763)', () => {
+  test('UnparseableExtractorOutputError writes a DISTINCT tombstone from the empty-extraction one', async () => {
+    const pages = [buildPage({ slug: 'wiki/garbage', body: 'prose the extractor never parses' })];
+    const { engine, captured } = buildMockEngine({ pages });
+    const extractor: ProposeTakesExtractor = async () => {
+      throw new UnparseableExtractorOutputError('no parseable takes JSON after retry (stopReason=length)');
+    };
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    const details = result.details as Record<string, unknown>;
+    expect(details.proposals_inserted).toBe(0);
+    expect(details.tombstones_written).toBe(0); // the empty-array counter — untouched
+    expect(details.unparseable_tombstones_written).toBe(1);
+
+    const inserts = captured.filter(c => c.sql.includes('INSERT INTO take_proposals'));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]!.params[5]).toBe(UNPARSEABLE_EXTRACTION_TOMBSTONE_TEXT); // claim_text
+    expect(inserts[0]!.params[5]).not.toBe(EMPTY_EXTRACTION_TOMBSTONE_TEXT);
+    expect(inserts[0]!.sql).toContain("'rejected'"); // stays out of pending-review
+  });
+
+  test('unchanged unparseable page is a cache hit next cycle (closes the 100%-of-pages re-billing loop)', async () => {
+    const pages = [buildPage({ slug: 'wiki/garbage', body: 'prose the extractor never parses' })];
+    const { engine } = buildMockEngine({ pages });
+    let extractorCalls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      extractorCalls++;
+      throw new UnparseableExtractorOutputError('no parseable takes JSON after retry');
+    };
+
+    // Cycle 1: cache miss → LLM call → tombstone written.
+    const r1 = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+    expect(extractorCalls).toBe(1);
+    expect((r1.details as Record<string, unknown>).unparseable_tombstones_written).toBe(1);
+
+    // Cycle 2 (and, per the reported bug, every cycle after — 92 cycles /
+    // 8,425 submits / 0 rows in the wild): same unchanged page → cache hit
+    // → extractor is NOT called again. Pre-fix this stayed a cache miss
+    // forever because no row was ever written for the unparseable case.
+    const r2 = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+    expect(extractorCalls).toBe(1); // the whole point of #3763
+    expect((r2.details as Record<string, unknown>).cache_hits).toBe(1);
+    expect((r2.details as Record<string, unknown>).cache_misses).toBe(0);
+  });
+
+  test('a generic (non-Unparseable) extractor error still writes NO tombstone — genuinely transient failures keep retrying every cycle', async () => {
+    const pages = [buildPage({ slug: 'wiki/flaky', body: 'some prose' })];
+    const { engine, captured } = buildMockEngine({ pages });
+    const extractor: ProposeTakesExtractor = async () => {
+      throw new Error('ECONNRESET');
+    };
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    const details = result.details as Record<string, unknown>;
+    expect(details.tombstones_written).toBe(0);
+    expect(details.unparseable_tombstones_written).toBe(0);
+    expect(captured.filter(c => c.sql.includes('INSERT INTO take_proposals'))).toHaveLength(0);
+  });
+
+  test('a real proposal on the SAME page in a later run is unaffected by an unrelated unparseable page', async () => {
+    const pages = [
+      buildPage({ slug: 'wiki/garbage', body: 'prose the extractor never parses' }),
+      buildPage({ slug: 'wiki/good', body: 'a page with a real gradeable claim' }),
+    ];
+    const { engine, captured } = buildMockEngine({ pages });
+    const extractor: ProposeTakesExtractor = async ({ pagePath }) => {
+      if (pagePath === 'wiki/garbage') {
+        throw new UnparseableExtractorOutputError('no parseable takes JSON after retry');
+      }
+      return [{ claim_text: 'a real claim', kind: 'take', holder: 'brain', weight: 0.6 }];
+    };
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    const details = result.details as Record<string, unknown>;
+    expect(details.proposals_inserted).toBe(1);
+    expect(details.unparseable_tombstones_written).toBe(1);
+    const inserts = captured.filter(c => c.sql.includes('INSERT INTO take_proposals'));
+    expect(inserts).toHaveLength(2);
+  });
+});
+
+// ─── defaultExtractor bounded retry (#3763) ──────────────────────────
+// `defaultExtractor` (production, gateway-backed) gets ONE bounded retry
+// before treating a page as unparseable — the retry escalates the token cap
+// when the failing call was truncated (stopReason:'length', the mandatory-
+// reasoning root cause #2113 already fixed for facts/extract.ts), or resends
+// with a JSON-only reminder otherwise. Only a retry that ALSO fails to parse
+// throws UnparseableExtractorOutputError. Uses the gateway chat-transport
+// test seam — no API key, no network (mirrors test/facts-extract-truncation.test.ts).
+
+function chatResult(text: string, stopReason: ChatResult['stopReason']): ChatResult {
+  return {
+    text,
+    blocks: [{ type: 'text', text }],
+    stopReason,
+    usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    model: 'anthropic:claude-sonnet-4-6',
+    providerId: 'anthropic',
+  } as ChatResult;
+}
+
+describe('defaultExtractor — bounded retry on unparseable output (#3763)', () => {
+  test('a clean successful parse on the first call never retries', async () => {
+    const seen: ChatOpts[] = [];
+    __setChatTransportForTests(async (opts) => {
+      seen.push(opts);
+      return chatResult(
+        '[{"claim_text":"a real claim","kind":"take","holder":"brain","weight":0.5}]',
+        'end',
+      );
+    });
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'sk-ant-test' } });
+    try {
+      const takes = await defaultExtractor({ pagePath: 'wiki/x', pageBody: 'prose', existingTakes: [] });
+      expect(seen).toHaveLength(1);
+      expect(takes).toHaveLength(1);
+    } finally {
+      __setChatTransportForTests(null);
+      resetGateway();
+    }
+  });
+
+  test('a clean empty array on the first call never retries (stays the empty-extraction case, not unparseable)', async () => {
+    let calls = 0;
+    __setChatTransportForTests(async () => {
+      calls++;
+      return chatResult('[]', 'end');
+    });
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'sk-ant-test' } });
+    try {
+      const takes = await defaultExtractor({ pagePath: 'wiki/x', pageBody: 'prose', existingTakes: [] });
+      expect(calls).toBe(1);
+      expect(takes).toEqual([]);
+    } finally {
+      __setChatTransportForTests(null);
+      resetGateway();
+    }
+  });
+
+  test("stopReason 'length' retries ONCE at double the token cap and recovers the takes", async () => {
+    const seen: ChatOpts[] = [];
+    __setChatTransportForTests(async (opts) => {
+      seen.push(opts);
+      // First call: truncated mid-array. Retry: full JSON.
+      return seen.length === 1
+        ? chatResult('[{"claim_text":"truncated mid-a', 'length')
+        : chatResult('[{"claim_text":"recovered claim","kind":"take","holder":"brain","weight":0.5}]', 'end');
+    });
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'sk-ant-test' } });
+    try {
+      const takes = await defaultExtractor({ pagePath: 'wiki/x', pageBody: 'prose', existingTakes: [] });
+      expect(seen).toHaveLength(2);
+      expect(seen[1]!.maxTokens).toBe(seen[0]!.maxTokens! * 2);
+      expect(takes).toHaveLength(1);
+      expect(takes[0]!.claim_text).toBe('recovered claim');
+    } finally {
+      __setChatTransportForTests(null);
+      resetGateway();
+    }
+  });
+
+  test('still-truncated retry throws UnparseableExtractorOutputError (bounded at one retry, not retried forever)', async () => {
+    let calls = 0;
+    __setChatTransportForTests(async () => {
+      calls++;
+      return chatResult('[{"claim_text":"still trunc', 'length');
+    });
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'sk-ant-test' } });
+    try {
+      await expect(
+        defaultExtractor({ pagePath: 'wiki/x', pageBody: 'prose', existingTakes: [] }),
+      ).rejects.toThrow(UnparseableExtractorOutputError);
+      expect(calls).toBe(2);
+    } finally {
+      __setChatTransportForTests(null);
+      resetGateway();
+    }
+  });
+
+  test('non-truncation malformed output retries once with a JSON-only reminder and recovers', async () => {
+    const seen: ChatOpts[] = [];
+    __setChatTransportForTests(async (opts) => {
+      seen.push(opts);
+      return seen.length === 1
+        ? chatResult('Sure, here are the claims for that page: nope not json', 'end')
+        : chatResult('[{"claim_text":"recovered claim","kind":"take","holder":"brain","weight":0.5}]', 'end');
+    });
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'sk-ant-test' } });
+    try {
+      const takes = await defaultExtractor({ pagePath: 'wiki/x', pageBody: 'prose', existingTakes: [] });
+      expect(seen).toHaveLength(2);
+      expect(seen[1]!.maxTokens).toBe(seen[0]!.maxTokens); // no truncation — cap stays the same
+      expect(String(seen[1]!.system)).toContain('valid JSON array');
+      expect(takes).toHaveLength(1);
+    } finally {
+      __setChatTransportForTests(null);
+      resetGateway();
+    }
+  });
+
+  test('a second non-truncation malformed response is still bounded — throws after exactly one retry', async () => {
+    let calls = 0;
+    __setChatTransportForTests(async () => {
+      calls++;
+      return chatResult('still not json either time', 'end');
+    });
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'sk-ant-test' } });
+    try {
+      await expect(
+        defaultExtractor({ pagePath: 'wiki/x', pageBody: 'prose', existingTakes: [] }),
+      ).rejects.toThrow(UnparseableExtractorOutputError);
+      expect(calls).toBe(2);
+    } finally {
+      __setChatTransportForTests(null);
+      resetGateway();
+    }
   });
 });
 
