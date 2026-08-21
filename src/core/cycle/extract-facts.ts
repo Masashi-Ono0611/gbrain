@@ -409,9 +409,13 @@ export async function runExtractFacts(
     // even though the fence is still on the page (just mis-placed). Detect
     // the mis-placement and treat it the same as the malformed-parse branch
     // above: loud (warn), never destructive (preserve the existing index).
-    // Require BOTH markers (not a bare BEGIN substring hit) so prose that
-    // merely mentions or quotes the marker text doesn't false-trigger the
-    // guard on an otherwise fence-less page.
+    // Require BOTH markers, in order (not a bare BEGIN substring hit), so a
+    // page that only happens to mention the BEGIN marker text in passing
+    // doesn't false-trigger the guard. This is a narrowing, not a full
+    // guarantee — prose that quotes a complete begin+end marker pair
+    // verbatim would still match — but a false positive here only costs an
+    // extra warning-and-preserve cycle, never data loss, so the tradeoff
+    // favors the cheaper check.
     const timeline = page.timeline ?? '';
     const timelineBeginIdx = timeline.indexOf(FACTS_FENCE_BEGIN);
     const hasTimelineFence = timelineBeginIdx !== -1
