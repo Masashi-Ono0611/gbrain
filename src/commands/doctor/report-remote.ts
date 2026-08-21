@@ -155,6 +155,20 @@ export async function doctorReportRemote(
     checks.push({ name: 'timeline_dedup_index', status: 'warn', message: 'Could not check idx_timeline_dedup shape' });
   }
 
+  // 2c. #550: pages(source_id, slug) unique-index presence. putPage upserts
+  // via ON CONFLICT (source_id, slug) on both engines; if the arbiter index
+  // is missing (dropped/renamed by an external migration, or a pages table
+  // created outside gbrain's own migration chain), every write fails while
+  // reads stay green and the version counter can't see it. Detection only —
+  // see pages-slug-index-check.ts for why no auto-repair.
+  try {
+    const { checkPagesSlugUniqueIndex, describePagesSlugIndexStatus } = await import('../../core/pages-slug-index-check.ts');
+    const idx = await checkPagesSlugUniqueIndex(engine);
+    checks.push({ name: 'pages_slug_unique_index', ...describePagesSlugIndexStatus(idx) });
+  } catch {
+    checks.push({ name: 'pages_slug_unique_index', status: 'warn', message: 'Could not check pages(source_id, slug) unique index' });
+  }
+
   // v0.42.x — Life Chronicle (#2390): orphaned event projections. Reads already
   // hide projections whose event page is soft-deleted (read-time correctness);
   // this always-run probe surfaces the cleanup backlog. Keyed off the real

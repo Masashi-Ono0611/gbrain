@@ -1900,6 +1900,21 @@ export async function buildChecks(
     checks.push({ name: 'schema_version', status: 'warn', message: 'Could not check schema version' });
   }
 
+  // 6b. #550: pages(source_id, slug) unique-index presence. putPage upserts
+  // via ON CONFLICT (source_id, slug) on both engines; if the arbiter index
+  // is missing (dropped/renamed by an external migration, or a pages table
+  // created outside gbrain's own migration chain), every write fails while
+  // reads stay green and the version counter can't see it. Detection only —
+  // see pages-slug-index-check.ts for why no auto-repair.
+  progress.heartbeat('pages_slug_unique_index');
+  try {
+    const { checkPagesSlugUniqueIndex, describePagesSlugIndexStatus } = await import('../core/pages-slug-index-check.ts');
+    const idx = await checkPagesSlugUniqueIndex(engine);
+    checks.push({ name: 'pages_slug_unique_index', ...describePagesSlugIndexStatus(idx) });
+  } catch {
+    checks.push({ name: 'pages_slug_unique_index', status: 'warn', message: 'Could not check pages(source_id, slug) unique index' });
+  }
+
   // Note: we intentionally DO NOT fail on "schema v7+ but no preferences.json".
   // That's a valid fresh-install state after `gbrain init` — the migration
   // orchestrator writes preferences, but `init` alone doesn't run it. The
