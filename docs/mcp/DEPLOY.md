@@ -334,6 +334,51 @@ Operator checklist:
 Optional defense-in-depth: a dedicated Postgres role (or RLS) limited to the
 allowed `source_id`s, so even a leaked connection string can't read everything.
 
+### Run `gbrain serve` under an init process (#2443)
+
+If `gbrain serve` (stdio or `--http`) is your container's `ENTRYPOINT`/`CMD`
+with nothing wrapping it, it becomes **PID 1** inside that container's PID
+namespace. A PID-1 process is responsible for reaping every process that
+gets reparented to it — and gbrain has no safe way to do that from
+user-space (no arbitrary-child `waitpid(-1, ...)` binding; see
+`src/core/zombie-reap.ts` for the full feasibility note). Left unaddressed,
+a process left behind by an aborted or timed-out subprocess (e.g. a `git`
+helper orphaned by a force-evicted autopilot worker) reparents to PID 1 and
+can accumulate as a zombie. On a cgroup v2 host this can exhaust `pids.max`
+and make `fork()` fail with `EAGAIN` — a crash-loop on a slow, multi-day
+cadence with no OOM in sight (that specific failure mode is what #2443
+reported and traced to zombie `git` processes; `EAGAIN` from `fork()` has
+other possible causes too — `RLIMIT_NPROC`, the system thread limit, or
+`pid_max` — so confirm by checking `pids.current`/`pids.max` and scanning
+for `Z`-state (`ps -eo stat,ppid,comm` or `/proc/[0-9]*/stat`) processes
+whose `ppid` is 1). `gbrain serve` logs a one-time startup warning when it
+detects `pid === 1` on Linux.
+
+Fix: give the container a real init so gbrain is never pid 1:
+
+```dockerfile
+# Docker: use the built-in init (SIGCHLD reaping + signal forwarding)
+# docker run --init ...
+# or, in a Dockerfile:
+ENTRYPOINT ["tini", "--", "gbrain", "serve", "--http"]
+```
+
+`docker run --init` and `tini`/`dumb-init` all solve this the same way:
+they occupy PID 1 themselves and reap orphans, so `gbrain serve` runs as an
+ordinary (non-PID-1) child that only ever needs to reap the processes it
+spawns directly — which it already does.
+
+**Kubernetes note:** a default Pod does NOT get this for free. Each
+container's own entrypoint is PID 1 in its own PID namespace unless the Pod
+sets `shareProcessNamespace: true`, in which case Kubernetes' `pause`
+binary becomes the shared PID 1 (and it does reap — it installs a SIGCHLD
+handler and calls `waitpid(-1, ...)`). Absent that setting, put `tini`/
+`dumb-init` in the image (as above) rather than assuming the platform
+handles it. `shareProcessNamespace: true` also has visibility implications
+(all containers in the Pod see each other's processes and share one
+network+IPC namespace) — enable it deliberately, not solely as a reaping
+workaround, if that tradeoff matters for your Pod.
+
 ## Troubleshooting
 
 **"missing_auth" error**
@@ -348,6 +393,16 @@ Database connection failed. Check your Supabase dashboard for outages.
 **Claude Desktop doesn't connect**
 Remote servers must be added via Settings > Integrations, NOT
 `claude_desktop_config.json`. See [CLAUDE_DESKTOP.md](CLAUDE_DESKTOP.md).
+
+**Container crash-loops every few days with `fork(): Resource temporarily
+unavailable` and no OOM kill**
+`EAGAIN` from `fork()` can indicate a full cgroup `pids.max`, `RLIMIT_NPROC`,
+the system thread limit, or `pid_max` exhaustion. For #2443, this was caused
+by zombie `git` processes accumulating under `gbrain serve` running as
+container PID 1 — check `pids.current`/`pids.max` and scan for `Z`-state
+processes with `ppid` 1 to confirm before assuming this specific cause. See
+[Run `gbrain serve` under an init process (#2443)](#run-gbrain-serve-under-an-init-process-2443)
+above.
 
 ## Expected Latencies
 

@@ -107,6 +107,9 @@ function makeHarness(opts: {
   initialParentPid?: number;
   probeWatchdog?: boolean;
   mcpStdio?: boolean;
+  // #2443: stub result for the PID-1 zombie-reap warning check. Defaults
+  // to null (no warning) — most tests here aren't exercising that path.
+  pid1Warning?: string | null;
 } = {}): Harness {
   const engine = new StubEngine();
   const stdin = new EventEmitter() as EventEmitter & { isTTY?: boolean };
@@ -153,6 +156,9 @@ function makeHarness(opts: {
     // the stdio lifecycle, not the sweep — test/sweep.test.ts owns the
     // sweep-timer wiring coverage — so opt out here.
     sweepEnabled: false,
+    // #2443: deterministic stub so these tests never depend on this test
+    // runner's real process.pid (which is never actually 1).
+    pid1Warning: () => opts.pid1Warning ?? null,
   };
 
   return {
@@ -179,6 +185,32 @@ async function startInBackground(
 ): Promise<void> {
   await runServe(engine as unknown as BrainEngine, args, opts);
 }
+
+describe('runServe #2443 PID-1 zombie-reap warning wiring', () => {
+  // These tests cover ONLY that runServe correctly calls the injected
+  // pid1Warning() check and forwards a non-null result to log() — they do
+  // NOT prove gbrain reaps a reparented grandchild when truly running as
+  // PID 1 (that's a container/PID-namespace integration-test concern, out
+  // of scope here — see the module doc comment in test/zombie-reap.test.ts
+  // and src/core/zombie-reap.ts for what real-binary coverage exists
+  // instead).
+  test('logs the warning when pid1Warning() returns a message', async () => {
+    const h = makeHarness({ pid1Warning: '[gbrain serve] WARNING: running as PID 1 test-marker' });
+    await startInBackground(h.engine, [], h.opts);
+    expect(h.logs.some(l => l.includes('test-marker'))).toBe(true);
+  });
+
+  test('logs nothing extra when pid1Warning() returns null (default: not PID 1)', async () => {
+    const h = makeHarness();
+    await startInBackground(h.engine, [], h.opts);
+    expect(h.logs.some(l => l.includes('PID 1'))).toBe(false);
+  });
+
+  // The --http lane is covered in test/serve-http-stall-watchdog.test.ts,
+  // whose harness already stubs runServeHttp (booting the real one here
+  // would bring up an actual HTTP server) — see 'fires before the --http
+  // lane boots (shared entry point)' there.
+});
 
 describe('runServe stdio lifecycle', () => {
   test('stdin end triggers engine.disconnect() and process exit(0)', async () => {

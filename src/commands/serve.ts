@@ -3,6 +3,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { startMcpServer } from '../mcp/server.ts';
 import { VERB_NAMES } from '../core/verbs.ts';
 import { redirectStdoutLoggingToStderr } from '../core/console-prefix.ts';
+import { pid1ZombieReapWarning } from '../core/zombie-reap.ts';
 import {
   installLoopStallWatchdog,
   resolveServeStallWatchdogMs,
@@ -129,6 +130,11 @@ export interface ServeOptions {
   // to resolveServeStallWatchdogMs(GBRAIN_SERVE_STALL_WATCHDOG_MS) — opt-in,
   // 15s floor, garbage values warn and stay off.
   stallWatchdogMs?: number;
+  // Test seam (#2443) for the PID-1 zombie-reap startup warning. Defaults
+  // to the real pid1ZombieReapWarning, which reads live process.pid — not
+  // safely mockable, so tests inject a stub here instead to assert the
+  // log-wiring without needing this test process to actually run as PID 1.
+  pid1Warning?: () => string | null;
 }
 
 /**
@@ -196,6 +202,15 @@ export async function runServe(
   // verifyAccessToken with legacy access_tokens fallback (so v0.22.7 callers
   // that used `gbrain auth create` keep working unchanged).
   const isHttp = args.includes('--http');
+
+  // #2443: loud one-time warning when gbrain is running as container PID 1
+  // with no init process reaping orphans ahead of it — applies to both the
+  // stdio and --http lanes, so it lives here rather than duplicated in
+  // serve-http.ts. See pid1ZombieReapWarning's doc comment for why this
+  // can't be a real fix (no arbitrary-child waitpid(-1) binding in this
+  // codebase — see zombie-reap.ts for the full feasibility note).
+  const pid1Warn = (opts.pid1Warning ?? pid1ZombieReapWarning)();
+  if (pid1Warn) (opts.log ?? ((msg: string) => console.error(msg)))(pid1Warn);
 
   // MEMORY_VERBS v1: tool-surface mode. Flag > config `mcp_surface` > 'full'.
   // 'verbs' exposes exactly the seven protocol verbs (the quickstart surface);

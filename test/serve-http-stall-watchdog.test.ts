@@ -64,6 +64,12 @@ function makeHarness(overrides: Partial<ServeOptions> = {}): Harness {
       };
     },
     stallWatchdogMs: 20_000,
+    // #2443: deterministic default so these tests never depend on this
+    // test runner's real process.pid/process.platform (which are never
+    // actually PID 1 on Linux in practice — codex review round 1 caught
+    // this harness falling through to the real pid1ZombieReapWarning()
+    // when no override was given, unlike the stdio harness's default).
+    pid1Warning: () => null,
     ...overrides,
   };
 
@@ -124,5 +130,30 @@ describe('serve --http loop-stall watchdog seam (#4281)', () => {
     const h = makeHarness({ stallWatchdogMs: 0 });
     await runServe(h.engine as unknown as BrainEngine, ['--http'], h.opts);
     expect(h.logs.join('\n')).not.toContain('loop-stall watchdog armed');
+  });
+});
+
+describe('serve --http PID-1 zombie-reap warning wiring (#2443)', () => {
+  // Proves runServe's shared pid1Warning() check fires for the --http lane
+  // too (it lives before the isHttp branch, so one call covers both). Does
+  // NOT prove gbrain reaps a reparented grandchild when actually running as
+  // PID 1 — that's out of scope for this suite; see test/zombie-reap.test.ts
+  // for what is and isn't covered.
+  test('fires exactly once for the --http lane too (shared entry point, not stdio-only, not duplicated)', async () => {
+    const h = makeHarness({
+      pid1Warning: () => '[gbrain serve] WARNING: running as PID 1 test-marker-http',
+    });
+    await runServe(h.engine as unknown as BrainEngine, ['--http'], h.opts);
+    // Count, not `.some()` — pins that the check fires ONCE, not merely
+    // "at least once" (codex review round 1 nit: an earlier draft's
+    // `.some()` assertion couldn't actually detect a duplicate call).
+    const matches = h.logs.filter(l => l.includes('test-marker-http')).length;
+    expect(matches).toBe(1);
+  });
+
+  test('logs nothing extra when pid1Warning() returns null (default: not PID 1)', async () => {
+    const h = makeHarness();
+    await runServe(h.engine as unknown as BrainEngine, ['--http'], h.opts);
+    expect(h.logs.some(l => l.includes('PID 1'))).toBe(false);
   });
 });
