@@ -161,6 +161,9 @@ export function classifyErrorCode(errorMsg: string): string {
   if (/Anthropic has no embedding model|EMBEDDING_NO_TOUCHPOINT/i.test(errorMsg)) {
     return 'EMBEDDING_NO_TOUCHPOINT';
   }
+  if (/\[embed\([^\r\n)]*\)\]\s+The operation timed out\.?|EMBEDDING_TIMEOUT/i.test(errorMsg)) {
+    return 'EMBEDDING_TIMEOUT';
+  }
   if (/\brate.?limit|\b429\b|too many requests|rate_limited|RateLimit/i.test(errorMsg)) {
     return 'EMBEDDING_RATE_LIMIT';
   }

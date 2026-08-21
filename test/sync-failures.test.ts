@@ -550,6 +550,13 @@ describe('v0.41.6.0 D2 — embedding error classification', () => {
     )).toBe('EMBEDDING_NO_TOUCHPOINT');
   });
 
+  test('EMBEDDING_TIMEOUT matches the normalized embed timeout shape', async () => {
+    const { classifyErrorCode } = await import('../src/core/sync.ts');
+    expect(classifyErrorCode(
+      '[embed(ollama:nomic-embed-text)] The operation timed out.'
+    )).toBe('EMBEDDING_TIMEOUT');
+  });
+
   test('EMBEDDING_RATE_LIMIT matches HTTP 429 phrasing', async () => {
     const { classifyErrorCode } = await import('../src/core/sync.ts');
     expect(classifyErrorCode('Request failed with status 429: rate limit exceeded')).toBe('EMBEDDING_RATE_LIMIT');
@@ -612,5 +619,10 @@ describe('v0.41.6.0 D2 — embedding error classification', () => {
   test('UNKNOWN still fires when no pattern matches', async () => {
     const { classifyErrorCode } = await import('../src/core/sync.ts');
     expect(classifyErrorCode('some random unmatched error message')).toBe('UNKNOWN');
+  });
+
+  test('generic non-embedding timeouts remain UNKNOWN', async () => {
+    const { classifyErrorCode } = await import('../src/core/sync.ts');
+    expect(classifyErrorCode('The operation timed out.')).toBe('UNKNOWN');
   });
 });
