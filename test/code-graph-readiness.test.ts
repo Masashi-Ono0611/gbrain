@@ -17,6 +17,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { importCodeFile } from '../src/core/import-file.ts';
 import { resolveCodeReadiness, readinessHint } from '../src/core/code-graph-readiness.ts';
+import { findCodeDef } from '../src/commands/code-def.ts';
 
 let engine: PGLiteEngine;
 
@@ -36,14 +37,75 @@ beforeEach(async () => {
   await engine.executeRaw('DELETE FROM pages');
 });
 
-const SAMPLE = `export function alpha(x: number): number {
-  return beta(x) + 1;
+const SAMPLE = `export const alpha = 1;
+
+export function beta(): number {
+  return alpha + 1;
 }
 
-export function beta(y: number): number {
-  return y * 2;
+export class Gamma {
+  value = beta();
 }
 `;
+
+// Every declaration is below the chunker's small-sibling threshold. The
+// resulting merged chunks deliberately have symbol_name = NULL.
+const SYMBOLLESS_SAMPLE = `export const A = 1;
+export const B = 2;
+export const C = 3;
+export const D = 4;
+export const E = 5;
+export const F = 6;
+export const G = 7;
+export const H = 8;
+export const I = 9;
+export const J = 10;
+`;
+
+describe('issue #3640 — code-def empty-result states stay distinguishable', () => {
+  test('never indexed: count 0, not_built, actionable message', async () => {
+    const results = await findCodeDef(engine, 'MissingWidget');
+    const readiness = await resolveCodeReadiness(engine, { kind: 'symbol', count: results.length });
+
+    expect(results).toHaveLength(0);
+    expect(readiness.status).toBe('not_built');
+    expect(readiness.ready).toBe(false);
+    expect(readinessHint(readiness)).toContain('sync');
+  });
+
+  test('code indexed but chunker produced zero symbols: count 0, no_symbols, explanatory message', async () => {
+    await importCodeFile(engine, 'src/tiny.ts', SYMBOLLESS_SAMPLE, { noEmbed: true });
+    const named = await engine.executeRaw<{ count: number }>(
+      `SELECT COUNT(*)::int AS count FROM content_chunks WHERE symbol_name IS NOT NULL`,
+    );
+    const results = await findCodeDef(engine, 'MissingWidget');
+    const readiness = await resolveCodeReadiness(engine, { kind: 'symbol', count: results.length });
+    const edgeReadiness = await resolveCodeReadiness(engine, { kind: 'edge', count: 0 });
+
+    expect(named[0]?.count).toBe(0);
+    expect(results).toHaveLength(0);
+    expect(readiness.status).toBe('no_symbols');
+    expect(readiness.ready).toBe(false);
+    expect(edgeReadiness.status).toBe('no_symbols');
+    expect(edgeReadiness.ready).toBe(false);
+    expect(readinessHint(readiness)).toContain('no named symbols');
+  });
+
+  test('symbol index populated but name is absent: count 0, ready, no warning message', async () => {
+    await importCodeFile(engine, 'src/sample.ts', SAMPLE, { noEmbed: true });
+    const named = await engine.executeRaw<{ count: number }>(
+      `SELECT COUNT(*)::int AS count FROM content_chunks WHERE symbol_name IS NOT NULL`,
+    );
+    const results = await findCodeDef(engine, 'MissingWidget');
+    const readiness = await resolveCodeReadiness(engine, { kind: 'symbol', count: results.length });
+
+    expect(named[0]?.count).toBeGreaterThan(0);
+    expect(results).toHaveLength(0);
+    expect(readiness.status).toBe('ready');
+    expect(readiness.ready).toBe(true);
+    expect(readinessHint(readiness)).toBeNull();
+  });
+});
 
 describe('resolveCodeReadiness — empty brain', () => {
   test('symbol grain → not_built when no code exists', async () => {
@@ -134,8 +196,9 @@ describe('resolveCodeReadiness — fail-open (CRITICAL regression)', () => {
 });
 
 describe('readinessHint', () => {
-  test('not_built / indexing / unknown produce a hint; ready does not', () => {
+  test('not_built / no_symbols / indexing / unknown produce a hint; ready does not', () => {
     expect(readinessHint({ status: 'not_built', ready: false, has_code: false, pending_edges: false })).toContain('not built');
+    expect(readinessHint({ status: 'no_symbols', ready: false, has_code: true, pending_edges: false })).toContain('no named symbols');
     expect(readinessHint({ status: 'indexing', ready: false, has_code: true, pending_edges: true })).toContain('still building');
     expect(readinessHint({ status: 'unknown', ready: false, has_code: false, pending_edges: false })).toContain('unavailable');
     expect(readinessHint({ status: 'ready', ready: true, has_code: true, pending_edges: false })).toBeNull();
