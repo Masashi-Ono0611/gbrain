@@ -79,7 +79,7 @@
 
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
-import { BudgetTracker } from '../budget/budget-tracker.ts';
+import { BudgetTracker, BudgetExhausted } from '../budget/budget-tracker.ts';
 import { withBudgetTracker } from '../ai/gateway.ts';
 import { errorFor } from '../errors.ts';
 import { applyEditBatch, getWorkingTreeStatusForFile, splitFrontmatter } from './apply-edits.ts';
@@ -331,6 +331,11 @@ async function runOptimizationLoop(
 
   // Run the loop inside withBudgetTracker so every nested gateway call composes.
   let outcome: 'accepted' | 'no_improvement' | 'aborted' | 'errored' = 'no_improvement';
+  // Set in the catch block below on abort/error; surfaced to stdout/stderr by
+  // the CLI (skillopt.ts) and echoed in the receipt so `--json` callers get it
+  // too. Previously this was logged ONLY to the audit JSONL and discarded —
+  // `gbrain skillopt` printed "Outcome: errored" with no indication why (#3516).
+  let errorMessage: string | undefined;
   let finalText = checkpoint.best_skill_text;
   let totalStepsRun = 0;
   // Hoisted for the receipt (computed inside the budget-tracker closure).
@@ -671,7 +676,17 @@ async function runOptimizationLoop(
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('BudgetExhausted') || msg.includes('budget_exhausted')) {
+    errorMessage = msg;
+    // Classify by TYPE (err instanceof BudgetExhausted), not by sniffing the
+    // message text for the class name — BudgetExhausted's `message` is a
+    // human-readable sentence (e.g. `"skillopt:<skill>: no pricing entry for
+    // model \"openrouter:...\" (kind=chat). Add it to ..."`) that never
+    // contains the literal substrings "BudgetExhausted"/"budget_exhausted".
+    // The old `msg.includes(...)` check therefore NEVER matched a real
+    // BudgetExhausted throw (cost cap, runtime cap, OR missing pricing) — every
+    // one fell into the generic `else` below, which also mislabeled the audit
+    // `reason` as `'sigint'` regardless of cause (#3516).
+    if (err instanceof BudgetExhausted) {
       outcome = 'aborted';
       logEvent({
         kind: 'abort',
@@ -695,7 +710,7 @@ async function runOptimizationLoop(
         kind: 'abort',
         run_id: runId,
         skill: skillName,
-        reason: 'sigint',
+        reason: 'unexpected_error',
         detail: msg,
       } as never);
     }
@@ -732,6 +747,7 @@ async function runOptimizationLoop(
     started_at: checkpoint.started_at,
     ended_at: new Date().toISOString(),
     outcome,
+    ...(errorMessage !== undefined ? { error_message: errorMessage } : {}),
     baseline_sel_score: baselineSelScore,
     best_sel_score: checkpoint.best_sel_score,
     ...(testScore !== undefined ? { test_score: testScore } : {}),

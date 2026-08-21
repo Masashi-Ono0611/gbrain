@@ -36,7 +36,8 @@ export type SkilloptEvent =
       ts: string }
   | { kind: 'abort'; run_id: string; skill: string; reason: 'budget_exhausted' |
       'runtime_exhausted' | 'dirty_tree' | 'lock_busy' | 'sentinel_pending' |
-      'bundled_skill_no_flag' | 'd_sel_too_small' | 'sigint'; detail?: string;
+      'bundled_skill_no_flag' | 'd_sel_too_small' | 'sigint' |
+      'unexpected_error'; detail?: string;
       ts: string };
 
 let _writer: AuditWriter<SkilloptEvent> | null = null;

@@ -207,6 +207,14 @@ export interface RunReceipt {
   started_at: string;
   ended_at?: string;
   outcome?: 'accepted' | 'no_improvement' | 'aborted' | 'errored';
+  /**
+   * Populated when outcome is 'aborted' or 'errored' — the actual error
+   * message (e.g. a BudgetExhausted no-pricing-entry message for an
+   * OpenRouter/litellm model id). Previously this detail was logged ONLY to
+   * the audit JSONL and never returned to the caller, so `gbrain skillopt`
+   * printed "Outcome: errored" with no indication why (#3516).
+   */
+  error_message?: string;
   baseline_sel_score?: number;
   best_sel_score?: number;
   baseline_test_score?: number;

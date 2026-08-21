@@ -295,6 +295,8 @@ interface RunOptsOverride {
   reflectMode?: 'both' | 'failure-only';
   disableValidationGate?: boolean;
   maxRuntimeMin?: number;
+  /** #3516 repro: point the target model at an unpriced provider:model id. */
+  targetModel?: string;
 }
 
 async function runOnce(fixture: Fixture, over: RunOptsOverride = {}) {
@@ -309,7 +311,7 @@ async function runOnce(fixture: Fixture, over: RunOptsOverride = {}) {
     lrSchedule: 'constant',
     split: [4, 1, 5],
     optimizerModel: 'anthropic:claude-opus-4-7',
-    targetModel: 'anthropic:claude-sonnet-4-6',
+    targetModel: over.targetModel ?? 'anthropic:claude-sonnet-4-6',
     judgeModel: 'anthropic:claude-sonnet-4-6',
     mode: 'patch',
     dryRun: false,
@@ -579,6 +581,61 @@ describe('skillopt full-loop E2E (happy path + broken cases)', () => {
       fixture.cleanup();
     }
   });
+
+  // #3516: an unpriced target model (any `openrouter:<vendor>/<model>` or
+  // `litellm:<vendor>/<model>` id not in CANONICAL_PRICING — both forms are
+  // reported in the issue) makes BudgetTracker.reserve() TX2 hard-fail with
+  // BudgetExhausted(reason:'no_pricing') on the very first rollout call.
+  // Before the fix, the orchestrator's catch block classified this via
+  // `msg.includes('BudgetExhausted')`, a substring that never appears in the
+  // actual thrown message — so the run silently landed on outcome='errored'
+  // with the real cause logged ONLY to the audit JSONL (never returned to the
+  // caller). `gbrain skillopt` printed "Outcome: errored" / "$0.00" and
+  // nothing else. This test would have failed pre-fix on BOTH assertions:
+  // outcome stayed 'errored' (not 'aborted') and `error_message` didn't exist
+  // on the receipt at all.
+  for (const unpricedModel of [
+    'openrouter:anthropic/claude-sonnet-4-5',
+    'litellm:deepseek-ai/DeepSeek-V4-Flash-0731',
+  ]) {
+    test(`unpriced target model "${unpricedModel}" surfaces the real error instead of a silent abort`, async () => {
+      const fixture = setupFixture(SKILL_PEOPLE_ONLY);
+      try {
+        installStub({});
+        try {
+          await withEnv({ GBRAIN_AUDIT_DIR: fixture.skillsDir }, async () => {
+            // maxCostUsd=20: preflight.ts's own estimate for an unknown
+            // provider falls back to a warn-only Sonnet-tier ($3/$15) guess
+            // (never gates — see its `lookupPrice` doc comment), which for
+            // this fixture's default epochs/batchSize comes to ~$7 — so the
+            // cap here must clear that fake estimate for the run to reach the
+            // loop. Once inside the loop, the REAL pricing lookup
+            // (BudgetTracker's `lookupPricing`, which does NOT fall back —
+            // it returns null on a miss) hard-fails TX2 on the very first
+            // rollout call, regardless of how high the cap is.
+            const result = await runOnce(fixture, { targetModel: unpricedModel, maxCostUsd: 20 });
+
+            expect(result.outcome).toBe('aborted');
+            expect(result.receipt.error_message).toBeDefined();
+            expect(result.receipt.error_message).toContain('no pricing entry');
+            expect(result.receipt.error_message).toContain(unpricedModel);
+            expect(result.receipt.final_cost_usd).toBe(0);
+
+            // No half-mutated state: same D8 contract as the mid-run abort case.
+            expect(result.mutatedSkillFile).toBe(false);
+            expect(fs.readFileSync(skillPath(fixture.skillsDir, SKILL), 'utf8'))
+              .toBe(SKILL_PEOPLE_ONLY);
+            const history = loadHistory(fixture.skillsDir, SKILL);
+            expect(history.filter((r) => r.status === 'pending')).toHaveLength(0);
+          });
+        } finally {
+          uninstallStub();
+        }
+      } finally {
+        fixture.cleanup();
+      }
+    });
+  }
 
   test('converged skill: re-running on perfect baseline yields no_improvement (no double-commit)', async () => {
     // Start from an already-perfect skill (baseline score = 1.0). The forward

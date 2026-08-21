@@ -314,6 +314,13 @@ export async function runSkillOptCommand(engine: BrainEngine | null, args: strin
       }) + '\n');
     } else {
       process.stderr.write(`[skillopt] Outcome: ${result.outcome}\n`);
+      // #3516: outcome 'aborted'/'errored' used to print with no indication
+      // why — the real cause (e.g. a BudgetExhausted no-pricing-entry error
+      // for an openrouter:/litellm: model id) was recorded ONLY in the audit
+      // JSONL. Surface it here so the terminal output is actionable.
+      if (result.receipt.error_message) {
+        process.stderr.write(`[skillopt] Error: ${result.receipt.error_message}\n`);
+      }
       process.stderr.write(`[skillopt] Best sel-score: ${(result.receipt.best_sel_score ?? 0).toFixed(3)}\n`);
       process.stderr.write(`[skillopt] Final cost: $${(result.receipt.final_cost_usd ?? 0).toFixed(2)}\n`);
       if (result.mutatedSkillFile) {
