@@ -172,8 +172,14 @@ export function readinessHint(r: CodeGraphReadiness): string | null {
       // already indexed and just outside this caller's grant — it re-syncs
       // an already-correctly-indexed brain and resolves nothing.
       if (r.out_of_scope) {
-        return 'No code indexed within your current source grant, but code exists elsewhere in this brain. ' +
-          'Widen the federated_read grant for this client to include the source(s) holding code, or retry with --all-sources if permitted.';
+        // Deliberately does not name a specific flag or param spelling: this
+        // hint is shared by CLI commands that support an all-sources escape
+        // hatch (code-callers/code-callees) and ones that don't (code-def/
+        // code-refs have no such flag), plus the MCP ops surface (a JSON
+        // param, different spelling again). Naming one exact syntax here
+        // would be wrong advice for the others.
+        return 'No code indexed within your current source grant, but code exists elsewhere in this brain — ' +
+          'widen the federated_read grant for this client to include the source(s) holding code.';
       }
       return 'Symbol graph not built (no code indexed in scope). Run `gbrain sync` to index code.';
     case 'indexing':

@@ -224,6 +224,58 @@ describe('#1780 Gap 1 — readiness envelope on code_* ops', () => {
   });
 });
 
+describe('#3707 — out_of_scope must never cross a remote caller\'s grant', () => {
+  // Adversarial regression guard (Codex review flagged this as a Critical
+  // during #3707's review): resolveCodeReadiness's out_of_scope signal
+  // reveals whether code exists OUTSIDE the caller's scope. That's fine for
+  // trusted local CLI callers, but for a remote/grant-restricted caller it
+  // would be a cross-grant existence leak if it ever reached the response.
+  // Today it doesn't (code_callers/code_callees/code_def/code_refs in
+  // ops/code-intel.ts spread only {status, ready} from the readiness
+  // object, never the whole thing or readinessHint()'s text) — this test
+  // pins that behavior so a future "helpful" `...readiness` refactor, or
+  // an added `hint: readinessHint(readiness)` line, would fail loudly
+  // instead of silently leaking. Asserts the FULL response key set (not
+  // just "no out_of_scope key") so a leak via a differently-named field
+  // (e.g. a nested `readiness` object, or `hint`) is caught too. Covers
+  // both scoped handlers (code_callers AND code_callees) — code_def/
+  // code_refs are brain-wide by design (see ops/code-intel.ts) and can't
+  // reach this path at all: they call resolveCodeReadiness with no
+  // sourceId, so the new probe structurally never fires for them.
+  test.each(['code_callers', 'code_callees'] as const)(
+    '%s response has no out_of_scope/readiness leak for a remote caller whose grant excludes the source with code',
+    async (opName) => {
+      await registerSource(engine, 'source-a'); // granted, empty of code
+      await registerSource(engine, 'source-b'); // has code, NOT granted
+      const pageB = await insertCodePage(engine, 'source-b', 'src/foo.ts');
+      await insertChunk(engine, pageB, 0, 'parseMarkdown', 'function');
+
+      const remoteCtx: any = {
+        engine,
+        config: { engine: 'pglite' as const },
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+        dryRun: false,
+        remote: true,
+        auth: { token: 't', clientId: 'c', scopes: ['read'], allowedSources: ['source-a'] },
+      };
+      const result = await operationsByName[opName]!.handler(remoteCtx, { symbol: 'parseMarkdown' });
+      const edgesKey = opName === 'code_callers' ? 'callers' : 'callees';
+      expect(Object.keys(result as object).sort()).toEqual(['count', 'ready', 'status', 'symbol', edgesKey].sort());
+      expect((result as { status: string }).status).toBe('not_built');
+
+      // Positive control: prove the HANDLER's own internal call to
+      // resolveCodeReadiness genuinely computes out_of_scope: true for this
+      // exact scenario (same engine state, same scope) — not just that the
+      // bare helper can return true in isolation. Otherwise the assertion
+      // above could pass vacuously because the dangerous state never got
+      // computed on this code path in the first place.
+      const { resolveCodeReadiness } = await import('../../src/core/code-graph-readiness.ts');
+      const direct = await resolveCodeReadiness(engine, { kind: 'edge', count: 0, sourceId: 'source-a' });
+      expect(direct.out_of_scope).toBe(true);
+    },
+  );
+});
+
 // ─────────────────────────────────────────────────────────────────
 // Fixtures
 // ─────────────────────────────────────────────────────────────────
