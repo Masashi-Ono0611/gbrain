@@ -1,10 +1,11 @@
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import { runThink, persistSynthesis, type ThinkLLMClient } from '../src/core/think/index.ts';
 import { sanitizeTakeForPrompt, renderTakesBlock } from '../src/core/think/sanitize.ts';
 import { resolveCitations, parseInlineCitations, normalizeStructuredCitations } from '../src/core/think/cite-render.ts';
 import { runGather } from '../src/core/think/gather.ts';
+import * as hybridModule from '../src/core/search/hybrid.ts';
 import { withoutAnthropicKey } from './helpers/no-anthropic-key.ts';
 
 let engine: PGLiteEngine;
@@ -161,31 +162,44 @@ describe('runGather — per-stream typed warnings (GATHER_*_FAILED)', () => {
   });
 
   test('a throwing hybrid stream surfaces GATHER_HYBRID_FAILED and stays fail-open', async () => {
-    const r = await runGather(withFailing(['searchKeyword']), { question: 'technical founder' });
-    expect(r.warnings).toContain('GATHER_HYBRID_FAILED');
-    expect(r.pages).toEqual([]);
-    // Fail-open: the takes stream keeps working.
-    expect(r.takes.length).toBeGreaterThan(0);
+    // hybridSearch itself now fails open internally on a searchKeyword rejection
+    // (#4091), so forcing GATHER_HYBRID_FAILED here means failing the whole
+    // hybridSearch call, not just one of its internal arms.
+    const spy = spyOn(hybridModule, 'hybridSearch').mockRejectedValue(new Error('hybrid boom'));
+    try {
+      const r = await runGather(engine, { question: 'technical founder' });
+      expect(r.warnings).toContain('GATHER_HYBRID_FAILED');
+      expect(r.pages).toEqual([]);
+      // Fail-open: the takes stream keeps working.
+      expect(r.takes.length).toBeGreaterThan(0);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test('each failing stream maps to its own code', async () => {
-    const r = await runGather(
-      withFailing(['searchKeyword', 'searchTakes', 'searchTakesVector', 'traversePaths']),
-      {
-        question: 'technical founder',
-        anchor: 'people/alice-example',
-        questionEmbedding: new Float32Array(8),
-      },
-    );
-    expect([...r.warnings].sort()).toEqual([
-      'GATHER_GRAPH_FAILED',
-      'GATHER_HYBRID_FAILED',
-      'GATHER_TAKES_KEYWORD_FAILED',
-      'GATHER_TAKES_VECTOR_FAILED',
-    ]);
-    expect(r.pages).toEqual([]);
-    expect(r.takes).toEqual([]);
-    expect(r.graphSlugs).toEqual([]);
+    const spy = spyOn(hybridModule, 'hybridSearch').mockRejectedValue(new Error('hybrid boom'));
+    try {
+      const r = await runGather(
+        withFailing(['searchTakes', 'searchTakesVector', 'traversePaths']),
+        {
+          question: 'technical founder',
+          anchor: 'people/alice-example',
+          questionEmbedding: new Float32Array(8),
+        },
+      );
+      expect([...r.warnings].sort()).toEqual([
+        'GATHER_GRAPH_FAILED',
+        'GATHER_HYBRID_FAILED',
+        'GATHER_TAKES_KEYWORD_FAILED',
+        'GATHER_TAKES_VECTOR_FAILED',
+      ]);
+      expect(r.pages).toEqual([]);
+      expect(r.takes).toEqual([]);
+      expect(r.graphSlugs).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test('runThink folds gather warnings into ThinkResult.warnings', async () => {
