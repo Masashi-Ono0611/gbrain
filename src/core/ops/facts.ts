@@ -31,11 +31,11 @@ import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 const extract_facts: Operation = {
   name: 'extract_facts',
   description:
-    'v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls the configured extraction model (key-aware: any servable provider — OpenAI or Anthropic key both work), runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. With NO servable chat model, returns skipped: extraction_unavailable + an agent_action telling YOU to extract and write via `remember` (visibility: "private"). Skips extraction when the turn is dream-generated content (anti-loop). For agent memory writes of a SINGLE already-formed fact, prefer the `remember` verb (zero LLM, mandatory provenance).',
+    'v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls the configured extraction model (key-aware: any servable provider — OpenAI or Anthropic key both work), runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status plus entity_hints usage metadata; only the first 5 hints reach the extraction model. With NO servable chat model, returns skipped: extraction_unavailable + an agent_action telling YOU to extract and write via `remember` (visibility: "private"). Skips extraction when the turn is dream-generated content (anti-loop). For agent memory writes of a SINGLE already-formed fact, prefer the `remember` verb (zero LLM, mandatory provenance).',
   params: {
     turn_text: { type: 'string', required: true, description: 'The user message or page body to extract facts from. Sanitized via INJECTION_PATTERNS before the LLM call.' },
     session_id: { type: 'string', description: 'Opaque session id (e.g. topic-id from MCP _meta.session_id, or CLI --session). Stored on each fact for the recall --session filter. Not an auth surface.' },
-    entity_hints: { type: 'array', items: { type: 'string' }, description: 'Existing canonical entity slugs the agent has already resolved. Helps the extractor pick the right slug.' },
+    entity_hints: { type: 'array', items: { type: 'string' }, description: 'Existing canonical entity slugs the agent has already resolved. Only the first 5 are sent to the extraction model; additional hints are dropped and counted in the response entity_hints metadata.' },
     is_dream_generated: { type: 'boolean', description: 'When true, extraction is skipped (anti-loop). Caller flips this on for pages with dream_generated:true frontmatter.' },
     visibility: { type: 'string', description: 'Default visibility for extracted facts. private (default) | world.' },
   },
@@ -43,7 +43,7 @@ const extract_facts: Operation = {
   scope: 'write',
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'extract_facts' };
-    const { isFactsExtractionEnabled } = await import('../facts/extract.ts');
+    const { isFactsExtractionEnabled, summarizeEntityHints } = await import('../facts/extract.ts');
     const { runFactsPipeline } = await import('../facts/backstop.ts');
 
     // D15: kill switch. Operator can disable facts extraction across the
@@ -69,11 +69,13 @@ const extract_facts: Operation = {
     const { resolveVisibilityParam } = await import('../facts/visibility.ts');
     const visibility: 'private' | 'world' = await resolveVisibilityParam(ctx.engine, p.visibility);
 
+    const entityHints = Array.isArray(p.entity_hints) ? (p.entity_hints as string[]) : undefined;
+    const entityHintsUsage = summarizeEntityHints(entityHints);
     const r = await runFactsPipeline(p.turn_text as string, {
       engine: ctx.engine,
       sourceId,
       sessionId: typeof p.session_id === 'string' ? p.session_id : null,
-      entityHints: Array.isArray(p.entity_hints) ? (p.entity_hints as string[]) : undefined,
+      entityHints,
       source: 'mcp:extract_facts',
       visibility,
       mode: 'inline',  // declarative; runFactsPipeline always inline
@@ -97,6 +99,7 @@ const extract_facts: Operation = {
       return {
         inserted: 0, duplicate: 0, superseded: 0, fact_ids: [],
         skipped: 'extraction_unavailable',
+        entity_hints: entityHintsUsage,
         agent_action:
           'No server-side chat model is available. You are an LLM: extract the facts ' +
           'yourself (up to ~10 per turn) and write each one with the `remember` verb: ' +
@@ -112,6 +115,7 @@ const extract_facts: Operation = {
         inserted: 0, duplicate: 0, superseded: 0, fact_ids: [],
         skipped: 'extraction_failed',
         reason: r.skipped_reason,
+        entity_hints: entityHintsUsage,
         agent_action:
           `The extractor failed on this turn (${r.skipped_reason}). You may extract the ` +
           'facts manually via the `remember` verb (one claim per call, provenance ' +
@@ -124,6 +128,7 @@ const extract_facts: Operation = {
       duplicate: r.duplicate,
       superseded: r.superseded,
       fact_ids: r.fact_ids,
+      entity_hints: entityHintsUsage,
     };
   },
 };

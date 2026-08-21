@@ -215,6 +215,22 @@ const EXTRACTOR_SYSTEM = [
 
 const MAX_TURN_TEXT_CHARS = 8000;
 
+/** Maximum entity hints included in the extractor prompt. */
+export const ENTITY_HINTS_PROMPT_LIMIT = 5;
+
+export interface EntityHintsUsage {
+  provided: number;
+  used: number;
+  dropped: number;
+}
+
+/** Summarize the entity-hint cap for the extract_facts operation response. */
+export function summarizeEntityHints(entityHints?: readonly string[]): EntityHintsUsage {
+  const provided = entityHints?.length ?? 0;
+  const used = Math.min(provided, ENTITY_HINTS_PROMPT_LIMIT);
+  return { provided, used, dropped: provided - used };
+}
+
 export type ExtractFailureReason =
   | 'chat_unavailable'
   | 'provider_error'
@@ -300,7 +316,7 @@ export async function extractFactsFromTurnWithOutcome(
   }
   const userContent = `<turn>\n${cleaned}\n</turn>\n\nExtract up to ${cap} facts.${
     input.entityHints && input.entityHints.length
-      ? ` Known entity slugs the user already mentioned: ${input.entityHints.slice(0, 5).join(', ')}.`
+      ? ` Known entity slugs the user already mentioned: ${input.entityHints.slice(0, ENTITY_HINTS_PROMPT_LIMIT).join(', ')}.`
       : ''
   }`;
   let result: ChatResult;

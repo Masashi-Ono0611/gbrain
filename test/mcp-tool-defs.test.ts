@@ -270,6 +270,8 @@ describe('paramDefToSchema structural guard', () => {
     expect(eh.type).toBe('array');
     expect(eh.items).toBeDefined();
     expect((eh.items as SchemaNode).type).toBe('string');
+    expect(eh.description).toContain('first 5');
+    expect(eh.description).toContain('response entity_hints metadata');
   });
 
   test('paramDefToSchema recursively propagates nested items.items.type', () => {

@@ -21,6 +21,7 @@
 import { describe, test, expect, beforeAll, afterAll, afterEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runFactsBackstop, runFactsPipeline } from '../src/core/facts/backstop.ts';
+import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import {
   __setChatTransportForTests,
   resetGateway,
@@ -114,6 +115,47 @@ describe('runFactsPipeline (extract_facts MCP op path) — response shape stabil
     expect(r.superseded).toBe(0);
     expect(r.fact_ids).toEqual([]);
     expect(r.entity_slugs).toEqual([]);
+  });
+});
+
+describe('extract_facts entity_hints visibility', () => {
+  async function callExtractFacts(entityHints: string[]) {
+    let prompt = '';
+    __setChatTransportForTests(async (opts): Promise<ChatResult> => {
+      prompt = String(opts.messages[0]?.content ?? '');
+      return {
+        text: '{"facts":[]}',
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'test:stub',
+        providerId: 'test',
+      };
+    });
+
+    const result = await dispatchToolCall(engine, 'extract_facts', {
+      turn_text: 'Nothing claim-worthy here.',
+      entity_hints: entityHints,
+    }, { remote: true, sourceId: 'default' });
+    expect(result.isError).toBeFalsy();
+    return { payload: JSON.parse(result.content[0]!.text), prompt };
+  }
+
+  test('more than 5 hints reports used and dropped counts and sends only the first 5', async () => {
+    const hints = Array.from({ length: 20 }, (_, i) => `people/hint-${i + 1}`);
+    const { payload, prompt } = await callExtractFacts(hints);
+
+    expect(payload.entity_hints).toEqual({ provided: 20, used: 5, dropped: 15 });
+    for (const hint of hints.slice(0, 5)) expect(prompt).toContain(hint);
+    for (const hint of hints.slice(5)) expect(prompt).not.toContain(hint);
+  });
+
+  test('5 or fewer hints are all used with none dropped', async () => {
+    const hints = ['people/one', 'people/two', 'companies/three'];
+    const { payload, prompt } = await callExtractFacts(hints);
+
+    expect(payload.entity_hints).toEqual({ provided: 3, used: 3, dropped: 0 });
+    for (const hint of hints) expect(prompt).toContain(hint);
   });
 });
 
