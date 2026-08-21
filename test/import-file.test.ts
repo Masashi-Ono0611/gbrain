@@ -143,6 +143,20 @@ This is the compiled truth.
     expect(chunkCall).toBeTruthy();
   });
 
+  test('an empty placeholder file stays on the file-import result path instead of throwing (#2822)', async () => {
+    const filePath = join(TMP, 'empty-placeholder.md');
+    writeFileSync(filePath, '');
+
+    const engine = mockEngine();
+    const result = await importFile(engine, filePath, 'inbox/empty-placeholder.md', { noEmbed: true });
+
+    // Disk files are authoritative and may intentionally be empty. Most
+    // importantly, this path must keep returning an ImportResult rather than
+    // inherit a CLI-only rejection as a thrown exception mid-sync.
+    expect(result.status).toBe('imported');
+    expect(result.chunks).toBe(0);
+  });
+
   test('skips files larger than MAX_FILE_SIZE (5MB)', async () => {
     const filePath = join(TMP, 'big-file.md');
     const bigContent = '---\ntitle: Big\n---\n' + 'x'.repeat(5_100_000);

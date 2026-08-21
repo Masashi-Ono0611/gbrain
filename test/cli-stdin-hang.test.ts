@@ -14,6 +14,8 @@
  * connect, so no brain/DB is touched.
  */
 import { describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 
 const REPO = dirname(import.meta.dir);
@@ -22,6 +24,7 @@ const CLI = join(REPO, 'src', 'cli.ts');
 interface CliRun {
   exited: boolean;
   exitCode: number | null;
+  stdout: string;
   stderr: string;
 }
 
@@ -41,10 +44,11 @@ async function runCliWithStdin(
   args: string[],
   stdin: 'hold-open' | 'closed-empty' | { data: string } | { file: string },
   windowMs: number,
+  env: Record<string, string | undefined> = process.env,
 ): Promise<CliRun> {
   const proc = Bun.spawn(['bun', 'run', CLI, ...args], {
     cwd: REPO,
-    env: { ...process.env, GBRAIN_STDIN_TIMEOUT_MS: '500' },
+    env: { ...env, GBRAIN_STDIN_TIMEOUT_MS: '500' },
     stdin: typeof stdin === 'object' && 'file' in stdin ? Bun.file(stdin.file) : 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
@@ -62,13 +66,14 @@ async function runCliWithStdin(
     exited = false;
     try { proc.kill('SIGKILL'); } catch { /* already dead */ }
   }, windowMs);
-  const [exitCode, stderr] = await Promise.all([
+  const [exitCode, stdout, stderr] = await Promise.all([
     proc.exited,
+    new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
   ]);
   clearTimeout(killer);
   try { pipeSink(proc).end(); } catch { /* hold-open cleanup */ }
-  return { exited, exitCode: exited ? exitCode : null, stderr };
+  return { exited, exitCode: exited ? exitCode : null, stdout, stderr };
 }
 
 describe('#3513 — stdin-capable op with a non-TTY, never-written stdin', () => {
@@ -92,17 +97,63 @@ describe('#3513 — stdin-capable op with a non-TTY, never-written stdin', () =>
     expect(run.stderr).toContain('Usage: gbrain put');
   }, 30_000);
 
-  test('empty-but-real input (`< /dev/null`) does not hang', async () => {
-    const run = await runCliWithStdin(['put'], { file: '/dev/null' }, 20_000);
+  test('empty non-TTY stdin (`< /dev/null`) fails clearly before engine dispatch (#2822)', async () => {
+    const run = await runCliWithStdin(
+      ['put', './note.md', '--slug', 'notes/foo'],
+      { file: '/dev/null' },
+      20_000,
+    );
     expect(run.exited).toBe(true);
     expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain('gbrain put received empty or whitespace-only stdin');
+    expect(run.stderr).toContain('gbrain put <slug> < file.md');
+    expect(run.stderr).not.toContain('No brain configured');
   }, 30_000);
 
-  test('an empty pipe that closes immediately does not hang', async () => {
-    const run = await runCliWithStdin(['put'], 'closed-empty', 20_000);
+  test('an empty pipe that closes immediately gets the same clear error (#2822)', async () => {
+    const run = await runCliWithStdin(['put', 'stdin-empty-test-slug'], 'closed-empty', 20_000);
     expect(run.exited).toBe(true);
     expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain('gbrain put received empty or whitespace-only stdin');
   }, 30_000);
+
+  test('whitespace-only piped stdin is rejected too (#2822)', async () => {
+    const run = await runCliWithStdin(['put', 'stdin-empty-test-slug'], { data: '  \n\t \n' }, 20_000);
+    expect(run.exited).toBe(true);
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain('gbrain put received empty or whitespace-only stdin');
+  }, 30_000);
+});
+
+describe('#2822 — normal non-empty CLI put remains functional', () => {
+  test('non-empty piped markdown reaches put_page and writes successfully', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-put-stdin-'));
+    try {
+      const configDir = join(home, '.gbrain');
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({
+        engine: 'pglite',
+        database_path: join(configDir, 'brain.pglite'),
+        embedding_disabled: true,
+      }));
+
+      const env: Record<string, string | undefined> = { ...process.env, GBRAIN_HOME: home };
+      delete env.DATABASE_URL;
+      delete env.GBRAIN_DATABASE_URL;
+      const run = await runCliWithStdin(
+        ['put', 'inbox/non-empty-stdin', '--json'],
+        { data: '---\ntitle: Non-empty stdin\n---\n\nReal body text.\n' },
+        30_000,
+        env,
+      );
+
+      expect(run.exited).toBe(true);
+      expect(run.exitCode).toBe(0);
+      expect(JSON.parse(run.stdout).status).toBe('created_or_updated');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 45_000);
 });
 
 describe('#3513 — applyStdinParam content preservation (subprocess driver)', () => {

@@ -577,11 +577,23 @@ async function main() {
   // transform, and required-param check are all engine-free; refactoring
   // them out of the engine try/catch is safe and unlocks routing.
   const params = parseOpArgs(op, subArgs);
+  const stdinParamWasUnset = op.cliHints?.stdin !== undefined && params[op.cliHints.stdin] === undefined;
 
   // #3513: stdin fill moved out of parseOpArgs so a non-TTY stdin with no
   // piped input can't block the parse forever — the bounded read leaves the
   // param unset on timeout and the required-param check below fails fast.
   await applyStdinParam(op, params);
+  // #2822: `put` with empty/whitespace-only piped stdin used to silently
+  // write a 0-chunk page (invisible to `embed --stale`, no error). This is
+  // a CLI-dispatch-only guard — importFromContent (the file-sync path) is
+  // untouched and keeps its existing {status:'skipped', error} convention
+  // for a genuinely empty on-disk placeholder file, which is a legitimate
+  // state importFile must not throw on.
+  if (op.name === 'put_page' && stdinParamWasUnset && typeof params.content === 'string' && params.content.trim() === '') {
+    console.error('Error: gbrain put received empty or whitespace-only stdin; refusing to write an empty page.');
+    console.error('Use `gbrain put <slug> < file.md` or `gbrain capture --file PATH --slug SLUG`.');
+    process.exit(1);
+  }
 
   // v0.27.1 (`gbrain query --image <path>`): swap the `image` param from
   // a filesystem path into base64 bytes + mime. The op accepts base64; the
