@@ -54,6 +54,17 @@ export interface CodeGraphReadiness {
   has_code: boolean;
   /** Whether unresolved/stale edge chunks remain in scope (edge kind only). */
   pending_edges: boolean;
+  /**
+   * #3707: set only alongside `status: 'not_built'`, when the caller's scope
+   * was narrowed (a `sourceId` restriction, e.g. a federated_read grant that
+   * excludes the sources holding code) AND code chunks exist brain-wide.
+   * Distinguishes "genuinely never indexed" from "indexed, but outside your
+   * grant" — the latter's remedy is a wider grant, not `gbrain sync` (which
+   * re-indexes an already-correctly-indexed brain and changes nothing).
+   * `status` itself stays `'not_built'` for backward compatibility with
+   * existing consumers that branch on it; this is a supplementary signal.
+   */
+  out_of_scope?: boolean;
 }
 
 /** Scope for a readiness probe. Omit `sourceId` (or set `allSources`) for brain-wide. */
@@ -125,7 +136,19 @@ export async function resolveCodeReadiness(
   try {
     const hasCode = await codeChunksExist(engine, sourceId);
     if (!hasCode) {
-      return { status: 'not_built', ready: false, has_code: false, pending_edges: false };
+      // #3707: only when the scope was actually narrowed to one source —
+      // an unscoped/all-sources caller with no code has nothing wider to
+      // check. One extra EXISTS probe, only on this already-empty path
+      // (same cost posture the module doc already commits to: queries run
+      // ONLY when count === 0).
+      const outOfScope = sourceId !== undefined && await codeChunksExist(engine, undefined);
+      return {
+        status: 'not_built',
+        ready: false,
+        has_code: false,
+        pending_edges: false,
+        ...(outOfScope ? { out_of_scope: true } : {}),
+      };
     }
     if (opts.kind === 'symbol') {
       // Symbol metadata is set at chunk time; code chunks exist ⇒ genuinely none.
@@ -145,6 +168,13 @@ export async function resolveCodeReadiness(
 export function readinessHint(r: CodeGraphReadiness): string | null {
   switch (r.status) {
     case 'not_built':
+      // #3707: `gbrain sync` is actively wrong advice when the code is
+      // already indexed and just outside this caller's grant — it re-syncs
+      // an already-correctly-indexed brain and resolves nothing.
+      if (r.out_of_scope) {
+        return 'No code indexed within your current source grant, but code exists elsewhere in this brain. ' +
+          'Widen the federated_read grant for this client to include the source(s) holding code, or retry with --all-sources if permitted.';
+      }
       return 'Symbol graph not built (no code indexed in scope). Run `gbrain sync` to index code.';
     case 'indexing':
       return 'Symbol graph still building (edges pending resolution). Re-run after the next `gbrain dream` cycle / autopilot tick.';
