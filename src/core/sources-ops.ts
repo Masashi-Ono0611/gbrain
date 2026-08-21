@@ -380,6 +380,18 @@ export async function addSource(
     opts = { ...opts, localPath: msysToNativePath(opts.localPath) };
   }
 
+  // gbrain#3696: a relative --path (e.g. `.`) is otherwise stored verbatim
+  // and later re-resolved against whatever process happens to touch it —
+  // which is "/" under a launchd daemon with no WorkingDirectory set,
+  // producing a full-filesystem walk (and, on macOS, a cascade of TCC
+  // consent prompts). Anchor it to an absolute path HERE, at the
+  // interactive write site, where process.cwd() is still the caller's real
+  // shell directory — not later, where it might be a daemon's root. No-op
+  // for already-absolute paths.
+  if (opts.localPath) {
+    opts = { ...opts, localPath: resolvePath(opts.localPath) };
+  }
+
   // Q4: pre-flight collision check before any clone work.
   const existing = await engine.executeRaw<{ id: string; local_path: string | null }>(
     `SELECT id, local_path FROM sources WHERE id = $1`,
@@ -426,7 +438,11 @@ export async function addSource(
   // Overlap check for any local path (existing behavior).
   let finalPath = opts.localPath ?? null;
   if (parsedUrl) {
-    finalPath = opts.cloneDir ?? defaultCloneDir(opts.id);
+    // gbrain#3696: same anchor-at-write-time treatment as opts.localPath
+    // above — a relative --clone-dir must not survive to be re-resolved
+    // against a daemon's cwd later. defaultCloneDir() is already absolute
+    // ($GBRAIN_HOME-based), so only the explicit-override branch needs it.
+    finalPath = opts.cloneDir ? resolvePath(opts.cloneDir) : defaultCloneDir(opts.id);
   }
   if (finalPath) {
     const others = await engine.executeRaw<{ id: string; local_path: string }>(

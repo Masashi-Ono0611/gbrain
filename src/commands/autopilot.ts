@@ -20,7 +20,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, utimesSync, unlinkSync, chmodSync, statSync } from 'fs';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { detectExecutionEnvironment } from '../core/execution-env.ts';
-import { join, dirname, isAbsolute } from 'path';
+import { join, dirname, isAbsolute, resolve as resolvePath } from 'path';
 import { execSync } from 'child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadPreferences } from '../core/preferences.ts';
@@ -1804,11 +1804,17 @@ ${generateSelfDisableGuard(repoPath, target)}exec '${safeGbrainPath}' autopilot 
 }
 
 async function installDaemon(engine: BrainEngine, args: string[]) {
-  const repoPath = parseArg(args, '--repo') || await engine.getConfig('sync.repo_path');
-  if (!repoPath) {
+  const rawRepoPath = parseArg(args, '--repo') || await engine.getConfig('sync.repo_path');
+  if (!rawRepoPath) {
     console.error('No repo path. Use --repo or run gbrain sync --repo first.');
     process.exit(1);
   }
+  // gbrain#3696: --install runs once, interactively, from the caller's real
+  // shell — the only correct moment to anchor a relative --repo/repo_path.
+  // Bake an absolute path into the wrapper script + plist so the daemon
+  // never has to re-resolve it against its own cwd (launchd defaults to
+  // "/", which turned a relative anchor into a full-filesystem walk).
+  const repoPath = resolvePath(rawRepoPath);
 
   const forcedTarget = parseArg(args, '--target') as InstallTarget | undefined;
   const target: InstallTarget = forcedTarget ?? detectInstallTarget();
@@ -1846,7 +1852,19 @@ async function installDaemon(engine: BrainEngine, args: string[]) {
 
 // v0.37.7.0 #1162 — pure function for plist generation so tests can
 // assert ThrottleInterval/KeepAlive shape without an installed daemon.
-export function generateLaunchdPlist(wrapperPath: string, home: string): string {
+export function generateLaunchdPlist(wrapperPath: string, home: string, repoPath?: string): string {
+  // gbrain#3696: without WorkingDirectory, launchd runs the daemon (and
+  // every child it spawns — `jobs work`, `serve --http`) with cwd "/". Any
+  // relative sources.local_path/sync.repo_path anchor that slipped through
+  // then resolves against the filesystem root, causing a full-filesystem
+  // walk and — on macOS — a cascade of TCC consent prompts. Anchoring cwd
+  // to the repo here is a second, independent line of defense on top of
+  // resolving paths absolute at write time (addSource/installDaemon):
+  // it also covers rows that predate this fix. Optional so existing callers
+  // that don't have a repoPath handy (tests) keep working unchanged.
+  const workingDirectoryEntry = repoPath
+    ? `  <key>WorkingDirectory</key><string>${escapeXml(repoPath)}</string>\n`
+    : '';
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1857,7 +1875,7 @@ export function generateLaunchdPlist(wrapperPath: string, home: string): string 
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <!--
+${workingDirectoryEntry}  <!--
     v0.37.7.0 #1162: ThrottleInterval=60 forces launchd to wait at
     least 60s between relaunches. Combined with the in-process
     classifier (recoverable vs unrecoverable in the supervisor loop),
@@ -1874,7 +1892,7 @@ export function generateLaunchdPlist(wrapperPath: string, home: string): string 
 }
 
 function installLaunchd(wrapperPath: string, home: string, repoPath: string) {
-  const plist = generateLaunchdPlist(wrapperPath, home);
+  const plist = generateLaunchdPlist(wrapperPath, home, repoPath);
 
   try {
     const agentsDir = join(home, 'Library', 'LaunchAgents');

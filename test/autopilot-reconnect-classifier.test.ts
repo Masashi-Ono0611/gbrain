@@ -134,4 +134,21 @@ describe('generateLaunchdPlist (#1162)', () => {
     const plist = generateLaunchdPlist('/wrapper.sh', '/Users/alice');
     expect(plist).toContain('/Users/alice/.gbrain/autopilot.err');
   });
+
+  test('#3696: plist omits WorkingDirectory when no repoPath is given (back-compat)', () => {
+    const plist = generateLaunchdPlist('/wrapper.sh', '/Users/alice');
+    expect(plist).not.toContain('WorkingDirectory');
+  });
+
+  test('#3696: plist sets WorkingDirectory to repoPath when given — anchors daemon cwd away from "/"', () => {
+    const plist = generateLaunchdPlist('/wrapper.sh', '/Users/alice', '/Users/alice/my-brain');
+    expect(plist).toMatch(
+      /<key>WorkingDirectory<\/key><string>\/Users\/alice\/my-brain<\/string>/,
+    );
+  });
+
+  test('#3696: plist escapes XML special chars in the WorkingDirectory value', () => {
+    const plist = generateLaunchdPlist('/wrapper.sh', '/home', '/repos/a&b');
+    expect(plist).toContain('<key>WorkingDirectory</key><string>/repos/a&amp;b</string>');
+  });
 });

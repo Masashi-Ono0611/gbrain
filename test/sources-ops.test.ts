@@ -13,7 +13,7 @@ import {
   chmodSync,
   existsSync,
 } from 'fs';
-import { join } from 'path';
+import { join, isAbsolute } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -1218,6 +1218,111 @@ describe('addSource --path — #3903 attach to existing path-less source', () =>
     }
     expect(threw).toBeInstanceOf(SourceOpError);
     expect(threw?.code).toBe('source_id_taken');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// addSource — gbrain#3696: a relative --path/--clone-dir must be anchored to
+// an absolute path AT WRITE TIME (when process.cwd() is still the caller's
+// real interactive shell dir), not left for a later daemon to re-resolve.
+// Under launchd (no WorkingDirectory set) that later resolution happens
+// against cwd "/", turning "." into a full-filesystem walk and — on macOS —
+// a cascade of TCC consent prompts.
+// ---------------------------------------------------------------------------
+
+describe('addSource --path/--clone-dir — #3696 absolute-at-write anchoring', () => {
+  const SANDBOX = join(tmpdir(), `gbrain-3696-abs-write-${process.pid}`);
+
+  function initGitRepo(dir: string): void {
+    mkdirSync(dir, { recursive: true });
+    execFileSync('git', ['-C', dir, 'init', '-q']);
+    execFileSync('git', ['-C', dir, 'config', 'user.email', 'test@example.com']);
+    execFileSync('git', ['-C', dir, 'config', 'user.name', 'Test']);
+    writeFileSync(join(dir, 'notes.md'), 'tracked');
+    execFileSync('git', ['-C', dir, 'add', '-A']);
+    execFileSync('git', ['-C', dir, 'commit', '-q', '-m', 'initial']);
+  }
+
+  beforeEach(() => {
+    rmSync(SANDBOX, { recursive: true, force: true });
+    mkdirSync(SANDBOX, { recursive: true });
+  });
+  afterAll(() => {
+    rmSync(SANDBOX, { recursive: true, force: true });
+  });
+
+  test('the issue #3696 repro (`sources add id --path .`) is stored absolute, not literal "."', async () => {
+    const repoDir = join(SANDBOX, 'repo-dot');
+    initGitRepo(repoDir);
+    const originalCwd = process.cwd();
+    let cwdAtCallTime = '';
+    try {
+      process.chdir(repoDir);
+      // Captured AFTER chdir: some tmpdirs (macOS /tmp -> /private/tmp) are
+      // themselves symlinks, and process.cwd() reports the realpath post-chdir
+      // — comparing against that (not the pre-chdir string) keeps this
+      // assertion symlink-safe.
+      cwdAtCallTime = process.cwd();
+      await addSource(engine, { id: 'rel-dot-3696', localPath: '.' });
+    } finally {
+      process.chdir(originalCwd);
+    }
+    const rows = await engine.executeRaw<{ local_path: string }>(
+      `SELECT local_path FROM sources WHERE id = 'rel-dot-3696'`,
+    );
+    expect(rows[0]!.local_path).not.toBe('.');
+    expect(isAbsolute(rows[0]!.local_path)).toBe(true);
+    expect(rows[0]!.local_path).toBe(cwdAtCallTime);
+  });
+
+  test('a relative subpath resolves against process.cwd() at call time, not a fixed value', async () => {
+    const parentDir = join(SANDBOX, 'parent');
+    const repoDir = join(parentDir, 'sub-repo');
+    initGitRepo(repoDir);
+    const originalCwd = process.cwd();
+    let expected = '';
+    try {
+      process.chdir(parentDir);
+      expected = join(process.cwd(), 'sub-repo');
+      await addSource(engine, { id: 'rel-subpath-3696', localPath: 'sub-repo' });
+    } finally {
+      process.chdir(originalCwd);
+    }
+    const rows = await engine.executeRaw<{ local_path: string }>(
+      `SELECT local_path FROM sources WHERE id = 'rel-subpath-3696'`,
+    );
+    expect(rows[0]!.local_path).toBe(expected);
+  });
+
+  test('an already-absolute --path is stored unchanged (no regression)', async () => {
+    const repoDir = join(SANDBOX, 'already-absolute');
+    initGitRepo(repoDir);
+    const row = await addSource(engine, { id: 'abs-3696', localPath: repoDir });
+    expect(row.local_path).toBe(repoDir);
+  });
+
+  test('a relative --clone-dir (--url source) is stored absolute, not literal', async () => {
+    await withEnv2(async () => {
+      const originalCwd = process.cwd();
+      let expected = '';
+      try {
+        process.chdir(FAKE_GIT_DIR);
+        expected = join(process.cwd(), 'rel-clone-dir-3696');
+        await addSource(engine, {
+          id: 'rel-clonedir-3696',
+          remoteUrl: 'https://github.com/example/repo',
+          cloneDir: 'rel-clone-dir-3696',
+        });
+      } finally {
+        process.chdir(originalCwd);
+      }
+      const rows = await engine.executeRaw<{ local_path: string }>(
+        `SELECT local_path FROM sources WHERE id = 'rel-clonedir-3696'`,
+      );
+      expect(rows[0]!.local_path).not.toBe('rel-clone-dir-3696');
+      expect(isAbsolute(rows[0]!.local_path)).toBe(true);
+      expect(rows[0]!.local_path).toBe(expected);
+    });
   });
 });
 
