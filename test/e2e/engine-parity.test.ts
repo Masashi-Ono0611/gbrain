@@ -1379,3 +1379,68 @@ describeBoth('Engine parity — putPage empty-overwrite guard', () => {
     }
   });
 });
+
+describeBoth('Engine parity — soft-deleted link endpoints (#3754)', () => {
+  let pgEngine: BrainEngine;
+  let pgliteEngine: PGLiteEngine;
+
+  beforeAll(async () => {
+    pgEngine = await setupDB();
+    pgliteEngine = new PGLiteEngine();
+    await pgliteEngine.connect({});
+    await pgliteEngine.initSchema();
+  }, 90_000);
+
+  afterAll(async () => {
+    await pgliteEngine.disconnect();
+    await teardownDB();
+  }, 30_000);
+
+  async function seedPair(
+    engine: BrainEngine,
+    prefix: string,
+  ): Promise<{ source: string; target: string }> {
+    const source = `${prefix}/source`;
+    const target = `${prefix}/target`;
+    await engine.putPage(source, {
+      type: 'note', title: 'Live source', compiled_truth: 'source body', timeline: '',
+    });
+    await engine.putPage(target, {
+      type: 'note', title: 'Live target', compiled_truth: 'target body', timeline: '',
+    });
+    await engine.addLink(source, target, '', 'mentions');
+    return { source, target };
+  }
+
+  test('healthy live-to-live link remains visible on both engines', async () => {
+    for (const [name, engine] of [['pg', pgEngine], ['pglite', pgliteEngine]] as const) {
+      const { source, target } = await seedPair(engine, `softdelete-parity/${name}/control`);
+      expect((await engine.getBacklinks(target)).map((link) => link.from_slug)).toEqual([source]);
+      expect((await engine.traversePaths(source, { depth: 1 })).map((edge) => edge.to_slug)).toEqual([target]);
+      expect((await engine.traverseGraph(source, 1)).map((node) => node.slug).sort())
+        .toEqual([source, target].sort());
+    }
+  });
+
+  test('soft-deleted source endpoint is excluded on both engines', async () => {
+    for (const [name, engine] of [['pg', pgEngine], ['pglite', pgliteEngine]] as const) {
+      const { source, target } = await seedPair(engine, `softdelete-parity/${name}/dead-source`);
+      await engine.softDeletePage(source);
+      expect(await engine.getBacklinks(target)).toEqual([]);
+      expect(await engine.traversePaths(target, { depth: 1, direction: 'in' })).toEqual([]);
+      expect(await engine.traverseGraph(source, 1)).toEqual([]);
+    }
+  });
+
+  test('soft-deleted target endpoint is excluded on both engines', async () => {
+    for (const [name, engine] of [['pg', pgEngine], ['pglite', pgliteEngine]] as const) {
+      const { source, target } = await seedPair(engine, `softdelete-parity/${name}/dead-target`);
+      await engine.softDeletePage(target);
+      expect(await engine.getBacklinks(target)).toEqual([]);
+      expect(await engine.traversePaths(source, { depth: 1 })).toEqual([]);
+      const nodes = await engine.traverseGraph(source, 1);
+      expect(nodes.map((node) => node.slug)).toEqual([source]);
+      expect(nodes[0]?.links).toEqual([]);
+    }
+  });
+});

@@ -3595,6 +3595,8 @@ export class PostgresEngine implements BrainEngine {
       // #2200: federated grant scopes all three endpoints (mirrors getLinks) —
       // the referrer (from), the queried page (to), AND the origin — so neither
       // a foreign referrer nor a foreign origin slug is disclosed to the caller.
+      // #3754: links remain physically present during soft-delete recovery, so
+      // both edge endpoints must be live before a backlink is visible.
       if (opts?.sourceIds && opts.sourceIds.length > 0) {
         const ids = opts.sourceIds;
         const rows = await tx`
@@ -3608,6 +3610,7 @@ export class PostgresEngine implements BrainEngine {
           JOIN pages t ON t.id = l.to_page_id
           LEFT JOIN pages o ON o.id = l.origin_page_id AND o.source_id = ANY(${ids}::text[])
           WHERE t.slug = ${slug} AND t.source_id = ANY(${ids}::text[]) AND f.source_id = ANY(${ids}::text[])
+            AND f.deleted_at IS NULL AND t.deleted_at IS NULL
         `;
         return rows as unknown as Link[];
       }
@@ -3624,6 +3627,7 @@ export class PostgresEngine implements BrainEngine {
           JOIN pages t ON t.id = l.to_page_id
           LEFT JOIN pages o ON o.id = l.origin_page_id
           WHERE t.slug = ${slug} AND t.source_id = ${opts.sourceId}
+            AND f.deleted_at IS NULL AND t.deleted_at IS NULL
         `;
         return rows as unknown as Link[];
       }
@@ -3638,6 +3642,7 @@ export class PostgresEngine implements BrainEngine {
         JOIN pages t ON t.id = l.to_page_id
         LEFT JOIN pages o ON o.id = l.origin_page_id
         WHERE t.slug = ${slug}
+          AND f.deleted_at IS NULL AND t.deleted_at IS NULL
       `;
       return rows as unknown as Link[];
     });
@@ -3756,6 +3761,7 @@ export class PostgresEngine implements BrainEngine {
     // exact when fanout is bounded; for hub-fanout graphs the cap fires
     // early). Post-query, count rows per depth — if any depth == cap, fire
     // the truncation callback.
+    // #3754: keep the seed, recursive neighbor, and displayed edge target live.
     const cap = opts?.frontierCap;
     const recursiveStep = cap !== undefined && cap > 0
       ? sql`(SELECT p2.id, p2.slug, p2.title, p2.type, g.depth + 1, g.visited || p2.id
@@ -3764,6 +3770,7 @@ export class PostgresEngine implements BrainEngine {
              JOIN pages p2 ON p2.id = l.to_page_id
              WHERE g.depth < ${depth}
                AND NOT (p2.id = ANY(g.visited))
+               AND p2.deleted_at IS NULL
                ${stepScope}
              ORDER BY p2.slug ASC, p2.id ASC
              LIMIT ${cap})`
@@ -3773,12 +3780,13 @@ export class PostgresEngine implements BrainEngine {
             JOIN pages p2 ON p2.id = l.to_page_id
             WHERE g.depth < ${depth}
               AND NOT (p2.id = ANY(g.visited))
+              AND p2.deleted_at IS NULL
               ${stepScope}`;
     // Cycle prevention: visited array tracks page IDs already in the path.
     const rows = await sql`
       WITH RECURSIVE graph AS (
         SELECT p.id, p.slug, p.title, p.type, 0 as depth, ARRAY[p.id] as visited
-        FROM pages p WHERE p.slug = ${slug} ${seedScope}
+        FROM pages p WHERE p.slug = ${slug} AND p.deleted_at IS NULL ${seedScope}
 
         UNION ALL
 
@@ -3796,7 +3804,7 @@ export class PostgresEngine implements BrainEngine {
           (SELECT jsonb_agg(DISTINCT jsonb_build_object('to_slug', p3.slug, 'link_type', l2.link_type))
            FROM links l2
            JOIN pages p3 ON p3.id = l2.to_page_id
-           WHERE l2.from_page_id = g.id ${aggScope}),
+           WHERE l2.from_page_id = g.id AND p3.deleted_at IS NULL ${aggScope}),
           '[]'::jsonb
         ) as links
       FROM graph g
@@ -3855,12 +3863,14 @@ export class PostgresEngine implements BrainEngine {
         ? sql`AND pt.source_id = ${opts.sourceId}`
         : sql``;
 
+    // #3754: every seed, recursive neighbor, and projected edge endpoint must
+    // be live so graph-query cannot walk through or display deleted pages.
     let rows;
     if (direction === 'out') {
       rows = await sql`
         WITH RECURSIVE walk AS (
           SELECT p.id, p.slug, 0::int as depth, ARRAY[p.id] as visited
-          FROM pages p WHERE p.slug = ${slug} ${seedScope}
+          FROM pages p WHERE p.slug = ${slug} AND p.deleted_at IS NULL ${seedScope}
           UNION ALL
           SELECT p2.id, p2.slug, w.depth + 1, w.visited || p2.id
           FROM walk w
@@ -3868,6 +3878,7 @@ export class PostgresEngine implements BrainEngine {
           JOIN pages p2 ON p2.id = l.to_page_id
           WHERE w.depth < ${depth}
             AND NOT (p2.id = ANY(w.visited))
+            AND p2.deleted_at IS NULL
             AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
             ${stepScope}
         )
@@ -3877,6 +3888,7 @@ export class PostgresEngine implements BrainEngine {
         JOIN links l ON l.from_page_id = w.id
         JOIN pages p2 ON p2.id = l.to_page_id
         WHERE w.depth < ${depth}
+          AND p2.deleted_at IS NULL
           AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
           ${stepScope}
         ORDER BY depth, from_slug, to_slug
@@ -3885,7 +3897,7 @@ export class PostgresEngine implements BrainEngine {
       rows = await sql`
         WITH RECURSIVE walk AS (
           SELECT p.id, p.slug, 0::int as depth, ARRAY[p.id] as visited
-          FROM pages p WHERE p.slug = ${slug} ${seedScope}
+          FROM pages p WHERE p.slug = ${slug} AND p.deleted_at IS NULL ${seedScope}
           UNION ALL
           SELECT p2.id, p2.slug, w.depth + 1, w.visited || p2.id
           FROM walk w
@@ -3893,6 +3905,7 @@ export class PostgresEngine implements BrainEngine {
           JOIN pages p2 ON p2.id = l.from_page_id
           WHERE w.depth < ${depth}
             AND NOT (p2.id = ANY(w.visited))
+            AND p2.deleted_at IS NULL
             AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
             ${stepScope}
         )
@@ -3902,6 +3915,7 @@ export class PostgresEngine implements BrainEngine {
         JOIN links l ON l.to_page_id = w.id
         JOIN pages p2 ON p2.id = l.from_page_id
         WHERE w.depth < ${depth}
+          AND p2.deleted_at IS NULL
           AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
           ${stepScope}
         ORDER BY depth, from_slug, to_slug
@@ -3910,7 +3924,7 @@ export class PostgresEngine implements BrainEngine {
       rows = await sql`
         WITH RECURSIVE walk AS (
           SELECT p.id, 0::int as depth, ARRAY[p.id] as visited
-          FROM pages p WHERE p.slug = ${slug} ${seedScope}
+          FROM pages p WHERE p.slug = ${slug} AND p.deleted_at IS NULL ${seedScope}
           UNION ALL
           SELECT p2.id, w.depth + 1, w.visited || p2.id
           FROM walk w
@@ -3918,6 +3932,7 @@ export class PostgresEngine implements BrainEngine {
           JOIN pages p2 ON p2.id = CASE WHEN l.from_page_id = w.id THEN l.to_page_id ELSE l.from_page_id END
           WHERE w.depth < ${depth}
             AND NOT (p2.id = ANY(w.visited))
+            AND p2.deleted_at IS NULL
             AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
             ${stepScope}
         )
@@ -3928,6 +3943,7 @@ export class PostgresEngine implements BrainEngine {
         JOIN pages pf ON pf.id = l.from_page_id
         JOIN pages pt ON pt.id = l.to_page_id
         WHERE w.depth < ${depth}
+          AND pf.deleted_at IS NULL AND pt.deleted_at IS NULL
           AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
           ${pfScope}
           ${ptScope}
