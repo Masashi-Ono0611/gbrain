@@ -1304,7 +1304,18 @@ export async function hybridSearch(
     earlyModality === 'image'
       ? [[], []]
       : await Promise.all([
-          engine.searchKeyword(query, searchOpts),
+          // #4091: keyword arm shares searchTitles' failure mode (a very long
+          // query overflows Postgres's websearch_to_tsquery parser — "stack
+          // depth limit exceeded") but had no fail-open, so it crashed direct
+          // hybridSearch callers instead of degrading like its sibling arm.
+          engine.searchKeyword(query, searchOpts).catch((err: unknown) => {
+            warnOncePerProcess(
+              'search-keyword-arm-failed',
+              `[gbrain] searchKeyword arm failed (fail-open, keyword candidates skipped): ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            );
+            return [] as SearchResult[];
+          }),
           engine.searchTitles(query, searchOpts).catch((err: unknown) => {
             warnOncePerProcess(
               'search-titles-arm-failed',
