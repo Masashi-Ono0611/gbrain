@@ -21,7 +21,7 @@ src/commands/extract.ts	2066	ratchet	lowered: timeline extractor hoisted to core
 src/commands/extract-conversation-facts.ts	2045	ratchet	grown v0.46.x per-provider gateway-unavailable copy
 src/core/import-file.ts	2016	ratchet	grown v0.46.24.0 overnight wave: embedding_plane_split named error (#4287)
 src/core/cycle/synthesize.ts	2702	ratchet	merged: five-issue wave + dream-wave C7 peel + C8 manifest + C9 mode/telemetry/backfill + adversarial fix batches
-src/commands/embed.ts	2046	ratchet	grown v0.46.25.0 delegated wave (#3971)
+src/commands/embed.ts	2122	ratchet	grown v0.46.25.0 fix waves: timeout-aware embed retry via embedBatchWithBackoff (#3374)
 src/core/types.ts	1882	ratchet	grown v0.46.22.0 phone wave: supersession rerank result fields + effective-date page filters (#4056 #4389)
 src/commands/skillpack.ts	1360	ratchet
 src/core/minions/queue.ts	2138	ratchet	grown by #4078 subagent-loop capability fix

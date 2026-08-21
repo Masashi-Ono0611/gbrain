@@ -1811,6 +1811,15 @@ async function embedAllStale(
  * v0.33.3: rate-limit-aware embedBatch wrapper.
  * #3966: also retries transient gateway errors (502/503/504) that NIM and
  * similar providers emit under sustained bulk load.
+ * #3374: also retries the gateway's own per-attempt `AI_EMBED_TIMEOUT_MS`
+ * abort (a `TimeoutError`). Each retry re-enters `embedBatch` with
+ * `maxRetries: 0`, which re-enters the gateway's `embedSubBatch` — and that
+ * builds a FRESH `withDefaultTimeout()` / `AbortSignal.timeout()` on every
+ * call (see gateway.ts). So each retry attempt gets its own full timeout
+ * window rather than sharing one; the AI SDK's own internal retries (the
+ * bug this wrapper exists to route around — see `embedBatch(...,
+ * {maxRetries: 0})` below) run all their attempts inside a SINGLE
+ * `_embedTransport` call, and therefore a SINGLE timeout window.
  *
  * The OpenAI SDK has built-in retry with exponential backoff, but its
  * backoff window (max ~4s) is too short for TPM (tokens-per-minute)
@@ -1831,8 +1840,13 @@ async function embedAllStale(
  *     sleep wakes up early AND the abortSignal is threaded into the gateway
  *     embed call so an in-flight HTTP request cancels too.
  *
- * Up to MAX_RATE_LIMIT_RETRIES attempts with the parsed (jittered) delay
- * (or a 60s fallback when the message can't be parsed).
+ * Up to MAX_RATE_LIMIT_RETRIES attempts. Rate-limit/gateway retries sleep
+ * the parsed (jittered) Retry-After delay (or a 60s fallback when the
+ * message can't be parsed); timeout retries (#3374) sleep a short fixed
+ * jittered delay instead (see `timeoutRetryDelayMs` — a timeout message
+ * carries no Retry-After hint, so reusing `parseRetryDelayMs` there would
+ * silently take the 60s fallback and recreate the shared-budget symptom
+ * this fix removes).
  *
  * @internal Exported for unit tests; not part of the public surface.
  */
@@ -1903,6 +1917,47 @@ export function parseRetryDelayMs(msg: string, rng: () => number = Math.random):
 }
 
 /**
+ * Walk the cause chain looking for a `TimeoutError` name — what
+ * `AbortSignal.timeout()` produces when it fires (Node/the AI SDK surface
+ * it as `{ name: 'TimeoutError', message: 'The operation timed out.' }`).
+ * The gateway's `normalizeAIError` wraps this in `AITransientError` with
+ * the original on `.cause` (same shape `detect429FromCause` walks), so this
+ * mirrors that helper rather than inspecting `e.name` directly (#3374).
+ *
+ * @internal exported for unit tests.
+ */
+export function detectTimeoutFromCause(e: unknown): boolean {
+  let cur: unknown = e;
+  for (let depth = 0; depth < 5 && cur !== undefined && cur !== null; depth++) {
+    const obj = cur as { name?: unknown; cause?: unknown };
+    if (obj.name === 'TimeoutError') return true;
+    cur = obj.cause;
+  }
+  return false;
+}
+
+/**
+ * Bounded jittered backoff before a timeout-classified retry (#3374).
+ * Deliberately distinct from `parseRetryDelayMs`: a client-side
+ * `AI_EMBED_TIMEOUT_MS` abort carries no "try again in Xms" hint, so
+ * parsing it with `parseRetryDelayMs` would silently take the 60s
+ * `RATE_LIMIT_FALLBACK_MS` path — burning most of a fresh retry's value on
+ * a sleep instead of the request itself. The actual fix for a timeout is
+ * that the retried attempt gets its OWN fresh timeout window (gateway.ts's
+ * `withDefaultTimeout` builds a new `AbortSignal.timeout()` on every
+ * `embedSubBatch` call), so the pre-retry sleep here only needs to be long
+ * enough to avoid hammering a possibly-still-slow backend.
+ *
+ * @internal exported for unit tests.
+ */
+export const TIMEOUT_RETRY_DELAY_MS = 250;
+
+export function timeoutRetryDelayMs(rng: () => number = Math.random): number {
+  const jitterFactor = 1 + (rng() * 2 - 1) * RATE_LIMIT_JITTER;
+  return Math.max(1, Math.floor(TIMEOUT_RETRY_DELAY_MS * jitterFactor));
+}
+
+/**
  * Sleep for `ms` milliseconds. Resolves early (not rejects) when `signal`
  * fires, so the retry loop's caller can re-check `signal.aborted` and
  * exit cleanly without an unhandled rejection.
@@ -1943,12 +1998,15 @@ export async function embedBatchWithBackoff(
     } catch (e: unknown) {
       // If the budget fired we may have been aborted mid-fetch; bubble out.
       if (signal?.aborted) throw e;
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!isEmbedRetriableError(e) || attempt === MAX_RATE_LIMIT_RETRIES) throw e;
+      const cls = classifyEmbedRetryError(e);
+      if (!cls || attempt === MAX_RATE_LIMIT_RETRIES) throw e;
 
-      const delayMs = parseRetryDelayMs(msg);
-      // One label for every retriable class — 429 and gateway blips share the loop.
-      serr(`  [embed-retry] attempt ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES}, waiting ${delayMs}ms...`);
+      // #3374: timeout retries use a short fixed backoff (the fresh
+      // per-attempt timeout window is the fix, not the sleep); rate-limit
+      // and gateway-overload retries use the parsed Retry-After delay.
+      const msg = e instanceof Error ? e.message : String(e);
+      const delayMs = cls === 'timeout' ? timeoutRetryDelayMs() : parseRetryDelayMs(msg);
+      serr(`  [embed-retry] attempt ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES} (${cls}), waiting ${delayMs}ms...`);
       await abortableSleep(delayMs, signal);
     }
   }
@@ -1957,20 +2015,35 @@ export async function embedBatchWithBackoff(
 }
 
 /**
- * Retriable embed errors: 429 rate limits plus transient gateway overload
- * (502/503/504). Shared by embedBatchWithBackoff (retry decision) and
+ * Classify a thrown embed error for retry purposes: 429 rate limits,
+ * transient gateway overload (502/503/504), or a SDK-internal per-attempt
+ * timeout (#3374 — `AI_EMBED_TIMEOUT_MS` firing via `withDefaultTimeout`).
+ * Returns `null` for anything else (non-retriable). Shared by
+ * embedBatchWithBackoff (retry decision + backoff strategy) and
  * embedPageTexts (fan-out decision). D4: structured detection first
  * (gateway-wrapped errors via cause chain); message-match as fallback for
- * providers whose wrappers strip `cause.status`.
+ * providers whose wrappers strip `cause.status`/`cause.name`.
+ *
+ * @internal exported for unit tests.
+ */
+export function classifyEmbedRetryError(e: unknown): 'rate_limit' | 'gateway' | 'timeout' | null {
+  const msg = e instanceof Error ? e.message : String(e);
+  if (detect429FromCause(e) || /rate.?limit|429/i.test(msg)) return 'rate_limit';
+  if (detectGatewayErrorFromCause(e) || /bad gateway|502|503|504|service unavailable|gateway timeout/i.test(msg)) {
+    return 'gateway';
+  }
+  if (detectTimeoutFromCause(e) || /\btimed out\b/i.test(msg)) return 'timeout';
+  return null;
+}
+
+/**
+ * Retriable embed errors: 429 rate limits, transient gateway overload
+ * (502/503/504), and SDK-internal per-attempt timeouts (#3374). Thin
+ * boolean wrapper over `classifyEmbedRetryError` for call sites that only
+ * need the yes/no decision.
  */
 function isEmbedRetriableError(e: unknown): boolean {
-  const msg = e instanceof Error ? e.message : String(e);
-  return (
-    detect429FromCause(e) ||
-    detectGatewayErrorFromCause(e) ||
-    /rate.?limit|429/i.test(msg) ||
-    /bad gateway|502|503|504|service unavailable|gateway timeout/i.test(msg)
-  );
+  return classifyEmbedRetryError(e) !== null;
 }
 
 /** Walk the cause chain (like detect429FromCause) for the first HTTP status. */
@@ -1996,8 +2069,11 @@ function statusFromCause(e: unknown): number | undefined {
  * costs one chunk.
  *
  * Cost bounding — when we do NOT fan out (rethrow instead):
- *   - 429 / rate limit: embedBatchWithBackoff already retried with backoff;
- *     fanning out N single-chunk calls would hammer the same limiter N-fold.
+ *   - 429 / rate limit, gateway overload (502/503/504), or a SDK-internal
+ *     per-attempt timeout (#3374): embedBatchWithBackoff already retried
+ *     with backoff (a fresh timeout window per retry, in the timeout case);
+ *     fanning out N single-chunk calls would either hammer the same limiter
+ *     N-fold or re-hit the same slow/degraded backend N times over.
  *   - AITransientError (5xx / network / unknown, per normalizeAIError): the
  *     batch CONTENT isn't the problem, so isolation can't help — during an
  *     outage it would just multiply failing calls per page.

@@ -9,7 +9,14 @@ import { chunkCodeText, chunkCodeTextFull, detectCodeLanguage, CHUNKER_VERSION }
 import { findChunkForOffset } from './chunkers/edge-extractor.ts';
 import { planEmbeddingReuse } from './embed-reuse.ts';
 import { extractCodeRefs, imageOfCandidates } from './link-extraction.ts';
-import { embedBatch, embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
+import { embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
+// #3374: both embed call sites below route through embedBatchWithBackoff
+// (not the raw gatewayEmbed embedBatch) so a transient failure — 429,
+// gateway overload, or the gateway's own AI_EMBED_TIMEOUT_MS abort — gets
+// a genuine retry with a FRESH per-attempt timeout budget instead of
+// sharing one timeout window across the AI SDK's internal retry attempts.
+// Same pattern src/core/embed-stale.ts already uses for embed --stale.
+import { embedBatchWithBackoff } from '../commands/embed.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath, hasMalformedPathSegment } from './sync.ts';
 import type { ChunkInput, PageInput, PageType } from './types.ts';
 import { computeEffectiveDate } from './effective-date.ts';
@@ -819,7 +826,7 @@ export async function importFromContent(
     const wrappedTexts = prefix
       ? chunks.map((c) => wrapChunkForEmbedding(c.chunk_text, prefix, c.chunk_source))
       : chunks.map((c) => c.chunk_text);
-    const embeddings = await embedBatch(wrappedTexts);
+    const embeddings = await embedBatchWithBackoff(wrappedTexts);
     for (let i = 0; i < chunks.length; i++) {
       chunks[i].embedding = embeddings[i];
       // token_count tracks the wrapped string length so cost reporting
@@ -1413,7 +1420,7 @@ export async function importCodeFile(
   if (!opts.noEmbed && needsEmbedIndexes.length > 0) {
     try {
       const textsToEmbed = needsEmbedIndexes.map((i) => chunks[i]!.chunk_text);
-      const embeddings = await embedBatch(textsToEmbed);
+      const embeddings = await embedBatchWithBackoff(textsToEmbed);
       for (let j = 0; j < needsEmbedIndexes.length; j++) {
         const i = needsEmbedIndexes[j]!;
         chunks[i]!.embedding = embeddings[j]!;
