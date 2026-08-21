@@ -80,6 +80,7 @@ async function seedPage(opts: {
   content_hash?: string | null;
   frontmatter?: Record<string, unknown>;
   source_id?: string;
+  source_path?: string;
   compiled_truth?: string;
 }) {
   await engine.putPage(
@@ -106,6 +107,12 @@ async function seedPage(opts: {
     await engine.executeRaw(
       `UPDATE pages SET content_hash = NULL WHERE slug = $1 AND source_id = $2`,
       [opts.slug, opts.source_id ?? 'default'],
+    );
+  }
+  if (opts.source_path) {
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = $1 WHERE slug = $2 AND source_id = $3`,
+      [opts.source_path, opts.slug, opts.source_id ?? 'default'],
     );
   }
 }
@@ -269,13 +276,15 @@ describe('v0.41.2.1: runPhaseExtractAtoms — dual-source merge + idempotency', 
     expect(result.details?.pages_processed).toBe(1);
   });
 
-  test('atom frontmatter: page-origin uses source_slug, transcript-origin uses source_path', async () => {
+  test('atom provenance: frontmatter strings and graph edges cover page + transcript origins', async () => {
+    await seedPage({ slug: 'meeting/p', type: 'meeting' });
+    await seedPage({ slug: 'transcripts/t', type: 'source', source_path: '/T.txt' });
     // Use stubChatUnique so the two work-items write to distinct slugs;
     // a constant title would upsert into one slug and mask one origin.
     const chat = stubChatUnique();
     await runPhaseExtractAtoms(engine, {
       _transcripts: [{ filePath: '/T.txt', content: 'tc', contentHash: 'tchash1234567890ab' }],
-      _pages: [{ slug: 'meeting/P', content: 'pc', contentHash: 'pchash1234567890ab' }],
+      _pages: [{ slug: 'meeting/p', content: 'pc', contentHash: 'pchash1234567890ab' }],
       _chat: chat,
     });
     const rows = await engine.executeRaw<{ slug: string; frontmatter: Record<string, unknown> }>(
@@ -288,8 +297,24 @@ describe('v0.41.2.1: runPhaseExtractAtoms — dual-source merge + idempotency', 
     expect(transcriptAtom!.frontmatter.source_path).toBe('/T.txt');
     expect(transcriptAtom!.frontmatter.source_hash).toBe('tchash1234567890');
     expect(pageAtom).toBeDefined();
-    expect(pageAtom!.frontmatter.source_slug).toBe('meeting/P');
+    expect(pageAtom!.frontmatter.source_slug).toBe('meeting/p');
     expect(pageAtom!.frontmatter.source_hash).toBe('pchash1234567890');
+
+    const pageOriginBacklinks = await engine.getBacklinks('meeting/p', { sourceId: 'default' });
+    expect(pageOriginBacklinks).toContainEqual(expect.objectContaining({
+      from_slug: pageAtom!.slug,
+      to_slug: 'meeting/p',
+      link_type: 'derived_from',
+      link_source: 'extract-atoms',
+    }));
+
+    const transcriptOriginBacklinks = await engine.getBacklinks('transcripts/t', { sourceId: 'default' });
+    expect(transcriptOriginBacklinks).toContainEqual(expect.objectContaining({
+      from_slug: transcriptAtom!.slug,
+      to_slug: 'transcripts/t',
+      link_type: 'derived_from',
+      link_source: 'extract-atoms',
+    }));
   });
 
   test('sourceId threads into putPage call (D9 #1 regression — atoms land in correct source)', async () => {

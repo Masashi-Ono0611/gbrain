@@ -62,6 +62,7 @@ import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { createHash } from 'crypto';
 import { slugifySegment } from '../sync.ts';
+import { resolveSlugByPathOrSourcePath } from '../sync-git.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 const DEFAULT_EXTRACT_ATOMS_MODEL = 'anthropic:claude-haiku-4-5';
@@ -819,6 +820,28 @@ export async function runPhaseExtractAtoms(
           importedSlugs.push(slug);
           totalAtomsExtracted++;
         }
+        // Match the generated-page provenance convention used by the other
+        // derived-page writers: the new page points OUT to the page it came
+        // from. Page inputs already carry a slug; transcript inputs carry a
+        // source_path, so resolve the actual stored slug first (including
+        // frontmatter-fallback slugs that cannot be derived from the path).
+        //
+        // Keep this before the source_hash completion flip. A transient link
+        // write failure therefore leaves the atoms provisional and the item
+        // retryable, while addLinksBatch safely JOIN-drops transcripts that do
+        // not have a corresponding brain page yet.
+        const provenanceSourceSlug = item.kind === 'transcript'
+          ? await resolveSlugByPathOrSourcePath(engine, item.filePath, sourceId)
+          : item.slug;
+        await engine.addLinksBatch(importedSlugs.map((atomSlug) => ({
+          from_slug: atomSlug,
+          to_slug: provenanceSourceSlug,
+          link_type: 'derived_from',
+          link_source: 'extract-atoms',
+          context: `Extracted from ${originLabel}`,
+          from_source_id: sourceId,
+          to_source_id: sourceId,
+        }))); // gbrain-allow-direct-insert: extract_atoms writes canonical atom → source provenance edges alongside its frontmatter receipt
         // Completion receipt: flip provisional → real in one statement, then
         // stamp the source page. A crash between flip and stamp degrades to
         // the legacy atom-rows-mean-done semantics — safe, not lossy.
