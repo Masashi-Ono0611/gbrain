@@ -31,8 +31,8 @@ frontmatter will read as absent. Refresh it once, from the repository root:
 ```bash
 git rm --cached -r . -q
 git reset --hard
-bash -n scripts/run-unit-parallel.sh          # silence means bash can read the scripts
-git ls-files --eol -- '*.md' | grep -c w/crlf # 0 means Markdown is clean
+bash -n scripts/run-unit-parallel.sh           # silence means bash can read the scripts
+git ls-files --eol -- '*.md' | grep -vc w/lf   # 0 means Markdown is clean (catches w/crlf AND w/mixed)
 ```
 
 Every `check:*` entry in `package.json` invokes its script as `bash scripts/<name>.sh`
