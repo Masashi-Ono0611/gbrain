@@ -57,7 +57,7 @@ import type { BrainEngine } from '../engine.ts';
 import { resolveSupersededByRow, type SupersedeTarget } from '../facts/supersede-resolve.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
-import { parseFactsFence } from '../facts-fence.ts';
+import { parseFactsFence, FACTS_FENCE_BEGIN, FACTS_FENCE_END } from '../facts-fence.ts';
 import {
   extractFactsFromFenceText,
   FENCE_SOURCE_DEFAULT,
@@ -398,6 +398,28 @@ export async function runExtractFacts(
       // could still recover. That partial result is not authoritative: using
       // it for reconciliation would interpret skipped rows as deletions.
       // Preserve this page's existing index and continue with other pages.
+      continue;
+    }
+
+    // #3625: splitBody() routes everything below the timeline sentinel into
+    // page.timeline, so a `## Facts` fence placed below the sentinel is
+    // invisible to parseFactsFence(compiled_truth) above — it comes back as
+    // "no facts", indistinguishable from a page that never had a fence. Left
+    // unguarded, that false negative deletes this page's fence-owned DB rows
+    // even though the fence is still on the page (just mis-placed). Detect
+    // the mis-placement and treat it the same as the malformed-parse branch
+    // above: loud (warn), never destructive (preserve the existing index).
+    // Require BOTH markers (not a bare BEGIN substring hit) so prose that
+    // merely mentions or quotes the marker text doesn't false-trigger the
+    // guard on an otherwise fence-less page.
+    const timeline = page.timeline ?? '';
+    const timelineBeginIdx = timeline.indexOf(FACTS_FENCE_BEGIN);
+    const hasTimelineFence = timelineBeginIdx !== -1
+      && timeline.indexOf(FACTS_FENCE_END, timelineBeginIdx + FACTS_FENCE_BEGIN.length) !== -1;
+    if (parsed.facts.length === 0 && hasTimelineFence) {
+      result.warnings.push(
+        `${slug}: FACTS_FENCE_BELOW_TIMELINE — a Facts fence exists below the timeline sentinel and is not being reconciled; move it above the sentinel`,
+      );
       continue;
     }
 
