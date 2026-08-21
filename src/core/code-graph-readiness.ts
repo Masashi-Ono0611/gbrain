@@ -15,8 +15,15 @@
  * Two grains, because the four commands read different data:
  *   - `code-def` / `code-refs` read `content_chunks.symbol_name` /
  *     `chunk_text`, which are populated at CHUNK time (during sync/import),
- *     independent of edge resolution. Their readiness is 2-state: code chunks
- *     exist → `ready`, else `not_built`. They never report `indexing` (edge
+ *     independent of edge resolution. Their readiness is 3-state: no code
+ *     chunks → `not_built`; code chunks exist but none carry `symbol_name`
+ *     (issue #3640/#3970 — the chunker's small-file merge path emits
+ *     `symbol_type: 'merged', symbol_name: NULL`, and a stale index can
+ *     carry the same shape after a metadata-wiping bug) → `no_symbols`; at
+ *     least one symbol-bearing chunk exists → `ready`. Without the
+ *     `no_symbols` state, a merged/wiped index is indistinguishable from a
+ *     healthy one that genuinely has no match for the queried symbol — both
+ *     read `count: 0, status: 'ready'`. They never report `indexing` (edge
  *     resolution is irrelevant to them).
  *   - `code-callers` / `code-callees` read the call graph (`code_edges_*`).
  *     Their readiness is 3-state: no code chunks → `not_built`; code chunks
@@ -43,7 +50,7 @@
 import type { BrainEngine } from './engine.ts';
 import { EDGE_EXTRACTOR_VERSION_TS } from './chunkers/symbol-resolver.ts';
 
-export type CodeGraphStatus = 'not_built' | 'indexing' | 'ready' | 'unknown';
+export type CodeGraphStatus = 'not_built' | 'indexing' | 'no_symbols' | 'ready' | 'unknown';
 
 export interface CodeGraphReadiness {
   /** Coarse machine-readable state. */
@@ -79,6 +86,33 @@ async function codeChunksExist(engine: BrainEngine, sourceId: string | undefined
        SELECT 1 FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
         WHERE p.page_kind = 'code' ${scopeClause}
+     ) AS e`,
+    params,
+  );
+  return Boolean(rows[0]?.e);
+}
+
+/**
+ * EXISTS probe: does any code chunk carry symbol metadata? `symbol_name` is
+ * NULL for the chunker's merged small-declaration chunks (`symbol_type:
+ * 'merged'`) and for any chunk whose metadata got wiped by a bug (e.g. #3705).
+ * Rides the partial index on `content_chunks(symbol_name) WHERE symbol_name
+ * IS NOT NULL`.
+ */
+async function symbolChunksExist(engine: BrainEngine, sourceId: string | undefined): Promise<boolean> {
+  const params: unknown[] = [];
+  let scopeClause = '';
+  if (sourceId) {
+    params.push(sourceId);
+    scopeClause = `AND p.source_id = $${params.length}`;
+  }
+  const rows = await engine.executeRaw<{ e: boolean }>(
+    `SELECT EXISTS(
+       SELECT 1 FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE p.page_kind = 'code'
+          AND cc.symbol_name IS NOT NULL
+          ${scopeClause}
      ) AS e`,
     params,
   );
@@ -128,8 +162,14 @@ export async function resolveCodeReadiness(
       return { status: 'not_built', ready: false, has_code: false, pending_edges: false };
     }
     if (opts.kind === 'symbol') {
-      // Symbol metadata is set at chunk time; code chunks exist ⇒ genuinely none.
-      return { status: 'ready', ready: true, has_code: true, pending_edges: false };
+      // Code chunks existing doesn't mean any of them carry symbol_name —
+      // the chunker's merge path (and pre-#3705-fix indexes) can leave
+      // every code chunk in scope with symbol_name: NULL. Probe for that
+      // before declaring `ready` (issue #3640/#3970).
+      const hasSymbols = await symbolChunksExist(engine, sourceId);
+      return hasSymbols
+        ? { status: 'ready', ready: true, has_code: true, pending_edges: false }
+        : { status: 'no_symbols', ready: false, has_code: true, pending_edges: false };
     }
     const pending = await pendingEdgeChunksExist(engine, sourceId);
     return pending
@@ -148,6 +188,8 @@ export function readinessHint(r: CodeGraphReadiness): string | null {
       return 'Symbol graph not built (no code indexed in scope). Run `gbrain sync` to index code.';
     case 'indexing':
       return 'Symbol graph still building (edges pending resolution). Re-run after the next `gbrain dream` cycle / autopilot tick.';
+    case 'no_symbols':
+      return 'Code is indexed in scope, but no chunk carries symbol metadata (small declarations can merge into one anonymous chunk, or the index predates a metadata-preserving fix) — this empty result does not confirm the symbol is absent. `gbrain reindex-code --force` rebuilds metadata if it went stale; verify against the source directly if the file is simply small.';
     case 'unknown':
       return 'Readiness check unavailable (DB error). Treat the empty result as best-effort.';
     case 'ready':
