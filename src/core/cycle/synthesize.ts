@@ -50,7 +50,8 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { chat as gatewayChat, validateModelId, type ChatResult } from '../ai/gateway.ts';
+import { validateModelId, type ChatResult } from '../ai/gateway.ts';
+import { chatWithFallback as gatewayChat } from '../ai/chat-fallback.ts';
 import { AIConfigError } from '../ai/errors.ts';
 import { resolveChatContextTokens } from '../ai/model-resolver.ts';
 import { normalizeModelId, splitProviderModelId } from '../model-id.ts';
