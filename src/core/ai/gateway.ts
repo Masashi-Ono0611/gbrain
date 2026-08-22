@@ -475,6 +475,7 @@ export function configureGateway(config: AIGatewayConfig): void {
     expansion_model: config.expansion_model ?? DEFAULT_EXPANSION_MODEL,
     chat_model: config.chat_model ?? DEFAULT_CHAT_MODEL,
     chat_fallback_chain: config.chat_fallback_chain,
+    chat_fallback_chains: config.chat_fallback_chains,
     // v0.35.0.0+: reranker_model stays undefined when unset — reranker is
     // opt-in and pulling DEFAULT_RERANKER_MODEL into every gateway start
     // would silently register a third-party model id on brains that never
@@ -865,8 +866,19 @@ export function getChatModel(): string {
   return requireConfig().chat_model ?? DEFAULT_CHAT_MODEL;
 }
 
-export function getChatFallbackChain(): string[] {
-  return requireConfig().chat_fallback_chain ?? [];
+/**
+ * patch 96: `chainKey` looks up a per-call-site override
+ * (`chat_fallback_chains[chainKey]`, set via `chat_fallback_chain.<chainKey>`
+ * config rows) before falling back to the single global `chat_fallback_chain`.
+ * Omitting `chainKey` (every pre-patch-96 caller) is identical to before.
+ */
+export function getChatFallbackChain(chainKey?: string): string[] {
+  const cfg = requireConfig();
+  if (chainKey) {
+    const specific = cfg.chat_fallback_chains?.[chainKey];
+    if (specific) return specific;
+  }
+  return cfg.chat_fallback_chain ?? [];
 }
 
 /**
@@ -4192,6 +4204,17 @@ export interface ToolLoopOpts {
    * one-shots, tests).
    */
   acquireTurnPermit?: () => Promise<TurnPermit>;
+  /**
+   * patch 96: injected per-turn chat implementation, defaulting to
+   * `gateway.chat()`. Lets a caller (src/core/minions/handlers/subagent.ts)
+   * substitute an availability-aware wrapper — `chatWithFallback` from
+   * ../ai/chat-fallback.ts — WITHOUT gateway.ts importing chat-fallback.ts,
+   * which would create a circular import (chat-fallback.ts already imports
+   * `chat`/`getChatFallbackChain`/etc. FROM gateway.ts). Same signature as
+   * `chat()`; called once per turn with the same ChatOpts this loop would
+   * otherwise pass to `chat()` directly.
+   */
+  chatFn?: (opts: ChatOpts) => Promise<ChatResult>;
 }
 
 export type TurnPermit =
@@ -4275,8 +4298,9 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
       }
     }
     let chatResult: ChatResult;
+    const chatCall = opts.chatFn ?? chat;
     try {
-      chatResult = await chat({
+      chatResult = await chatCall({
         model: opts.model,
         system: opts.system,
         messages,

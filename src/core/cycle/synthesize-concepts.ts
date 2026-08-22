@@ -27,6 +27,7 @@ import type { ProgressReporter } from '../progress.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { chat as gatewayChat, isAvailable } from '../ai/gateway.ts';
+import { chatWithFallback } from '../ai/chat-fallback.ts';
 import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
 // #2163: concept pages route through importFromContent (the same
 // parse→chunk→embed pipeline put_page uses) instead of a bare engine.putPage,
@@ -102,7 +103,10 @@ export async function runPhaseSynthesizeConcepts(
   engine: BrainEngine,
   opts: SynthesizeConceptsOpts = {},
 ): Promise<PhaseResult> {
-  const chat = opts._chat ?? gatewayChat;
+  // patch 96: availability-aware fallback by default (test seam unchanged).
+  const chat = opts._chat
+    ?? ((chatOpts: Parameters<typeof gatewayChat>[0]) =>
+      chatWithFallback(chatOpts, { chainKey: 'models.dream.synthesize' }));
 
   // 1. Get atom pages (test seam OR DB query)
   let atoms = opts._atoms ?? [];

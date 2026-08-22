@@ -2,6 +2,10 @@
  * Availability-only chat fallback with sticky demotions. The demotion cache is
  * process-local and keyed only by normalized model id, so gateway
  * reconfiguration within the same process inherits earlier demotions.
+ *
+ * patch 96: callers may pass `{ chainKey }` to resolve a per-call-site chain
+ * override (`chat_fallback_chains[chainKey]`) ahead of the single global
+ * `chat_fallback_chain` — see `getChatFallbackChain()` in gateway.ts.
  */
 import { classifyGlobalLlmError, type GlobalLlmErrorClass } from './errors.ts';
 import {
@@ -117,12 +121,28 @@ function logSkippedEntry(
   );
 }
 
+export interface ChatWithFallbackParams {
+  /**
+   * patch 96: looks up a per-call-site chain override
+   * (`chat_fallback_chains[chainKey]`, config key `chat_fallback_chain.<chainKey>`)
+   * before falling back to the single global `chat_fallback_chain`. Pass the
+   * SAME config key the caller used to resolve `opts.model` (e.g.
+   * `models.dream.patterns`) so an operator can override that one call
+   * site's chain independently. Omitting it (every pre-patch-96 caller)
+   * behaves exactly as before.
+   */
+  chainKey?: string;
+}
+
 /**
  * Run a chat call and advance through the configured provider chain only for
  * availability failures. Primary auth/unclassified failures propagate; the
  * same failures from optional chain entries are reported and skipped.
  */
-export async function chatWithFallback(opts: ChatOpts): Promise<ChatResult> {
+export async function chatWithFallback(
+  opts: ChatOpts,
+  params?: ChatWithFallbackParams,
+): Promise<ChatResult> {
   const primaryModel = opts.model ?? getChatModel();
   const primary: Candidate = {
     model: primaryModel,
@@ -131,7 +151,7 @@ export async function chatWithFallback(opts: ChatOpts): Promise<ChatResult> {
 
   const seen = new Set([primary.normalized]);
   const fallbacks: Candidate[] = [];
-  for (const entry of getChatFallbackChain()) {
+  for (const entry of getChatFallbackChain(params?.chainKey)) {
     const normalized = normalizedModel(entry);
     if (seen.has(normalized)) continue;
     seen.add(normalized);

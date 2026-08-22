@@ -57,7 +57,7 @@ function makeBatchEngine(map: Record<string, string>): {
       sqls.push(sql);
       const keys = (params?.[0] ?? []) as string[];
       return Object.entries(map)
-        .filter(([k]) => keys.includes(k) || k.startsWith('cycle.'))
+        .filter(([k]) => keys.includes(k) || k.startsWith('cycle.') || k.startsWith('chat_fallback_chain.'))
         .map(([key, value]) => ({ key, value })) as T[];
     },
   };
@@ -100,9 +100,11 @@ describe('applyDbPlaneReadSideMerge — batched read (D2)', () => {
     expect(counts.executeRaw).toBe(1);
     expect(counts.getConfig).toBe(0);
     expect(counts.listConfigKeys).toBe(0);
-    // The single statement carries BOTH arms: scalar batch + cycle prefix.
+    // The single statement carries all three arms: scalar batch + cycle
+    // prefix + patch 96's per-chainKey chat_fallback_chain prefix.
     expect(sqls[0]).toContain('key = ANY($1)');
     expect(sqls[0]).toContain(`key LIKE 'cycle.%'`);
+    expect(sqls[0]).toContain(`key LIKE 'chat_fallback_chain.%'`);
   });
 
   test('merges provider keys, chat pins, chat_fallback_chain, and cycle.* from the batch', async () => {
@@ -130,6 +132,37 @@ describe('applyDbPlaneReadSideMerge — batched read (D2)', () => {
       'auto_think.enabled': 'true',
       'extract_atoms.budget_usd': '0.25',
     });
+  });
+
+  test('patch 96: merges chat_fallback_chain.<chainKey> rows into chat_fallback_chains', async () => {
+    const { engine } = makeBatchEngine({
+      chat_model: 'anthropic:claude-haiku-4-5',
+      'chat_fallback_chain.models.dream.patterns': 'anthropic:claude-haiku-4-5, openai:gpt-5-mini',
+      'chat_fallback_chain.models.dream.synthesize': '["openrouter:some-model"]',
+    });
+    const merged: GBrainConfig = { engine: 'pglite' };
+    await applyDbPlaneReadSideMerge(merged, engine);
+
+    expect(merged.chat_fallback_chains).toEqual({
+      'models.dream.patterns': ['anthropic:claude-haiku-4-5', 'openai:gpt-5-mini'],
+      'models.dream.synthesize': ['openrouter:some-model'],
+    });
+    // The global singular chain is untouched when no `chat_fallback_chain`
+    // row is present.
+    expect(merged.chat_fallback_chain).toBeUndefined();
+  });
+
+  test('patch 96: an existing chat_fallback_chains[chainKey] (file/env) wins over the DB row', async () => {
+    const { engine } = makeBatchEngine({
+      'chat_fallback_chain.models.dream.patterns': 'db-loser-model',
+    });
+    const merged: GBrainConfig = {
+      engine: 'pglite',
+      chat_fallback_chains: { 'models.dream.patterns': ['file-winner-model'] },
+    };
+    await applyDbPlaneReadSideMerge(merged, engine);
+
+    expect(merged.chat_fallback_chains).toEqual({ 'models.dream.patterns': ['file-winner-model'] });
   });
 
   test('file/env precedence survives the batch: defined fields are never overwritten', async () => {
@@ -234,13 +267,27 @@ describe('applyDbPlaneReadSideMerge — per-key fallback (no executeRaw)', () =>
     expect(merged.cycle?.['enrich_thin.enabled']).toBe('true');
     expect(counts.executeRaw).toBe(0);
     expect(counts.getConfig).toBeGreaterThan(0);
-    expect(counts.listConfigKeys).toBe(1);
+    // patch 96: the per-key fallback path now walks TWO prefixes
+    // (cycle. and chat_fallback_chain.), one listConfigKeys call each.
+    expect(counts.listConfigKeys).toBe(2);
 
     // Second merge on the same handle: fully memoized, zero new reads.
     const before = counts.getConfig;
     await applyDbPlaneReadSideMerge({ engine: 'pglite' }, engine);
     expect(counts.getConfig).toBe(before);
-    expect(counts.listConfigKeys).toBe(1);
+    expect(counts.listConfigKeys).toBe(2);
+  });
+
+  test('patch 96: per-key chat_fallback_chain.<chainKey> merges via listConfigKeys too', async () => {
+    const { engine, counts } = makeFallbackEngine({
+      'chat_fallback_chain.models.dream.patterns': 'openai:gpt-5-mini',
+    });
+    const merged: GBrainConfig = { engine: 'pglite' };
+    await applyDbPlaneReadSideMerge(merged, engine);
+
+    expect(merged.chat_fallback_chains).toEqual({ 'models.dream.patterns': ['openai:gpt-5-mini'] });
+    // Walked BOTH prefixes (cycle. and chat_fallback_chain.) via listConfigKeys.
+    expect(counts.listConfigKeys).toBe(2);
   });
 });
 
@@ -258,15 +305,17 @@ describe('batched SQL shape on a real engine (PGLite)', () => {
     await engine.disconnect();
   });
 
-  test(`key = ANY($1) OR key LIKE 'cycle.%' round-trips through PGLite`, async () => {
+  test(`key = ANY($1) OR key LIKE 'cycle.%' OR key LIKE 'chat_fallback_chain.%' round-trips through PGLite`, async () => {
     await engine.setConfig('chat_model', 'anthropic:claude-haiku-4-5');
     await engine.setConfig('cycle.auto_think.enabled', 'true');
     await engine.setConfig('cycle.empty_value', ''); // dbStr semantics: unset
+    await engine.setConfig('chat_fallback_chain.models.dream.patterns', 'openai:gpt-5-mini');
 
     const merged: GBrainConfig = { engine: 'pglite' };
     await applyDbPlaneReadSideMerge(merged, engine);
 
     expect(merged.chat_model).toBe('anthropic:claude-haiku-4-5');
     expect(merged.cycle).toEqual({ 'auto_think.enabled': 'true' });
+    expect(merged.chat_fallback_chains).toEqual({ 'models.dream.patterns': ['openai:gpt-5-mini'] });
   }, 60_000);
 });

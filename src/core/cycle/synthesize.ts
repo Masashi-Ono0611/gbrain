@@ -798,6 +798,13 @@ async function runPhaseSynthesizeInner(
             config.originalsPrefix,
           ),
           model: subagentModel,
+          // patch 96: same config key resolveModel() used for `subagentModel`
+          // (config.model above), so a billing/rate_limit failure on a
+          // per-transcript child can fall through chat_fallback_chain.
+          // models.dream.synthesize (or the global chat_fallback_chain)
+          // instead of dead-lettering — regardless of whether this child
+          // runs oneshot or falls through to the agentic loop (#4216).
+          fallback_chain_key: 'models.dream.synthesize',
           max_turns: config.maxTurns,
           allowed_slug_prefixes: allowedSlugPrefixes,
           // #4216: execution mode + the structural slug-suffix contract

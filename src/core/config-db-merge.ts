@@ -8,6 +8,11 @@
  * `loadConfigWithEngine()` (src/core/config.ts) after its per-key merges,
  * with the same precedence: env > file > DB.
  *
+ * patch 96 added a second fallback-chain shape alongside the single global
+ * `chat_fallback_chain`: per-chainKey overrides at `chat_fallback_chain.<key>`,
+ * merged into `chat_fallback_chains` via the same `chat_fallback_chain.%`
+ * prefix walk as `cycle.*` (see CHAT_FALLBACK_CHAIN_KEY_PREFIX below).
+ *
  * Sibling module (not inlined in config.ts) per the module-size ratchet;
  * runtime dependency direction is config.ts → here (the GBrainConfig import
  * below is type-only, erased at compile time — no cycle).
@@ -74,6 +79,8 @@ const DB_MERGED_SCALAR_KEYS: readonly string[] = [
 ];
 
 const CYCLE_PREFIX = 'cycle.';
+/** patch 96: per-call-site chatWithFallback chain override prefix (see chat_fallback_chains doc on GBrainConfig). */
+const CHAT_FALLBACK_CHAIN_KEY_PREFIX = 'chat_fallback_chain.';
 
 /**
  * D2 remediation: this merge used to issue ~12 sequential `engine.getConfig`
@@ -116,7 +123,8 @@ async function readDbPlaneMergeValues(
   if (typeof engine.executeRaw === 'function') {
     try {
       const rows = await engine.executeRaw<{ key: string; value: string | null }>(
-        `SELECT key, value FROM config WHERE key = ANY($1) OR key LIKE 'cycle.%'`,
+        `SELECT key, value FROM config
+          WHERE key = ANY($1) OR key LIKE 'cycle.%' OR key LIKE 'chat_fallback_chain.%'`,
         [[...DB_MERGED_SCALAR_KEYS]],
       );
       for (const row of rows) {
@@ -137,19 +145,48 @@ async function readDbPlaneMergeValues(
       }
     }
     if (typeof engine.listConfigKeys === 'function') {
-      try {
-        for (const key of await engine.listConfigKeys(CYCLE_PREFIX)) {
-          if (!key.startsWith(CYCLE_PREFIX)) continue;
-          const v = await engine.getConfig(key).catch(() => undefined);
-          if (v !== undefined && v !== null && v !== '') values.set(key, v);
+      for (const prefix of [CYCLE_PREFIX, CHAT_FALLBACK_CHAIN_KEY_PREFIX]) {
+        try {
+          for (const key of await engine.listConfigKeys(prefix)) {
+            if (!key.startsWith(prefix)) continue;
+            const v = await engine.getConfig(key).catch(() => undefined);
+            if (v !== undefined && v !== null && v !== '') values.set(key, v);
+          }
+        } catch {
+          // quiet failure — no merge for this prefix this load
         }
-      } catch {
-        // quiet failure — no cycle merge this load
       }
     }
   }
   dbMergeMemo.set(engine, { at: nowFn(), values });
   return values;
+}
+
+/**
+ * Parse a DB-plane fallback-chain value: a JSON string-array (what a tooling
+ * writer would naturally store) or the same comma-separated form
+ * GBRAIN_CHAT_FALLBACK_CHAIN/GBRAIN_CHAT_FALLBACK_CHAINS use. Returns
+ * undefined (and warns, unless `warnLabel` is omitted) on malformed JSON or
+ * a non-string-array shape, or when the parsed/split chain is empty — no
+ * value → no field, the same container discipline as every merge branch.
+ */
+function parseFallbackChainValue(raw: string, warnLabel: string): string[] | undefined {
+  let chain: string[] | undefined;
+  if (raw.trim().startsWith('[')) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.every((x) => typeof x === 'string')) {
+        chain = parsed.map((s) => s.trim()).filter(Boolean);
+      } else {
+        console.warn(`[gbrain] config: ${warnLabel} DB value is not a JSON array of strings; ignoring`);
+      }
+    } catch (err) {
+      console.warn(`[gbrain] config: ${warnLabel} DB value is not valid JSON; ignoring (${(err as Error).message})`);
+    }
+  } else {
+    chain = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+  return chain && chain.length > 0 ? chain : undefined;
 }
 
 /**
@@ -185,25 +222,27 @@ export async function applyDbPlaneReadSideMerge(
   if (merged.chat_fallback_chain === undefined) {
     const rawChain = values.get('chat_fallback_chain');
     if (rawChain !== undefined) {
-      let chain: string[] | undefined;
-      if (rawChain.trim().startsWith('[')) {
-        try {
-          const parsed = JSON.parse(rawChain);
-          if (Array.isArray(parsed) && parsed.every((x) => typeof x === 'string')) {
-            chain = parsed.map((s) => s.trim()).filter(Boolean);
-          } else {
-            console.warn('[gbrain] config: chat_fallback_chain DB value is not a JSON array of strings; ignoring');
-          }
-        } catch (err) {
-          console.warn(`[gbrain] config: chat_fallback_chain DB value is not valid JSON; ignoring (${(err as Error).message})`);
-        }
-      } else {
-        chain = rawChain.split(',').map((s) => s.trim()).filter(Boolean);
-      }
-      if (chain !== undefined && chain.length > 0) {
-        merged.chat_fallback_chain = chain;
-      }
+      const chain = parseFallbackChainValue(rawChain, 'chat_fallback_chain');
+      if (chain !== undefined) merged.chat_fallback_chain = chain;
     }
+  }
+
+  // patch 96: per-call-site chat_fallback_chain.<chainKey> overrides, fed by
+  // the same batched read (`key LIKE 'chat_fallback_chain.%'` arm). Env/file
+  // wins per chainKey (same precedence as every other branch here); a
+  // chainKey already set by env/file (GBRAIN_CHAT_FALLBACK_CHAINS or
+  // config.json) is left untouched.
+  const dbChains: Record<string, string[]> = {};
+  for (const key of [...values.keys()].sort()) {
+    if (!key.startsWith(CHAT_FALLBACK_CHAIN_KEY_PREFIX)) continue;
+    const chainKey = key.slice(CHAT_FALLBACK_CHAIN_KEY_PREFIX.length);
+    if (!chainKey) continue;
+    if (merged.chat_fallback_chains?.[chainKey] !== undefined) continue;
+    const chain = parseFallbackChainValue(values.get(key)!, key);
+    if (chain !== undefined) dbChains[chainKey] = chain;
+  }
+  if (Object.keys(dbChains).length > 0) {
+    merged.chat_fallback_chains = { ...(merged.chat_fallback_chains ?? {}), ...dbChains };
   }
 
   // Flat cycle.* merge (#2137/#4297 read-side), fed by the same batched read

@@ -172,6 +172,15 @@ export interface GBrainConfig {
    * failures. Silent-refusal fallback is not implemented.
    */
   chat_fallback_chain?: string[];
+  /**
+   * Per-call-site overrides of `chat_fallback_chain` (patch 96), keyed by the
+   * caller's own model-resolution config key (e.g. `models.dream.patterns`).
+   * DB-plane keys look like `chat_fallback_chain.<chainKey>` (see
+   * config-db-merge.ts); `gbrain config set chat_fallback_chain.models.dream.patterns
+   * model-a,model-b` sets one entry. Absent/unset keys fall through to
+   * `chat_fallback_chain`.
+   */
+  chat_fallback_chains?: Record<string, string[]>;
   /** Optional base URL overrides for openai-compatible providers (keyed by recipe id). */
   provider_base_urls?: Record<string, string>;
   /** Optional chat request providerOptions overrides keyed by recipe id or "recipe:modelId". */
@@ -736,6 +745,39 @@ export function envShadowDetected(dir: string = process.cwd()): boolean {
   );
 }
 
+/**
+ * Parse `GBRAIN_CHAT_FALLBACK_CHAINS` — a JSON object of
+ * `{ "<chainKey>": "model-a,model-b" }` — into `GBrainConfig.chat_fallback_chains`.
+ * Fail-safe: undefined/empty input, invalid JSON, a non-object shape, or a
+ * chainKey whose value isn't a non-empty CSV string all warn (except the
+ * unset case, which is silent) and are dropped rather than throwing, so a
+ * malformed env var never crashes startup. Exported for tests.
+ */
+export function parseChatFallbackChainsEnv(raw: string | undefined): Record<string, string[]> | undefined {
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.warn(`[gbrain] config: GBRAIN_CHAT_FALLBACK_CHAINS is not valid JSON; ignoring (${(err as Error).message})`);
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    console.warn('[gbrain] config: GBRAIN_CHAT_FALLBACK_CHAINS must be a JSON object of chainKey -> CSV string; ignoring');
+    return undefined;
+  }
+  const result: Record<string, string[]> = {};
+  for (const [chainKey, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof value !== 'string') {
+      console.warn(`[gbrain] config: GBRAIN_CHAT_FALLBACK_CHAINS["${chainKey}"] is not a string; ignoring that entry`);
+      continue;
+    }
+    const chain = value.split(',').map(s => s.trim()).filter(Boolean);
+    if (chain.length > 0) result[chainKey] = chain;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
 export function loadConfig(): GBrainConfig | null {
   // #3893 (reimplemented from @y2688): fill process.env from the
   // operator-owned ~/.gbrain/.env BEFORE the env-over-file merge below, so
@@ -766,6 +808,13 @@ export function loadConfig(): GBrainConfig | null {
     ? 'postgres'
     : fileConfig?.engine || (fileConfig?.database_path ? 'pglite' : 'postgres');
 
+  // patch 96: GBRAIN_CHAT_FALLBACK_CHAINS is a JSON object mapping a chainKey
+  // (the caller's own model-resolution config key, e.g. "models.dream.patterns")
+  // to a CSV chain string — same per-value shape as GBRAIN_CHAT_FALLBACK_CHAIN.
+  // Malformed input warns and is dropped so a typo'd env var never crashes
+  // startup (mirrors the DB-plane chain parsing in config-db-merge.ts).
+  const envChatFallbackChains = parseChatFallbackChainsEnv(process.env.GBRAIN_CHAT_FALLBACK_CHAINS);
+
   // Merge: env vars override config file. READ only — never mutate process.env.
   const merged = {
     ...fileConfig,
@@ -783,6 +832,7 @@ export function loadConfig(): GBrainConfig | null {
     ...(process.env.GBRAIN_CHAT_FALLBACK_CHAIN
       ? { chat_fallback_chain: process.env.GBRAIN_CHAT_FALLBACK_CHAIN.split(',').map(s => s.trim()).filter(Boolean) }
       : {}),
+    ...(envChatFallbackChains ? { chat_fallback_chains: envChatFallbackChains } : {}),
     ...(process.env.GBRAIN_EMBEDDING_MULTIMODAL
       ? { embedding_multimodal: process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true' }
       : {}),
@@ -1588,6 +1638,10 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'models.',           // models.* (tier, aliases, per-task)
   'dream.',            // dream.synthesize.*, dream.patterns.*
   'cycle.',            // cycle.<phase>.*
+  // patch 96: per-call-site chatWithFallback chain override, keyed by the
+  // caller's model-resolution config key, e.g.
+  // chat_fallback_chain.models.dream.patterns
+  'chat_fallback_chain.',
   'embedding_columns.', // per-column overrides
   'provider_base_urls.', // per-provider base URL overrides
   'provider_chat_options.', // per-provider / per-model chat providerOptions
