@@ -833,7 +833,7 @@ export async function runPhaseExtractAtoms(
         const provenanceSourceSlug = item.kind === 'transcript'
           ? await resolveSlugByPathOrSourcePath(engine, item.filePath, sourceId)
           : item.slug;
-        await engine.addLinksBatch(importedSlugs.map((atomSlug) => ({
+        await engine.addLinksBatch(importedSlugs.map((atomSlug) => ({ // gbrain-allow-direct-insert: extract_atoms writes canonical atom → source provenance edges alongside its frontmatter receipt
           from_slug: atomSlug,
           to_slug: provenanceSourceSlug,
           link_type: 'derived_from',
@@ -841,7 +841,7 @@ export async function runPhaseExtractAtoms(
           context: `Extracted from ${originLabel}`,
           from_source_id: sourceId,
           to_source_id: sourceId,
-        }))); // gbrain-allow-direct-insert: extract_atoms writes canonical atom → source provenance edges alongside its frontmatter receipt
+        })));
         // Completion receipt: flip provisional → real in one statement, then
         // stamp the source page. A crash between flip and stamp degrades to
         // the legacy atom-rows-mean-done semantics — safe, not lossy.
