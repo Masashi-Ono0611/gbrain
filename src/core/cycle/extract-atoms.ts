@@ -652,6 +652,11 @@ export async function runPhaseExtractAtoms(
   // chat call resets the streak.
   const llmHalt = createGlobalLlmHaltTracker();
   let abortedGlobalError: GlobalLlmErrorClass | null = null;
+  // Rollup/doctor-health signal only. `failures` (below) stays inclusive of
+  // transient entries for CLI/receipt reporting; this counts everything
+  // EXCEPT the ones TRANSIENT_EXTRACT_ERROR_RE + the rate_limit abort class
+  // say are "retryable, never counted" — see that regex's doc comment.
+  let hardFailureCount = 0;
 
   /** Stamp the zero-yield/complete tombstone (hash-keyed; edits re-eligibilize). */
   async function stampAtomsScanHash(item: { slug: string; contentHash: string }): Promise<void> {
@@ -727,6 +732,7 @@ export async function runPhaseExtractAtoms(
       const parseOutcome = parseAtomsOutcome(result.text);
       if (!parseOutcome.ok) {
         malformedOutputs++;
+        hardFailureCount++;
         const failCount = await recordPageFailureCount(item);
         failures.push({
           source: originLabel,
@@ -889,6 +895,7 @@ export async function runPhaseExtractAtoms(
       const decision = llmHalt.observe(err);
       if (decision !== 'continue') {
         abortedGlobalError = haltedClassOf(decision);
+        if (abortedGlobalError !== 'rate_limit') hardFailureCount++;
         failures.push({
           source: originLabel,
           error: `aborting phase: ${llmHalt.note()} (${message})`,
@@ -897,7 +904,10 @@ export async function runPhaseExtractAtoms(
       }
       const transient =
         llmHalt.lastClass() === 'rate_limit' || TRANSIENT_EXTRACT_ERROR_RE.test(message);
-      if (!transient) await recordPageFailureCount(item);
+      if (!transient) {
+        await recordPageFailureCount(item);
+        hardFailureCount++;
+      }
       failures.push({
         source: originLabel,
         error: transient ? `${message} [transient — retried next run]` : message,
@@ -930,12 +940,18 @@ export async function runPhaseExtractAtoms(
     }
   }
   if (!opts.dryRun) {
+    // gbrain#4148 / TRANSIENT_EXTRACT_ERROR_RE: transient provider/infra
+    // failures (rate limits, timeouts, 5xx, network) are "retryable, never
+    // counted" by design — count only hardFailureCount here, not
+    // failures.length (which stays inclusive, for CLI/receipt reporting),
+    // so a heavy run that only ever hit transient errors doesn't trip the
+    // doctor extract_health halt-rate warning.
     await upsertExtractRollup(engine, {
       kind: 'atoms',
       source_id: sourceId,
       cost_delta: estimatedSpendUsd,
-      round_completed_delta: failures.length === 0 ? 1 : 0,
-      halt_delta: failures.length > 0 ? 1 : 0,
+      round_completed_delta: hardFailureCount === 0 ? 1 : 0,
+      halt_delta: hardFailureCount > 0 ? 1 : 0,
     });
   }
 
