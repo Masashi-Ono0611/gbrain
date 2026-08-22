@@ -202,6 +202,21 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
 
   const stat = statSync(filePath);
   const filename = basename(filePath);
+  // basename() already strips every directory component, so filename can
+  // never contain a path separator — except the two single-segment edge
+  // cases '.' and '..' (e.g. `filePath` ending in "/.." resolves to a
+  // literal basename of ".."), which would still let the sidecar path
+  // below escape its intended directory by one level. Reject those
+  // explicitly rather than relying on basename()'s guarantee alone.
+  if (filename === '.' || filename === '..' || filename.includes('/') || filename.includes('\\')) {
+    console.error(JSON.stringify({
+      success: false,
+      storage: 'git',
+      reason: 'unsafe_filename',
+      message: `Refusing to persist a raw upload with an unsafe filename: ${JSON.stringify(filename)}.`,
+    }));
+    process.exit(1);
+  }
   const mimeType = getMimeType(filePath);
   const isMedia = mimeType?.startsWith('video/') || mimeType?.startsWith('audio/') || mimeType?.startsWith('image/');
   const needsCloud = stat.size >= SIZE_THRESHOLD || isMedia;

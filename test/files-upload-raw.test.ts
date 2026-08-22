@@ -195,4 +195,27 @@ describe('files upload-raw — small file persistence (#2297)', () => {
     expect(reported.success).toBe(false);
     expect(reported.reason).toBe('no_repo_configured');
   });
+
+  // Semgrep (javascript.lang.security.audit.path-traversal.path-join-resolve-traversal)
+  // flagged the two `join(..., filename)` sidecar-path sites: basename()
+  // strips every directory component EXCEPT the single-segment edge cases
+  // '.' and '..' (a filePath ending in "/.." resolves to a literal
+  // basename of ".."), which would otherwise let the sidecar path escape
+  // its intended directory by one level.
+  test('refuses a filename that resolves to ".." instead of writing outside the intended directory', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    // uploadDir/.. is a real, existing path (uploadDir's parent) whose raw
+    // string basename is literally '..' — path.basename() is lexical, it
+    // does not resolve '..' against the filesystem. path.join() would
+    // normalize the '..' away, so this must be raw string concatenation.
+    const srcFile = `${uploadDir}/..`;
+
+    const { errs, exit } = await runUploadRawExpectingExit([srcFile, '--page', 'people/example']);
+
+    expect(exit).toBe(1);
+    expect(errs.length).toBeGreaterThan(0);
+    const reported = JSON.parse(errs[errs.length - 1]);
+    expect(reported.success).toBe(false);
+    expect(reported.reason).toBe('unsafe_filename');
+  });
 });
