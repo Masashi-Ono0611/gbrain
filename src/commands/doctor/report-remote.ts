@@ -35,7 +35,6 @@ import {
   checkSyncConsolidation,
   checkPoolBudget,
   checkLinksExtractionLag,
-  checkChatFallbackChainInert,
   checkSearchMode,
   checkEvalDrift,
   checkRerankerHealth,
@@ -399,8 +398,6 @@ export async function doctorReportRemote(
   checks.push(await checkSchemaPackSourceDrift(engine));
 
   // 7. v0.32.3 search-lite mode + per-key drift surface.
-  const inertFallbackChain = await checkChatFallbackChainInert(engine);
-  if (inertFallbackChain) checks.push(inertFallbackChain);
   checks.push(await checkSearchMode(engine));
 
   // 8. v0.32.3 eval_drift: retrieval-affecting files changed since last
