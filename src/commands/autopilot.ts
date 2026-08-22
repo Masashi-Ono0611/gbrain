@@ -1814,7 +1814,11 @@ async function installDaemon(engine: BrainEngine, args: string[]) {
   // Bake an absolute path into the wrapper script + plist so the daemon
   // never has to re-resolve it against its own cwd (launchd defaults to
   // "/", which turned a relative anchor into a full-filesystem walk).
-  const repoPath = resolvePath(rawRepoPath);
+  // rawRepoPath is the local operator's own --repo flag or sync.repo_path
+  // config, typed/set by the same person running this interactive install
+  // command on their own machine — the identical trust boundary as the
+  // process.cwd() this line replaces.
+  const repoPath = resolvePath(rawRepoPath); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- locally-trusted operator input, see comment above
 
   const forcedTarget = parseArg(args, '--target') as InstallTarget | undefined;
   const target: InstallTarget = forcedTarget ?? detectInstallTarget();

@@ -387,9 +387,12 @@ export async function addSource(
   // consent prompts). Anchor it to an absolute path HERE, at the
   // interactive write site, where process.cwd() is still the caller's real
   // shell directory — not later, where it might be a daemon's root. No-op
-  // for already-absolute paths.
+  // for already-absolute paths. opts.localPath is the local operator's own
+  // `gbrain sources add --path` argument, typed by the same person calling
+  // this write path on their own machine — the identical trust boundary as
+  // the process.cwd() this anchoring replaces.
   if (opts.localPath) {
-    opts = { ...opts, localPath: resolvePath(opts.localPath) };
+    opts = { ...opts, localPath: resolvePath(opts.localPath) }; // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- locally-trusted operator input, see comment above
   }
 
   // Q4: pre-flight collision check before any clone work.
@@ -442,7 +445,10 @@ export async function addSource(
     // above — a relative --clone-dir must not survive to be re-resolved
     // against a daemon's cwd later. defaultCloneDir() is already absolute
     // ($GBRAIN_HOME-based), so only the explicit-override branch needs it.
-    finalPath = opts.cloneDir ? resolvePath(opts.cloneDir) : defaultCloneDir(opts.id);
+    // opts.cloneDir is the same locally-trusted CLI argument as
+    // opts.localPath above; see that comment for the trust-boundary
+    // justification.
+    finalPath = opts.cloneDir ? resolvePath(opts.cloneDir) : defaultCloneDir(opts.id); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- locally-trusted operator input
   }
   if (finalPath) {
     const others = await engine.executeRaw<{ id: string; local_path: string }>(
