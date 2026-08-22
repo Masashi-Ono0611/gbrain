@@ -64,6 +64,7 @@ import type { PhaseResult } from '../cycle.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { ProgressReporter } from '../progress.ts';
 import { chat as gatewayChat, withBudgetTracker, isAvailable } from '../ai/gateway.ts';
+import { chatWithFallback } from '../ai/chat-fallback.ts';
 import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { importFromContent } from '../import-file.ts';
 import { serializeMarkdown } from '../markdown.ts';
@@ -652,7 +653,10 @@ export async function runPhaseExtractAtoms(
   opts: ExtractAtomsOpts = {},
 ): Promise<PhaseResult> {
   const sourceId = opts.sourceId ?? 'default';
-  const chat = opts._chat ?? gatewayChat;
+  // patch 96: availability-aware fallback by default (test seam unchanged).
+  const chat = opts._chat
+    ?? ((chatOpts: Parameters<typeof gatewayChat>[0]) =>
+      chatWithFallback(chatOpts, { chainKey: 'models.dream.extract_atoms' }));
   const managed = await managedAtomSession(engine, sourceId, opts._managedRetry);
   const writeRequests: WriteReceipt[] = [];
 

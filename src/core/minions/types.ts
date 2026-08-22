@@ -585,6 +585,20 @@ export interface SubagentHandlerData {
    */
   oneshot_slug_suffix?: string;
   /**
+   * patch 96 — the config key the caller used to resolve `model`
+   * (e.g. `models.dream.patterns`, `models.dream.synthesize`). Threaded
+   * through to `chatWithFallback(opts, { chainKey })` on BOTH LLM paths this
+   * handler can take — the oneshot single-completion call
+   * (subagent-oneshot.ts) and the agentic gateway.toolLoop() per-turn call
+   * (runSubagentViaGateway below) — so a billing/rate_limit failure on
+   * `model` can fall through to `chat_fallback_chain.<fallback_chain_key>`
+   * (or the global `chat_fallback_chain`) instead of dead-lettering the job.
+   * Unset → chatWithFallback still runs, just without a per-site override
+   * (identical to the global chain). Same trust story as `allowed_slug_prefixes`
+   * (PROTECTED_JOB_NAMES); MCP-submitted jobs can't set it.
+   */
+  fallback_chain_key?: string;
+  /**
    * v0.41 Approach C: opt out of the auto-generated tool-usage preamble
    * that `buildSystemPrompt()` splices into `system`. Default behavior
    * (omitted or false) prepends a deterministic preamble listing each
