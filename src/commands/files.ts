@@ -255,7 +255,7 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
       repoRoot = target.writeRoot;
       const pageDir = dirname(target.filePath);
       const pageName = basename(target.filePath, extname(target.filePath));
-      sidecarPath = join(pageDir, '.raw', pageName, filename);
+      sidecarPath = join(pageDir, '.raw', pageName, filename); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- filename is basename(filePath), already rejected above if it resolves to '.', '..', or contains a separator
     } else {
       // No --page given: fall back to the default source's repo root,
       // mirroring the cloud branch's existing `unsorted/` convention below.
@@ -270,7 +270,7 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
         process.exit(1);
       }
       repoRoot = configuredRoot;
-      sidecarPath = join(repoRoot, 'unsorted', '.raw', `${hash.slice(0, 8)}-${filename}`);
+      sidecarPath = join(repoRoot, 'unsorted', '.raw', `${hash.slice(0, 8)}-${filename}`); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- filename is basename(filePath), already rejected above if it resolves to '.', '..', or contains a separator
     }
 
     mkdirSync(dirname(sidecarPath), { recursive: true });
