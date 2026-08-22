@@ -519,10 +519,6 @@
       },
       {
         "category": "ops",
-        "name": "chat_fallback_chain_inert"
-      },
-      {
-        "category": "ops",
         "name": "search_mode"
       },
       {
