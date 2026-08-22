@@ -348,3 +348,68 @@ describe('chatWithFallback', () => {
     ).toContain('429');
   });
 });
+
+describe('chatWithFallback — chainKey (patch 96)', () => {
+  const CHAIN_KEY = 'models.dream.patterns';
+
+  test('a chainKey-specific chain is used when configured, in preference to the global chain', async () => {
+    const called: string[] = [];
+    __setGenerateTextTransportForTests(async (args: any) => {
+      called.push(targetOf(args));
+      if (called.length === 1) throw statusError(429);
+      return response('chainKey fallback answer');
+    });
+    configureGateway({
+      chat_model: PRIMARY,
+      chat_fallback_chain: [ANTHROPIC_FALLBACK], // global — must be ignored
+      chat_fallback_chains: { [CHAIN_KEY]: [OPENAI_FALLBACK] },
+      env: { OPENAI_API_KEY: 'fake', ANTHROPIC_API_KEY: 'fake' },
+    });
+
+    const result = await chatWithFallback(opts, { chainKey: CHAIN_KEY });
+
+    expect(called).toEqual([PRIMARY, OPENAI_FALLBACK]);
+    expect(result.model).toBe(OPENAI_FALLBACK);
+    expect(result.text).toBe('chainKey fallback answer');
+  });
+
+  test('falls through to the global chain when chainKey has no override', async () => {
+    const called: string[] = [];
+    __setGenerateTextTransportForTests(async (args: any) => {
+      called.push(targetOf(args));
+      if (called.length === 1) throw statusError(429);
+      return response('global fallback answer');
+    });
+    configureGateway({
+      chat_model: PRIMARY,
+      chat_fallback_chain: [ANTHROPIC_FALLBACK],
+      chat_fallback_chains: { 'models.dream.synthesize': [OPENAI_FALLBACK] }, // different key
+      env: { OPENAI_API_KEY: 'fake', ANTHROPIC_API_KEY: 'fake' },
+    });
+
+    const result = await chatWithFallback(opts, { chainKey: CHAIN_KEY });
+
+    expect(called).toEqual([PRIMARY, ANTHROPIC_FALLBACK]);
+    expect(result.model).toBe(ANTHROPIC_FALLBACK);
+  });
+
+  test('omitting chainKey (every pre-patch-96 caller) is unaffected by chat_fallback_chains', async () => {
+    const called: string[] = [];
+    __setGenerateTextTransportForTests(async (args: any) => {
+      called.push(targetOf(args));
+      if (called.length === 1) throw statusError(429);
+      return response('unkeyed fallback answer');
+    });
+    configureGateway({
+      chat_model: PRIMARY,
+      chat_fallback_chain: [ANTHROPIC_FALLBACK],
+      chat_fallback_chains: { [CHAIN_KEY]: [OPENAI_FALLBACK] },
+      env: { OPENAI_API_KEY: 'fake', ANTHROPIC_API_KEY: 'fake' },
+    });
+
+    const result = await chatWithFallback(opts);
+
+    expect(called).toEqual([PRIMARY, ANTHROPIC_FALLBACK]);
+    expect(result.model).toBe(ANTHROPIC_FALLBACK);
+  });
+});

@@ -521,6 +521,15 @@ export interface AIGatewayConfig {
    * refusal fallback is not implemented.
    */
   chat_fallback_chain?: string[];
+  /**
+   * Per-call-site overrides of `chat_fallback_chain`, keyed by the caller's
+   * own model-resolution config key (e.g. `models.dream.patterns`). A
+   * `chatWithFallback(opts, { chainKey })` lookup checks this map first and
+   * falls back to `chat_fallback_chain` when the key is absent — so callers
+   * that never pass a chainKey (or whose key has no override configured)
+   * see identical behavior to the single global chain.
+   */
+  chat_fallback_chains?: Record<string, string[]>;
   /** Optional per-provider base URL override (openai-compatible variants). */
   base_urls?: Record<string, string>;
   /** Optional chat providerOptions overrides keyed by recipe id or "recipe:modelId". */
