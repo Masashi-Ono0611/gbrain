@@ -1,12 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import type { ChatOpts, ChatResult } from '../../src/core/ai/gateway.ts';
+import type { TouchpointKind } from '../../src/core/ai/types.ts';
 import {
-  __setGenerateTextTransportForTests,
-  configureGateway,
-  resetGateway,
-} from '../../src/core/ai/gateway.ts';
-import {
+  __chatWithFallbackUsing,
   __resetChatFallbackStateForTests,
-  chatWithFallback,
 } from '../../src/core/ai/chat-fallback.ts';
 import { classifyGlobalLlmError } from '../../src/core/ai/errors.ts';
 
@@ -31,34 +28,68 @@ function targetOf(args: any): string {
   return `${provider}:${args.model.modelId}`;
 }
 
-function configure(chain: string[], env: Record<string, string> = {}): void {
-  configureGateway({
-    chat_model: PRIMARY,
-    chat_fallback_chain: chain,
-    env,
-  });
+let fallbackChain: string[] = [];
+let keyedChains: Record<string, string[]> = {};
+let env: Record<string, string> = {};
+let transport: ((args: any) => Promise<any>) | null = null;
+
+function configure(chain: string[], keys: Record<string, string> = {}, keyed: Record<string, string[]> = {}): void {
+  fallbackChain = chain;
+  env = keys;
+  keyedChains = keyed;
 }
+
+function setChatTransport(fn: ((args: any) => Promise<any>) | null): void {
+  transport = fn;
+}
+
+const testRuntime = {
+  getChatModel: () => PRIMARY,
+  getChatFallbackChain: (key?: string) => key && keyedChains[key] ? keyedChains[key]! : fallbackChain,
+  isAvailable: (_touchpoint: TouchpointKind, model?: string) => {
+    if (!model) return true;
+    const provider = model.split(':', 1)[0];
+    const key = provider === 'openai' ? 'OPENAI_API_KEY' : provider === 'anthropic' ? 'ANTHROPIC_API_KEY' : undefined;
+    return key === undefined || Boolean(env[key]);
+  },
+  chat: async (chatOpts: ChatOpts): Promise<ChatResult> => {
+    if (!transport) throw new Error('test chat transport is not configured');
+    const model = chatOpts.model ?? PRIMARY;
+    const [provider, ...modelParts] = model.split(':');
+    const result = await transport({ model: { provider: `${provider}.mock`, modelId: modelParts.join(':') } });
+    return {
+      text: result.content?.find((part: any) => part.type === 'text')?.text ?? '',
+      blocks: [], stopReason: 'end',
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model, providerId: provider,
+    };
+  },
+};
+
+const chatWithFallback = (chatOpts: ChatOpts, params?: { chainKey?: string }) =>
+  __chatWithFallbackUsing(chatOpts, params, testRuntime);
 
 const opts = {
   messages: [{ role: 'user' as const, content: 'hello' }],
 };
 
 beforeEach(() => {
-  resetGateway();
-  __setGenerateTextTransportForTests(null);
+  fallbackChain = [];
+  keyedChains = {};
+  env = {};
+  setChatTransport(null);
   __resetChatFallbackStateForTests();
 });
 
 afterEach(() => {
-  __setGenerateTextTransportForTests(null);
-  resetGateway();
+  setChatTransport(null);
   __resetChatFallbackStateForTests();
 });
 
-describe('chatWithFallback', () => {
+describe.serial('chatWithFallback', () => {
   test('switches to the first configured fallback after a 429', async () => {
     const called: string[] = [];
-    __setGenerateTextTransportForTests(async (args: any) => {
+    setChatTransport(async (args: any) => {
       called.push(targetOf(args));
       if (called.length === 1) throw statusError(429);
       return response('fallback answer');
@@ -74,7 +105,7 @@ describe('chatWithFallback', () => {
 
   test('switches providers after a billing failure', async () => {
     let calls = 0;
-    __setGenerateTextTransportForTests(async () => {
+    setChatTransport(async () => {
       calls++;
       if (calls === 1) throw statusError(402);
       return response();
@@ -89,7 +120,7 @@ describe('chatWithFallback', () => {
 
   test.each([401, 403])('does not fall back after HTTP %i', async status => {
     let calls = 0;
-    __setGenerateTextTransportForTests(async () => {
+    setChatTransport(async () => {
       calls++;
       throw statusError(status);
     });
@@ -109,7 +140,7 @@ describe('chatWithFallback', () => {
   test('does not fall back after an unclassifiable error', async () => {
     const original = new Error('unexpected provider failure');
     let calls = 0;
-    __setGenerateTextTransportForTests(async () => {
+    setChatTransport(async () => {
       calls++;
       throw original;
     });
@@ -128,7 +159,7 @@ describe('chatWithFallback', () => {
 
   test('throws a rate-limit-classified last error when the chain is exhausted', async () => {
     let calls = 0;
-    __setGenerateTextTransportForTests(async () => {
+    setChatTransport(async () => {
       calls++;
       throw statusError(429, ` on attempt ${calls}`);
     });
@@ -152,7 +183,7 @@ describe('chatWithFallback', () => {
 
   test('a later rate limit outranks an earlier unclassified chain error', async () => {
     const called: string[] = [];
-    __setGenerateTextTransportForTests(async (args: any) => {
+    setChatTransport(async (args: any) => {
       const target = targetOf(args);
       called.push(target);
       // 400 is a PER_ITEM_HTTP_STATUSES member (errors.ts) — normalizeAIError
@@ -189,7 +220,7 @@ describe('chatWithFallback', () => {
 
   test('an empty chain makes exactly the primary chat attempt', async () => {
     const called: string[] = [];
-    __setGenerateTextTransportForTests(async (args: any) => {
+    setChatTransport(async (args: any) => {
       called.push(targetOf(args));
       return response('primary answer');
     });
@@ -204,7 +235,7 @@ describe('chatWithFallback', () => {
 
   test('an already-aborted signal burns no attempts', async () => {
     let calls = 0;
-    __setGenerateTextTransportForTests(async () => {
+    setChatTransport(async () => {
       calls++;
       return response();
     });
@@ -225,7 +256,7 @@ describe('chatWithFallback', () => {
 
   test('skips a fallback provider that has no configured credentials', async () => {
     const called: string[] = [];
-    __setGenerateTextTransportForTests(async (args: any) => {
+    setChatTransport(async (args: any) => {
       called.push(targetOf(args));
       if (called.length === 1) throw statusError(429);
       return response();
@@ -244,7 +275,7 @@ describe('chatWithFallback', () => {
   test('sticky demotion skips the failed primary and a later success clears it', async () => {
     let primaryFails = true;
     let called: string[] = [];
-    __setGenerateTextTransportForTests(async (args: any) => {
+    setChatTransport(async (args: any) => {
       const target = targetOf(args);
       called.push(target);
       if (target === PRIMARY && primaryFails) throw statusError(429);
@@ -275,7 +306,7 @@ describe('chatWithFallback', () => {
 
   test('sticky demotion skips a failed fallback entry on the next call', async () => {
     let called: string[] = [];
-    __setGenerateTextTransportForTests(async (args: any) => {
+    setChatTransport(async (args: any) => {
       const target = targetOf(args);
       called.push(target);
       if (target !== ANTHROPIC_FALLBACK) throw statusError(429);
@@ -301,7 +332,7 @@ describe('chatWithFallback', () => {
     'skips a $classification failure from a fallback entry',
     async ({ status }) => {
       const called: string[] = [];
-      __setGenerateTextTransportForTests(async (args: any) => {
+      setChatTransport(async (args: any) => {
         const target = targetOf(args);
         called.push(target);
         if (target === PRIMARY) throw statusError(429);
@@ -322,7 +353,7 @@ describe('chatWithFallback', () => {
 
   test('chain exhaustion surfaces an actionable fallback auth error', async () => {
     const called: string[] = [];
-    __setGenerateTextTransportForTests(async (args: any) => {
+    setChatTransport(async (args: any) => {
       const target = targetOf(args);
       called.push(target);
       if (target === OPENAI_FALLBACK) throw statusError(401);
@@ -346,5 +377,61 @@ describe('chatWithFallback', () => {
     expect(
       (caught as { fallbackFirstError?: Error }).fallbackFirstError?.message,
     ).toContain('429');
+  });
+});
+
+describe.serial('chatWithFallback — chainKey (patch 96)', () => {
+  const CHAIN_KEY = 'models.dream.patterns';
+
+  test('a chainKey-specific chain is used when configured, in preference to the global chain', async () => {
+    const called: string[] = [];
+    setChatTransport(async (args: any) => {
+      called.push(targetOf(args));
+      if (called.length === 1) throw statusError(429);
+      return response('chainKey fallback answer');
+    });
+    configure([ANTHROPIC_FALLBACK], { OPENAI_API_KEY: 'fake', ANTHROPIC_API_KEY: 'fake' }, {
+      [CHAIN_KEY]: [OPENAI_FALLBACK],
+    });
+
+    const result = await chatWithFallback(opts, { chainKey: CHAIN_KEY });
+
+    expect(called).toEqual([PRIMARY, OPENAI_FALLBACK]);
+    expect(result.model).toBe(OPENAI_FALLBACK);
+    expect(result.text).toBe('chainKey fallback answer');
+  });
+
+  test('falls through to the global chain when chainKey has no override', async () => {
+    const called: string[] = [];
+    setChatTransport(async (args: any) => {
+      called.push(targetOf(args));
+      if (called.length === 1) throw statusError(429);
+      return response('global fallback answer');
+    });
+    configure([ANTHROPIC_FALLBACK], { OPENAI_API_KEY: 'fake', ANTHROPIC_API_KEY: 'fake' }, {
+      'models.dream.synthesize': [OPENAI_FALLBACK],
+    });
+
+    const result = await chatWithFallback(opts, { chainKey: CHAIN_KEY });
+
+    expect(called).toEqual([PRIMARY, ANTHROPIC_FALLBACK]);
+    expect(result.model).toBe(ANTHROPIC_FALLBACK);
+  });
+
+  test('omitting chainKey (every pre-patch-96 caller) is unaffected by chat_fallback_chains', async () => {
+    const called: string[] = [];
+    setChatTransport(async (args: any) => {
+      called.push(targetOf(args));
+      if (called.length === 1) throw statusError(429);
+      return response('unkeyed fallback answer');
+    });
+    configure([ANTHROPIC_FALLBACK], { OPENAI_API_KEY: 'fake', ANTHROPIC_API_KEY: 'fake' }, {
+      [CHAIN_KEY]: [OPENAI_FALLBACK],
+    });
+
+    const result = await chatWithFallback(opts);
+
+    expect(called).toEqual([PRIMARY, ANTHROPIC_FALLBACK]);
+    expect(result.model).toBe(ANTHROPIC_FALLBACK);
   });
 });
