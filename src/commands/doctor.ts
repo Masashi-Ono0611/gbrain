@@ -95,7 +95,6 @@ export {
   checkCyclePhaseScope,
 } from './doctor/checks/routing-federation.ts';
 export {
-  checkChatFallbackChainInert,
   checkSearchMode,
   checkEvalDrift,
   checkEmbeddingEnvOverride,
