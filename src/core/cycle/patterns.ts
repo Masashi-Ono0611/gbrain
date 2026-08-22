@@ -225,6 +225,10 @@ export async function runPhasePatterns(
     const data: SubagentHandlerData = {
       prompt: buildPatternsPrompt(reflections, config.minEvidence, config.sourceSlugPrefix, config.outputSlugPrefix),
       model: config.model,
+      // patch 96: same config key resolveModel() used for `model` above, so
+      // a billing/rate_limit failure can fall through chat_fallback_chain.
+      // models.dream.patterns (or the global chat_fallback_chain).
+      fallback_chain_key: 'models.dream.patterns',
       max_turns: 30,
       // #4217/CDX-12: a patterns child whose every put_page failed must
       // dead-letter (its whole purpose is writing pattern pages), not report
