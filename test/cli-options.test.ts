@@ -225,6 +225,69 @@ describe('--timeout flag', () => {
   });
 });
 
+// #4541: extract/onboard/whoknows each parse their own `--explain` out of
+// argv, but the global parser claimed it unconditionally for search/query's
+// per-stage attribution view — so none of the three ever saw it (confirmed
+// live: `gbrain extract --explain timeline` ran a full extraction, args
+// reaching runExtract were `["timeline"]`). Mirrors the --timeout
+// owning-command hand-back below.
+describe('--explain flag (owning-command hand-back, #4541)', () => {
+  for (const cmd of ['extract', 'onboard', 'whoknows']) {
+    test(`'${cmd} --explain timeline' hands the flag back adjacent to its kind argument`, () => {
+      // The reported bug's exact repro shape (extract) / same code path
+      // (onboard, whoknows). Unlike --timeout's hand-back (appended at the
+      // end), --explain's hand-back preserves original adjacency:
+      // extract-explain.ts's own parser reads the token immediately after
+      // --explain as the kind (with a positional fallback), so moving the
+      // flag to the end would strand it away from "timeline" and break
+      // that parser too.
+      const r = parseGlobalFlags([cmd, '--explain', 'timeline']);
+      expect(r.cliOpts.explain).toBe(false);
+      expect(r.rest).toEqual([cmd, '--explain', 'timeline']);
+    });
+
+    test(`'--explain ${cmd} timeline' (global-flag-first style) still dispatches to '${cmd}', not '--explain'`, () => {
+      // The CLI documents global-flag-first invocations as valid (this
+      // file's own header: `gbrain --progress-json doctor`). --explain
+      // starting BEFORE the command word must not end up at rest[0] — that
+      // is where cli.ts reads the command name, so leaving it there would
+      // make '--explain' itself the (unrecognized) command and break
+      // dispatch entirely, which is worse than the original bug.
+      const r = parseGlobalFlags(['--explain', cmd, 'timeline']);
+      expect(r.cliOpts.explain).toBe(false);
+      expect(r.rest).toEqual([cmd, '--explain', 'timeline']);
+    });
+
+    test(`duplicate --explain (one before, one after '${cmd}') is deduplicated to one`, () => {
+      // A second handed-back --explain would land in extract-explain.ts's
+      // args[explainIdx+1] slot instead of the real kind and misfire its
+      // own usage error — at most one --explain survives, however many the
+      // user typed, and it stays adjacent to the kind argument.
+      const r = parseGlobalFlags(['--explain', cmd, '--explain', 'timeline']);
+      expect(r.rest).toEqual([cmd, '--explain', 'timeline']);
+    });
+
+    test(`duplicate --explain (both after '${cmd}') is deduplicated to one`, () => {
+      const r = parseGlobalFlags([cmd, '--explain', '--explain', 'timeline']);
+      expect(r.rest).toEqual([cmd, '--explain', 'timeline']);
+    });
+  }
+
+  test('--explain is still claimed globally for search (non-owning command)', () => {
+    const r = parseGlobalFlags(['search', '--explain', 'test query']);
+    expect(r.cliOpts.explain).toBe(true);
+    expect(r.rest).not.toContain('--explain');
+    expect(r.rest).toEqual(['search', 'test query']);
+  });
+
+  test('--explain is still claimed globally for query (non-owning command)', () => {
+    const r = parseGlobalFlags(['--explain', 'query', 'test query']);
+    expect(r.cliOpts.explain).toBe(true);
+    expect(r.rest).not.toContain('--explain');
+  });
+
+});
+
 describe('--brain flag (brain axis routing)', () => {
   test('--brain <id> space form: parsed + stripped from rest', () => {
     const r = parseGlobalFlags(['query', 'X', '--brain', 'media-team']);

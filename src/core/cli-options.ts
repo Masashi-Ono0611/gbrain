@@ -93,16 +93,32 @@ function parseBrainValue(val: string | undefined): string {
  */
 export const TIMEOUT_OWNING_COMMANDS = new Set(['sync', 'remote']);
 
+/**
+ * #4541: commands that parse their own `--explain` flag out of argv, same
+ * bug shape as #3013's TIMEOUT_OWNING_COMMANDS above. `extract` (`--explain
+ * <kind>`: pack-resolution inspection, no mutation — src/commands/
+ * extract-explain.ts), `onboard` (`--explain`: per-cluster upgrade
+ * narrative — src/commands/onboard.ts), and `whoknows` (`--explain`: match
+ * reasoning — src/commands/whoknows.ts) each read `args.includes('--explain')`
+ * themselves, but the global parser below claimed the flag for search/query's
+ * per-stage attribution view (v0.40.4) unconditionally — so none of these
+ * three ever saw it: `gbrain extract --explain timeline` silently ran a full
+ * timeline extraction instead of explaining it (confirmed live: args reaching
+ * runExtract were `["timeline"]`, --explain gone).
+ */
+export const EXPLAIN_OWNING_COMMANDS = new Set(['extract', 'onboard', 'whoknows']);
+
 export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: string[] } {
   const cliOpts: CliOptions = { ...DEFAULT_CLI_OPTIONS };
-  // #3013: --timeout can't be resolved inline — whether the GLOBAL parser
-  // claims it depends on which command is running, and the command token is
-  // only known once the whole argv has been scanned (global flags may precede
-  // it). The scan collects positional slots; --timeout slots are resolved in
-  // a second pass below.
+  // #3013 / #4541: --timeout and --explain can't be resolved inline —
+  // whether the GLOBAL parser claims either depends on which command is
+  // running, and the command token is only known once the whole argv has
+  // been scanned (global flags may precede it). The scan collects positional
+  // slots; both are resolved in a second pass below.
   type Slot =
     | { plain: string }
-    | { timeoutValue: string; equalsForm: boolean };
+    | { timeoutValue: string; equalsForm: boolean }
+    | { explainFlag: true };
   const slots: Slot[] = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -151,8 +167,10 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
       continue;
     }
     // v0.40.4 — --explain for `gbrain search/query` per-stage attribution.
+    // #4541: resolution deferred to the second pass below — whether this
+    // claims cliOpts.explain or gets handed back depends on the command.
     if (a === '--explain') {
-      cliOpts.explain = true;
+      slots.push({ explainFlag: true });
       continue;
     }
     // --brain <id> / --brain=<id> — brain (database) axis. Exact-match only:
@@ -190,12 +208,64 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
   const commandSlot = slots.find((s): s is { plain: string } => 'plain' in s);
   const commandOwnsTimeout =
     commandSlot !== undefined && TIMEOUT_OWNING_COMMANDS.has(commandSlot.plain);
+  // #4541: same hand-back shape as --timeout above, but --explain is a bare
+  // boolean with no value to validate, so the owning branch is a one-liner —
+  // handed back verbatim, otherwise claimed into cliOpts.explain (pre-#4541
+  // global behavior, still correct for search/query and any other non-owning
+  // command).
+  const commandOwnsExplain =
+    commandSlot !== undefined && EXPLAIN_OWNING_COMMANDS.has(commandSlot.plain);
 
   const rest: string[] = [];
   const handback: string[] = [];
+  // #4541: an owned --explain that precedes the command token (the CLI
+  // documents `gbrain --progress-json doctor`-style global-flag-first
+  // invocations as valid, so `gbrain --explain extract timeline` must not
+  // become an exception) is buffered here and flushed immediately after the
+  // command is pushed — never left at rest[0], which cli.ts reads as the
+  // command name. Deduplicated: extract-explain.ts reads args[idx+1] as the
+  // kind, so a second handed-back `--explain` (e.g. `--explain extract
+  // --explain timeline`, or two after the command) would land in that slot
+  // instead of the real kind and misfire its own usage error — at most one
+  // survives, regardless of how many the user typed.
+  let deferredExplainForCommand = false;
+  let explainAlreadyEmitted = false;
+  let commandPushed = false;
   for (const s of slots) {
     if ('plain' in s) {
       rest.push(s.plain);
+      if (!commandPushed && commandOwnsExplain && s.plain === commandSlot?.plain) {
+        commandPushed = true;
+        if (deferredExplainForCommand && !explainAlreadyEmitted) {
+          rest.push('--explain');
+          explainAlreadyEmitted = true;
+        }
+        deferredExplainForCommand = false;
+      }
+      continue;
+    }
+    if ('explainFlag' in s) {
+      if (commandOwnsExplain) {
+        // Unlike --timeout's handback (appended at the end — sync/remote
+        // scan for the flag anywhere), extract-explain.ts's own parser
+        // reads the token immediately after --explain as the kind, with a
+        // fallback that only looks at positions > 0. So this preserves
+        // --explain's original adjacency to its kind argument instead of
+        // moving it to the end — UNLESS the command hasn't been emitted
+        // yet, in which case pushing here would land --explain at rest[0]
+        // (cli.ts's command slot) and break dispatch entirely; that case
+        // is deferred above until right after the command is pushed.
+        if (commandPushed) {
+          if (!explainAlreadyEmitted) {
+            rest.push('--explain');
+            explainAlreadyEmitted = true;
+          }
+        } else {
+          deferredExplainForCommand = true;
+        }
+      } else {
+        cliOpts.explain = true;
+      }
       continue;
     }
     if (commandOwnsTimeout) {
