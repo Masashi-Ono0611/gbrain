@@ -13,6 +13,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
 import { parseFactsFence } from '../src/core/facts-fence.ts';
+import { importFromContent } from '../src/core/import-file.ts';
 
 let engine: PGLiteEngine;
 
@@ -49,6 +50,20 @@ async function putPage(slug: string, body: string): Promise<void> {
     compiled_truth: body,
     frontmatter: {},
     timeline: '',
+  });
+}
+
+// #3625: writes compiled_truth and timeline as SEPARATE columns, mirroring
+// what splitBody() produces when a `## Facts` fence sits below the
+// `<!-- timeline -->` sentinel — the fence text lands in `timeline`, not
+// `compiled_truth`, exactly as MCP put_page would store it.
+async function putPageWithTimeline(slug: string, compiledTruth: string, timeline: string): Promise<void> {
+  await engine.putPage(slug, {
+    title: slug,
+    type: 'person',
+    compiled_truth: compiledTruth,
+    frontmatter: {},
+    timeline,
   });
 }
 
@@ -297,6 +312,164 @@ describe('runExtractFacts — happy path', () => {
       `SELECT COUNT(*) AS n FROM facts WHERE source_markdown_slug = 'people/alice'`,
     );
     expect(Number(rows.rows[0].n)).toBe(0);
+  });
+
+  test('#3625: a Facts fence below the timeline sentinel is preserved, not deleted, and warns loudly', async () => {
+    // Seed the page with the fence in its normal place (above the sentinel)
+    // and let it index normally.
+    await putPage('people/alice', FACT_FENCE(
+      `| 1 | Founded Acme | fact | 1.0 | world | high | 2017-01-01 |  | linkedin |  |
+| 2 | Prefers async | preference | 0.85 | private | medium | 2026-04-29 |  | OH |  |`,
+    ));
+    await runExtractFacts(engine, { slugs: ['people/alice'] });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const seeded = await (engine as any).db.query(
+      `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice' ORDER BY row_num`,
+    );
+    expect(seeded.rows).toHaveLength(2);
+
+    // #3625 repro: rewrite the page so the SAME fence content now lives in
+    // `timeline` (below the sentinel) instead of `compiled_truth` — exactly
+    // what splitBody() produces for a page whose `## Facts` fence was
+    // written below `<!-- timeline -->`. compiled_truth carries none of the
+    // fence text, so parseFactsFence(compiled_truth) sees zero facts.
+    await putPageWithTimeline(
+      'people/alice',
+      '# Page\n\nBody.\n',
+      FACT_FENCE(
+        `| 1 | Founded Acme | fact | 1.0 | world | high | 2017-01-01 |  | linkedin |  |
+| 2 | Prefers async | preference | 0.85 | private | medium | 2026-04-29 |  | OH |  |`,
+      ),
+    );
+
+    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    // The fix: this must NOT read as "fence removed" and must NOT delete
+    // the previously-indexed rows.
+    expect(r.factsDeleted).toBe(0);
+    expect(r.warnings.some(w => w.includes('FACTS_FENCE_BELOW_SENTINEL'))).toBe(true);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice' ORDER BY row_num`,
+    );
+    expect(rows.rows.map((row: { fact: string }) => row.fact)).toEqual(['Founded Acme', 'Prefers async']);
+  });
+
+  test('#3625 control: a genuinely fence-less page (no fence anywhere in the body) still wipes as before', async () => {
+    // Same shape as the misplaced-fence case above, but this time the fence
+    // is truly absent from BOTH compiled_truth and timeline — the existing
+    // "user deleted the fence" contract must still hold; the #3625 guard
+    // must not swallow genuine deletions.
+    await putPage('people/alice', FACT_FENCE(
+      `| 1 | seeded | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
+    ));
+    await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    await putPageWithTimeline('people/alice', '# Just a page\n\nNo fence.\n', 'Some unrelated timeline prose.\n');
+    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    expect(r.factsDeleted).toBe(1);
+    expect(r.warnings.some(w => w.includes('FACTS_FENCE_BELOW_SENTINEL'))).toBe(false);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      `SELECT COUNT(*) AS n FROM facts WHERE source_markdown_slug = 'people/alice'`,
+    );
+    expect(Number(rows.rows[0].n)).toBe(0);
+  });
+
+  test('#3625 via the real MCP write path: a stray fence below the sentinel is preserved even when import-file.ts is in play', async () => {
+    // Codex review finding: the two tests above write compiled_truth/timeline
+    // directly via engine.putPage, bypassing importFromContent's own #2044
+    // remote-preservation logic (restores an old fence into compiled_truth
+    // when an incoming remote write's compiled half has ZERO facts — which
+    // would otherwise mask a below-sentinel duplicate by never even letting
+    // this test reach the state it wants to prove: confirmed by running the
+    // simpler "compiled_truth ends up with zero facts" version of this test
+    // first — #2044 fired and restored the OLD fence, so compiled_truth
+    // never went empty and this guard was never exercised).
+    //
+    // Reproduce a case #2044 does NOT swallow: the incoming remote write's
+    // compiled_truth keeps ONE valid fact above the sentinel (so
+    // incomingFacts.facts.length > 0 — #2044's restore condition requires
+    // exactly 0 and does not fire) while ALSO carrying a stray duplicate
+    // fence below the sentinel (e.g. an agent re-appending a "## Facts"
+    // section near new content it's adding at the bottom of the page).
+    // splitBody() (inside putPage, called by importFromContent) does the
+    // real fence/sentinel split — no direct column poking.
+    const seed = `---
+title: alice
+type: person
+---
+
+Some body content.
+
+## Facts
+
+<!--- gbrain:facts:begin -->
+| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |
+|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|
+| 1 | Founded Acme | fact | 1.0 | world | high | 2017-01-01 |  |  linkedin |  |
+| 2 | Prefers async | preference | 0.85 | world | medium | 2026-04-29 |  |  OH |  |
+<!--- gbrain:facts:end -->
+
+<!-- timeline -->
+`;
+    await importFromContent(engine, 'people/alice', seed, { noEmbed: true, remote: true });
+    await runExtractFacts(engine, { slugs: ['people/alice'] });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const seeded = await (engine as any).db.query(
+      `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice'`,
+    );
+    expect(seeded.rows).toHaveLength(2);
+
+    // A malformed remote rewrite: row 1 stays correctly placed above the
+    // sentinel (so #2044's restore never fires — incomingFacts.facts.length
+    // is 1, not 0), but row 2 got duplicated into a second fence below it.
+    const misplaced = `---
+title: alice
+type: person
+---
+
+Some body content.
+
+## Facts
+
+<!--- gbrain:facts:begin -->
+| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |
+|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|
+| 1 | Founded Acme | fact | 1.0 | world | high | 2017-01-01 |  |  linkedin |  |
+<!--- gbrain:facts:end -->
+
+<!-- timeline -->
+
+## Facts
+
+<!--- gbrain:facts:begin -->
+| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |
+|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|
+| 1 | Prefers async | preference | 0.85 | world | medium | 2026-04-29 |  |  OH |  |
+<!--- gbrain:facts:end -->
+`;
+    await importFromContent(engine, 'people/alice', misplaced, { noEmbed: true, remote: true });
+
+    const page = await engine.getPage('people/alice');
+    // Sanity: confirm the real write path actually reproduces the #3625
+    // precondition (#2044 did NOT restore anything away, and a fence marker
+    // really did land in timeline) before trusting the assertions below.
+    expect(parseFactsFence(page!.compiled_truth ?? '').facts).toHaveLength(1);
+    expect((page!.timeline ?? '')).toContain('gbrain:facts:begin');
+
+    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
+    expect(r.factsDeleted).toBe(0);
+    expect(r.warnings.some(w => w.includes('FACTS_FENCE_BELOW_SENTINEL'))).toBe(true);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice'`,
+    );
+    expect(rows.rows).toHaveLength(2);
   });
 
   test('dry-run does not touch DB', async () => {

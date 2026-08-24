@@ -57,7 +57,7 @@ import type { BrainEngine } from '../engine.ts';
 import { resolveSupersededByRow, type SupersedeTarget } from '../facts/supersede-resolve.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
-import { parseFactsFence } from '../facts-fence.ts';
+import { parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
 import {
   extractFactsFromFenceText,
   FENCE_SOURCE_DEFAULT,
@@ -398,6 +398,32 @@ export async function runExtractFacts(
       // could still recover. That partial result is not authoritative: using
       // it for reconciliation would interpret skipped rows as deletions.
       // Preserve this page's existing index and continue with other pages.
+      continue;
+    }
+
+    // #3625: splitBody() puts everything below the timeline sentinel into
+    // page.timeline, not compiled_truth — a `## Facts` fence written there
+    // (agent-composed bodies commonly append it at the bottom) is invisible
+    // to the parseFactsFence(body) call above. Without this check,
+    // parsed.facts.length === 0 reads as "the user deleted the fence" and
+    // the block below prunes every previously-indexed row for the page —
+    // when the fence is actually just misplaced, not absent. Distinguish
+    // the two by checking whether a fence marker ALSO landed in
+    // page.timeline: if so, the page is non-authoritative — malformed
+    // placement (loud warning, preserve the existing index), never treated
+    // as absence (destructive delete). Checked unconditionally on
+    // parsed.facts.length (not just when it's 0): a page can have a valid
+    // fence above the sentinel AND a stray/duplicate one below it (e.g. a
+    // partial hand-edit), in which case parsed.facts.length > 0 but
+    // reconciling from compiled_truth alone would still misread the
+    // below-sentinel rows as deleted.
+    if ((page.timeline ?? '').includes(FACTS_FENCE_BEGIN)) {
+      result.warnings.push(
+        `${slug}: FACTS_FENCE_BELOW_SENTINEL: a ## Facts fence was found below ` +
+        `the <!-- timeline --> sentinel, where extract_facts cannot see it. ` +
+        `Move the fence above the sentinel and re-save — leaving it in place ` +
+        `preserves the existing indexed facts but they will not update.`,
+      );
       continue;
     }
 
