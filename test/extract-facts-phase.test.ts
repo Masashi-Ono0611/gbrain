@@ -379,6 +379,62 @@ describe('runExtractFacts — happy path', () => {
     expect(Number(rows.rows[0].n)).toBe(0);
   });
 
+  test('#3625 adversarial review finding: the marker merely mentioned inside a ```code block``` does not block a genuine deletion', async () => {
+    // A naive `.includes(FACTS_FENCE_BEGIN)` check false-positives here — the
+    // marker text is present in timeline, but only as documentation, not as
+    // a real fence. The real fence was genuinely removed and must delete.
+    await putPage('people/alice', FACT_FENCE(
+      `| 1 | seeded | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
+    ));
+    await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    await putPageWithTimeline(
+      'people/alice',
+      '# Alice\n\nThe real Facts fence was removed.\n',
+      '## Docs\n\n```markdown\n<!--- gbrain:facts:begin -->\nexample only\n```\n',
+    );
+    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    expect(r.factsDeleted).toBe(1);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('#3625 adversarial review finding: the marker merely quoted in prose does not block a genuine deletion', async () => {
+    await putPage('people/alice', FACT_FENCE(
+      `| 1 | seeded | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
+    ));
+    await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    await putPageWithTimeline(
+      'people/alice',
+      '# Alice\n\nThe real Facts fence was removed.\n',
+      '> Historical docs mention the token <!--- gbrain:facts:begin -->, but this is not a fence.\n',
+    );
+    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    expect(r.factsDeleted).toBe(1);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('#3625 control: a genuine unbalanced marker (own line, not inside a code block) still blocks deletion', async () => {
+    // Contrast with the two false-positive tests above — this marker IS a
+    // real (if malformed/unbalanced) fence occurrence and must still guard.
+    await putPage('people/alice', FACT_FENCE(
+      `| 1 | seeded | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
+    ));
+    await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    await putPageWithTimeline(
+      'people/alice',
+      '# Alice\n\nNo compiled fence.\n',
+      '<!--- gbrain:facts:begin -->\nPRIVATE_UNBALANCED_ROW\n',
+    );
+    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    expect(r.factsDeleted).toBe(0);
+    expect(r.warnings.some(w => w.includes('FACTS_FENCE_BELOW_SENTINEL'))).toBe(true);
+  });
+
   test('#3625 via the real MCP write path: a stray fence below the sentinel is preserved even when import-file.ts is in play', async () => {
     // Codex review finding: the two tests above write compiled_truth/timeline
     // directly via engine.putPage, bypassing importFromContent's own #2044

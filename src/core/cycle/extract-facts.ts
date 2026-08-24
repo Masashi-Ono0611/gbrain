@@ -58,6 +58,7 @@ import { resolveSupersededByRow, type SupersedeTarget } from '../facts/supersede
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
+import { scanFencedBlocks } from '../fence-scan.ts';
 import {
   extractFactsFromFenceText,
   FENCE_SOURCE_DEFAULT,
@@ -184,6 +185,39 @@ export interface ExtractFactsResult {
   phantomsSkippedDrift: number;
   phantomsLockBusy: boolean;
   phantomsMorePending: boolean;
+}
+
+/**
+ * #3625 (adversarial review finding): whether `timeline` contains a
+ * GENUINE Facts fence marker, as opposed to the marker text merely being
+ * mentioned inside a fenced code example or quoted prose. A naive
+ * `.includes(FACTS_FENCE_BEGIN)` false-positives on both — e.g. a page
+ * whose real fence WAS removed, but whose timeline documents the fence
+ * syntax in a ```markdown code block or a `> ...` blockquote, would wrongly
+ * be treated as "misplaced" and block a genuine deletion, leaving stale
+ * facts indexed indefinitely.
+ *
+ * A real fence marker is always written as its own line (see
+ * FENCE_BODY-shaped output from fence-write.ts / upsertFactRow), so this
+ * checks: after stripping any ```-fenced code blocks (scanFencedBlocks,
+ * the same linear scanner import-file.ts uses for chunk extraction), does
+ * any remaining line, trimmed, exactly equal the marker? This rules out
+ * both hazards without needing a full markdown AST: code-block mentions
+ * are removed by the fence strip, and prose/blockquote mentions fail the
+ * exact-line-match (mirrors findTimelineSplitIndex's own `trimmed ===
+ * sentinel` pattern for the same class of problem on the timeline
+ * sentinel itself).
+ */
+function timelineHasGenuineFactsFenceMarker(timeline: string): boolean {
+  if (!timeline.includes(FACTS_FENCE_BEGIN)) return false;
+  const { fences } = scanFencedBlocks(timeline);
+  let stripped = timeline;
+  for (const fence of fences) {
+    if (fence.text.includes(FACTS_FENCE_BEGIN)) {
+      stripped = stripped.replace(fence.text, '');
+    }
+  }
+  return stripped.split(/\r\n|\r|\n/).some((line) => line.trim() === FACTS_FENCE_BEGIN);
 }
 
 /**
@@ -416,8 +450,12 @@ export async function runExtractFacts(
     // fence above the sentinel AND a stray/duplicate one below it (e.g. a
     // partial hand-edit), in which case parsed.facts.length > 0 but
     // reconciling from compiled_truth alone would still misread the
-    // below-sentinel rows as deleted.
-    if ((page.timeline ?? '').includes(FACTS_FENCE_BEGIN)) {
+    // below-sentinel rows as deleted. Uses timelineHasGenuineFactsFenceMarker
+    // rather than a raw .includes() (adversarial review finding: the naive
+    // substring check false-positives on the marker text merely being
+    // mentioned in a doc code-block or quoted prose, wrongly blocking a
+    // genuine deletion and leaving stale facts indexed indefinitely).
+    if (timelineHasGenuineFactsFenceMarker(page.timeline ?? '')) {
       result.warnings.push(
         `${slug}: FACTS_FENCE_BELOW_SENTINEL: a ## Facts fence was found below ` +
         `the <!-- timeline --> sentinel, where extract_facts cannot see it. ` +

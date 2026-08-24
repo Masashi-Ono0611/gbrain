@@ -231,6 +231,100 @@ ${FACTS_FENCE_END}
 });
 
 // ─────────────────────────────────────────────────────────────────
+// #3625 residual: #2044 restoration extended to `timeline`
+// ─────────────────────────────────────────────────────────────────
+//
+// Adversarial review on #3625's own PR caught this: the Critical fix above
+// (stripping private fences from `timeline`, not just `compiled_truth`)
+// closed a read-side leak but opened a write-side hazard identical to the
+// one #2044 already exists to prevent for `compiled_truth` — a remote
+// get_page -> edit -> put_page round-trip on a page whose canonical fence
+// lives in `timeline` now arrives with the private row(s) missing there,
+// for the exact same privacy-boundary reason. import-file.ts's `#2044`
+// restoration block is mirrored for `timeline`.
+//
+// Scope note: #2044's restoration (both the original compiled_truth block
+// and this timeline mirror) only fires when the INCOMING fence has gone to
+// ZERO facts — a fence that still has SOME rows (e.g. a mixed world+private
+// fence where only the private row was stripped) is not restored. This is
+// a pre-existing #2044 design limitation for compiled_truth (confirmed by
+// direct test below, unrelated to #3625) that the timeline mirror
+// necessarily inherits — not a regression #3625 introduces. A Takes fence
+// in EITHER column has no restoration mechanism at all today (#2044 only
+// ever covered Facts) — also pre-existing, also out of this PR's scope.
+describe('#3625 residual — #2044 restoration mirrored to timeline', () => {
+  function makeCtx(opts: Partial<OperationContext> = {}): OperationContext {
+    return {
+      engine,
+      config: { engine: 'pglite' as const },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      dryRun: false,
+      remote: false,
+      sourceId: 'default',
+      deferEmbeds: true,
+      ...opts,
+    };
+  }
+
+  test('an all-private Facts fence in timeline (matches #2044\'s existing precondition: incoming goes to zero) survives a remote get_page -> edit -> put_page round-trip', async () => {
+    const putPageOp = operations.find((o) => o.name === 'put_page')!;
+    const getPageOp = operations.find((o) => o.name === 'get_page')!;
+    const slug = 'people/timeline-allprivate-roundtrip';
+    const fence = FENCE_BODY(
+      '| 1 | PRIVATE_ONLY_TIMELINE_FACT | fact | 1.0 | private | high | 2026-01-01 |  | s |  |',
+    );
+    await putPageOp.handler(makeCtx({ remote: false }), {
+      slug,
+      content: `---\ntitle: ${slug}\ntype: person\n---\n\nBody.\n\n<!-- timeline -->\n\n${fence}`,
+    });
+
+    const remote = await getPageOp.handler(makeCtx({ remote: true }), {
+      slug,
+      include_content: true,
+    }) as { content?: string };
+    expect(remote.content).not.toContain('PRIVATE_ONLY_TIMELINE_FACT');
+    const edited = (remote.content ?? '').replace('Body.', 'Body edited.');
+    await putPageOp.handler(makeCtx({ remote: true }), { slug, content: edited });
+
+    const raw = await engine.getPage(slug, { sourceId: 'default' });
+    expect((raw?.timeline ?? '')).toContain('PRIVATE_ONLY_TIMELINE_FACT');
+  });
+
+  test('KNOWN PRE-EXISTING GAP (not introduced by #3625): a mixed world+private Facts fence in compiled_truth already loses the private row on round-trip today', async () => {
+    // Ground-truth control: same round-trip shape, but targeting
+    // compiled_truth (the original, long-standing #2044 mechanism) with a
+    // MIXED fence rather than an all-private one. Proves the "incoming
+    // must go to exactly zero facts" limitation predates #3625 and is not
+    // specific to the timeline mirror above.
+    const putPageOp = operations.find((o) => o.name === 'put_page')!;
+    const getPageOp = operations.find((o) => o.name === 'get_page')!;
+    const slug = 'people/compiled-mixed-roundtrip';
+    const fence = FENCE_BODY(
+      `| 1 | PUBLIC_COMPILED_FACT | fact | 1.0 | world | high | 2026-01-01 |  | s |  |
+| 2 | PRIVATE_COMPILED_FACT | fact | 1.0 | private | high | 2026-01-02 |  | s |  |`,
+    );
+    await putPageOp.handler(makeCtx({ remote: false }), {
+      slug,
+      content: `---\ntitle: ${slug}\ntype: person\n---\n\nBody.\n\n${fence}`,
+    });
+
+    const remote = await getPageOp.handler(makeCtx({ remote: true }), {
+      slug,
+      include_content: true,
+    }) as { content?: string };
+    expect(remote.content).not.toContain('PRIVATE_COMPILED_FACT');
+    const edited = (remote.content ?? '').replace('Body.', 'Body edited.');
+    await putPageOp.handler(makeCtx({ remote: true }), { slug, content: edited });
+
+    const raw = await engine.getPage(slug, { sourceId: 'default' });
+    // Documents the existing gap — this is NOT the behavior we want, but it
+    // is the behavior #2044 already has today, independent of #3625.
+    expect((raw?.compiled_truth ?? '')).not.toContain('PRIVATE_COMPILED_FACT');
+    expect((raw?.compiled_truth ?? '')).toContain('PUBLIC_COMPILED_FACT');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
 // Forget-as-fence (Codex R2-#3)
 // ─────────────────────────────────────────────────────────────────
 

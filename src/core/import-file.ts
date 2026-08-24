@@ -622,6 +622,32 @@ export async function importFromContent(
     }
   }
 
+  // #3625 residual: the identical #2044 hazard, but for a Facts fence that
+  // ended up in `timeline` (below the `<!-- timeline -->` sentinel) instead
+  // of `compiled_truth`. #3625's own fix made get_page/fetch_page strip
+  // private facts from `timeline` too (previously only `compiled_truth` was
+  // stripped) — so a remote get_page -> edit -> put_page round-trip on a
+  // page whose canonical fence lives in `timeline` now arrives with an
+  // empty/missing fence there for the exact same privacy-boundary reason
+  // #2044 already handles for `compiled_truth`. Without this, that
+  // round-trip would silently and permanently erase the private rows
+  // (adversarially proven while landing #3625 — see that PR's description).
+  // Apply the identical restoration, scoped to `timeline`.
+  if (opts.remote === true && existing?.timeline) {
+    const incomingTimelineFacts = parseFactsFence(parsed.timeline ?? '');
+    const existingTimelineFacts = parseFactsFence(existing.timeline);
+    const existingTimelineFenceBlock = extractFactsFenceBlock(existing.timeline);
+    if (
+      incomingTimelineFacts.facts.length === 0 &&
+      incomingTimelineFacts.warnings.length === 0 &&
+      existingTimelineFacts.warnings.length === 0 &&
+      existingTimelineFacts.facts.length > 0 &&
+      existingTimelineFenceBlock
+    ) {
+      parsed.timeline = replaceOrAppendFactsFence(parsed.timeline ?? '', existingTimelineFenceBlock);
+    }
+  }
+
   // #1035: absence of an explicit frontmatter `type:` on an EXISTING page
   // means "preserve the stored type", not "re-infer". Pre-fix, a round-trip
   // put (get_page → edit body → put_page without `type:`) silently regressed
