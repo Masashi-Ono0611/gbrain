@@ -435,6 +435,47 @@ describe('runExtractFacts — happy path', () => {
     expect(r.warnings.some(w => w.includes('FACTS_FENCE_BELOW_SENTINEL'))).toBe(true);
   });
 
+  test('#3625 adversarial review round 2: a CRLF-line-ending code block mentioning the marker does not false-positive', async () => {
+    // Round-1 fix (scanFencedBlocks + string removal) normalized line
+    // endings internally but tried to remove fence text from the
+    // UN-normalized original string, silently failing to strip a CRLF code
+    // block and leaving the false positive in place. The round-2 fix
+    // (single-pass line scanner, one \r\n|\r|\n split applied throughout)
+    // must handle this correctly.
+    await putPage('people/alice', FACT_FENCE(
+      `| 1 | seeded | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
+    ));
+    await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    await putPageWithTimeline(
+      'people/alice',
+      '# Alice\n\nThe real Facts fence was removed.\n',
+      '## Docs\r\n\r\n```markdown\r\n<!--- gbrain:facts:begin -->\r\nexample only\r\n```\r\n',
+    );
+    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    expect(r.factsDeleted).toBe(1);
+    expect(r.warnings).toEqual([]);
+  });
+
+  test('#3625 adversarial review round 2: two identical code-block mentions of the marker do not false-positive', async () => {
+    await putPage('people/alice', FACT_FENCE(
+      `| 1 | seeded | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
+    ));
+    await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    const codeBlock = '```markdown\n<!--- gbrain:facts:begin -->\nexample only\n```\n';
+    await putPageWithTimeline(
+      'people/alice',
+      '# Alice\n\nThe real Facts fence was removed.\n',
+      `${codeBlock}\n${codeBlock}`,
+    );
+    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
+
+    expect(r.factsDeleted).toBe(1);
+    expect(r.warnings).toEqual([]);
+  });
+
   test('#3625 via the real MCP write path: a stray fence below the sentinel is preserved even when import-file.ts is in play', async () => {
     // Codex review finding: the two tests above write compiled_truth/timeline
     // directly via engine.putPage, bypassing importFromContent's own #2044

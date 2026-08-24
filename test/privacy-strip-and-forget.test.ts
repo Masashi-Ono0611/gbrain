@@ -290,12 +290,11 @@ describe('#3625 residual — #2044 restoration mirrored to timeline', () => {
     expect((raw?.timeline ?? '')).toContain('PRIVATE_ONLY_TIMELINE_FACT');
   });
 
-  test('KNOWN PRE-EXISTING GAP (not introduced by #3625): a mixed world+private Facts fence in compiled_truth already loses the private row on round-trip today', async () => {
-    // Ground-truth control: same round-trip shape, but targeting
-    // compiled_truth (the original, long-standing #2044 mechanism) with a
-    // MIXED fence rather than an all-private one. Proves the "incoming
-    // must go to exactly zero facts" limitation predates #3625 and is not
-    // specific to the timeline mirror above.
+  test('#3625 P1 fix (adversarial review round 2): a MIXED world+private Facts fence in compiled_truth now preserves the private row on round-trip', async () => {
+    // Prior to the row-level merge fix, restoration only fired when the
+    // incoming fence went to exactly zero facts — a mixed fence where the
+    // world row survives stripping (incoming.facts.length===1, not 0) never
+    // triggered the old whole-block-swap, silently losing the private row.
     const putPageOp = operations.find((o) => o.name === 'put_page')!;
     const getPageOp = operations.find((o) => o.name === 'get_page')!;
     const slug = 'people/compiled-mixed-roundtrip';
@@ -312,15 +311,71 @@ describe('#3625 residual — #2044 restoration mirrored to timeline', () => {
       slug,
       include_content: true,
     }) as { content?: string };
+    expect(remote.content).toContain('PUBLIC_COMPILED_FACT');
     expect(remote.content).not.toContain('PRIVATE_COMPILED_FACT');
     const edited = (remote.content ?? '').replace('Body.', 'Body edited.');
     await putPageOp.handler(makeCtx({ remote: true }), { slug, content: edited });
 
     const raw = await engine.getPage(slug, { sourceId: 'default' });
-    // Documents the existing gap — this is NOT the behavior we want, but it
-    // is the behavior #2044 already has today, independent of #3625.
-    expect((raw?.compiled_truth ?? '')).not.toContain('PRIVATE_COMPILED_FACT');
     expect((raw?.compiled_truth ?? '')).toContain('PUBLIC_COMPILED_FACT');
+    expect((raw?.compiled_truth ?? '')).toContain('PRIVATE_COMPILED_FACT');
+  });
+
+  test('#3625 P1 fix, timeline variant: a MIXED world+private Facts fence in timeline now preserves the private row on round-trip', async () => {
+    const putPageOp = operations.find((o) => o.name === 'put_page')!;
+    const getPageOp = operations.find((o) => o.name === 'get_page')!;
+    const slug = 'people/timeline-mixed-roundtrip';
+    const fence = FENCE_BODY(
+      `| 1 | PUBLIC_TIMELINE_MIXED_FACT | fact | 1.0 | world | high | 2026-01-01 |  | s |  |
+| 2 | PRIVATE_TIMELINE_MIXED_FACT | fact | 1.0 | private | high | 2026-01-02 |  | s |  |`,
+    );
+    await putPageOp.handler(makeCtx({ remote: false }), {
+      slug,
+      content: `---\ntitle: ${slug}\ntype: person\n---\n\nBody.\n\n<!-- timeline -->\n\n${fence}`,
+    });
+
+    const remote = await getPageOp.handler(makeCtx({ remote: true }), {
+      slug,
+      include_content: true,
+    }) as { content?: string };
+    expect(remote.content).toContain('PUBLIC_TIMELINE_MIXED_FACT');
+    expect(remote.content).not.toContain('PRIVATE_TIMELINE_MIXED_FACT');
+    const edited = (remote.content ?? '').replace('Body.', 'Body edited.');
+    await putPageOp.handler(makeCtx({ remote: true }), { slug, content: edited });
+
+    const raw = await engine.getPage(slug, { sourceId: 'default' });
+    expect((raw?.timeline ?? '')).toContain('PUBLIC_TIMELINE_MIXED_FACT');
+    expect((raw?.timeline ?? '')).toContain('PRIVATE_TIMELINE_MIXED_FACT');
+  });
+
+  test('#3625 P2 fix (adversarial review round 2): deleting a fully-visible world-only fence is honored, not silently undone', async () => {
+    // The old whole-block-swap restored EVERY existing row whenever the
+    // incoming fence went to zero — including a world-only fence the
+    // caller could see in full and genuinely chose to delete. The
+    // row-level merge only ever restores rows the caller could NOT see
+    // (non-'world'), so a world-only deletion has nothing to restore.
+    const putPageOp = operations.find((o) => o.name === 'put_page')!;
+    const getPageOp = operations.find((o) => o.name === 'get_page')!;
+    const slug = 'people/world-only-delete';
+    const fence = FENCE_BODY(
+      '| 1 | WORLD_ONLY_FACT | fact | 1.0 | world | high | 2026-01-01 |  | s |  |',
+    );
+    await putPageOp.handler(makeCtx({ remote: false }), {
+      slug,
+      content: `---\ntitle: ${slug}\ntype: person\n---\n\nBody.\n\n${fence}`,
+    });
+
+    const remote = await getPageOp.handler(makeCtx({ remote: true }), {
+      slug,
+      include_content: true,
+    }) as { content?: string };
+    expect(remote.content).toContain('WORLD_ONLY_FACT');
+    // The caller saw the fence in full and deletes it entirely.
+    const edited = (remote.content ?? '').replace(fence, '').replace('Body.', 'Body, fence removed.');
+    await putPageOp.handler(makeCtx({ remote: true }), { slug, content: edited });
+
+    const raw = await engine.getPage(slug, { sourceId: 'default' });
+    expect((raw?.compiled_truth ?? '')).not.toContain('WORLD_ONLY_FACT');
   });
 });
 
