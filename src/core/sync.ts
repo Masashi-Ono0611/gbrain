@@ -677,6 +677,7 @@ export {
   acknowledgeSyncFailures,
   recordFailures,
   clearFailures,
+  restoreFailures,
   acknowledgeFailures,
   autoSkipFailures,
   withLedgerLock,
@@ -689,6 +690,10 @@ export {
   applySyncFailureGate,
   DEFAULT_SOURCE_ID,
   SENTINEL_PREFIX,
+  RENAME_SENTINEL_PREFIX,
+  renameSentinelPath,
+  renameReconcileErrorMessage,
+  parseRenameReconcileFrom,
   DEFAULT_AUTOSKIP_AFTER,
 } from './sync-failure-ledger.ts';
 export type {
