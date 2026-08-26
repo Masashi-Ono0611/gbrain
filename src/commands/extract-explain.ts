@@ -169,10 +169,21 @@ export async function runExtractExplain(
   }
 
   if (json) {
-    // bigintToStringReplacer: defense-in-depth in case a bigint reaches
-    // this object some other way (the SQL cast above already keeps
-    // `rollup` itself string/number/null-only). Matches the repo's
-    // established convention (src/cli.ts, added for #2450).
+    // Number()-coerce the four INT-aggregate fields so --json's rollup_7d
+    // shape matches `extract status --json` and doctor's extract_health
+    // (both already Number()-coerce the same columns) rather than leaving
+    // them as the SQL-level ::text strings. bigintToStringReplacer stays as
+    // a defense-in-depth backstop in case a raw bigint reaches this object
+    // some other way; it's a no-op here since rollup is already
+    // string/number/null-only.
+    const rollupJson = rollup ? {
+      cost_7d_usd: rollup.cost_7d_usd,
+      eval_pass_count: Number(rollup.eval_pass_count) || 0,
+      eval_fail_count: Number(rollup.eval_fail_count) || 0,
+      halt_count: Number(rollup.halt_count) || 0,
+      round_completed_count: Number(rollup.round_completed_count) || 0,
+      last_updated_at: rollup.last_updated_at,
+    } : null;
     console.log(JSON.stringify({
       schema_version: 1,
       kind: kindArg,
@@ -181,7 +192,7 @@ export async function runExtractExplain(
       spec,
       prompt_template: promptPath ? { path: promptPath, exists: promptExists } : null,
       fixture_corpus: fixturePath ? { path: fixturePath, exists: fixtureExists } : null,
-      rollup_7d: rollup,
+      rollup_7d: rollupJson,
     }, bigintToStringReplacer, 2));
     return;
   }

@@ -3,10 +3,14 @@
 // bigint (halt_count/eval_pass_count/eval_fail_count/round_completed_count
 // are all INT columns) — postgres.js surfaces that as JS `bigint`, which
 // plain JSON.stringify cannot serialize. The fix casts those four SUM()
-// results to ::text in SQL (so the JSON shape is engine-consistent — PGLite
-// would otherwise return a plain `number` for the same query) and also
-// keeps bigintToStringReplacer on the JSON.stringify call as a
-// defense-in-depth backstop.
+// results to ::text in SQL (so the intermediate shape is engine-consistent
+// before it ever reaches JS — PGLite would otherwise return a plain
+// `number` for the same query) and then Number()-coerces them for the
+// --json output, matching `extract status --json` and doctor's
+// extract_health (both already Number()-coerce the same columns) so all
+// three surfaces agree on type. bigintToStringReplacer stays on the
+// JSON.stringify call as a defense-in-depth backstop for the rest of the
+// payload.
 
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -32,9 +36,13 @@ afterEach(() => {
   try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* swallow */ }
 });
 
-// A value past Number.MAX_SAFE_INTEGER (2^53 - 1) so a regression to
-// Number()-coercion (silent precision loss) is distinguishable from the
-// correct string-preserving behavior, not just "does it throw".
+// A value past Number.MAX_SAFE_INTEGER (2^53 - 1). --json's rollup_7d now
+// Number()-coerces this column like the plain-text path and
+// extract-status.ts already do, so precision above 2^53 is not preserved
+// here — the same trade-off the rest of the codebase already accepts for
+// this column, in exchange for a consistent type across all three surfaces
+// that read it. Used to pin the coercion itself: a string surviving
+// untouched into --json output would be the regression.
 const HALT_COUNT_STR = '9007199254740993';
 
 // 'atoms' is a built-in cycle-phase kind (not pack-declared), so exercising
@@ -88,11 +96,12 @@ describe('runExtractExplain --json', () => {
     expect(sql).not.toMatch(/SUM\(cost_usd\)::text/);
   });
 
-  it('serializes ::text-cast rollup columns as-is (post-fix SQL shape, both engines)', async () => {
-    // This is what the fixed query actually returns on both PGLite and
-    // Postgres: cost_7d_usd stays a plain number (cost_usd is REAL, no cast
-    // needed), the four INT-aggregate columns are already strings because
-    // of the SQL ::text cast.
+  it('Number()-coerces the ::text-cast rollup columns for --json (matches extract-status.ts)', async () => {
+    // The fixed query returns cost_7d_usd as a plain number (cost_usd is
+    // REAL, no cast needed) and the four INT-aggregate columns as ::text
+    // strings. --json then Number()-coerces those four so rollup_7d's
+    // shape matches `extract status --json` and doctor's extract_health
+    // instead of leaving them as engine-internal ::text strings.
     const engine = stubEngine({
       cost_7d_usd: 12.5,
       eval_pass_count: '0',
@@ -106,17 +115,19 @@ describe('runExtractExplain --json', () => {
       const output = await runAndCapture(engine, ['--json']);
       expect(() => JSON.parse(output)).not.toThrow();
       const parsed = JSON.parse(output);
-      expect(parsed.rollup_7d.halt_count).toBe(HALT_COUNT_STR);
-      expect(parsed.rollup_7d.round_completed_count).toBe('5');
+      expect(parsed.rollup_7d.halt_count).toBe(Number(HALT_COUNT_STR));
+      expect(typeof parsed.rollup_7d.halt_count).toBe('number');
+      expect(parsed.rollup_7d.round_completed_count).toBe(5);
       expect(parsed.rollup_7d.cost_7d_usd).toBe(12.5);
     });
   });
 
-  it('does not throw if a bigint reaches JSON.stringify anyway (defense-in-depth backstop)', async () => {
+  it('does not throw if a bigint reaches this object anyway (defense-in-depth: Number() + bigintToStringReplacer)', async () => {
     // Simulates a driver/engine that doesn't honor the ::text cast the way
-    // Postgres does, or a future column added without one. bigintToStringReplacer
-    // on the JSON.stringify call is what actually prevents the crash here —
-    // the SQL cast alone would not help if the driver still hands back a bigint.
+    // Postgres does, or a future column added without one. The --json
+    // branch's Number() coercion already handles a raw bigint safely here;
+    // bigintToStringReplacer remains the backstop for any OTHER field that
+    // might carry a raw bigint into this object.
     const engine = stubEngine({
       cost_7d_usd: 12.5,
       eval_pass_count: 0n,
@@ -130,7 +141,7 @@ describe('runExtractExplain --json', () => {
       const output = await runAndCapture(engine, ['--json']);
       expect(() => JSON.parse(output)).not.toThrow();
       const parsed = JSON.parse(output);
-      expect(parsed.rollup_7d.halt_count).toBe(HALT_COUNT_STR);
+      expect(parsed.rollup_7d.halt_count).toBe(Number(HALT_COUNT_STR));
     });
   });
 
@@ -148,7 +159,11 @@ describe('runExtractExplain --json', () => {
       const jsonOutput = await runAndCapture(engine, ['--json']);
       expect(() => JSON.parse(jsonOutput)).not.toThrow();
       const parsed = JSON.parse(jsonOutput);
-      expect(parsed.rollup_7d.halt_count).toBeNull();
+      // Number(null) || 0, matching extract-status.ts's convention for the
+      // same zero-matching-rows shape. cost_7d_usd is untouched (never a
+      // bigint risk), so it stays null rather than being zeroed.
+      expect(parsed.rollup_7d.halt_count).toBe(0);
+      expect(parsed.rollup_7d.cost_7d_usd).toBeNull();
 
       const textOutput = await runAndCapture(engine);
       expect(textOutput).toContain('halts:');
