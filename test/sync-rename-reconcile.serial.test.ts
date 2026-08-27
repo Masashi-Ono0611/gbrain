@@ -2540,7 +2540,7 @@ describe('rename destination import: an errored skip must not checkpoint the ren
   });
 });
 
-describe('#3942 residual (#3570 follow-up): the no-sourceId rename lane must stay source-scoped', () => {
+describe('the no-sourceId rename lane must stay source-scoped', () => {
   test('e2e: a same-path row in a different source must not license a rename of an unrelated default-source page', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     const NO_SOURCE_ID_OPTS = { noPull: true, noEmbed: true, noExtract: true } as const;
@@ -2602,7 +2602,7 @@ describe('#3942 residual (#3570 follow-up): the no-sourceId rename lane must sta
   });
 });
 
-describe('#3942 residual (#3570 follow-up): rename lane must not repoint a foreign-origin page', () => {
+describe('#3942: the rename lane must not repoint a foreign-origin page', () => {
   test('e2e (sourceId set, batched lane): renaming a legacy trailing-hyphen path must not corrupt a different, live page', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
 
@@ -2628,9 +2628,9 @@ describe('#3942 residual (#3570 follow-up): rename lane must not repoint a forei
 
     // Sync 3: rename ONLY the legacy trailing-hyphen file (never the clean
     // page's own file). Content stays byte-identical so git's similarity
-    // detection reports a RENAME. Pre-fix, the batched pre-resolve's exact
-    // source_path lookup misses (the legacy path is no longer any page's
-    // recorded origin) and falls back to the unverified re-slugified
+    // detection reports a RENAME. An unguarded batched pre-resolve's exact
+    // source_path lookup misses here (the legacy path is not any page's
+    // recorded origin anymore) and falls back to an unverified re-slugified
     // fallback — the SAME slug as the clean page — cheap-renaming that
     // unrelated, live, foreign-origin page.
     mkdirSync(join(repo, 'notes'), { recursive: true });
