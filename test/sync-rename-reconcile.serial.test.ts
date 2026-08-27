@@ -2591,5 +2591,13 @@ describe('#3942 residual (#3570 follow-up): the no-sourceId rename lane must sta
     const victim = await engine.getPage('people/victim', { sourceId: 'default' });
     expect(victim).not.toBeNull();
     expect(victim?.compiled_truth).toBe('victim body');
+    // ...and the foreign 'acme' row itself was never written to — this is a
+    // read-only resolve, so the seeded row must survive byte-identical.
+    const acmeRow = await engine.executeRaw<{ slug: string; source_path: string | null; compiled_truth: string }>(
+      `SELECT slug, source_path, compiled_truth FROM pages WHERE source_id = 'acme'`,
+    );
+    expect(acmeRow).toEqual([
+      { slug: 'people/victim', source_path: 'notes/shared.md', compiled_truth: 'foreign body' },
+    ]);
   });
 });
