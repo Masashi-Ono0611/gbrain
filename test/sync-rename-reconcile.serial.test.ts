@@ -2539,3 +2539,57 @@ describe('rename destination import: an errored skip must not checkpoint the ren
     expect((await engine.getPage('people/beta'))?.compiled_truth).toBe('Alpha is a person, fixed.');
   });
 });
+
+describe('#3942 residual (#3570 follow-up): the no-sourceId rename lane must stay source-scoped', () => {
+  test('e2e: a same-path row in a different source must not license a rename of an unrelated default-source page', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const NO_SOURCE_ID_OPTS = { noPull: true, noEmbed: true, noExtract: true } as const;
+
+    // Two unrelated pages in the 'default' source, synced from one repo.
+    const repo = mkRepo({
+      'notes/shared.md': personMd('Shared', 'default body'),
+      'people/victim.md': personMd('Victim', 'victim body'),
+    });
+    await performSync(engine, { repoPath: repo, ...NO_SOURCE_ID_OPTS });
+    expect(await engine.getPage('notes/shared', { sourceId: 'default' })).not.toBeNull();
+    expect(await engine.getPage('people/victim', { sourceId: 'default' })).not.toBeNull();
+
+    // A DIFFERENT source ('acme') happens to have a row whose source_path is
+    // the exact file about to be renamed, but whose OWN slug coincides with
+    // the unrelated victim page's slug in 'default'. 'acme' sorts before
+    // 'default', so a from-path resolve that isn't scoped to the caller's
+    // own source would surface this foreign slug instead of the real page's
+    // own ('notes/shared') — the rename lane's updateSlug call is always
+    // default-scoped (renameOpts is undefined for the no-sourceId lane), so
+    // reading a foreign slug here would repoint an unrelated default-source
+    // row rather than the file's own page.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`,
+      ['acme'],
+    );
+    await engine.executeRaw(
+      `INSERT INTO pages (source_id, slug, source_path, type, title, compiled_truth, timeline, frontmatter)
+       VALUES ('acme', 'people/victim', 'notes/shared.md', 'note', 'people/victim', 'foreign body', '', '{}'::jsonb)`,
+    );
+
+    // Rename ONLY notes/shared.md. Content stays byte-identical to keep
+    // git's similarity-based rename detection above its threshold.
+    execSync('git mv notes/shared.md notes/renamed.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git add -A && git commit -m "rename shared"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...NO_SOURCE_ID_OPTS });
+
+    // The rename must land at its own new slug in 'default'...
+    expect((await engine.getPage('notes/renamed', { sourceId: 'default' }))?.compiled_truth)
+      .toBe('default body');
+    // ...the old slug is gone (a real rename, not a permanent orphan)...
+    expect(await engine.getPage('notes/shared', { sourceId: 'default' })).toBeNull();
+    // ...and the unrelated victim page — which merely shares a slug VALUE
+    // with the foreign 'acme' row, never the file being renamed — must
+    // never have been touched. A from-path resolve that ignored source
+    // scope would return the 'acme' row's slug ('people/victim'), and the
+    // default-scoped updateSlug would match and repoint THIS page instead.
+    const victim = await engine.getPage('people/victim', { sourceId: 'default' });
+    expect(victim).not.toBeNull();
+    expect(victim?.compiled_truth).toBe('victim body');
+  });
+});
