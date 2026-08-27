@@ -2601,3 +2601,84 @@ describe('#3942 residual (#3570 follow-up): the no-sourceId rename lane must sta
     ]);
   });
 });
+
+describe('#3942 residual (#3570 follow-up): rename lane must not repoint a foreign-origin page', () => {
+  test('e2e (sourceId set, batched lane): renaming a legacy trailing-hyphen path must not corrupt a different, live page', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+
+    // Sync 1: only the legacy trailing-hyphen file exists. slugifyPath strips
+    // the trailing hyphen, so it imports AT the clean slug.
+    const repo = mkRepo({
+      'extracts/propose-/round-single.md': personMd('Legacy', 'legacy body'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('extracts/propose/round-single', { sourceId: 'default' }))
+      .not.toBeNull();
+
+    // Sync 2: the clean file lands at the SAME derived slug with DIFFERENT
+    // content. The reimport re-records source_path to the clean file, so the
+    // page now has a FOREIGN origin relative to the legacy trailing-hyphen
+    // path (whose own file is untouched and still on disk).
+    mkdirSync(join(repo, 'extracts/propose'), { recursive: true });
+    writeFileSync(join(repo, 'extracts/propose/round-single.md'), personMd('Clean', 'clean body'));
+    execSync('git add -A && git commit -m "add clean variant"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect((await engine.getPage('extracts/propose/round-single', { sourceId: 'default' }))
+      ?.compiled_truth).toBe('clean body');
+
+    // Sync 3: rename ONLY the legacy trailing-hyphen file (never the clean
+    // page's own file). Content stays byte-identical so git's similarity
+    // detection reports a RENAME. Pre-fix, the batched pre-resolve's exact
+    // source_path lookup misses (the legacy path is no longer any page's
+    // recorded origin) and falls back to the unverified re-slugified
+    // fallback — the SAME slug as the clean page — cheap-renaming that
+    // unrelated, live, foreign-origin page.
+    mkdirSync(join(repo, 'notes'), { recursive: true });
+    execSync('git mv "extracts/propose-/round-single.md" notes/renamed.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git add -A && git commit -m "rename legacy trailing-hyphen file"', {
+      cwd: repo, stdio: 'pipe',
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    // The clean page — a different file's page — must survive untouched.
+    const cleanPage = await engine.getPage('extracts/propose/round-single', { sourceId: 'default' });
+    expect(cleanPage).not.toBeNull();
+    expect(cleanPage?.compiled_truth).toBe('clean body');
+    // The renamed destination lands as its own page, carrying the legacy
+    // file's (unchanged) content.
+    expect((await engine.getPage('notes/renamed', { sourceId: 'default' }))?.compiled_truth)
+      .toBe('legacy body');
+  });
+
+  test('e2e (no sourceId, per-path lane): the same collision is guarded on the legacy no-sourceId lane too', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const NO_SOURCE_ID_OPTS = { noPull: true, noEmbed: true, noExtract: true } as const;
+
+    const repo = mkRepo({
+      'extracts/propose-/round-single.md': personMd('Legacy', 'legacy body'),
+    });
+    await performSync(engine, { repoPath: repo, ...NO_SOURCE_ID_OPTS });
+    expect(await engine.getPage('extracts/propose/round-single', { sourceId: 'default' }))
+      .not.toBeNull();
+
+    mkdirSync(join(repo, 'extracts/propose'), { recursive: true });
+    writeFileSync(join(repo, 'extracts/propose/round-single.md'), personMd('Clean', 'clean body'));
+    execSync('git add -A && git commit -m "add clean variant"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...NO_SOURCE_ID_OPTS });
+    expect((await engine.getPage('extracts/propose/round-single', { sourceId: 'default' }))
+      ?.compiled_truth).toBe('clean body');
+
+    mkdirSync(join(repo, 'notes'), { recursive: true });
+    execSync('git mv "extracts/propose-/round-single.md" notes/renamed.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git add -A && git commit -m "rename legacy trailing-hyphen file"', {
+      cwd: repo, stdio: 'pipe',
+    });
+    await performSync(engine, { repoPath: repo, ...NO_SOURCE_ID_OPTS });
+
+    const cleanPage = await engine.getPage('extracts/propose/round-single', { sourceId: 'default' });
+    expect(cleanPage).not.toBeNull();
+    expect(cleanPage?.compiled_truth).toBe('clean body');
+    expect((await engine.getPage('notes/renamed', { sourceId: 'default' }))?.compiled_truth)
+      .toBe('legacy body');
+  });
+});
