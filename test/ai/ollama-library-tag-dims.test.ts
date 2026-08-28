@@ -18,19 +18,25 @@
  *     naive first-colon strip eating the `qwen3-embedding` head and falling
  *     through to default_dims (768).
  *
- *   The bare form is not a theoretical caller: `parseModelId('ollama:
+ *   The bare form is not a purely theoretical input: `parseModelId('ollama:
  *   qwen3-embedding:8b')` (model-resolver.ts) splits on the FIRST colon
  *   only, so its `.modelId` is exactly the bare `qwen3-embedding:8b` — and
- *   `src/core/ai/gateway.ts` passes that already-parsed `.modelId` straight
- *   into `embeddingDimsForModel()` at both its preflight dim-check
- *   (line ~959) and its per-call dim lookup (line ~2384). A brain configured
- *   with the standard qualified `ollama:qwen3-embedding:8b` embedding model
- *   hit the bare-form path on every gateway dim check before this fix.
+ *   `src/core/ai/gateway.ts`'s preflight dim-check (`~959`) passes that
+ *   already-parsed `.modelId` straight into `embeddingDimsForModel()`. Today
+ *   that one call site only branches on zero-vs-nonzero (both the old wrong
+ *   768 and the correct 4096 are nonzero, so its outcome doesn't currently
+ *   change), and the ollama recipe doesn't declare `supports_multimodal` so
+ *   it never reaches the OTHER embeddingDimsForModel() call site
+ *   (`~2384`, multimodal-only). So this fix is not closing an
+ *   observed-broken production path today — it's closing the actual parse
+ *   gap for the one real caller that already exists (proven below) and for
+ *   any future caller (dim mismatch errors, migration planning, etc.) that
+ *   depends on the correct declared width rather than a zero check.
  */
 
 import { describe, expect, test } from 'bun:test';
 import { getRecipe } from '../../src/core/ai/recipes/index.ts';
-import { embeddingDimsForModel } from '../../src/core/ai/model-resolver.ts';
+import { embeddingDimsForModel, resolveRecipe } from '../../src/core/ai/model-resolver.ts';
 import { resolveMigrationTarget } from '../../src/core/embedding-migration.ts';
 
 describe('ollama library-tag dims — new pullable tags', () => {
@@ -45,14 +51,18 @@ describe('ollama library-tag dims — new pullable tags', () => {
     expect(embeddingDimsForModel(ollama, 'ollama:qwen3-embedding:8b')).toBe(4096);
   });
 
-  test('bare qwen3-embedding:8b resolves to its true 4096 (the gateway.ts:959/:2384 call shape)', () => {
+  test('bare qwen3-embedding:8b resolves to its true 4096', () => {
     // embeddingDimsForModel() now tries the id exactly as given (an exact
     // model_dims lookup) before assuming a leading `provider:` separator,
-    // so the bare colon-bearing form — exactly what parseModelId('ollama:
-    // qwen3-embedding:8b').modelId produces, and what gateway.ts passes
-    // straight through — resolves correctly instead of silently falling
-    // back to default_dims (768).
+    // so the bare colon-bearing form resolves correctly instead of silently
+    // falling back to default_dims (768).
     expect(embeddingDimsForModel(ollama, 'qwen3-embedding:8b')).toBe(4096);
+  });
+
+  test('resolveRecipe("ollama:qwen3-embedding:8b").parsed.modelId is the bare colon-bearing form, and feeding it straight to embeddingDimsForModel() resolves correctly — the exact shape gateway.ts:959 passes', () => {
+    const { parsed, recipe } = resolveRecipe('ollama:qwen3-embedding:8b');
+    expect(parsed.modelId).toBe('qwen3-embedding:8b');
+    expect(embeddingDimsForModel(recipe, parsed.modelId)).toBe(4096);
   });
 
   test('legacy spellings keep validating at their declared dims', () => {
