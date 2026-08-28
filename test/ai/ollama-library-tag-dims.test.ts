@@ -1,37 +1,13 @@
 /**
  * Ollama library-tag dims — coverage for the pullable-tag catalog refresh.
  *
- * The ollama recipe gained the REAL Ollama library spellings
- * (`qwen3-embedding:8b`, `snowflake-arctic-embed2`) alongside the legacy
- * never-pullable spellings (`qwen3-embed-8b`, `snowflake-arctic-embed-l-v2`).
  * `qwen3-embedding:8b` is the first colon-bearing model tag in any recipe's
  * models list, which makes it the first tag to exercise
  * `embeddingDimsForModel()`'s strip-the-leading-`provider:`-prefix logic with
- * a colon INSIDE the model id.
- *
- * Contract pinned here (both forms now resolve to the true 4096):
- *   - Qualified form (`ollama:qwen3-embedding:8b`) strips only the FIRST
- *     colon, so the tag survives and resolves to its declared 4096.
- *   - Bare colon-bearing form (`qwen3-embedding:8b`) is tried as-given
- *     FIRST (an exact `model_dims` lookup) before any provider-prefix strip
- *     is attempted, so it also resolves to 4096 instead of the earlier
- *     naive first-colon strip eating the `qwen3-embedding` head and falling
- *     through to default_dims (768).
- *
- *   The bare form is not a purely theoretical input: `parseModelId('ollama:
- *   qwen3-embedding:8b')` (model-resolver.ts) splits on the FIRST colon
- *   only, so its `.modelId` is exactly the bare `qwen3-embedding:8b` — and
- *   `src/core/ai/gateway.ts`'s preflight dim-check (`~959`) passes that
- *   already-parsed `.modelId` straight into `embeddingDimsForModel()`. Today
- *   that one call site only branches on zero-vs-nonzero (both the old wrong
- *   768 and the correct 4096 are nonzero, so its outcome doesn't currently
- *   change), and the ollama recipe doesn't declare `supports_multimodal` so
- *   it never reaches the OTHER embeddingDimsForModel() call site
- *   (`~2384`, multimodal-only). So this fix is not closing an
- *   observed-broken production path today — it's closing the actual parse
- *   gap for the one real caller that already exists (proven below) and for
- *   any future caller (dim mismatch errors, migration planning, etc.) that
- *   depends on the correct declared width rather than a zero check.
+ * a colon INSIDE the model id. Both the qualified form
+ * (`ollama:qwen3-embedding:8b`) and the bare form (`qwen3-embedding:8b`)
+ * resolve to the declared 4096 — see the PR description for the reachability
+ * analysis of who calls `embeddingDimsForModel()` with which form.
  */
 
 import { describe, expect, test } from 'bun:test';
@@ -59,7 +35,7 @@ describe('ollama library-tag dims — new pullable tags', () => {
     expect(embeddingDimsForModel(ollama, 'qwen3-embedding:8b')).toBe(4096);
   });
 
-  test('resolveRecipe("ollama:qwen3-embedding:8b").parsed.modelId is the bare colon-bearing form, and feeding it straight to embeddingDimsForModel() resolves correctly — the exact shape gateway.ts:959 passes', () => {
+  test('resolver output preserves the colon-bearing tag for dimension lookup', () => {
     const { parsed, recipe } = resolveRecipe('ollama:qwen3-embedding:8b');
     expect(parsed.modelId).toBe('qwen3-embedding:8b');
     expect(embeddingDimsForModel(recipe, parsed.modelId)).toBe(4096);
