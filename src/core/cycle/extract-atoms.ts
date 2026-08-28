@@ -5,7 +5,8 @@
 //      via a single raw SQL query (NOT EXISTS subquery filters out
 //      pages already extracted by content hash — see "Idempotency" below).
 //   2. Dedup by content_hash; transcripts win on collision.
-//   3. Per work-item, ask Haiku for 1-3 atoms.
+//   3. Per work-item, ask the configured extract_atoms model (key-aware
+//      utility-tier default, see resolveExtractAtomsModel below) for 1-3 atoms.
 //   4. Write each atom via importFromContent(slug, markdown, {sourceId})
 //      with sourceId threaded so federated brains route correctly. The
 //      canonical import path (not engine.putPage) is what chunks and embeds
@@ -447,6 +448,21 @@ export async function atomsExistingForHashes(
 }
 
 /**
+ * The exact two-step model resolution `runPhaseExtractAtoms` uses:
+ * `models.dream.extract_atoms` DB config wins if set, else the key-aware
+ * `resolveTierDefault('utility')`. Deliberately NOT `resolveModel()`'s
+ * fuller chain (which also honors `models.tier.utility`, `models.default`,
+ * and an env var) — extract_atoms has never read those, and unifying the
+ * two behaviors is a separate, larger change. Exported so `gbrain models`
+ * can report the actual routing instead of a generic chain that can diverge
+ * from it in partially-configured installs.
+ */
+export async function resolveExtractAtomsModel(engine: BrainEngine): Promise<string> {
+  const configuredModel = await engine.getConfig('models.dream.extract_atoms');
+  return configuredModel || resolveTierDefault('utility');
+}
+
+/**
  * v0.41 minimal extract_atoms body, rebuilt for v0.41.2.1.
  *
  * Test-driven minimum: takes _transcripts AND _pages directly when set,
@@ -607,7 +623,7 @@ export async function runPhaseExtractAtoms(
     };
   }
 
-  // 4. Per work-item: extract atoms via Haiku
+  // 4. Per work-item: extract atoms via the configured extract_atoms model
   let totalAtomsExtracted = 0;
   let transcriptsProcessed = 0;
   let pagesProcessed = 0;
@@ -618,6 +634,9 @@ export async function runPhaseExtractAtoms(
   let budgetExhausted = false;
   // #3813: key-aware tier default, not a hardcoded Anthropic model — an
   // OPENAI_API_KEY-only install must not route to an unservable provider.
+  // Pre-computed so a config-read failure inside the try below (caught, see
+  // "Keep safe defaults" comment) still leaves extractModel on this default,
+  // matching the pre-refactor fail-soft behavior exactly.
   let extractModel = resolveTierDefault('utility');
   let budgetCap = DEFAULT_BUDGET_USD;
   // #4529/#4540: the per-item input/output caps were hardcoded (slice(0, 50_000) +
@@ -627,12 +646,7 @@ export async function runPhaseExtractAtoms(
   let maxOutputTokens = DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS;
   let pacingMs = 0;
   try {
-    const configuredModel = await engine.getConfig('models.dream.extract_atoms');
-    if (configuredModel) extractModel = configuredModel;
-    // `models.dream.extract_atoms` is DB-plane/operator-selected config.
-    // The gateway no longer has a model allowlist/extended-model registry:
-    // configured per-task chat models resolve like `models.default`, so local
-    // user-managed providers (e.g. Ollama tags) need no registration here.
+    extractModel = await resolveExtractAtomsModel(engine);
     const configuredBudget = await engine.getConfig('cycle.extract_atoms.budget_usd');
     if (configuredBudget) {
       const n = Number(configuredBudget);
@@ -669,7 +683,7 @@ export async function runPhaseExtractAtoms(
     }
   } catch {
     // Keep safe defaults on any config-read failure: key-aware utility-tier
-    // model, $0.30 cap, default max_source_chars.
+    // model, $0.30 cap, default input cap (max_input_chars).
   }
   // A cost cap is only meaningful for a model the tracker can price.
   // BudgetTracker.reserve() hard-fails with BudgetExhausted(reason:'no_pricing')
