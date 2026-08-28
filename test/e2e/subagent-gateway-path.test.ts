@@ -72,6 +72,7 @@ interface FakeJobOpts {
   prompt: string;
   model?: string;
   allowed_tools?: string[];
+  mode?: string;
 }
 
 async function makeFakeJob(opts: FakeJobOpts): Promise<{ jobId: number; ctx: MinionJobContext; tokenSink: any[] }> {
@@ -80,7 +81,7 @@ async function makeFakeJob(opts: FakeJobOpts): Promise<{ jobId: number; ctx: Min
     `INSERT INTO minion_jobs (name, status, data, queue, priority, created_at)
      VALUES ('subagent', 'active', $1::jsonb, 'default', 0, now())
      RETURNING id`,
-    [JSON.stringify({ prompt: opts.prompt, model: opts.model, allowed_tools: opts.allowed_tools })],
+    [JSON.stringify({ prompt: opts.prompt, model: opts.model, allowed_tools: opts.allowed_tools, mode: opts.mode })],
   );
   const jobId = rows[0].id;
 
@@ -91,7 +92,7 @@ async function makeFakeJob(opts: FakeJobOpts): Promise<{ jobId: number; ctx: Min
   const ctx: MinionJobContext = {
     id: jobId,
     name: 'subagent',
-    data: { prompt: opts.prompt, model: opts.model, allowed_tools: opts.allowed_tools },
+    data: { prompt: opts.prompt, model: opts.model, allowed_tools: opts.allowed_tools, mode: opts.mode },
     attempts_made: 0,
     signal: abortCtrl.signal,
     deadlineAtMs: null,
@@ -138,6 +139,28 @@ function makeStubTools(executions: Array<{ name: string; input: unknown; ts: num
       idempotent: true,
       async execute(_input: unknown, _ctx: ToolCtx) {
         throw new Error('intentional tool failure');
+      },
+    },
+  ];
+}
+
+/**
+ * `brain_put_page` stub — the oneshot dispatch path (`data.mode ===
+ * 'oneshot'`) requires this exact tool name to be present in the registry
+ * (`args.putPageTool = registry.find(t => t.name === 'brain_put_page')`) or
+ * it never calls chat() at all (falls back with `no_put_page_tool` before
+ * reaching the model). Only present for oneshot-path tests; never invoked
+ * by the error-path test below (the chat() call itself throws first).
+ */
+function makeOneshotStubTools(): ToolDef[] {
+  return [
+    {
+      name: 'brain_put_page',
+      description: 'stub brain_put_page',
+      input_schema: { type: 'object' },
+      idempotent: false,
+      async execute() {
+        throw new Error('brain_put_page stub should not execute in this test');
       },
     },
   ];
@@ -447,6 +470,52 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
       // normalizeAIError()-wrapped "BadRequestError" text) must survive into
       // the dead-lettered job's error — this is what an operator reads to
       // diagnose a `dead` job, not just a generic label.
+      expect(message).toContain('1707509 tokens > 1000000 maximum');
+      expect(message).not.toContain('BadRequestError');
+    } finally {
+      __setGenerateTextTransportForTests(null);
+    }
+  });
+
+  it('terminal classification: the oneshot dispatch path (data.mode=oneshot) also converts "prompt is too long" to UnrecoverableError (sibling gap to the gateway-loop fix above, #4674)', async () => {
+    // Same production error boundary as the gateway-loop test above: the
+    // oneshot dispatch runner (subagent-oneshot.ts) calls the SAME
+    // gateway.chat() entrypoint, so a prompt-too-long error arrives
+    // normalizeAIError()-wrapped here too. Before this fix, the oneshot
+    // catch rethrew every non-abort error verbatim — no isPromptTooLongError
+    // check — so this exact condition retried up to max_stalled on the
+    // oneshot path even though the gateway-loop and legacy paths already
+    // fast-failed on it.
+    __setChatTransportForTests(null);
+    __setGenerateTextTransportForTests(async () => {
+      throw {
+        status: 400,
+        message: 'BadRequestError',
+        error: {
+          type: 'invalid_request_error',
+          message: 'prompt is too long: 1707509 tokens > 1000000 maximum',
+        },
+      };
+    });
+
+    try {
+      const tools = makeOneshotStubTools();
+      const handler = buildHandler(tools);
+      const { ctx } = await makeFakeJob({
+        prompt: 'huge input',
+        model: 'anthropic:claude-sonnet-4-6',
+        mode: 'oneshot',
+      });
+
+      let caught: unknown;
+      try {
+        await handler(ctx);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(UnrecoverableError);
+      const message = String((caught as Error).message);
+      expect(message).toContain('prompt_too_long');
       expect(message).toContain('1707509 tokens > 1000000 maximum');
       expect(message).not.toContain('BadRequestError');
     } finally {
