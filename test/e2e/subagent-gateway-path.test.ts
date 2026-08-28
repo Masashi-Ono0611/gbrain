@@ -24,9 +24,11 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'bun:test'
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { makeSubagentHandler } from '../../src/core/minions/handlers/subagent.ts';
+import { UnrecoverableError } from '../../src/core/minions/types.ts';
 import type { MinionJobContext, ToolDef, ToolCtx } from '../../src/core/minions/types.ts';
 import {
   __setChatTransportForTests,
+  __setGenerateTextTransportForTests,
   configureGateway,
   resetGateway,
   type ChatBlock,
@@ -398,6 +400,58 @@ describe('runSubagentViaGateway (v0.38 Slice 1 — full handler path through gat
     );
     expect(toolRows[0].status).toBe('failed');
     expect(String(toolRows[0].error)).toContain('intentional tool failure');
+  });
+
+  it('terminal classification: a "prompt is too long" error is converted to UnrecoverableError (gap parity with the legacy path)', async () => {
+    // The legacy raw-Anthropic-SDK path (subagent.ts's non-gateway branch)
+    // converts this exact condition to UnrecoverableError so the worker
+    // routes straight to `dead`, bypassing max_stalled retries. Pins that
+    // the gateway-native path does the same.
+    //
+    // Deliberately exercises the REAL production error boundary rather than
+    // __setChatTransportForTests (which bypasses gateway.chat()'s own
+    // try/catch): __setGenerateTextTransportForTests stubs the transport ONE
+    // layer deeper, so the thrown error passes through chat()'s real catch
+    // and gets normalizeAIError()-wrapped exactly like a live provider call.
+    // The thrown shape puts the phrase ONLY on the SDK's actual inner
+    // `.error.message` field (not the outer `.message`, which normalizeAIError
+    // copies onto the wrapped error) — the shape isPromptTooLongError's
+    // cause-chain walk exists to still catch post-wrap.
+    __setChatTransportForTests(null);
+    __setGenerateTextTransportForTests(async () => {
+      throw {
+        status: 400,
+        message: 'BadRequestError',
+        error: {
+          type: 'invalid_request_error',
+          message: 'prompt is too long: 1707509 tokens > 1000000 maximum',
+        },
+      };
+    });
+
+    try {
+      const tools = makeStubTools([]);
+      const handler = buildHandler(tools);
+      const { ctx } = await makeFakeJob({ prompt: 'huge input', model: 'anthropic:claude-sonnet-4-6' });
+
+      let caught: unknown;
+      try {
+        await handler(ctx);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(UnrecoverableError);
+      const message = String((caught as Error).message);
+      expect(message).toContain('prompt_too_long');
+      // The actually-useful detail (the inner .error.message, not the outer
+      // normalizeAIError()-wrapped "BadRequestError" text) must survive into
+      // the dead-lettered job's error — this is what an operator reads to
+      // diagnose a `dead` job, not just a generic label.
+      expect(message).toContain('1707509 tokens > 1000000 maximum');
+      expect(message).not.toContain('BadRequestError');
+    } finally {
+      __setGenerateTextTransportForTests(null);
+    }
   });
 
   it('max_turns: loop terminates when budget exhausted', async () => {
