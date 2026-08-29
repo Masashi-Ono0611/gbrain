@@ -260,27 +260,47 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
             }).toString();
             if (statusOut.trim() !== '') {
               dirty = true;
+              known = true;
             } else {
               const branchOut = execFileSync('git', ['-C', ws, 'branch', '--show-current'], {
                 stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
               }).toString().trim();
-              const upstreamRef = branchOut ? `origin/${branchOut}..HEAD` : '@{u}..HEAD';
-              try {
-                const aheadOut = execFileSync('git', ['-C', ws, 'rev-list', '--count', upstreamRef], {
-                  stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
-                }).toString().trim();
-                dirty = (parseInt(aheadOut, 10) || 0) > 0;
-              } catch {
-                // origin/<branch> (or @{u}) doesn't resolve — e.g. never
-                // pushed. Any local commit on top of an empty tree still
-                // counts as needing a push.
-                const haveOut = execFileSync('git', ['-C', ws, 'rev-list', '--count', 'HEAD'], {
-                  stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
-                }).toString().trim();
-                dirty = (parseInt(haveOut, 10) || 0) > 0;
+              if (branchOut) {
+                try {
+                  const aheadOut = execFileSync(
+                    'git', ['-C', ws, 'rev-list', '--count', `origin/${branchOut}..HEAD`],
+                    { stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 },
+                  ).toString().trim();
+                  dirty = (parseInt(aheadOut, 10) || 0) > 0;
+                  known = true;
+                } catch {
+                  // origin/<branch> doesn't resolve — e.g. never pushed. Any
+                  // local commit on top of an empty tree still counts as
+                  // needing a push (this fallback only applies to a NAMED
+                  // branch with no upstream; see the detached-HEAD branch
+                  // below for why the same trick is unsafe there).
+                  const haveOut = execFileSync('git', ['-C', ws, 'rev-list', '--count', 'HEAD'], {
+                    stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+                  }).toString().trim();
+                  dirty = (parseInt(haveOut, 10) || 0) > 0;
+                  known = true;
+                }
+              } else {
+                // Detached HEAD: `rev-list --count HEAD` counts ALL history
+                // reachable from HEAD, not just unpushed commits, so it is
+                // NOT a safe "never pushed" fallback here (unlike the named-
+                // branch case above) — it would flag any non-trivial repo as
+                // dirty even when HEAD is already contained by origin. If
+                // `@{u}` doesn't resolve, tree state is simply unverifiable.
+                try {
+                  const aheadOut = execFileSync('git', ['-C', ws, 'rev-list', '--count', '@{u}..HEAD'], {
+                    stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+                  }).toString().trim();
+                  dirty = (parseInt(aheadOut, 10) || 0) > 0;
+                  known = true;
+                } catch { known = false; }
               }
             }
-            known = true;
           } catch { dirty = false; known = false; }
         }
         if (stale && dirty) {

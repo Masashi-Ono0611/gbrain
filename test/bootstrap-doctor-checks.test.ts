@@ -93,15 +93,19 @@ function writeVerifyRun(home: string, name: string, body: string): void {
  * and a fake `origin/<branch>` ref pointing at HEAD (verified clean, in sync
  * — no real remote/fetch needed). `ahead: true` is like `clean` but the
  * `origin/<branch>` ref is left one commit behind HEAD (committed but
- * unpushed — clean working tree, still needs a push).
+ * unpushed — clean working tree, still needs a push). `detached: true` is
+ * like `clean` but checked out at a detached HEAD with NO remote-tracking
+ * ref at all (no `origin/<branch>` line to key off, and `@{u}` can't
+ * resolve) — the working tree is genuinely clean, but push-ahead status
+ * can't be verified this way.
  */
-function makeWorkspace(opts: { dirty?: boolean; clean?: boolean; ahead?: boolean } = {}): string {
+function makeWorkspace(opts: { dirty?: boolean; clean?: boolean; ahead?: boolean; detached?: boolean } = {}): string {
   const ws = mkdtempSync(join(tmpdir(), 'gb-bdc-ws-'));
   tmpDirs.push(ws);
   if (opts.dirty) {
     execFileSync('git', ['init', '-q', ws], { stdio: 'ignore' });
     writeFileSync(join(ws, 'unpushed-note.md'), 'recent agent memory\n');
-  } else if (opts.clean || opts.ahead) {
+  } else if (opts.clean || opts.ahead || opts.detached) {
     const g = (...args: string[]) =>
       execFileSync('git', ['-C', ws, ...args], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
     execFileSync('git', ['init', '-q', ws], { stdio: 'ignore' });
@@ -119,8 +123,12 @@ function makeWorkspace(opts: { dirty?: boolean; clean?: boolean; ahead?: boolean
       g('add', '-A');
       g('commit', '-q', '-m', 'local-advance');
     }
-    // `opts.clean`: origin/<branch> === HEAD (nothing to push).
-    execFileSync('git', ['-C', ws, 'update-ref', `refs/remotes/origin/${branch}`, originSha], { stdio: 'ignore' });
+    if (opts.detached) {
+      g('checkout', '-q', '--detach', originSha); // no branch, no origin/<branch> ref at all
+    } else {
+      // `opts.clean`: origin/<branch> === HEAD (nothing to push).
+      execFileSync('git', ['-C', ws, 'update-ref', `refs/remotes/origin/${branch}`, originSha], { stdio: 'ignore' });
+    }
   }
   return ws;
 }
@@ -371,6 +379,21 @@ describe('bootstrap_push_health', () => {
     const c = byName(await run(parent), 'bootstrap_push_health');
     expect(c?.status).toBe('fail');
     expect(c?.message).toContain(ws);
+  }, T);
+
+  test('>48h stale + clean but DETACHED HEAD with no origin ref (unverifiable) → warn, never a false fail', async () => {
+    const { parent, home } = makeHome();
+    // Working tree IS clean here, but `rev-list --count HEAD` would count
+    // ALL history (not just unpushed commits) if used as a naive fallback —
+    // this regression-tests that detached HEAD does NOT take that fallback
+    // and does NOT get reported as a false 'fail' for a repo that is not
+    // actually dirty.
+    const ws = makeWorkspace({ detached: true });
+    writeReceipt(home, ws);
+    writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('warn');
+    expect(c?.message).toContain('unverified');
   }, T);
 
   test('>48h stale + DIRTY workspace tree (uncommitted changes) → fail [B4]', async () => {
