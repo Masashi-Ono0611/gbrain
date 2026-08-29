@@ -278,7 +278,15 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
                   // local commit on top of an empty tree still counts as
                   // needing a push (this fallback only applies to a NAMED
                   // branch with no upstream; see the detached-HEAD branch
-                  // below for why the same trick is unsafe there).
+                  // below for why the same trick is unsafe there). Mirrors
+                  // treeNeedsPush's [hook.ts] existing "never pushed" fallback
+                  // as-is: a topic branch already fully contained in another
+                  // remote branch (e.g. origin/main) but never itself fetched
+                  // as origin/<branch> can over-report as dirty here — an
+                  // inherited, pre-existing edge case (same shape as the
+                  // per-root note in this PR's description), left as a false
+                  // FAIL rather than a false OK, which is the safer direction
+                  // for this specific check.
                   const haveOut = execFileSync('git', ['-C', ws, 'rev-list', '--count', 'HEAD'], {
                     stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
                   }).toString().trim();
@@ -316,7 +324,7 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
           // two states that name a real fix.
           checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `no push activity since ${staleIso}; tree confirmed clean, nothing to push` });
         } else if (stale) {
-          checks.push({ name: 'bootstrap_push_health', status: 'warn', message: `last successful push ${staleIso} (>48h ago); workspace tree state unverified — run \`gbrain doctor\` again inside the workspace to confirm` });
+          checks.push({ name: 'bootstrap_push_health', status: 'warn', message: `last successful push ${staleIso} (>48h ago); workspace tree state unverified (no bootstrap receipt for this machine, or the git probe failed) — check the workspace manually, or run \`gbrain sources push\` to be safe` });
         } else {
           checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `last push ok (${staleIso})` });
         }
