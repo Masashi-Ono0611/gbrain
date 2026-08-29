@@ -63,6 +63,14 @@ function writePushStatus(home: string, body: string): void {
   writeFileSync(join(home, 'bootstrap', 'push-status.json'), body);
 }
 
+/** A per-root push-status file (`push-status-<12 hex>.json`) — the shape
+ * `readPushStatuses` prefers when present, and the only way to get more than
+ * one tracked target in a single test (the legacy file above is singular). */
+function writePushStatusRoot(home: string, hash12hex: string, body: string): void {
+  mkdirSync(join(home, 'bootstrap'), { recursive: true });
+  writeFileSync(join(home, 'bootstrap', `push-status-${hash12hex}.json`), body);
+}
+
 /** A valid v1 install receipt pointing at `ws` (or a receipt-shaped blob). */
 function writeReceipt(home: string, ws: string): void {
   mkdirSync(join(home, 'bootstrap'), { recursive: true });
@@ -405,6 +413,21 @@ describe('bootstrap_push_health', () => {
     expect(c?.status).toBe('fail');
     expect(c?.message).toContain('DIRTY');
     expect(c?.message).toContain(ws);
+  }, T);
+
+  test('>48h stale across TWO tracked workspaces, receipt ws verified clean → warn, NOT ok (can\'t attribute the stale entry to a single tree)', async () => {
+    const { parent, home } = makeHome();
+    // The receipt workspace is genuinely clean — but there are two tracked
+    // push targets, so a clean `ws` says nothing about the OTHER (possibly
+    // dirty) root that might be the actually-stale one. Per-root files
+    // [D13]: the WORST entry decides — ambiguous must never resolve to ok.
+    const ws = makeWorkspace({ clean: true });
+    writeReceipt(home, ws);
+    writePushStatusRoot(home, 'aaaaaaaaaaaa', JSON.stringify({ ts: STALE_TS, ok: true, repoRoot: ws }));
+    writePushStatusRoot(home, 'bbbbbbbbbbbb', JSON.stringify({ ts: new Date().toISOString(), ok: true, repoRoot: makeWorkspace() }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('warn');
+    expect(c?.message).toContain('2 tracked workspace');
   }, T);
 
   test('unparseable ts → not stale (NaN guard) → ok', async () => {

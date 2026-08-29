@@ -245,6 +245,16 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
         const stalest = stamps.length > 0 ? Math.min(...stamps) : NaN;
         const staleIso = Number.isFinite(stalest) ? new Date(stalest).toISOString() : 'unknown';
         const stale = Number.isFinite(stalest) && Date.now() - stalest > PUSH_STALE_MS;
+        // Can the staleness verdict be safely attributed to `ws` — the only
+        // workspace this check actually probes? Only when there's exactly
+        // ONE tracked push-status target, and it's either legacy-shaped (no
+        // repoRoot field) or explicitly `ws` itself. With multiple targets,
+        // "clean" on `ws` says nothing about whichever OTHER root is
+        // actually the stale one — per-root files [D13]: the WORST entry
+        // decides, so an ambiguous multi-root stale must never be
+        // downgraded to ok on the strength of a different root's clean tree.
+        const targetMatchesWs =
+          pushStatuses.length === 1 && (pushStatuses[0]!.repoRoot === undefined || pushStatuses[0]!.repoRoot === ws);
         // `dirty` also covers commits ahead of origin (a clean working tree
         // with committed-but-unpushed commits is still unpushed work) — the
         // same two-dimensional definition `treeNeedsPush` uses for the
@@ -317,14 +327,31 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
             status: 'fail',
             message: `last successful push ${staleIso} (>48h) with a DIRTY workspace tree — recent agent memory is unpushed [B4]. Run \`gbrain sources push --path ${ws}\`.`,
           });
+        } else if (stale && !targetMatchesWs) {
+          // Multiple tracked push targets (or the one target names a
+          // different repoRoot than `ws`) — the stale entry can't be
+          // attributed to the workspace just probed, so a clean `ws` proves
+          // nothing about the actually-stale root. Stay warn, same as the
+          // pre-this-PR behavior for every stale case.
+          checks.push({
+            name: 'bootstrap_push_health',
+            status: 'warn',
+            message: `last successful push ${staleIso} (>48h ago) across ${pushStatuses.length} tracked workspace(s) — can't attribute the stale entry to a single tree; check each with \`gbrain sources status\``,
+          });
         } else if (stale && known) {
           // Stale push + VERIFIED clean tree (no local changes, not ahead of
           // origin) is benign: nothing to push, no action needed. The dirty
-          // case above (fail) and the unverified case below (warn) are the
-          // two states that name a real fix.
+          // case above (fail) and the unverified/ambiguous cases (warn) are
+          // the states that name a real fix.
           checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `no push activity since ${staleIso}; tree confirmed clean, nothing to push` });
         } else if (stale) {
-          checks.push({ name: 'bootstrap_push_health', status: 'warn', message: `last successful push ${staleIso} (>48h ago); workspace tree state unverified (no bootstrap receipt for this machine, or the git probe failed) — check the workspace manually, or run \`gbrain sources push\` to be safe` });
+          checks.push({
+            name: 'bootstrap_push_health',
+            status: 'warn',
+            message: ws
+              ? `last successful push ${staleIso} (>48h ago); workspace tree state unverified (the git probe failed) — check ${ws} manually, or run \`gbrain sources push --path ${ws}\` to be safe`
+              : `last successful push ${staleIso} (>48h ago); workspace tree state unverified (no bootstrap receipt on this machine names a workspace to check) — check the workspace manually`,
+          });
         } else {
           checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `last push ok (${staleIso})` });
         }
