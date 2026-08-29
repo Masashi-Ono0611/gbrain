@@ -316,13 +316,12 @@ describe('bootstrap_push_health', () => {
     expect(c?.message).toContain('push_failed');
   }, T);
 
-  test('>48h stale + CLEAN tree → warn only (likely just idle)', async () => {
+  test('>48h stale + CLEAN tree → ok (nothing to push, not actionable)', async () => {
     const { parent, home } = makeHome();
     // No receipt → ws is null → dirty stays false: the stale-only branch.
     writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
     const c = byName(await run(parent), 'bootstrap_push_health');
-    expect(c?.status).toBe('warn');
-    expect(c?.message).toContain('>48h');
+    expect(c?.status).toBe('ok');
     expect(c?.message).toContain('idle');
   }, T);
 

@@ -260,7 +260,10 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
             message: `last successful push ${staleIso} (>48h) with a DIRTY workspace tree — recent agent memory is unpushed [B4]. Run \`gbrain sources push --path ${ws}\`.`,
           });
         } else if (stale) {
-          checks.push({ name: 'bootstrap_push_health', status: 'warn', message: `last successful push ${staleIso} (>48h ago); tree clean — likely just idle` });
+          // Stale push + clean tree is benign (nothing to push): informational
+          // only, not actionable. Warn is reserved for the dirty+stale case
+          // above, which names a real fix.
+          checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `idle since ${staleIso}; tree clean, nothing to push` });
         } else {
           checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `last push ok (${staleIso})` });
         }
