@@ -255,8 +255,9 @@ export async function runSkillOpt(opts: SkillOptOpts): Promise<RunSkillOptResult
  * catch-all string sniff it replaces (`msg.includes('BudgetExhausted') ||
  * msg.includes('budget_exhausted')`) could never match, because every
  * BudgetExhausted thrown by src/core/budget/budget-tracker.ts carries a
- * human-readable message ("projected cost $X exceeds --max-cost $Y", "N
- * exceeded --max-runtime Ns", ...) containing neither literal substring.
+ * human-readable message ("projected cost $X exceeds the configured cap
+ * $Y", "N exceeded --max-runtime Ns", ...) containing neither literal
+ * substring.
  * Every cost-cap / no-pricing / (unreachable from this tracker today,
  * since it's never constructed with maxRuntimeMs) runtime abort fell
  * through to the generic catch-all instead, misreporting outcome='errored'
