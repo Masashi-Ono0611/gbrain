@@ -15,24 +15,29 @@
  * matching test/import-source-id-bookkeeping.test.ts's convention.
  */
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { mkdtempSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runImport } from '../src/commands/import.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
 
 let engine: PGLiteEngine;
 
-beforeEach(async () => {
+beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
 });
 
-afterEach(async () => {
+afterAll(async () => {
   await engine.disconnect();
+});
+
+beforeEach(async () => {
+  await resetPgliteState(engine);
 });
 
 async function lastSyncAt(sourceId: string): Promise<Date | string | null> {
