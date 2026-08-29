@@ -383,7 +383,7 @@ describe('files upload-raw git-storage branch (#2297)', () => {
       cap.restore();
       exitSpy.mockRestore();
     }
-    expect(cap.errs.join('\n')).toContain('does not name a real file');
+    expect(cap.errs.join('\n')).toContain('resolves to "."');
   });
 
   test('file argument resolving to ".." exits 1 with a clear error, not a filesystem crash', async () => {
@@ -401,7 +401,7 @@ describe('files upload-raw git-storage branch (#2297)', () => {
       cap.restore();
       exitSpy.mockRestore();
     }
-    expect(cap.errs.join('\n')).toContain('does not name a real file');
+    expect(cap.errs.join('\n')).toContain('resolves to ".."');
   });
 });
 

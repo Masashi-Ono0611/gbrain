@@ -244,14 +244,17 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
 
   const stat = statSync(filePath);
   const filename = basename(filePath);
-  // A file argument like `.` or `..` (or a path resolving to one, e.g. the
-  // last path segment being empty) makes basename() return `.`/`..` itself
-  // rather than a real leaf filename. The git-storage branch below joins
-  // this value onto its sidecar dest dir (`destDir/${filename}`) — a `..`
-  // segment there walks the join back up OUT of the intended `.raw/<page>/`
-  // dir before the copy. Reject early with a clear error instead of letting
-  // it silently resolve to the parent dir and fail deep inside copyFileSync
-  // with an opaque EISDIR.
+  // A file argument that IS `.` or `..` makes basename() return that
+  // literal string back rather than a real leaf filename (a trailing
+  // separator, e.g. `foo/`, is stripped by basename() to `foo` — not
+  // affected). The git-storage branch below joins this value onto its
+  // sidecar dest dir (`destDir/${filename}`) — a `..` segment there walks
+  // the join back up OUT of the intended `.raw/<page>/` dir before the
+  // copy. Reject early with a clear error instead of letting it silently
+  // resolve to the parent dir and fail deep inside copyFileSync with a
+  // confusing OS-level error (observed on macOS: `ENOTSUP: operation not
+  // supported on socket, copyfile ...` — the target is a directory, not a
+  // normal file).
   if (filename === '.' || filename === '..') {
     console.error(`files upload-raw: "${filePath}" does not name a real file (resolves to "${filename}").`);
     process.exit(1);
