@@ -845,6 +845,32 @@ export async function runImport(
     // this import's to move (its sync anchors live on the `sources` row).
   }
 
+  // #1691: a named source registered with `local_path` but fed only via
+  // `gbrain import` (never `gbrain sync`) never got `sources.last_sync_at`
+  // touched, so doctor's `sync_freshness` read it as permanently
+  // "never synced". Stamp it on a clean run only (mirrors the bookmark
+  // gate above). `!opts.managedBookmark` excludes performFullSync's call —
+  // that path stamps its own, more-authoritative `last_sync_at` via
+  // writeSyncAnchor AFTER its full gate (applySyncFailureGate) decides the
+  // sync actually advanced; stamping here too would race ahead of that
+  // decision. remote_url sources are excluded too: autopilot's freshness
+  // dispatcher (autopilot.ts) reads last_sync_at to decide when to queue a
+  // real `git pull` for those, and a plain import never pulls.
+  if (sourceId && failures.length === 0 && !opts.managedBookmark) {
+    try {
+      const [row] = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
+        `SELECT local_path, config FROM sources WHERE id = $1`,
+        [sourceId],
+      );
+      const { sourceConfigHasRemoteUrl } = await import('../core/sources-load.ts');
+      if (row?.local_path && !sourceConfigHasRemoteUrl(row.config)) {
+        await engine.executeRaw(`UPDATE sources SET last_sync_at = now() WHERE id = $1`, [sourceId]);
+      }
+    } catch {
+      // best-effort — see comment above.
+    }
+  }
+
   const totalMalformed = malformedExcluded.length + malformedFileSkips;
   return {
     imported, skipped, errors, chunksCreated, failures,
