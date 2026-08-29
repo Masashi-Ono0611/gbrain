@@ -245,13 +245,43 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
         const stalest = stamps.length > 0 ? Math.min(...stamps) : NaN;
         const staleIso = Number.isFinite(stalest) ? new Date(stalest).toISOString() : 'unknown';
         const stale = Number.isFinite(stalest) && Date.now() - stalest > PUSH_STALE_MS;
+        // `dirty` also covers commits ahead of origin (a clean working tree
+        // with committed-but-unpushed commits is still unpushed work) — the
+        // same two-dimensional definition `treeNeedsPush` uses for the
+        // per-turn push [hook.ts]. `known` distinguishes "verified clean"
+        // from "couldn't verify" (no receipt/workspace, or the git probe
+        // itself failed): unverified must NOT be treated as clean below.
         let dirty = false;
+        let known = false;
         if (ws) {
           try {
-            dirty = execFileSync('git', ['-C', ws, 'status', '--porcelain'], {
+            const statusOut = execFileSync('git', ['-C', ws, 'status', '--porcelain'], {
               stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
-            }).toString().trim() !== '';
-          } catch { dirty = false; }
+            }).toString();
+            if (statusOut.trim() !== '') {
+              dirty = true;
+            } else {
+              const branchOut = execFileSync('git', ['-C', ws, 'branch', '--show-current'], {
+                stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+              }).toString().trim();
+              const upstreamRef = branchOut ? `origin/${branchOut}..HEAD` : '@{u}..HEAD';
+              try {
+                const aheadOut = execFileSync('git', ['-C', ws, 'rev-list', '--count', upstreamRef], {
+                  stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+                }).toString().trim();
+                dirty = (parseInt(aheadOut, 10) || 0) > 0;
+              } catch {
+                // origin/<branch> (or @{u}) doesn't resolve — e.g. never
+                // pushed. Any local commit on top of an empty tree still
+                // counts as needing a push.
+                const haveOut = execFileSync('git', ['-C', ws, 'rev-list', '--count', 'HEAD'], {
+                  stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+                }).toString().trim();
+                dirty = (parseInt(haveOut, 10) || 0) > 0;
+              }
+            }
+            known = true;
+          } catch { dirty = false; known = false; }
         }
         if (stale && dirty) {
           checks.push({
@@ -259,11 +289,14 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
             status: 'fail',
             message: `last successful push ${staleIso} (>48h) with a DIRTY workspace tree — recent agent memory is unpushed [B4]. Run \`gbrain sources push --path ${ws}\`.`,
           });
+        } else if (stale && known) {
+          // Stale push + VERIFIED clean tree (no local changes, not ahead of
+          // origin) is benign: nothing to push, no action needed. The dirty
+          // case above (fail) and the unverified case below (warn) are the
+          // two states that name a real fix.
+          checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `no push activity since ${staleIso}; tree confirmed clean, nothing to push` });
         } else if (stale) {
-          // Stale push + clean tree is benign (nothing to push): informational
-          // only, not actionable. Warn is reserved for the dirty+stale case
-          // above, which names a real fix.
-          checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `idle since ${staleIso}; tree clean, nothing to push` });
+          checks.push({ name: 'bootstrap_push_health', status: 'warn', message: `last successful push ${staleIso} (>48h ago); workspace tree state unverified — run \`gbrain doctor\` again inside the workspace to confirm` });
         } else {
           checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `last push ok (${staleIso})` });
         }

@@ -87,13 +87,40 @@ function writeVerifyRun(home: string, name: string, body: string): void {
   writeFileSync(join(home, 'bootstrap', name), body);
 }
 
-/** A workspace dir; `dirty: true` makes it a git repo with an untracked file. */
-function makeWorkspace(opts: { dirty?: boolean } = {}): string {
+/**
+ * A workspace dir. `dirty: true` makes it a git repo with an untracked file
+ * (uncommitted changes). `clean: true` makes it a git repo with one commit
+ * and a fake `origin/<branch>` ref pointing at HEAD (verified clean, in sync
+ * — no real remote/fetch needed). `ahead: true` is like `clean` but the
+ * `origin/<branch>` ref is left one commit behind HEAD (committed but
+ * unpushed — clean working tree, still needs a push).
+ */
+function makeWorkspace(opts: { dirty?: boolean; clean?: boolean; ahead?: boolean } = {}): string {
   const ws = mkdtempSync(join(tmpdir(), 'gb-bdc-ws-'));
   tmpDirs.push(ws);
   if (opts.dirty) {
     execFileSync('git', ['init', '-q', ws], { stdio: 'ignore' });
     writeFileSync(join(ws, 'unpushed-note.md'), 'recent agent memory\n');
+  } else if (opts.clean || opts.ahead) {
+    const g = (...args: string[]) =>
+      execFileSync('git', ['-C', ws, ...args], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+    execFileSync('git', ['init', '-q', ws], { stdio: 'ignore' });
+    g('config', 'user.email', 'test@example.com');
+    g('config', 'user.name', 'Test');
+    writeFileSync(join(ws, 'note.md'), 'settled\n');
+    g('add', '-A');
+    g('commit', '-q', '-m', 'origin-state');
+    const branch = g('branch', '--show-current');
+    const originSha = g('rev-parse', 'HEAD'); // real ancestor of HEAD in both cases
+    if (opts.ahead) {
+      // Commit once more, unpushed: origin/<branch> stays at originSha, one
+      // commit behind HEAD — clean working tree, still needs a push.
+      writeFileSync(join(ws, 'note2.md'), 'more\n');
+      g('add', '-A');
+      g('commit', '-q', '-m', 'local-advance');
+    }
+    // `opts.clean`: origin/<branch> === HEAD (nothing to push).
+    execFileSync('git', ['-C', ws, 'update-ref', `refs/remotes/origin/${branch}`, originSha], { stdio: 'ignore' });
   }
   return ws;
 }
@@ -316,16 +343,37 @@ describe('bootstrap_push_health', () => {
     expect(c?.message).toContain('push_failed');
   }, T);
 
-  test('>48h stale + CLEAN tree → ok (nothing to push, not actionable)', async () => {
+  test('>48h stale + no receipt/workspace (state unverified) → warn, not ok', async () => {
     const { parent, home } = makeHome();
-    // No receipt → ws is null → dirty stays false: the stale-only branch.
+    // No receipt → ws is null → tree state can't be probed at all.
+    // Unverified must stay warn, never silently become ok.
+    writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('warn');
+    expect(c?.message).toContain('unverified');
+  }, T);
+
+  test('>48h stale + git-VERIFIED clean tree (in sync with origin) → ok', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace({ clean: true });
+    writeReceipt(home, ws);
     writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
     const c = byName(await run(parent), 'bootstrap_push_health');
     expect(c?.status).toBe('ok');
-    expect(c?.message).toContain('idle');
+    expect(c?.message).toContain('confirmed clean');
   }, T);
 
-  test('>48h stale + DIRTY workspace tree → fail [B4]', async () => {
+  test('>48h stale + clean working tree but AHEAD of origin (committed, unpushed) → fail [B4]', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace({ ahead: true });
+    writeReceipt(home, ws);
+    writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('fail');
+    expect(c?.message).toContain(ws);
+  }, T);
+
+  test('>48h stale + DIRTY workspace tree (uncommitted changes) → fail [B4]', async () => {
     const { parent, home } = makeHome();
     const ws = makeWorkspace({ dirty: true });
     writeReceipt(home, ws);
