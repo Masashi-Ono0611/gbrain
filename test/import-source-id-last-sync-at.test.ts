@@ -16,7 +16,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdtempSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -169,6 +169,32 @@ describe('import stamps sources.last_sync_at for a local_path-registered source 
       const result = await runImport(engine, [repo, '--no-embed', '--json', '--source-id', 'dept-x']);
       expect(result.failures.length).toBe(0);
       expect(await lastSyncAt('dept-x')).toBeNull();
+    });
+  });
+
+  test('local_path that is a SUBDIR of a git checkout → last_sync_at stays untouched (git-root discovery walks up)', async () => {
+    // A bare `.git`-at-local_path probe would miss this shape: the #753/#774
+    // monorepo pattern anchors a source at a subdirectory of a git repo.
+    // discoverGitRoot (rev-parse --show-toplevel) walks up and finds the
+    // ancestor root, so this source is excluded from the stamp too.
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-import-gitsub-'));
+    const sub = join(repo, 'brain');
+    mkdirSync(sub);
+    writeFileSync(join(sub, 'seed.md'), '---\ntype: note\n---\n# Seed\n\nbody\n');
+    execSync('git init', { cwd: repo, stdio: 'pipe' });
+    execSync('git config user.email "t@t.t" && git config user.name "T"', { cwd: repo, stdio: 'pipe' });
+    execSync('git add -A && git commit -m seed', { cwd: repo, stdio: 'pipe' });
+
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path) VALUES ('dept-sub', 'dept-sub', $1)`,
+      [sub],
+    );
+
+    const gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-home-'));
+    await withEnv({ GBRAIN_HOME: gbrainHome }, async () => {
+      const result = await runImport(engine, [sub, '--no-embed', '--json', '--source-id', 'dept-sub']);
+      expect(result.failures.length).toBe(0);
+      expect(await lastSyncAt('dept-sub')).toBeNull();
     });
   });
 

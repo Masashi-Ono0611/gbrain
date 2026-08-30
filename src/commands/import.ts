@@ -860,7 +860,12 @@ export async function runImport(
   // source" case): `gbrain import` never advances the source's own
   // `last_commit`, so stamping last_sync_at for a git checkout would mask
   // real commit-level staleness that `gbrain sync` (not `import`) is the
-  // correct pipeline to detect. Malformed-filename exclusions/skips
+  // correct pipeline to detect. Detection reuses sync's own
+  // `discoverGitRoot` (rev-parse --show-toplevel, walks UP) rather than a
+  // bare `.git`-at-local_path probe, so a source anchored at a SUBDIR of a
+  // git checkout (the #753/#774 monorepo shape) is excluded too — that is
+  // exactly the shape sync's git-root slug anchoring exists for.
+  // Malformed-filename exclusions/skips
   // (tallied into `malformedExcluded`/`malformedFileSkips` below, NOT into
   // `failures`) count toward the clean-run gate too — a run that silently
   // dropped files isn't "clean" for freshness purposes even with zero
@@ -873,7 +878,16 @@ export async function runImport(
         [sourceId],
       );
       const { sourceConfigHasRemoteUrl } = await import('../core/sources-load.ts');
-      const isGitTracked = row?.local_path ? existsSync(join(row.local_path, '.git')) : false;
+      let isGitTracked = false;
+      if (row?.local_path) {
+        try {
+          const { discoverGitRoot } = await import('../core/sync-git.ts');
+          discoverGitRoot(row.local_path);
+          isGitTracked = true;
+        } catch {
+          isGitTracked = false;
+        }
+      }
       if (row?.local_path && !sourceConfigHasRemoteUrl(row.config) && !isGitTracked) {
         await engine.executeRaw(`UPDATE sources SET last_sync_at = now() WHERE id = $1`, [sourceId]);
       }
