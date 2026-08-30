@@ -198,6 +198,24 @@ describe('import stamps sources.last_sync_at for a local_path-registered source 
     });
   });
 
+  test('connector-managed source (config.kind: google) → last_sync_at stays untouched', async () => {
+    // v0.47 google sources register a real, non-git local_path with no
+    // remote_url — the connector owns last_sync_at via its own sync path,
+    // and `gbrain waiting`'s freshness gate reads it for google sources.
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-import-google-'));
+    writeFileSync(join(dir, 'seed.md'), '---\ntype: note\n---\n# Seed\n\nbody\n');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config) VALUES ('g-acct', 'g-acct', $1, $2::text::jsonb)`,
+      [dir, JSON.stringify({ kind: 'google', g_account: 't@t.t' })],
+    );
+    const gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-home-'));
+    await withEnv({ GBRAIN_HOME: gbrainHome }, async () => {
+      const result = await runImport(engine, [dir, '--no-embed', '--json', '--source-id', 'g-acct']);
+      expect(result.failures.length).toBe(0);
+      expect(await lastSyncAt('g-acct')).toBeNull();
+    });
+  });
+
   test('clean import but with malformed-filename skips → last_sync_at stays untouched', async () => {
     // Malformed-filename exclusions (bracket/control-char names) never enter
     // `failures[]` — they're a silent walker-level skip. A run that dropped

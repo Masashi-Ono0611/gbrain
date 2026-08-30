@@ -878,6 +878,17 @@ export async function runImport(
         [sourceId],
       );
       const { sourceConfigHasRemoteUrl } = await import('../core/sources-load.ts');
+      // Connector-managed sources (config.kind: github/google, v0.47 API-backed
+      // shapes) own their last_sync_at via the connector's sync path — a google
+      // source has a non-git local_path and no remote_url, so without this
+      // check a stray `import --source-id` would mask connector staleness
+      // (and flip `gbrain waiting`'s google-freshness gate).
+      const cfg = ((): Record<string, unknown> => {
+        const c = row?.config;
+        if (typeof c === 'string') { try { return JSON.parse(c) as Record<string, unknown>; } catch { return {}; } }
+        return (c ?? {}) as Record<string, unknown>;
+      })();
+      const isConnectorManaged = typeof cfg.kind === 'string' && cfg.kind.length > 0;
       let isGitTracked = false;
       if (row?.local_path) {
         try {
@@ -888,7 +899,7 @@ export async function runImport(
           isGitTracked = false;
         }
       }
-      if (row?.local_path && !sourceConfigHasRemoteUrl(row.config) && !isGitTracked) {
+      if (row?.local_path && !sourceConfigHasRemoteUrl(row.config) && !isGitTracked && !isConnectorManaged) {
         await engine.executeRaw(`UPDATE sources SET last_sync_at = now() WHERE id = $1`, [sourceId]);
       }
     } catch {
