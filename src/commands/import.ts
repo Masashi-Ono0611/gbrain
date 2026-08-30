@@ -855,15 +855,26 @@ export async function runImport(
   // sync actually advanced; stamping here too would race ahead of that
   // decision. remote_url sources are excluded too: autopilot's freshness
   // dispatcher (autopilot.ts) reads last_sync_at to decide when to queue a
-  // real `git pull` for those, and a plain import never pulls.
-  if (sourceId && failures.length === 0 && !opts.managedBookmark) {
+  // real `git pull` for those, and a plain import never pulls. A git-tracked
+  // local_path is excluded too (scoped to #1691's actual "non-git local
+  // source" case): `gbrain import` never advances the source's own
+  // `last_commit`, so stamping last_sync_at for a git checkout would mask
+  // real commit-level staleness that `gbrain sync` (not `import`) is the
+  // correct pipeline to detect. Malformed-filename exclusions/skips
+  // (tallied into `malformedExcluded`/`malformedFileSkips` below, NOT into
+  // `failures`) count toward the clean-run gate too — a run that silently
+  // dropped files isn't "clean" for freshness purposes even with zero
+  // recorded failures.
+  const totalMalformed = malformedExcluded.length + malformedFileSkips;
+  if (sourceId && failures.length === 0 && totalMalformed === 0 && !opts.managedBookmark) {
     try {
       const [row] = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
         `SELECT local_path, config FROM sources WHERE id = $1`,
         [sourceId],
       );
       const { sourceConfigHasRemoteUrl } = await import('../core/sources-load.ts');
-      if (row?.local_path && !sourceConfigHasRemoteUrl(row.config)) {
+      const isGitTracked = row?.local_path ? existsSync(join(row.local_path, '.git')) : false;
+      if (row?.local_path && !sourceConfigHasRemoteUrl(row.config) && !isGitTracked) {
         await engine.executeRaw(`UPDATE sources SET last_sync_at = now() WHERE id = $1`, [sourceId]);
       }
     } catch {
@@ -871,7 +882,6 @@ export async function runImport(
     }
   }
 
-  const totalMalformed = malformedExcluded.length + malformedFileSkips;
   return {
     imported, skipped, errors, chunksCreated, failures,
     ...(totalMalformed > 0 ? { malformedSkipped: totalMalformed } : {}),

@@ -17,6 +17,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { mkdtempSync, writeFileSync } from 'fs';
+import { execSync } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -143,6 +144,53 @@ describe('import stamps sources.last_sync_at for a local_path-registered source 
     await withEnv({ GBRAIN_HOME: gbrainHome }, async () => {
       const result = await runImport(engine, [repo, '--no-embed', '--json', '--source-id', 'dept-x']);
       expect(result.failures.length).toBe(0);
+      expect(await lastSyncAt('dept-x')).toBeNull();
+    });
+  });
+
+  test('git-tracked local_path → last_sync_at stays untouched (scoped to non-git sources per #1691)', async () => {
+    // `gbrain import` never advances the source's own last_commit — only
+    // `gbrain sync` does. Stamping last_sync_at for a git checkout would
+    // mask real commit-level staleness that sync (not import) is the
+    // correct pipeline to detect.
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-import-git-'));
+    writeFileSync(join(repo, 'seed.md'), '---\ntype: note\n---\n# Seed\n\nbody\n');
+    execSync('git init', { cwd: repo, stdio: 'pipe' });
+    execSync('git config user.email "t@t.t" && git config user.name "T"', { cwd: repo, stdio: 'pipe' });
+    execSync('git add -A && git commit -m seed', { cwd: repo, stdio: 'pipe' });
+
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path) VALUES ('dept-x', 'dept-x', $1)`,
+      [repo],
+    );
+
+    const gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-home-'));
+    await withEnv({ GBRAIN_HOME: gbrainHome }, async () => {
+      const result = await runImport(engine, [repo, '--no-embed', '--json', '--source-id', 'dept-x']);
+      expect(result.failures.length).toBe(0);
+      expect(await lastSyncAt('dept-x')).toBeNull();
+    });
+  });
+
+  test('clean import but with malformed-filename skips → last_sync_at stays untouched', async () => {
+    // Malformed-filename exclusions (bracket/control-char names) never enter
+    // `failures[]` — they're a silent walker-level skip. A run that dropped
+    // files this way isn't "clean" for freshness purposes even at
+    // failures.length === 0.
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-import-malformed-'));
+    writeFileSync(join(repo, 'legit.md'), '---\ntype: note\n---\n# Legit\n\nbody\n');
+    writeFileSync(join(repo, '[junk.md](https-example).md'), '---\ntype: note\n---\n# Junk\n\nbody\n');
+
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path) VALUES ('dept-x', 'dept-x', $1)`,
+      [repo],
+    );
+
+    const gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-home-'));
+    await withEnv({ GBRAIN_HOME: gbrainHome }, async () => {
+      const result = await runImport(engine, [repo, '--no-embed', '--json', '--source-id', 'dept-x']);
+      expect(result.failures.length).toBe(0);
+      expect(result.malformedSkipped).toBeGreaterThan(0);
       expect(await lastSyncAt('dept-x')).toBeNull();
     });
   });
