@@ -877,18 +877,31 @@ export async function runImport(
         `SELECT local_path, config FROM sources WHERE id = $1`,
         [sourceId],
       );
-      const { sourceConfigHasRemoteUrl } = await import('../core/sources-load.ts');
+      const { sourceConfigHasRemoteUrl, parseSourceConfig } = await import('../core/sources-load.ts');
       // Connector-managed sources (config.kind: github/google, v0.47 API-backed
       // shapes) own their last_sync_at via the connector's sync path — a google
       // source has a non-git local_path and no remote_url, so without this
       // check a stray `import --source-id` would mask connector staleness
-      // (and flip `gbrain waiting`'s google-freshness gate).
-      const cfg = ((): Record<string, unknown> => {
-        const c = row?.config;
-        if (typeof c === 'string') { try { return JSON.parse(c) as Record<string, unknown>; } catch { return {}; } }
-        return (c ?? {}) as Record<string, unknown>;
-      })();
+      // (and flip `gbrain waiting`'s google-freshness gate). parseSourceConfig,
+      // not a bare JSON.parse: nested-string / historical-array configs are
+      // real shapes (#2829) and must not slip past the kind check.
+      const cfg = parseSourceConfig(row?.config);
       const isConnectorManaged = typeof cfg.kind === 'string' && cfg.kind.length > 0;
+      // Freshness is a claim about the WHOLE registered root. Configured-root
+      // enforcement is default-off, so an import of an unrelated directory —
+      // or of a mere subdirectory of the root — can complete cleanly with
+      // --source-id; neither says anything about the rest of the root, so
+      // only an import whose canonical target IS the registered local_path
+      // may stamp. `dir` is already the canonical realpath (#1728).
+      let coversRegisteredRoot = false;
+      if (row?.local_path) {
+        try {
+          const { realpathSync } = await import('fs');
+          coversRegisteredRoot = realpathSync(row.local_path) === dir;
+        } catch {
+          coversRegisteredRoot = false;
+        }
+      }
       let isGitTracked = false;
       if (row?.local_path) {
         try {
@@ -899,7 +912,7 @@ export async function runImport(
           isGitTracked = false;
         }
       }
-      if (row?.local_path && !sourceConfigHasRemoteUrl(row.config) && !isGitTracked && !isConnectorManaged) {
+      if (row?.local_path && coversRegisteredRoot && !sourceConfigHasRemoteUrl(row.config) && !isGitTracked && !isConnectorManaged) {
         await engine.executeRaw(`UPDATE sources SET last_sync_at = now() WHERE id = $1`, [sourceId]);
       }
     } catch {

@@ -216,6 +216,61 @@ describe('import stamps sources.last_sync_at for a local_path-registered source 
     });
   });
 
+  test('import of a directory UNRELATED to the registered local_path → last_sync_at stays untouched', async () => {
+    // Configured-root enforcement is default-off, so this import completes
+    // cleanly — but it says nothing about the registered root's freshness.
+    const rootA = mkdtempSync(join(tmpdir(), 'gbrain-import-rootA-'));
+    const dirB = mkdtempSync(join(tmpdir(), 'gbrain-import-dirB-'));
+    writeFileSync(join(dirB, 'seed.md'), '---\ntype: note\n---\n# Seed\n\nbody\n');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path) VALUES ('dept-a', 'dept-a', $1)`,
+      [rootA],
+    );
+    const gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-home-'));
+    await withEnv({ GBRAIN_HOME: gbrainHome }, async () => {
+      const result = await runImport(engine, [dirB, '--no-embed', '--json', '--source-id', 'dept-a']);
+      expect(result.failures.length).toBe(0);
+      expect(await lastSyncAt('dept-a')).toBeNull();
+    });
+  });
+
+  test('import of a SUBDIRECTORY of the registered local_path → last_sync_at stays untouched', async () => {
+    // A child-dir import proves nothing about the rest of the root — only an
+    // import whose canonical target IS the registered root may stamp.
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-import-rootsub-'));
+    const child = join(root, 'inbox');
+    mkdirSync(child);
+    writeFileSync(join(child, 'seed.md'), '---\ntype: note\n---\n# Seed\n\nbody\n');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path) VALUES ('dept-r', 'dept-r', $1)`,
+      [root],
+    );
+    const gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-home-'));
+    await withEnv({ GBRAIN_HOME: gbrainHome }, async () => {
+      const result = await runImport(engine, [child, '--no-embed', '--json', '--source-id', 'dept-r']);
+      expect(result.failures.length).toBe(0);
+      expect(await lastSyncAt('dept-r')).toBeNull();
+    });
+  });
+
+  test('connector kind survives a nested-JSON-string config (parseSourceConfig, #2829 shape) → untouched', async () => {
+    // PGLite historically double-wrapped configs as nested JSON strings; a
+    // bare JSON.parse sees a string, not an object, and misses `kind`.
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-import-gnested-'));
+    writeFileSync(join(dir, 'seed.md'), '---\ntype: note\n---\n# Seed\n\nbody\n');
+    const nested = JSON.stringify(JSON.stringify(JSON.stringify({ kind: 'google', g_account: 't@t.t' })));
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config) VALUES ('g-nested', 'g-nested', $1, $2::text::jsonb)`,
+      [dir, nested],
+    );
+    const gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-home-'));
+    await withEnv({ GBRAIN_HOME: gbrainHome }, async () => {
+      const result = await runImport(engine, [dir, '--no-embed', '--json', '--source-id', 'g-nested']);
+      expect(result.failures.length).toBe(0);
+      expect(await lastSyncAt('g-nested')).toBeNull();
+    });
+  });
+
   test('clean import but with malformed-filename skips → last_sync_at stays untouched', async () => {
     // Malformed-filename exclusions (bracket/control-char names) never enter
     // `failures[]` — they're a silent walker-level skip. A run that dropped
