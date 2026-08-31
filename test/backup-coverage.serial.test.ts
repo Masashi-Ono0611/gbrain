@@ -373,6 +373,12 @@ describe('computeBackupCoverage — bootstrap workspace', () => {
     expect(asset?.id).toBe(ws);
     expect(asset?.state).toBe('no_remote');
     expect(asset?.fix_argv).toEqual(['gbrain', 'bootstrap', 'repo']);
+    // The message also names `bootstrap attach` for the out-of-band-adopted
+    // case (a git origin already configured on this workspace) — otherwise
+    // the reader only discovers it after `bootstrap repo` guaranteed-fails
+    // with ORIGIN_NOT_EMPTY (see src/core/bootstrap/repo.ts).
+    expect(asset?.detail).toContain('no private repo yet');
+    expect(asset?.detail).toContain('bootstrap attach');
     expect(s.overall).toBe('warn');
     expect(s.totals.no_remote).toBe(1);
   });

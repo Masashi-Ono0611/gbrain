@@ -165,7 +165,10 @@ export async function computeBackupCoverage(
           kind: 'bootstrap_workspace',
           id: receipt.workspace_dir,
           state: 'no_remote',
-          detail: 'bootstrap workspace has no private repo yet',
+          detail:
+            'bootstrap workspace has no private repo yet — run `gbrain bootstrap repo` to create one, ' +
+            'or `gbrain bootstrap attach` instead if this workspace already has a git origin configured ' +
+            '(e.g. it was pushed or adopted out-of-band).',
           fix_argv: ['gbrain', 'bootstrap', 'repo'],
         });
       } else {
