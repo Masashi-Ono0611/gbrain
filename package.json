@@ -28,7 +28,9 @@
     "./extract": "./src/commands/extract.ts",
     "./ingestion": "./src/core/ingestion/index.ts",
     "./ingestion/test-harness": "./src/core/ingestion/test-harness.ts",
-    "./core/guardrails": "./src/core/guardrails.ts"
+    "./core/guardrails": "./src/core/guardrails.ts",
+    "./core/skillopt": "./src/core/skillopt/orchestrator.ts",
+    "./version": "./src/version.ts"
   },
   "scripts": {
     "dev": "bun run src/cli.ts",
