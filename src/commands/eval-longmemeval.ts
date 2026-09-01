@@ -567,9 +567,20 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
       })
     : '';
 
+  // Codex review (PR #4770): opts.expansion alone no longer tells the whole
+  // story once search.expansion can be set via --search-config or
+  // runOpts.searchConfigSnapshot (resolveExpansionLimitSearchOpts then
+  // defers to hybridSearch's own config/mode-bundle resolution instead of
+  // the CLI flag). Report "config" rather than asserting a possibly-wrong
+  // on/off — the true effective value depends on hybridSearch's internal
+  // resolveSearchMode chain, which this banner does not duplicate.
+  const expansionConfiguredForBanner =
+    'search.expansion' in (opts.searchConfig ?? {}) ||
+    'search.expansion' in (runOpts.searchConfigSnapshot ?? {});
+  const expansionBanner = expansionConfiguredForBanner ? 'config' : (opts.expansion ? 'on' : 'off');
   process.stderr.write(`[longmemeval] estimated 20-60 minutes for ${questions.length} questions; use --limit N for shorter runs\n`);
   process.stderr.write(`[longmemeval] connecting in-memory brain...\n`);
-  process.stderr.write(`[longmemeval] starting (questions: ${questions.length}, model: ${model}, expansion: ${opts.expansion ? 'on' : 'off'}${opts.mode ? `, mode: ${opts.mode}` : ''}, trajectory: ${trajectoryEnabled ? 'on' : 'off'}${trajectoryEnabled ? `, extractor: ${extractorModel}` : ''})\n`);
+  process.stderr.write(`[longmemeval] starting (questions: ${questions.length}, model: ${model}, expansion: ${expansionBanner}${opts.mode ? `, mode: ${opts.mode}` : ''}, trajectory: ${trajectoryEnabled ? 'on' : 'off'}${trajectoryEnabled ? `, extractor: ${extractorModel}` : ''})\n`);
   if (trajectoryEnabled) {
     resetExtractorState();
   }
