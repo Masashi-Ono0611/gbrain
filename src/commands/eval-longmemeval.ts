@@ -713,6 +713,31 @@ interface TrajectoryRunOpts {
   extractorModel: string;
 }
 
+/**
+ * Codex review (PR #4770): `search.expansion`/`search.searchLimit` injected
+ * via --search-config were silently shadowed by always-on per-call
+ * `limit`/`expansion` fields passed to hybridSearch, so setting either key
+ * via --search-config had no effect — defeating the "faithfully reproduce
+ * the live pipeline" purpose of --search-config (see the `searchConfig`
+ * field docstring above, v0.45.0+ #3676). Pulled out as a pure function so
+ * the precedence rule (an explicit --search-config key wins over the CLI
+ * default, mirroring how --search-config already wins over an injected
+ * runOpts.searchConfigSnapshot) is unit-testable without a live engine.
+ * Default behavior (no --search-config) is unchanged: both fields are set
+ * from the CLI flags exactly as before.
+ */
+export function resolveExpansionLimitSearchOpts(
+  opts: Pick<ParsedArgs, 'expansion' | 'topK' | 'searchConfig'>,
+): { limit?: number; expansion?: boolean } {
+  const configured = opts.searchConfig ?? {};
+  const limitConfigured = 'search.searchLimit' in configured;
+  const expansionConfigured = 'search.expansion' in configured;
+  return {
+    ...(limitConfigured ? {} : { limit: opts.topK }),
+    ...(expansionConfigured ? {} : { expansion: opts.expansion }),
+  };
+}
+
 async function runOneQuestion(
   engine: PGLiteEngine,
   q: LongMemEvalQuestion,
@@ -759,9 +784,11 @@ async function runOneQuestion(
   if (opts.keywordOnly) {
     results = await engine.searchKeyword(q.question, { limit: opts.topK });
   } else {
-    const searchOpts = opts.expansion
-      ? { limit: opts.topK, expansion: true, expandFn: expandQuery }
-      : { limit: opts.topK, expansion: false };
+    const resolved = resolveExpansionLimitSearchOpts(opts);
+    const searchOpts: Parameters<typeof hybridSearch>[2] = {
+      ...resolved,
+      ...(resolved.expansion === true ? { expandFn: expandQuery } : {}),
+    };
     results = await hybridSearch(engine, q.question, searchOpts);
   }
 

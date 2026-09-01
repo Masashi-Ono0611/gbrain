@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { runEvalLongMemEval } from '../src/commands/eval-longmemeval.ts';
+import { runEvalLongMemEval, resolveExpansionLimitSearchOpts } from '../src/commands/eval-longmemeval.ts';
 import { createBenchmarkBrain } from '../src/eval/longmemeval/harness.ts';
 
 const FIXTURE_PATH = join(import.meta.dir, 'fixtures', 'longmemeval-mini.jsonl');
@@ -61,70 +61,131 @@ describe('runEvalLongMemEval — injected search config snapshot', () => {
 describe('runEvalLongMemEval — --search-config CLI flag', () => {
   test('repeatable --search-config KEY=VAL pairs reach the isolated benchmark brain', async () => {
     const engine = await createBenchmarkBrain();
-    await withTmpDir(async (tmp) => {
-      await runEvalLongMemEval(
-        [
-          FIXTURE_PATH,
-          '--keyword-only',
-          '--retrieval-only',
-          '--no-trajectory',
-          '--limit',
-          '1',
-          '--output',
-          join(tmp, 'out.jsonl'),
-          '--search-config',
-          'search.reranker.enabled=true',
-          '--search-config',
-          'search.reranker.model=llama-server-reranker:qwen3-reranker-4b',
-        ],
-        { engine },
-      );
+    try {
+      await withTmpDir(async (tmp) => {
+        await runEvalLongMemEval(
+          [
+            FIXTURE_PATH,
+            '--keyword-only',
+            '--retrieval-only',
+            '--no-trajectory',
+            '--limit',
+            '1',
+            '--output',
+            join(tmp, 'out.jsonl'),
+            '--search-config',
+            'search.reranker.enabled=true',
+            '--search-config',
+            'search.reranker.model=llama-server-reranker:qwen3-reranker-4b',
+          ],
+          { engine },
+        );
 
-      expect(await engine.getConfig('search.reranker.enabled')).toBe('true');
-      expect(await engine.getConfig('search.reranker.model'))
-        .toBe('llama-server-reranker:qwen3-reranker-4b');
-    });
-    await engine.disconnect();
+        expect(await engine.getConfig('search.reranker.enabled')).toBe('true');
+        expect(await engine.getConfig('search.reranker.model'))
+          .toBe('llama-server-reranker:qwen3-reranker-4b');
+      });
+    } finally {
+      await engine.disconnect();
+    }
   }, 60_000);
 
   test('--search-config wins over an injected runOpts.searchConfigSnapshot for the same key', async () => {
     const engine = await createBenchmarkBrain();
-    await withTmpDir(async (tmp) => {
-      await runEvalLongMemEval(
-        [
-          FIXTURE_PATH,
-          '--keyword-only',
-          '--retrieval-only',
-          '--no-trajectory',
-          '--limit',
-          '1',
-          '--output',
-          join(tmp, 'out.jsonl'),
-          '--search-config',
-          'search.reranker.enabled=true',
-        ],
-        {
-          engine,
-          searchConfigSnapshot: {
-            'search.reranker.enabled': 'false',
-            // Key with no --search-config counterpart: the snapshot value
-            // must still land untouched.
-            'search.reranker.timeout_ms': '30000',
+    try {
+      await withTmpDir(async (tmp) => {
+        await runEvalLongMemEval(
+          [
+            FIXTURE_PATH,
+            '--keyword-only',
+            '--retrieval-only',
+            '--no-trajectory',
+            '--limit',
+            '1',
+            '--output',
+            join(tmp, 'out.jsonl'),
+            '--search-config',
+            'search.reranker.enabled=true',
+          ],
+          {
+            engine,
+            searchConfigSnapshot: {
+              'search.reranker.enabled': 'false',
+              // Key with no --search-config counterpart: the snapshot value
+              // must still land untouched.
+              'search.reranker.timeout_ms': '30000',
+            },
           },
-        },
-      );
+        );
 
-      // Explicit CLI flag wins over the programmatic snapshot for the
-      // overlapping key...
-      expect(await engine.getConfig('search.reranker.enabled')).toBe('true');
-      // ...while a snapshot key with no CLI counterpart is untouched.
-      expect(await engine.getConfig('search.reranker.timeout_ms')).toBe('30000');
-    });
-    await engine.disconnect();
+        // Explicit CLI flag wins over the programmatic snapshot for the
+        // overlapping key...
+        expect(await engine.getConfig('search.reranker.enabled')).toBe('true');
+        // ...while a snapshot key with no CLI counterpart is untouched.
+        expect(await engine.getConfig('search.reranker.timeout_ms')).toBe('30000');
+      });
+    } finally {
+      await engine.disconnect();
+    }
   }, 60_000);
 
   test('--search-config VALUE-with-no-equals throws a clear usage error', () => {
     expect(runEvalLongMemEval([FIXTURE_PATH, '--search-config', 'noequalssign'], {}))
       .rejects.toThrow(/--search-config must be KEY=VAL/);
+  });
+});
+
+// Codex review (PR #4770): resolveExpansionLimitSearchOpts is the pure
+// extraction of the precedence rule that fixes the finding — a
+// --search-config value for `search.expansion`/`search.searchLimit` must
+// win over the CLI's --expansion/--top-k defaults, not be silently
+// shadowed by them. Unit-tested directly (no engine/DB) so the exact
+// defect the reviewer caught stays pinned.
+describe('resolveExpansionLimitSearchOpts', () => {
+  test('no --search-config: both fields come from the CLI flags (unchanged default behavior)', () => {
+    expect(resolveExpansionLimitSearchOpts({ expansion: false, topK: 8, searchConfig: undefined }))
+      .toEqual({ limit: 8, expansion: false });
+    expect(resolveExpansionLimitSearchOpts({ expansion: true, topK: 8, searchConfig: {} }))
+      .toEqual({ limit: 8, expansion: true });
+  });
+
+  test('search.expansion configured: expansion field is omitted so the injected config wins', () => {
+    expect(
+      resolveExpansionLimitSearchOpts({
+        expansion: false,
+        topK: 8,
+        searchConfig: { 'search.expansion': 'true' },
+      }),
+    ).toEqual({ limit: 8 });
+  });
+
+  test('search.searchLimit configured: limit field is omitted so the injected config wins', () => {
+    expect(
+      resolveExpansionLimitSearchOpts({
+        expansion: false,
+        topK: 8,
+        searchConfig: { 'search.searchLimit': '50' },
+      }),
+    ).toEqual({ expansion: false });
+  });
+
+  test('both configured: both fields are omitted', () => {
+    expect(
+      resolveExpansionLimitSearchOpts({
+        expansion: false,
+        topK: 8,
+        searchConfig: { 'search.expansion': 'true', 'search.searchLimit': '50' },
+      }),
+    ).toEqual({});
+  });
+
+  test('an unrelated --search-config key does not affect expansion/limit resolution', () => {
+    expect(
+      resolveExpansionLimitSearchOpts({
+        expansion: true,
+        topK: 8,
+        searchConfig: { 'search.reranker.enabled': 'true' },
+      }),
+    ).toEqual({ limit: 8, expansion: true });
   });
 });
