@@ -62,6 +62,7 @@ const EXPECTED_EXPORTS: ExpectedExport[] = [
   // cat30–33 consume, replacing physical node_modules deep imports.
   { subpath: 'gbrain/core/skillopt', canary: ['runSkillOpt', 'scoreSkillOnTasks', 'loadHeldOut'] },
   { subpath: 'gbrain/pglite-lock', canary: ['peekLock'] },
+  { subpath: 'gbrain/version', canary: ['VERSION'] },
 ];
 
 function readPackageExports(): Record<string, string> {
@@ -78,6 +79,7 @@ describe('public exports — package.json exports map', () => {
     // Removing exports: see CLAUDE.md "Removing any of these is a
     // breaking change going forward" — bump minor and update this count.
     // 23→24 (2026-08 fix wave): ./core/skillopt (audit skillopt-cats-11).
+    // 24→25: ./version (gbrain-evals TODOS P3 — direct VERSION import).
     expect(count).toBe(27);
   });
 
