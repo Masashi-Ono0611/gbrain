@@ -614,6 +614,14 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
         await engine.setConfig(key, value);
       }
     }
+    // Codex review (PR #4770): the union of keys set from EITHER source
+    // above — runOneQuestion uses this to decide whether to defer its own
+    // per-call expansion/limit fields to what was just written to engine
+    // config (see resolveExpansionLimitSearchOpts).
+    const configuredSearchKeys = new Set<string>([
+      ...Object.keys(runOpts.searchConfigSnapshot ?? {}),
+      ...Object.keys(opts.searchConfig ?? {}),
+    ]);
     // v0.32.3 search-lite: explicit --mode wins over any injected snapshot.
     // resetTables preserves `config` between questions, so this fires once
     // for the run. hybridSearch resolves it through the standard chain.
@@ -623,11 +631,11 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
     for (const q of questions) {
       const qStart = Date.now();
       try {
-        await runOneQuestion(engine, q, opts, model, client, emitter, recallByType, {
-          trajectoryEnabled,
-          extractorClient,
-          extractorModel,
-        });
+        await runOneQuestion(
+          engine, q, opts, model, client, emitter, recallByType,
+          { trajectoryEnabled, extractorClient, extractorModel },
+          configuredSearchKeys,
+        );
         progress.tick(1, q.question_id);
       } catch (err: any) {
         errorCount++;
@@ -714,24 +722,35 @@ interface TrajectoryRunOpts {
 }
 
 /**
- * Codex review (PR #4770): `search.expansion`/`search.searchLimit` injected
- * via --search-config were silently shadowed by always-on per-call
- * `limit`/`expansion` fields passed to hybridSearch, so setting either key
- * via --search-config had no effect — defeating the "faithfully reproduce
- * the live pipeline" purpose of --search-config (see the `searchConfig`
- * field docstring above, v0.45.0+ #3676). Pulled out as a pure function so
- * the precedence rule (an explicit --search-config key wins over the CLI
- * default, mirroring how --search-config already wins over an injected
- * runOpts.searchConfigSnapshot) is unit-testable without a live engine.
- * Default behavior (no --search-config) is unchanged: both fields are set
- * from the CLI flags exactly as before.
+ * Codex review (PR #4770), 2 rounds: `search.expansion`/`search.searchLimit`
+ * injected via --search-config OR runOpts.searchConfigSnapshot were silently
+ * shadowed by always-on per-call `limit`/`expansion` fields passed to
+ * hybridSearch, so setting either key had no effect — defeating the
+ * "faithfully reproduce the live pipeline" purpose of --search-config (see
+ * the `searchConfig` field docstring above, v0.45.0+ #3676). Round 1 fixed
+ * this for --search-config only (missed the programmatic
+ * searchConfigSnapshot caller — nightly-probe-adapters.ts); round 2 widens
+ * the check to `configuredSearchKeys`, the union of BOTH sources (computed
+ * once in `work()` below, since both are applied to the same engine before
+ * any question runs). Pulled out as a pure function so the precedence rule
+ * is unit-testable without a live engine. Default behavior (neither source
+ * sets the key) is unchanged: both fields are set from the CLI flags
+ * exactly as before.
+ *
+ * Note: this only decides whether the per-call `limit`/`expansion` FIELDS
+ * are set. Actually *invoking* expansion additionally requires `expandFn`
+ * to be present on the SearchOpts passed to hybridSearch (see call site) —
+ * hybridSearch's own resolveSearchMode chain decides whether expansion
+ * fires (per-call → config → mode bundle), but `expandFn` is a JS callback
+ * that config can never supply, so the call site must always pass it and
+ * let hybridSearch's own gate decide whether to invoke it.
  */
 export function resolveExpansionLimitSearchOpts(
-  opts: Pick<ParsedArgs, 'expansion' | 'topK' | 'searchConfig'>,
+  opts: Pick<ParsedArgs, 'expansion' | 'topK'>,
+  configuredSearchKeys: ReadonlySet<string>,
 ): { limit?: number; expansion?: boolean } {
-  const configured = opts.searchConfig ?? {};
-  const limitConfigured = 'search.searchLimit' in configured;
-  const expansionConfigured = 'search.expansion' in configured;
+  const limitConfigured = configuredSearchKeys.has('search.searchLimit');
+  const expansionConfigured = configuredSearchKeys.has('search.expansion');
   return {
     ...(limitConfigured ? {} : { limit: opts.topK }),
     ...(expansionConfigured ? {} : { expansion: opts.expansion }),
@@ -747,6 +766,7 @@ async function runOneQuestion(
   emitter: JsonlEmitter,
   recallByType: Record<string, { hit: number; total: number }>,
   traj: TrajectoryRunOpts,
+  configuredSearchKeys: ReadonlySet<string>,
 ): Promise<void> {
   await resetTables(engine);
   const adapterPages = haystackToPages(q);
@@ -784,10 +804,14 @@ async function runOneQuestion(
   if (opts.keywordOnly) {
     results = await engine.searchKeyword(q.question, { limit: opts.topK });
   } else {
-    const resolved = resolveExpansionLimitSearchOpts(opts);
+    // expandFn is always supplied (harmless if unused): hybridSearch only
+    // invokes it when its own resolveSearchMode chain resolves expansion
+    // to true (per-call → config → mode bundle), so a config- or
+    // mode-bundle-driven expansion=true — which the per-call `expansion`
+    // field below may deliberately leave unset to defer to — still fires.
     const searchOpts: Parameters<typeof hybridSearch>[2] = {
-      ...resolved,
-      ...(resolved.expansion === true ? { expandFn: expandQuery } : {}),
+      ...resolveExpansionLimitSearchOpts(opts, configuredSearchKeys),
+      expandFn: expandQuery,
     };
     results = await hybridSearch(engine, q.question, searchOpts);
   }

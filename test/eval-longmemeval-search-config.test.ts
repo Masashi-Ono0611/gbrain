@@ -129,63 +129,67 @@ describe('runEvalLongMemEval — --search-config CLI flag', () => {
     }
   }, 60_000);
 
-  test('--search-config VALUE-with-no-equals throws a clear usage error', () => {
-    expect(runEvalLongMemEval([FIXTURE_PATH, '--search-config', 'noequalssign'], {}))
+  test('--search-config VALUE-with-no-equals throws a clear usage error', async () => {
+    // Codex review (PR #4770, round 2 Nit): an un-awaited `.rejects` lets
+    // the test function return before the assertion settles, so a failing
+    // assertion could surface after the test already reported pass.
+    await expect(runEvalLongMemEval([FIXTURE_PATH, '--search-config', 'noequalssign'], {}))
       .rejects.toThrow(/--search-config must be KEY=VAL/);
   });
 });
 
-// Codex review (PR #4770): resolveExpansionLimitSearchOpts is the pure
-// extraction of the precedence rule that fixes the finding — a
-// --search-config value for `search.expansion`/`search.searchLimit` must
-// win over the CLI's --expansion/--top-k defaults, not be silently
-// shadowed by them. Unit-tested directly (no engine/DB) so the exact
-// defect the reviewer caught stays pinned.
+// Codex review (PR #4770, 2 rounds): resolveExpansionLimitSearchOpts is the
+// pure extraction of the precedence rule that fixes the finding — a
+// `search.expansion`/`search.searchLimit` key set via EITHER --search-config
+// OR runOpts.searchConfigSnapshot must win over the CLI's
+// --expansion/--top-k defaults, not be silently shadowed by them.
+// Round 2 widened the signature from `searchConfig` alone to the caller-
+// computed union `configuredSearchKeys` (round 1 missed the
+// searchConfigSnapshot-only caller, nightly-probe-adapters.ts). Unit-tested
+// directly (no engine/DB) so the exact defect stays pinned.
 describe('resolveExpansionLimitSearchOpts', () => {
-  test('no --search-config: both fields come from the CLI flags (unchanged default behavior)', () => {
-    expect(resolveExpansionLimitSearchOpts({ expansion: false, topK: 8, searchConfig: undefined }))
+  test('nothing configured: both fields come from the CLI flags (unchanged default behavior)', () => {
+    expect(resolveExpansionLimitSearchOpts({ expansion: false, topK: 8 }, new Set()))
       .toEqual({ limit: 8, expansion: false });
-    expect(resolveExpansionLimitSearchOpts({ expansion: true, topK: 8, searchConfig: {} }))
+    expect(resolveExpansionLimitSearchOpts({ expansion: true, topK: 8 }, new Set()))
       .toEqual({ limit: 8, expansion: true });
   });
 
   test('search.expansion configured: expansion field is omitted so the injected config wins', () => {
     expect(
-      resolveExpansionLimitSearchOpts({
-        expansion: false,
-        topK: 8,
-        searchConfig: { 'search.expansion': 'true' },
-      }),
+      resolveExpansionLimitSearchOpts({ expansion: false, topK: 8 }, new Set(['search.expansion'])),
     ).toEqual({ limit: 8 });
   });
 
   test('search.searchLimit configured: limit field is omitted so the injected config wins', () => {
     expect(
-      resolveExpansionLimitSearchOpts({
-        expansion: false,
-        topK: 8,
-        searchConfig: { 'search.searchLimit': '50' },
-      }),
+      resolveExpansionLimitSearchOpts({ expansion: false, topK: 8 }, new Set(['search.searchLimit'])),
     ).toEqual({ expansion: false });
   });
 
   test('both configured: both fields are omitted', () => {
     expect(
-      resolveExpansionLimitSearchOpts({
-        expansion: false,
-        topK: 8,
-        searchConfig: { 'search.expansion': 'true', 'search.searchLimit': '50' },
-      }),
+      resolveExpansionLimitSearchOpts(
+        { expansion: false, topK: 8 },
+        new Set(['search.expansion', 'search.searchLimit']),
+      ),
     ).toEqual({});
   });
 
-  test('an unrelated --search-config key does not affect expansion/limit resolution', () => {
+  test('an unrelated configured key does not affect expansion/limit resolution', () => {
     expect(
-      resolveExpansionLimitSearchOpts({
-        expansion: true,
-        topK: 8,
-        searchConfig: { 'search.reranker.enabled': 'true' },
-      }),
+      resolveExpansionLimitSearchOpts({ expansion: true, topK: 8 }, new Set(['search.reranker.enabled'])),
     ).toEqual({ limit: 8, expansion: true });
   });
 });
+
+// The round-1 gap (this function ignored runOpts.searchConfigSnapshot) is
+// fixed at the CALL SITE, not in this pure function: work() (in
+// eval-longmemeval.ts) now computes `configuredSearchKeys` as the union of
+// Object.keys(runOpts.searchConfigSnapshot ?? {}) and
+// Object.keys(opts.searchConfig ?? {}) before calling
+// resolveExpansionLimitSearchOpts — a snapshot-only key is indistinguishable
+// from a --search-config key once unioned, so the cases above already cover
+// it from this function's point of view. Not re-tested with a fake
+// snapshot-only Set here since that would just be the same assertion under
+// a different docstring.
