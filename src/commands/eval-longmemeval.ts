@@ -91,6 +91,18 @@ interface ParsedArgs {
    * rate falls below this floor. Default unset = informational only.
    */
   byTypeFloor?: number;
+  /**
+   * Repeatable `--search-config KEY=VAL` pairs. Same injection target as
+   * RunOpts.searchConfigSnapshot (the nightly-probe's copy of live
+   * search-mode/reranker config into the isolated benchmark brain), exposed
+   * on the CLI so an operator can reproduce that config by hand instead of
+   * only via a programmatic caller (closes the gap named in
+   * garrytan/gbrain-evals' TODOS.md, finding WS7). Applied AFTER
+   * runOpts.searchConfigSnapshot (an explicit CLI flag wins for a given key)
+   * and BEFORE --mode (which stays the more specific, validated override for
+   * the search.mode key).
+   */
+  searchConfig?: Record<string, string>;
 }
 
 function parseArgs(args: string[]): ParsedArgs {
@@ -134,6 +146,20 @@ function parseArgs(args: string[]): ParsedArgs {
       }
       continue;
     }
+    if (a === '--search-config') {
+      const raw = args[++i];
+      if (raw === undefined) {
+        throw new Error(`--search-config requires a KEY=VAL argument`);
+      }
+      const eq = raw.indexOf('=');
+      if (eq <= 0) {
+        throw new Error(`--search-config must be KEY=VAL (got: ${raw})`);
+      }
+      const key = raw.slice(0, eq);
+      const value = raw.slice(eq + 1);
+      (out.searchConfig ??= {})[key] = value;
+      continue;
+    }
     if (!a.startsWith('-') && !out.datasetPath) { out.datasetPath = a; continue; }
   }
   return out;
@@ -159,6 +185,14 @@ function printHelp(): void {
     `                            Mode resolves through src/core/search/mode.ts so the search\n` +
     `                            behavior matches what production gets under that mode.\n` +
     `                            --mode tokenmax implies --expansion unless overridden.\n` +
+    `  --search-config KEY=VAL   Copy an arbitrary config key/value into the\n` +
+    `                            isolated benchmark brain before the run (repeatable). Same\n` +
+    `                            injection point as a programmatic caller's\n` +
+    `                            RunOpts.searchConfigSnapshot (e.g. reproduce the nightly\n` +
+    `                            probe's live search-mode/reranker settings by hand):\n` +
+    `                              --search-config search.reranker.enabled=true \\\n` +
+    `                              --search-config search.reranker.model=llama-server-reranker:qwen3-reranker-4b\n` +
+    `                            Applied before --mode, so --mode still wins for search.mode.\n` +
     `  --output FILE             Write JSONL to FILE instead of stdout.\n` +
     `  --resume-from FILE        Skip question_ids already present in FILE; resume the\n` +
     `                            remaining questions. Typically the same path as --output\n` +
@@ -567,6 +601,15 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
     // config into this isolated engine. Data tables stay hermetic, but the
     // benchmark no longer silently evaluates a different reranker/mode.
     for (const [key, value] of Object.entries(runOpts.searchConfigSnapshot ?? {})) {
+      if (key.trim().length > 0) {
+        await engine.setConfig(key, value);
+      }
+    }
+    // --search-config KEY=VAL applies on top of any programmatic caller's
+    // searchConfigSnapshot — an explicit CLI flag wins for a given key over
+    // the injected snapshot, mirroring how --mode (below) wins over an
+    // injected `search.mode`.
+    for (const [key, value] of Object.entries(opts.searchConfig ?? {})) {
       if (key.trim().length > 0) {
         await engine.setConfig(key, value);
       }
