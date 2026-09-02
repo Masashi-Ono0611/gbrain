@@ -482,3 +482,92 @@ function afterEachCleanup(fn: () => void) {
   const { afterEach } = require("bun:test");
   afterEach(fn);
 }
+
+// ---------------------------------------------------------------------------
+// #1767 follow-up: cwd_walk_up (tier 1b) is explicitly ungated -- it can
+// land on a directory belonging to a different tool entirely. A single
+// skill in that foreign directory coincidentally shipping a `triggers:`
+// frontmatter field (unrelated to gbrain) used to be enough to flip every
+// OTHER triggerless skill in the same directory from the soft
+// "genuinely-uninitialized" fallback into individual hard `unreachable`
+// errors, crashing doctor's health_score for a directory gbrain has no
+// business grading. This only softens severity when BOTH conditions hold:
+// discovered via cwd_walk_up AND no RESOLVER.md/AGENTS.md present. A real
+// gbrain skillpack (RESOLVER.md present, or reached via a higher-confidence
+// tier) keeps full strict enforcement.
+// ---------------------------------------------------------------------------
+
+function makeForeignSkillsFixture(): string {
+  const dir = mkdtempSync(join(tmpdir(), "gbrain-foreign-skills-"));
+  // No RESOLVER.md, no AGENTS.md, no manifest.json -- deriveManifest()
+  // walks the directory listing instead, same as a real foreign tool's
+  // skills/ dir with no gbrain awareness whatsoever.
+  mkdirSync(join(dir, "some-unrelated-tool-skill"), { recursive: true });
+  writeFileSync(
+    join(dir, "some-unrelated-tool-skill", "SKILL.md"),
+    "---\n" +
+    "name: some-unrelated-tool-skill\n" +
+    "description: belongs to a different tool, no triggers field\n" +
+    "---\n" +
+    "body\n"
+  );
+  // The one coincidental trigger-bearing skill that defeats the
+  // triggerEntries.length===0 fallback in real-world repros.
+  mkdirSync(join(dir, "coincidentally-has-triggers"), { recursive: true });
+  writeFileSync(
+    join(dir, "coincidentally-has-triggers", "SKILL.md"),
+    "---\n" +
+    "name: coincidentally-has-triggers\n" +
+    "description: also unrelated, but happens to declare triggers\n" +
+    "triggers:\n" +
+    "  - \"some phrase\"\n" +
+    "---\n" +
+    "body\n"
+  );
+  return dir;
+}
+
+describe("checkResolvable — #1767 low-confidence foreign skills dir", () => {
+  let dir: string;
+  afterEachCleanup(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("cwd_walk_up + no RESOLVER.md: unreachable issue is downgraded to warning", () => {
+    dir = makeForeignSkillsFixture();
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBe(1);
+    expect(unreachable[0].skill).toBe("some-unrelated-tool-skill");
+    expect(unreachable[0].severity).toBe("warning");
+    // Downgraded severity must actually move the issue out of errors[]
+    // and into warnings[] (checkResolvable filters on .severity at the
+    // end) -- otherwise health_score still takes the -20 hit.
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(false);
+    expect(report.warnings.some(i => i.type === "unreachable")).toBe(true);
+  });
+
+  test("no skillsDirSource (higher-confidence tiers): unreachable stays a hard error", () => {
+    dir = makeForeignSkillsFixture();
+    const report = checkResolvable(dir);
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBe(1);
+    expect(unreachable[0].severity).toBe("error");
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
+  });
+
+  test("cwd_walk_up but RESOLVER.md present: stays a hard error (real skillpack, not foreign)", () => {
+    dir = makeForeignSkillsFixture();
+    writeFileSync(
+      join(dir, "RESOLVER.md"),
+      "## Brain operations\n| Trigger | Skill |\n|---------|-------|\n"
+    );
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBeGreaterThan(0);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("error");
+    }
+  });
+});
+
