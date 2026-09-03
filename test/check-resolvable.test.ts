@@ -491,10 +491,13 @@ function afterEachCleanup(fn: () => void) {
 // OTHER triggerless skill in the same directory from the soft
 // "genuinely-uninitialized" fallback into individual hard `unreachable`
 // errors, crashing doctor's health_score for a directory gbrain has no
-// business grading. This only softens severity when BOTH conditions hold:
-// discovered via cwd_walk_up AND no RESOLVER.md/AGENTS.md present. A real
-// gbrain skillpack (RESOLVER.md present, or reached via a higher-confidence
-// tier) keeps full strict enforcement.
+// business grading. This only softens severity when ALL FOUR conditions
+// hold: discovered via cwd_walk_up, no RESOLVER.md/AGENTS.md present,
+// unreachable skills outnumber reachable ones (sparse coverage), AND the
+// manifest was derived rather than an explicit, validly-parsed
+// manifest.json. A real gbrain skillpack (RESOLVER.md present, reached via
+// a higher-confidence tier, dense trigger coverage, or an explicit
+// manifest.json) keeps full strict enforcement.
 // ---------------------------------------------------------------------------
 
 function makeSkillWithoutTriggers(dir: string, name: string): void {
@@ -615,6 +618,33 @@ describe("checkResolvable — #1767 low-confidence foreign skills dir", () => {
     expect(unreachable.length).toBe(1);
     expect(unreachable[0].skill).toBe("not-yet-migrated-skill");
     expect(unreachable[0].severity).toBe("error");
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
+  });
+
+  test("cwd_walk_up + no RESOLVER.md + sparse triggers BUT explicit manifest.json: unreachable stays a hard error", () => {
+    // Codex review: an explicit manifest.json (loadOrDeriveManifest's
+    // derived:false) is itself a deliberate "this is a gbrain skillpack"
+    // declaration -- a foreign tool's directory never ships one. Even
+    // with sparse trigger coverage and no resolver file, the manifest's
+    // presence should keep enforcement strict.
+    dir = makeSparseForeignSkillsFixture();
+    writeFileSync(
+      join(dir, "manifest.json"),
+      JSON.stringify({
+        skills: [
+          { name: "some-unrelated-tool-skill", path: "some-unrelated-tool-skill/SKILL.md" },
+          { name: "another-unrelated-skill", path: "another-unrelated-skill/SKILL.md" },
+          { name: "yet-another-unrelated-skill", path: "yet-another-unrelated-skill/SKILL.md" },
+          { name: "coincidentally-has-triggers", path: "coincidentally-has-triggers/SKILL.md" },
+        ],
+      })
+    );
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBe(3);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("error");
+    }
     expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
   });
 });
