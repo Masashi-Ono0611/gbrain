@@ -618,4 +618,3 @@ describe("checkResolvable — #1767 low-confidence foreign skills dir", () => {
     expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
   });
 });
-
