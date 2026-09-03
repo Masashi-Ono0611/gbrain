@@ -491,10 +491,13 @@ function afterEachCleanup(fn: () => void) {
 // OTHER triggerless skill in the same directory from the soft
 // "genuinely-uninitialized" fallback into individual hard `unreachable`
 // errors, crashing doctor's health_score for a directory gbrain has no
-// business grading. This only softens severity when BOTH conditions hold:
-// discovered via cwd_walk_up AND no RESOLVER.md/AGENTS.md present. A real
-// gbrain skillpack (RESOLVER.md present, or reached via a higher-confidence
-// tier) keeps full strict enforcement.
+// business grading. This only softens severity when ALL FOUR conditions
+// hold: discovered via cwd_walk_up, no RESOLVER.md/AGENTS.md present,
+// unreachable skills outnumber reachable ones (sparse coverage), AND the
+// manifest was derived rather than an explicit, validly-parsed
+// manifest.json. A real gbrain skillpack (RESOLVER.md present, reached via
+// a higher-confidence tier, dense trigger coverage, or an explicit
+// manifest.json) keeps full strict enforcement.
 // ---------------------------------------------------------------------------
 
 function makeSkillWithoutTriggers(dir: string, name: string): void {
