@@ -359,7 +359,7 @@ export function checkResolvable(
   // and lint stages that still take string content. Re-emits both
   // frontmatter-derived AND RESOLVER.md-derived entries as one table.
   const resolverContent = entriesToResolverContent(triggerEntries);
-  const { skills: manifest } = loadOrDeriveManifest(skillsDir);
+  const { skills: manifest, derived: manifestIsDerived } = loadOrDeriveManifest(skillsDir);
 
   // Build lookup sets
   const resolverSkillPaths = new Set(
@@ -406,9 +406,18 @@ export function checkResolvable(
   // Directories reached via a higher-confidence tier (explicit env var,
   // $OPENCLAW_WORKSPACE, or the read-only install-path fallback) keep full
   // strict enforcement regardless -- those carry real operator intent that
-  // this is meant to be a gbrain skill root.
+  // this is meant to be a gbrain skill root. A fourth condition (Codex
+  // review): an explicit `manifest.json` (loadOrDeriveManifest's
+  // `derived: false`) is itself a deliberate gbrain-skillpack declaration
+  // -- a foreign tool's directory never ships one. Requiring the manifest
+  // to be DERIVED (walked from the directory listing, not hand-authored)
+  // keeps a real, explicitly-declared skillpack with sparse trigger
+  // migration and no resolver file strict, even via cwd_walk_up.
   const lowConfidenceForeignDir =
-    opts?.skillsDirSource === 'cwd_walk_up' && !resolverPathOrNull && unreachable > reachable;
+    opts?.skillsDirSource === 'cwd_walk_up' &&
+    !resolverPathOrNull &&
+    unreachable > reachable &&
+    manifestIsDerived;
 
   for (const { skill, reachable: isReachable } of resolved) {
     if (isReachable) continue;

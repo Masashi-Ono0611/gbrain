@@ -617,4 +617,31 @@ describe("checkResolvable — #1767 low-confidence foreign skills dir", () => {
     expect(unreachable[0].severity).toBe("error");
     expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
   });
+
+  test("cwd_walk_up + no RESOLVER.md + sparse triggers BUT explicit manifest.json: unreachable stays a hard error", () => {
+    // Codex review: an explicit manifest.json (loadOrDeriveManifest's
+    // derived:false) is itself a deliberate "this is a gbrain skillpack"
+    // declaration -- a foreign tool's directory never ships one. Even
+    // with sparse trigger coverage and no resolver file, the manifest's
+    // presence should keep enforcement strict.
+    dir = makeSparseForeignSkillsFixture();
+    writeFileSync(
+      join(dir, "manifest.json"),
+      JSON.stringify({
+        skills: [
+          { name: "some-unrelated-tool-skill", path: "some-unrelated-tool-skill/SKILL.md" },
+          { name: "another-unrelated-skill", path: "another-unrelated-skill/SKILL.md" },
+          { name: "yet-another-unrelated-skill", path: "yet-another-unrelated-skill/SKILL.md" },
+          { name: "coincidentally-has-triggers", path: "coincidentally-has-triggers/SKILL.md" },
+        ],
+      })
+    );
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBe(3);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("error");
+    }
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
+  });
 });
