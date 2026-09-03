@@ -13,6 +13,7 @@
 import { readFileSync, existsSync, readdirSync } from 'fs';
 import { join, relative } from 'path';
 import { findResolverFile, findAllResolverFiles, RESOLVER_FILENAMES_LABEL } from './resolver-filenames.ts';
+import type { SkillsDirSource } from './repo-root.ts';
 import { loadOrDeriveManifest } from './skill-manifest.ts';
 import {
   indexResolverTriggers,
@@ -299,7 +300,10 @@ export function extractDelegationTargets(content: string): DelegationRef[] {
  *
  * @param skillsDir — path to the `skills/` directory
  */
-export function checkResolvable(skillsDir: string): ResolvableReport {
+export function checkResolvable(
+  skillsDir: string,
+  opts?: { skillsDirSource?: SkillsDirSource | null },
+): ResolvableReport {
   const issues: ResolvableIssue[] = [];
 
   // Load inputs via the v0.41.11 shared primitive. UNION semantics
@@ -323,6 +327,7 @@ export function checkResolvable(skillsDir: string): ResolvableReport {
   // will create it on first write).
   const resolverPathOrNull = findPrimaryResolverPath(skillsDir);
   const resolverPath = resolverPathOrNull ?? join(skillsDir, 'RESOLVER.md');
+
   if (!resolverPathOrNull && triggerEntries.length === 0) {
     // No RESOLVER.md / AGENTS.md anywhere AND no skill ships frontmatter
     // triggers — the resolver tree is fully empty. Preserve the
@@ -361,40 +366,69 @@ export function checkResolvable(skillsDir: string): ResolvableReport {
     entries.filter(e => !e.isGStack).map(e => e.skillPath)
   );
 
-  // 1. Check every manifest skill is reachable from RESOLVER.md
+  // 1. Check every manifest skill is reachable from RESOLVER.md. Two
+  // passes: resolve reachability for every skill first (no severity
+  // decision yet), THEN decide how to grade the unreachable ones using the
+  // final tally, THEN construct issues. This lets the severity call factor
+  // in how SPARSE trigger coverage is across the whole directory, not just
+  // whether this one skill has a trigger.
+  const resolved = manifest.map(skill => {
+    const expectedPath = `skills/${skill.path}`;
+    if (resolverSkillPaths.has(expectedPath)) return { skill, reachable: true };
+    // Also check if the skill name appears in any resolver entry
+    const nameInResolver = entries.some(
+      e => e.skillPath.includes(skill.name) || e.trigger.includes(skill.name)
+    );
+    return { skill, reachable: nameInResolver };
+  });
   let reachable = 0;
   let unreachable = 0;
+  for (const r of resolved) {
+    if (r.reachable) reachable++;
+    else unreachable++;
+  }
 
-  for (const skill of manifest) {
-    const expectedPath = `skills/${skill.path}`;
-    if (resolverSkillPaths.has(expectedPath)) {
-      reachable++;
-    } else {
-      // Also check if the skill name appears in any resolver entry
-      const nameInResolver = entries.some(
-        e => e.skillPath.includes(skill.name) || e.trigger.includes(skill.name)
-      );
-      if (nameInResolver) {
-        reachable++;
-      } else {
-        unreachable++;
-        // Find the best section for this skill based on its description
-        const section = 'Brain operations'; // default suggestion
-        issues.push({
-          type: 'unreachable',
-          severity: 'error',
-          skill: skill.name,
-          message: `Skill '${skill.name}' is in manifest but has no trigger row in ${RESOLVER_FILENAMES_LABEL}`,
-          action: `Add a trigger row for 'skills/${skill.path}' in RESOLVER.md under ${section}`,
-          fix: {
-            type: 'add_trigger',
-            file: resolverPath,
-            section,
-            skill_path: `skills/${skill.path}`,
-          },
-        });
-      }
-    }
+  // #1767: `cwd_walk_up` (tier 1b of autoDetectSkillsDir, repo-root.ts) is
+  // explicitly documented as ungated -- it accepts ANY `skills/` directory
+  // found by walking up from cwd, with no signal that the directory is
+  // actually a gbrain skillpack (in progress or otherwise). The soft
+  // missing_file fallback above only fires when the WHOLE tree is empty
+  // (zero triggers anywhere); a single unrelated skill that happens to ship
+  // a `triggers:` field (coincidence, not gbrain intent -- e.g. another
+  // tool's own frontmatter convention landing on the same field name) is
+  // enough to flip every other skill in a foreign directory into
+  // individual hard 'unreachable' errors under the un-refined version of
+  // this check. The `unreachable > reachable` guard narrows this further
+  // (Codex review): a skillpack that's mostly migrated to triggers: (say
+  // 20 of 26 skills already reachable) whose RESOLVER.md/AGENTS.md was
+  // merely deleted by accident should still fail loudly -- only a
+  // directory where triggers are themselves sparse gets the softer read.
+  // Directories reached via a higher-confidence tier (explicit env var,
+  // $OPENCLAW_WORKSPACE, or the read-only install-path fallback) keep full
+  // strict enforcement regardless -- those carry real operator intent that
+  // this is meant to be a gbrain skill root.
+  const lowConfidenceForeignDir =
+    opts?.skillsDirSource === 'cwd_walk_up' && !resolverPathOrNull && unreachable > reachable;
+
+  for (const { skill, reachable: isReachable } of resolved) {
+    if (isReachable) continue;
+    // Find the best section for this skill based on its description
+    const section = 'Brain operations'; // default suggestion
+    issues.push({
+      type: 'unreachable',
+      severity: lowConfidenceForeignDir ? 'warning' : 'error',
+      skill: skill.name,
+      message: lowConfidenceForeignDir
+        ? `Skill '${skill.name}' is in manifest but has no trigger row in ${RESOLVER_FILENAMES_LABEL} (this skills/ dir was found by walking up from cwd with no RESOLVER.md/AGENTS.md present -- if it belongs to a different tool, this can be ignored)`
+        : `Skill '${skill.name}' is in manifest but has no trigger row in ${RESOLVER_FILENAMES_LABEL}`,
+      action: `Add a trigger row for 'skills/${skill.path}' in RESOLVER.md under ${section}`,
+      fix: {
+        type: 'add_trigger',
+        file: resolverPath,
+        section,
+        skill_path: `skills/${skill.path}`,
+      },
+    });
   }
 
   // 2. Check every resolver entry points to a file that exists
