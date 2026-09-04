@@ -647,4 +647,75 @@ describe("checkResolvable — #1767 low-confidence foreign skills dir", () => {
     }
     expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
   });
+
+  test("cwd_walk_up + no RESOLVER.md + sparse triggers BUT MALFORMED manifest.json: unreachable stays a hard error", () => {
+    // Automated-triage review on PR #4822: loadOrDeriveManifest's
+    // `derived` flag is true both when manifest.json is absent AND when
+    // it exists but fails to parse / fails the shape gate. A real
+    // skillpack's manifest.json getting corrupted (e.g. a bad merge) is
+    // exactly the corruption doctor exists to catch -- the downgrade must
+    // key on the manifest file's on-disk absence, not on `derived` alone,
+    // or a corrupted-but-present manifest gets treated the same as a
+    // foreign directory that never had one.
+    dir = makeSparseForeignSkillsFixture();
+    writeFileSync(join(dir, "manifest.json"), "{ this is not valid json");
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBe(3);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("error");
+    }
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
+  });
+
+  test("cwd_walk_up + generic AGENTS.md with no resolver rows + sparse triggers: unreachable is STILL downgraded to warning", () => {
+    // Automated-triage review on PR #4822: `resolverPathOrNull` is
+    // filename-only (existsSync), not content-aware. A foreign tool that
+    // ships its own generic AGENTS.md -- a prose agent-instructions file
+    // unrelated to gbrain routing, an increasingly common convention --
+    // used to flip `!resolverPathOrNull` to false and disable the
+    // downgrade entirely, even though that file contributes zero
+    // resolver-table rows. The coincidental frontmatter `triggers:` field
+    // on one skill still produces a non-empty merged `entries` array, so
+    // the fix must check for a resolver_md-sourced entry specifically,
+    // not `entries.length`.
+    dir = makeSparseForeignSkillsFixture();
+    writeFileSync(
+      join(dir, "AGENTS.md"),
+      "# Agent Instructions\n\nThis is a generic agent configuration file for an unrelated tool. " +
+        "It has no resolver routing table -- just prose.\n"
+    );
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBe(3);
+    expect(unreachable.map(i => i.skill).sort()).toEqual([
+      "another-unrelated-skill",
+      "some-unrelated-tool-skill",
+      "yet-another-unrelated-skill",
+    ]);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("warning");
+    }
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(false);
+    expect(report.warnings.some(i => i.type === "unreachable")).toBe(true);
+  });
+
+  test("cwd_walk_up + AGENTS.md WITH real resolver rows + sparse triggers elsewhere: unreachable stays a hard error", () => {
+    // Inverse of the above: when the found AGENTS.md actually carries a
+    // resolver table (source: 'resolver_md'), it's real routing intent,
+    // not a foreign convention collision -- must NOT be downgraded.
+    dir = makeSparseForeignSkillsFixture();
+    writeFileSync(
+      join(dir, "AGENTS.md"),
+      "## Routing\n\n| trigger | skill |\n| --- | --- |\n" +
+        "| some real trigger | `skills/some-unrelated-tool-skill/SKILL.md` |\n"
+    );
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBeGreaterThan(0);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("error");
+    }
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
+  });
 });

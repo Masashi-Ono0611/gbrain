@@ -413,11 +413,48 @@ export function checkResolvable(
   // to be DERIVED (walked from the directory listing, not hand-authored)
   // keeps a real, explicitly-declared skillpack with sparse trigger
   // migration and no resolver file strict, even via cwd_walk_up.
+  //
+  // Two more refinements (automated-triage review on PR #4822):
+  //
+  // - `resolverPathOrNull` is filename-only (findAllResolverFiles just
+  //   checks existsSync) -- it does not care whether the file actually
+  //   contains a parseable resolver table. A foreign tool that happens to
+  //   ship its own generic AGENTS.md (an increasingly common convention
+  //   for prose agent instructions, unrelated to gbrain routing) makes
+  //   `resolverPathOrNull` non-null and used to disable the downgrade
+  //   entirely, even though that file contributes zero routing rows.
+  //   `entries` may still be non-empty from a coincidental frontmatter
+  //   `triggers:` field (source: 'frontmatter'), so we specifically check
+  //   whether any entry actually came FROM a resolver file
+  //   (source: 'resolver_md') rather than checking `entries.length`.
+  // - `loadOrDeriveManifest`'s `derived` flag is true both when
+  //   manifest.json is absent AND when it exists but fails to parse /
+  //   fails the shape gate (deliberately, per its own docstring, so a
+  //   corrupted manifest.json still resolves skills via the directory
+  //   walk instead of going dark). That's the right behavior for deriving
+  //   the skill list, but it's the wrong signal for "is this a foreign
+  //   directory" -- a corrupted manifest.json on a REAL skillpack (e.g. a
+  //   bad merge) is exactly the kind of corruption doctor exists to catch,
+  //   and silently downgrading its unreachable errors would mask it. Gate
+  //   on the manifest file's on-disk absence instead of the derived flag.
+  // `RESOLVER.md` is gbrain-NATIVE -- no foreign tool ships one by
+  // coincidence, so its mere presence (even still-empty, being
+  // populated) is real operator intent and must NOT be softened.
+  // `AGENTS.md` is the shared OpenClaw/agent-tooling convention -- many
+  // non-gbrain tools ship a generic prose AGENTS.md, so an AGENTS.md that
+  // contributes zero resolver rows is exactly as weak a signal as no
+  // resolver file at all.
+  const foundOnlyEmptyAgentsMd =
+    resolverPathOrNull !== null &&
+    resolverPathOrNull.endsWith('/AGENTS.md') &&
+    !triggerEntries.some(e => e.source === 'resolver_md');
+  const manifestJsonAbsent = !existsSync(join(skillsDir, 'manifest.json'));
   const lowConfidenceForeignDir =
     opts?.skillsDirSource === 'cwd_walk_up' &&
-    !resolverPathOrNull &&
+    (!resolverPathOrNull || foundOnlyEmptyAgentsMd) &&
     unreachable > reachable &&
-    manifestIsDerived;
+    manifestIsDerived &&
+    manifestJsonAbsent;
 
   for (const { skill, reachable: isReachable } of resolved) {
     if (isReachable) continue;
