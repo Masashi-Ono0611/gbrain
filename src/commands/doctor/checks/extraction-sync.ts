@@ -813,11 +813,20 @@ export async function computeAtomProvenanceDriftCheck(
        SELECT count(*) AS total,
               count(*) FILTER (WHERE drifted) AS drifted,
               count(*) FILTER (WHERE drifted AND src_alive) AS source_changed,
-              -- "gone" needs a slug binding to have failed. A pre-binding-era
+              -- "gone" needs a slug binding to have failed. A slug-unbound
               -- atom (source_path only, no source_slug — see
               -- isCompatibleAtomBinding in extract-atoms.ts) can never match
-              -- p.slug, so counting it here reported every legacy atom as an
-              -- orphan even when its source page is alive.
+              -- p.slug, so counting it here reported every one of them as an
+              -- orphan even when its source page is alive. This is NOT a
+              -- closed legacy set: every transcript-kind atom is minted this
+              -- way today (extract-atoms.ts:994 sets source_path only,
+              -- never source_slug, for transcript origins) -- it is an
+              -- actively growing, structurally distinct binding kind, not a
+              -- shrinking cohort from before slug binding existed. Doctor
+              -- runs as a DB-only query and has no filesystem access to the
+              -- transcript corpus a source_path points at, so liveness for
+              -- this bucket genuinely cannot be resolved here (unlike
+              -- source_slug, which resolves against the pages table).
               count(*) FILTER (WHERE drifted AND NOT src_alive AND ss IS NOT NULL) AS source_gone,
               count(*) FILTER (WHERE drifted AND ss IS NULL) AS legacy_unbound,
               -- lexicographic min of ISO-shaped strings ≈ chronological min
@@ -865,7 +874,7 @@ export async function computeAtomProvenanceDriftCheck(
           `${drifted}/${total} atom(s) (${details.drift_pct}%) reference a source_hash no live page carries ` +
           `— ${sourceChanged} whose source page still exists (edited), ${sourceGone} whose source page is gone` +
           (legacyUnbound > 0
-            ? `, ${legacyUnbound} pre-binding-era (source_path only, no source_slug — liveness not resolvable by slug)`
+            ? `, ${legacyUnbound} slug-unbound (source_path only, typically transcript-origin — liveness not resolvable against \`pages\` by slug)`
             : '') +
           (oldestDays != null ? `; oldest ${oldestDays}d` : '') +
           `. These still surface in search with a source_quote that no current page contains. Fix: ${fix}`,
