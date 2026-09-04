@@ -448,6 +448,7 @@ export function checkResolvable(
     resolverPathOrNull !== null &&
     resolverPathOrNull.endsWith('/AGENTS.md') &&
     !triggerEntries.some(e => e.source === 'resolver_md');
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- `skillsDir` is this function's own `@param` (the local skills/ directory resolved by the caller's CLI args / auto-detected repo root, per the file header docstring), never remote/user input; same trusted-local shape as the pre-existing `join(skillsDir, 'RESOLVER.md')` two lines above this block, which is unflagged only because it predates this diff
   const manifestJsonAbsent = !existsSync(join(skillsDir, 'manifest.json'));
   const lowConfidenceForeignDir =
     opts?.skillsDirSource === 'cwd_walk_up' &&
