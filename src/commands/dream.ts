@@ -598,7 +598,8 @@ async function runDrain(
 ): Promise<void> {
   const { LockUnavailableError } = await import('../core/db-lock.ts');
   const { countExtractAtomsBacklog } = await import('../core/cycle/extract-atoms.ts');
-  const { runExtractAtomsDrainForSource } = await import('../core/cycle/extract-atoms-drain.ts');
+  const { runExtractAtomsDrainForSource: productionDrainRunner } = await import('../core/cycle/extract-atoms-drain.ts');
+  const runExtractAtomsDrainForSource = dreamDrainRunnerForTests ?? productionDrainRunner;
 
   const extractionSourceId = resolvedSourceId ?? 'default';
 
@@ -669,6 +670,14 @@ async function runDrain(
     `Rerun: gbrain dream --drain --window ${opts.windowSeconds}${opts.source ? ` --source ${opts.source}` : ''}\n`,
   );
   process.exit(EXIT_DRAIN_INCOMPLETE);
+}
+
+type DreamDrainRunner = typeof import('../core/cycle/extract-atoms-drain.ts').runExtractAtomsDrainForSource;
+let dreamDrainRunnerForTests: DreamDrainRunner | null = null;
+
+/** @internal Inject the drain boundary in CLI tests without mutating Bun's module registry. */
+export function __setDreamDrainRunnerForTests(runner: DreamDrainRunner | null): void {
+  dreamDrainRunnerForTests = runner;
 }
 
 export async function runDream(engine: BrainEngine | null, args: string[]): Promise<CycleReport | void> {
