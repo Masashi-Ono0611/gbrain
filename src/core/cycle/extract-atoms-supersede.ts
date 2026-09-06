@@ -49,7 +49,11 @@ function normForRetirement(s: string): string {
       .replace(/^[ \t]*(?:>[ \t]?)+/gm, '')                 // blockquote markers
       .replace(/^[ \t]*#{1,6}[ \t]+/gm, '')                 // ATX headings
       .replace(/^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+/gm, '')  // list bullets
-      .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)/g, '$1')        // [text](url) → text
+      // [text](url) → text. The destination may carry ONE level of balanced
+      // parentheses (`https://x/a_(b)`, a common wiki-style URL shape); without
+      // that allowance the fold stopped at the inner `)` and left a stray `)`
+      // in the page text, so a supported quote read as absent and was retired.
+      .replace(/!?\[([^\]\n]*)\]\((?:[^()\n]|\([^()\n]*\))*\)/g, '$1')
       .replace(/<((?:https?|mailto):[^>\s]+)>/g, '$1')      // <url> → url
       .replace(/[`*_~]/g, ''),                              // emphasis / code marks
   );
