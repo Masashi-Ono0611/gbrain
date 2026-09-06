@@ -52,6 +52,8 @@ function baseResult(overrides: Partial<ExtractAtomsDrainResult>): ExtractAtomsDr
     status: 'ok',
     extracted: 1,
     skipped: 0,
+    superseded: 0,
+    reanchored: 0,
     remaining: 0, // fully drained → dream exits 0 (no process.exit call)
     batches: 1,
     stopped: 'drained',

@@ -196,6 +196,16 @@ describe('shared wiring helper holds the cycle lock (5A)', () => {
   // (failures.length > 0 && transcripts_processed + pages_processed === 0),
   // not from `r.status` (which collapses partial and total failure into the
   // same 'warn' value — the exact discard the issue reports).
+  // #4566 — the wiring adapter is what a real drain runs; the phase's
+  // destructive count has to be READ from its details, not dropped on the
+  // floor. (The adapter itself needs a live engine + lock, so this reads the
+  // mapping; the pure-loop case above pins the arithmetic.)
+  it('runBatch maps the phase details\' retired/re-anchored atom counts', () => {
+    const runBatchBlock = src.slice(src.indexOf('runBatch: async () => {'));
+    expect(runBatchBlock).toContain("superseded: Number(d.atoms_superseded ?? 0)");
+    expect(runBatchBlock).toContain("reanchored: Number(d.atoms_reanchored ?? 0)");
+  });
+
   it('runBatch derives providerFailure from failures.length + zero processed items, not r.status', () => {
     const runBatchBlock = src.slice(src.indexOf('runBatch: async () => {'));
     expect(runBatchBlock).toContain('d.failures');
@@ -248,6 +258,30 @@ describe('#2144: zero-yield tombstone progress semantics', () => {
     expect(result.extracted).toBe(0);
     expect(result.remaining).toBe(0);
     expect(batches).toBe(2);
+  });
+
+  // #4566 — the drain lane is where extract_atoms runs nightly, so the only
+  // DESTRUCTIVE number the phase produces has to survive the adapter into
+  // `--json`. Missing values (the pre-#4566 adapter shape) count as 0.
+  it('sums the retired/re-anchored atom counts across batches, defaulting absent ones to 0', async () => {
+    const counts = [
+      { extracted: 1, skipped: 0, superseded: 2, reanchored: 1 },
+      { extracted: 1, skipped: 0 },
+      { extracted: 1, skipped: 0, superseded: 3, reanchored: 4 },
+    ];
+    let i = 0;
+    const result = await runExtractAtomsDrain(
+      {
+        withLock: passThroughLock,
+        countRemaining: seq([3, 2, 1, 0, 0]),
+        runBatch: async () => counts[i++]!,
+        now: () => 0,
+      },
+      { windowMs: 1_000_000 },
+    );
+    expect(result.batches).toBe(3);
+    expect(result.superseded).toBe(5);
+    expect(result.reanchored).toBe(5);
   });
 
   it('stops no_progress when a zero-atom batch leaves the backlog flat', async () => {

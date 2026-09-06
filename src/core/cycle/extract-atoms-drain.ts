@@ -91,6 +91,14 @@ export interface ExtractAtomsDrainDeps {
   runBatch: () => Promise<{
     extracted: number;
     skipped: number;
+    /**
+     * #4566: atoms the batch RETIRED (soft-deleted because their source page
+     * no longer supports them) and atoms it re-anchored to the page's current
+     * hash. Optional so the pure loop keeps accepting the pre-#4566 adapter
+     * shape; a missing value counts as 0.
+     */
+    superseded?: number;
+    reanchored?: number;
     providerFailure?: boolean;
     failureCount?: number;
     firstError?: string;
@@ -102,6 +110,15 @@ export interface ExtractAtomsDrainDeps {
   now: () => number;
   /** Optional progress sink (one line per batch). */
   onBatch?: (info: { batch: number; extracted: number; remaining: number | null }) => void;
+}
+
+/**
+ * Coerce an optional adapter-reported count to a whole, non-negative number —
+ * same defensive shape the failure counters use, so a malformed adapter can
+ * never make a total go backwards.
+ */
+function nonNegativeCount(n: number | undefined): number {
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
 export interface ExtractAtomsDrainOpts {
@@ -123,6 +140,15 @@ export interface ExtractAtomsDrainResult {
   status: 'ok' | 'provider_failure';
   extracted: number;
   skipped: number;
+  /**
+   * #4566: atoms RETIRED across the window (soft-deleted because their source
+   * page no longer supports them) and atoms re-anchored to their page's
+   * current hash. The retirement count is the only destructive number this
+   * lane produces, so `--json` carries it verbatim — a drain that quietly
+   * deleted rows is otherwise unobservable in the lane that runs nightly.
+   */
+  superseded: number;
+  reanchored: number;
   /** Eligible pages still pending after the window. null if the count errored. */
   remaining: number | null;
   /** Batches actually processed. */
@@ -163,6 +189,8 @@ export async function runExtractAtomsDrain(
     const deadline = deps.now() + opts.windowMs;
     let extracted = 0;
     let skipped = 0;
+    let superseded = 0;
+    let reanchored = 0;
     let batches = 0;
     let stopped: ExtractAtomsDrainResult['stopped'] = 'window';
     // issue #3218: latched once any batch reports providerFailure — drives
@@ -184,6 +212,8 @@ export async function runExtractAtomsDrain(
       const r = await deps.runBatch();
       extracted += r.extracted;
       skipped += r.skipped;
+      superseded += nonNegativeCount(r.superseded);
+      reanchored += nonNegativeCount(r.reanchored);
       batches++;
       // #4730: preserve typed per-item records (bounded, sanitized) while
       // keeping failure_count exact and reconcilable — count-only adapters
@@ -264,6 +294,8 @@ export async function runExtractAtomsDrain(
       status: providerFailure ? 'provider_failure' : 'ok',
       extracted,
       skipped,
+      superseded,
+      reanchored,
       remaining,
       batches,
       stopped,
@@ -361,6 +393,11 @@ export async function runExtractAtomsDrainForSource(
         return {
           extracted: Number(d.atoms_extracted ?? 0),
           skipped: Number(d.duplicates_skipped ?? 0),
+          // #4566: the phase's destructive count (and its non-destructive
+          // twin) ride through to `--json`; without this mapping the drain
+          // lane deletes rows it never reports.
+          superseded: Number(d.atoms_superseded ?? 0),
+          reanchored: Number(d.atoms_reanchored ?? 0),
           providerFailure: failures.length > 0 && itemsSucceeded === 0,
           failureCount: failures.length,
           failures: typedFailures,
