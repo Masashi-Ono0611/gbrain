@@ -7,40 +7,34 @@
  *
  * The drain loop itself (capping, sanitizing, reconciling failure_count) is
  * pinned in test/extract-atoms-drain*.test.ts. This file pins dream.ts's
- * rendering of the drain RESULT and its argv/exit-code wiring (#1678), so the shared drain helper is replaced by a
- * stub that returns a hand-built result. Serial: a top-level mock.module.
+ * rendering of the drain RESULT and its argv/exit-code wiring (#1678), so the shared drain helper is replaced
+ * by a stub through a narrow test seam.
  */
 
-import { afterAll, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import type { ExtractAtomsDrainResult } from '../src/core/cycle/extract-atoms-drain.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { LockUnavailableError } from '../src/core/db-lock.ts';
+import { __setDreamDrainRunnerForTests, runDream } from '../src/commands/dream.ts';
 
 let nextResult: ExtractAtomsDrainResult | Error;
 let drainCalls: Array<{ sourceId: string | undefined; windowSeconds: number }> = [];
 
-mock.module('../src/core/cycle/extract-atoms-drain.ts', () => ({
-  MAX_DRAIN_FAILURE_RECORDS: 25,
-  MAX_DRAIN_FAILURE_SOURCE_CHARS: 256,
-  MAX_DRAIN_FAILURE_REASON_CHARS: 200,
-  runExtractAtomsDrainForSource: async (_engine: unknown, opts: { sourceId: string | undefined; windowSeconds: number }) => {
-    drainCalls.push({ sourceId: opts.sourceId, windowSeconds: opts.windowSeconds });
-    if (nextResult instanceof Error) throw nextResult;
-    return nextResult;
-  },
-}));
-
-let runDream: typeof import('../src/commands/dream.ts').runDream;
+__setDreamDrainRunnerForTests(async (_engine, opts) => {
+  drainCalls.push({ sourceId: opts.sourceId, windowSeconds: opts.windowSeconds });
+  if (nextResult instanceof Error) throw nextResult;
+  return nextResult;
+});
 let engine: PGLiteEngine;
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-  ({ runDream } = await import('../src/commands/dream.ts'));
 }, 120_000);
 
 afterAll(async () => {
+  __setDreamDrainRunnerForTests(null);
   await engine.disconnect();
 });
 
@@ -54,6 +48,7 @@ function baseResult(overrides: Partial<ExtractAtomsDrainResult>): ExtractAtomsDr
     status: 'ok',
     extracted: 1,
     skipped: 0,
+    atoms_source_changed: 0,
     remaining: 0, // fully drained → dream exits 0 (no process.exit call)
     batches: 1,
     stopped: 'drained',
