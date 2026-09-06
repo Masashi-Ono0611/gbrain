@@ -7,6 +7,51 @@ import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
 import { normForGrounding } from './synthesize-verify.ts';
 
 /**
+ * A normalized quote shorter than this is not evidence enough to destroy a
+ * row: at that length an accidental substring match (or miss) is as likely as
+ * a real one, and the atom is cheap to keep and expensive to lose. Retirement
+ * skips these; they stay live with their stale binding.
+ */
+const MIN_RETIREMENT_QUOTE_CHARS = 8;
+
+/**
+ * The presence test that gates a DESTRUCTIVE decision, deliberately looser
+ * than `normForGrounding` (the grounding primitive, which folds only
+ * whitespace, curly quotes, unicode dashes, ellipsis and case — and is left
+ * alone here because other callers depend on its exact fold).
+ *
+ * Grounding asks "did the model quote this text?", where a strict fold is
+ * right. Retirement asks "is this claim still on the page?", where a stricter
+ * fold turns a COSMETIC edit into data loss: an NFC→NFD re-encode of Japanese
+ * prose, a half→full-width punctuation pass, `**emphasis**` added inside the
+ * quoted span, a link wrapped around one word, or re-bulleting two sentences
+ * all leave the claim verbatim on screen while changing its bytes.
+ *
+ * So, in order: NFKC (composes NFD, folds full-width forms to ASCII), strip
+ * the markdown syntax that carries no meaning (blockquote/heading/list
+ * markers at line start, `[text](url)` → text, `<url>` → url, emphasis and
+ * code marks), then the shared fold + whitespace collapse.
+ *
+ * Applied to BOTH sides — quote and page — so every transform above is
+ * symmetric: it can only ever ADD matches relative to the grounding fold,
+ * never remove one. That direction is the point. This function may keep an
+ * atom the strict fold would have retired; it cannot retire one the strict
+ * fold would have kept.
+ */
+function normForRetirement(s: string): string {
+  return normForGrounding(
+    s
+      .normalize('NFKC')
+      .replace(/^[ \t]*(?:>[ \t]?)+/gm, '')                 // blockquote markers
+      .replace(/^[ \t]*#{1,6}[ \t]+/gm, '')                 // ATX headings
+      .replace(/^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+/gm, '')  // list bullets
+      .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)/g, '$1')        // [text](url) → text
+      .replace(/<((?:https?|mailto):[^>\s]+)>/g, '$1')      // <url> → url
+      .replace(/[`*_~]/g, ''),                              // emphasis / code marks
+  );
+}
+
+/**
  * #4566 follow-through — reclaim the atoms a re-extracted page has invalidated.
  *
  * The doctor's `atom_provenance_drift` check counts atoms whose `source_hash`
@@ -49,9 +94,31 @@ import { normForGrounding } from './synthesize-verify.ts';
  *
  * Presence is a plain normalized-containment test over the page's FULL current
  * content — deliberately looser than extract-atoms' `locateQuote` (which also
- * demands character-aligned boundaries and uniqueness) and applied to the
- * whole page rather than the model's truncated cut. Both choices err toward
- * "still present", i.e. toward keeping the atom.
+ * demands character-aligned boundaries and uniqueness), applied to the whole
+ * page rather than the model's truncated cut, and normalized by
+ * `normForRetirement` (NFKC + markdown-syntax fold) rather than the strict
+ * grounding fold. All three choices err toward "still present", i.e. toward
+ * keeping the atom.
+ *
+ * RE-ANCHORING. A run that retires anything also repoints the atoms it KEPT on
+ * evidence — same page, stale `source_hash`, verified quote still present — at
+ * the hash just reconciled. Two reasons, and both are about not making the
+ * retirement permanent:
+ *   - It is truthful. The atom is supported by the content at THIS hash; the
+ *     hash it carried says only which pass minted it.
+ *   - `discoverExtractablePages` skips a page when any live atom already
+ *     carries its current hash. A kept atom still holding the OLD hash
+ *     therefore masks the old content forever: revert the page and discovery
+ *     says "already extracted", so the atoms retired at the new hash are never
+ *     re-derived and the purge window ends them. Re-anchoring frees the old
+ *     hash, the revert re-discovers the page, and the deterministic atom slug
+ *     makes the re-import revive the soft-deleted row in place.
+ * Only the evidenced set moves: an atom with no quote (or an unverified one)
+ * has nothing to justify a new binding, so it keeps its hash and can still
+ * mask an older one — the residual, narrowed to rows this reconciler would
+ * never retire anyway. Runs that retire nothing re-anchor nothing: without a
+ * retirement the old hash's extraction is still fully represented, and the
+ * common no-op page must not pay a write.
  *
  * `currentContent` is the snapshot the phase read before the model call, so
  * the work is gated on the live page STILL carrying `hash16`: if the page was
@@ -64,9 +131,10 @@ import { normForGrounding } from './synthesize-verify.ts';
  * — never open a transaction, so the batch phase keeps paying one SELECT.
  *
  * Soft-delete via `softDeletePages`, so rows stay recoverable inside the usual
- * purge window rather than being destroyed. Returns the number of rows
- * actually flipped active → soft-deleted. `dryRun` runs the SELECT only and
- * returns the would-be count without touching a row.
+ * purge window rather than being destroyed. Returns how many rows were
+ * actually flipped active → soft-deleted and how many were re-anchored.
+ * `dryRun` runs the SELECT only and returns the would-be counts without
+ * touching a row.
  *
  * Atoms whose source page was DELETED (the doctor's `source_gone` bucket) are
  * out of scope: this only ever runs for a page that was just re-extracted.
@@ -80,18 +148,27 @@ interface SupersedeArgs {
   dryRun: boolean;
 }
 
+/** One page's stale-bound atoms, split by what the current content says. */
+interface Verdict {
+  /** Verified quote no longer in the page → soft-delete. */
+  retire: string[];
+  /** Verified quote still in the page → repoint at the current hash. */
+  reanchor: string[];
+}
+
 /**
  * The evidence query: which of this page's atoms its current text no longer
- * supports. `lock` adds `FOR UPDATE` so the transactional pass holds the
- * candidate atom rows themselves — otherwise a concurrent import could refresh
- * an atom's quote between the judgement and the soft-delete, and the delete
- * (which matches on slug alone) would retire a row that is supported again.
+ * supports, and which it still does. `lock` adds `FOR UPDATE` so the
+ * transactional pass holds the candidate atom rows themselves — otherwise a
+ * concurrent import could refresh an atom's quote between the judgement and
+ * the soft-delete, and the delete (which matches on slug alone) would retire a
+ * row that is supported again.
  */
-async function findUnsupportedAtoms(
+async function classifyStaleAtoms(
   engine: BrainEngine,
   args: SupersedeArgs,
   lock = false,
-): Promise<string[]> {
+): Promise<Verdict> {
   const rows = await engine.executeRaw<{ slug: string; quote: string | null; verified: string | null }>(
     `SELECT slug,
             frontmatter->>'source_quote' AS quote,
@@ -112,22 +189,73 @@ async function findUnsupportedAtoms(
         )${lock ? '\n        FOR UPDATE' : ''}`,
     [args.sourceId, args.pageSlug, args.hash16, args.keepSlugs],
   );
-  const currentNorm = normForGrounding(args.currentContent);
-  return rows
-    .filter(r => r.verified === 'true' && !!r.quote && !currentNorm.includes(normForGrounding(r.quote)))
-    .map(r => r.slug);
+  const currentNorm = normForRetirement(args.currentContent);
+  const verdict: Verdict = { retire: [], reanchor: [] };
+  for (const r of rows) {
+    // No verified quote → no evidence in either direction: neither retire nor
+    // re-anchor, so the row keeps whatever binding it has.
+    if (r.verified !== 'true' || !r.quote) continue;
+    const quote = normForRetirement(r.quote);
+    if (quote.length < MIN_RETIREMENT_QUOTE_CHARS) continue;
+    (currentNorm.includes(quote) ? verdict.reanchor : verdict.retire).push(r.slug);
+  }
+  return verdict;
 }
+
+/**
+ * Repoint kept-but-stale atoms at the hash just reconciled. Runs INSIDE the
+ * retirement transaction (same row locks, same all-or-nothing rollback), and
+ * touches only `frontmatter.source_hash` — not `updated_at`, matching
+ * `softDeletePages`, so a reconciliation does not read downstream as a content
+ * edit. Returns the rows actually repointed.
+ */
+async function reanchorAtoms(
+  tx: BrainEngine,
+  args: SupersedeArgs,
+  slugs: string[],
+): Promise<number> {
+  let moved = 0;
+  for (let i = 0; i < slugs.length; i += DELETE_BATCH_SIZE) {
+    const rows = await tx.executeRaw<{ slug: string }>(
+      `UPDATE pages
+          SET frontmatter = frontmatter || jsonb_build_object('source_hash', $3::text)
+        WHERE source_id = $1
+          AND type = 'atom'
+          AND deleted_at IS NULL
+          AND frontmatter->>'source_slug' = $2
+          AND slug = ANY($4::text[])
+        RETURNING slug`,
+      [args.sourceId, args.pageSlug, args.hash16, slugs.slice(i, i + DELETE_BATCH_SIZE)],
+    );
+    moved += rows.length;
+  }
+  return moved;
+}
+
+export interface ReconcileCounts {
+  superseded: number;
+  reanchored: number;
+}
+
+const NOTHING: ReconcileCounts = { superseded: 0, reanchored: 0 };
 
 async function supersedeStaleAtomsForPage(
   engine: BrainEngine,
   args: SupersedeArgs,
-): Promise<number> {
-  if (args.dryRun) return (await findUnsupportedAtoms(engine, args)).length;
+): Promise<ReconcileCounts> {
+  if (args.dryRun) {
+    const would = await classifyStaleAtoms(engine, args);
+    // Report the same coupling a real run applies: no retirement, no
+    // re-anchoring.
+    return would.retire.length === 0
+      ? NOTHING
+      : { superseded: would.retire.length, reanchored: would.reanchor.length };
+  }
   // Fast path first: the overwhelming majority of re-extracted pages have
   // nothing to retire, and this is a batch phase — one plain SELECT per page,
   // no transaction. Only a page that actually has candidates pays for the
   // locked re-check below.
-  if ((await findUnsupportedAtoms(engine, args)).length === 0) return 0;
+  if ((await classifyStaleAtoms(engine, args)).retire.length === 0) return NOTHING;
   return engine.transaction(async (tx) => {
     // Take the "page still carries hash16" gate as a row lock: a concurrent
     // edit to this page now waits for the commit below instead of slipping in
@@ -139,26 +267,30 @@ async function supersedeStaleAtomsForPage(
         FOR UPDATE`,
       [args.sourceId, args.pageSlug, args.hash16],
     );
-    if (held.length === 0) return 0;
+    if (held.length === 0) return NOTHING;
     // Re-derived under the lock, not reused from the fast path: the lock is
     // what makes this list current.
-    const slugs = await findUnsupportedAtoms(tx, args, true);
+    const { retire, reanchor } = await classifyStaleAtoms(tx, args, true);
+    // The lock may have revealed that nothing is unsupported after all —
+    // then this is a no-op run and the kept atoms' bindings stay put.
+    if (retire.length === 0) return NOTHING;
     // softDeletePages is a single-batch primitive — oversized input throws.
     let superseded = 0;
-    for (let i = 0; i < slugs.length; i += DELETE_BATCH_SIZE) {
-      const flipped = await tx.softDeletePages(slugs.slice(i, i + DELETE_BATCH_SIZE), {
+    for (let i = 0; i < retire.length; i += DELETE_BATCH_SIZE) {
+      const flipped = await tx.softDeletePages(retire.slice(i, i + DELETE_BATCH_SIZE), {
         sourceId: args.sourceId,
       });
       superseded += flipped.length;
     }
-    return superseded;
+    return { superseded, reanchored: await reanchorAtoms(tx, args, reanchor) };
   });
 }
 
 /**
  * Bind the reconciler to one phase run. The returned function is a no-op for
  * transcript items (a transcript is a file, not a page, so nothing is bound to
- * it) and otherwise returns how many of the page's atoms were retired.
+ * it) and otherwise returns how many of the page's atoms were retired and how
+ * many were re-anchored.
  *
  * It is allowed to THROW: callers must run it before the item's completion
  * markers, on the same footing as the provenance-edge flush. Both markers (the
@@ -171,8 +303,8 @@ export function createAtomReconciler(engine: BrainEngine, sourceId: string, dryR
   return async (
     item: { kind: string; slug?: string; content: string; contentHash: string },
     keepSlugs: string[],
-  ): Promise<number> => {
-    if (item.kind !== 'page' || !item.slug) return 0;
+  ): Promise<ReconcileCounts> => {
+    if (item.kind !== 'page' || !item.slug) return NOTHING;
     return supersedeStaleAtomsForPage(engine, {
       sourceId, pageSlug: item.slug, hash16: item.contentHash.slice(0, 16),
       currentContent: item.content, keepSlugs, dryRun,

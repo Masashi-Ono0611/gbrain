@@ -728,6 +728,7 @@ export async function runPhaseExtractAtoms(
   // 4. Per work-item: extract atoms via the configured extract_atoms model
   let totalAtomsExtracted = 0;
   let atomsSuperseded = 0;
+  let atomsReanchored = 0;
   let transcriptsProcessed = 0;
   let pagesProcessed = 0;
   let transcriptsSkipped = 0;
@@ -886,6 +887,10 @@ export async function runPhaseExtractAtoms(
   // supports. Evidence rule, throw-before-the-completion-markers contract and
   // dry-run semantics all live in the reconciler module.
   const reconcileAtoms = createAtomReconciler(engine, sourceId, opts.dryRun === true);
+  const countReconciled = (c: { superseded: number; reanchored: number }) => {
+    atomsSuperseded += c.superseded;
+    atomsReanchored += c.reanchored;
+  };
 
   await withBudgetTracker(budgetTracker, async () => {
   for (const item of work) {
@@ -965,7 +970,7 @@ export async function runPhaseExtractAtoms(
         // still retire the atoms whose quotes it deleted, and a failure here
         // has to leave the page unstamped so the next run retries. Nothing was
         // written, so nothing is exempt.
-        atomsSuperseded += await reconcileAtoms(item, []);
+        countReconciled(await reconcileAtoms(item, []));
         if (!opts.dryRun && item.kind === 'page') {
           await stampAtomsScanHash(item);
         }
@@ -1088,7 +1093,7 @@ export async function runPhaseExtractAtoms(
         // before-the-flip footing as the provenance flush. The rows just
         // written are exempt twice over — they are in importedSlugs, and their
         // provisional `pending:` hashes are excluded by the predicate.
-        atomsSuperseded += await reconcileAtoms(item, importedSlugs);
+        countReconciled(await reconcileAtoms(item, importedSlugs));
         // Completion receipt: flip provisional → real in one statement (only
         // after every atom AND provenance edge persisted), then stamp the
         // source page. A crash between flip and stamp degrades to the legacy
@@ -1108,7 +1113,7 @@ export async function runPhaseExtractAtoms(
         if (item.kind === 'page') {
           const wouldWrite: string[] = [];
           for (const a of atoms) wouldWrite.push(await resolvePageAtomSlug(engine, a.title, item.slug, sourceId));
-          atomsSuperseded += await reconcileAtoms(item, wouldWrite);
+          countReconciled(await reconcileAtoms(item, wouldWrite));
         }
       }
       if (item.kind === 'transcript') transcriptsProcessed++;
@@ -1221,6 +1226,7 @@ export async function runPhaseExtractAtoms(
     details: {
       atoms_extracted: totalAtomsExtracted,
       atoms_superseded: atomsSuperseded,
+      atoms_reanchored: atomsReanchored,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,
       transcripts_skipped_budget: transcriptsSkipped,
