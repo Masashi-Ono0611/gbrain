@@ -19,8 +19,10 @@
  *       cut and returns only a handful of atoms per pass.
  *   (b) live-mix: an atom bound to a DIFFERENT page (same date prefix, same
  *       title — the #4733 locator-fold case) and a pre-binding-era atom (no
- *       source_slug/source_path) are untouched, even though both carry a
- *       stale hash and a quote absent from this page.
+ *       source_slug/source_path) are untouched, even though neither carries
+ *       the hash being reconciled and neither's quote is in this page. Only
+ *       the binding check saves them. (Q's own hash is current for Q; it is
+ *       simply not P's.)
  *   (c) reverse control for (b): the same run DID soft-delete the page's own
  *       invalidated atom — so (b) cannot pass vacuously on a no-op.
  *   (d) dry-run: no row changes at all, and the reported would-be count
@@ -178,8 +180,8 @@ interface Fixture { ns: string; p: string; q: string; legacyTitle: string; legac
 /**
  * Two same-date source pages (so their atoms share the `atoms/2026-07-01/`
  * prefix and only the locator fold separates them) plus a pre-binding-era
- * atom. P is extracted at body1(ns); Q is extracted once and never again, so its
- * atom's hash stays stale for the rest of the fixture.
+ * atom. P is extracted at body1(ns); Q is extracted once and never again, so
+ * Q's atom keeps Q's hash — current for Q, but never P's.
  */
 async function seed(ns: string): Promise<Fixture> {
   const p = `writings/2026-07-01-p-${ns}`;
@@ -210,7 +212,8 @@ async function seed(ns: string): Promise<Fixture> {
   expect((await atomRow(T_OLD, p))?.verified).toBe('true');
 
   // Q emits the SAME atom title on the SAME date — distinct slug via the
-  // #4733 locator fold — with a quote that lives only in Q's own body.
+  // #4733 locator fold — with a quote that lives only in Q's own body, so
+  // reconciling P sees a bound-elsewhere row whose quote P does not contain.
   const sibling = await runPhaseExtractAtoms(engine, {
     _transcripts: [],
     _pages: [{ slug: q, content: body([Q_SIBLING], ns), contentHash: hq }],
