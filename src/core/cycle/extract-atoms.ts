@@ -72,6 +72,7 @@ import { BudgetExhausted, BudgetTracker, isModelPriceable } from '../budget/budg
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { createHash } from 'crypto';
+import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
 import { slugifySegment } from '../sync.ts';
 import { resolveTierDefault } from '../model-config.ts';
 import { normalizeForGrounding } from './synthesize-verify.ts';
@@ -530,6 +531,70 @@ export async function atomsExistingForHashes(
 }
 
 /**
+ * #4566 follow-through — supersede the atoms a re-extracted page has replaced.
+ *
+ * The doctor's `atom_provenance_drift` check counts atoms whose `source_hash`
+ * no longer matches any live page and is explicitly diagnostic: it never
+ * deletes. Its larger bucket (`source_changed` — the source page still exists,
+ * it was merely edited) had nothing to reclaim it. Re-extraction upserts an
+ * atom in place only when the new pass produces the SAME title; a reworded
+ * claim lands on a new deterministic slug and the old atom stays behind,
+ * still searchable, still carrying a `source_quote` no current page contains.
+ *
+ * This reconciles ONE page's atom set at the moment its replacement set has
+ * been imported and stamped with the current hash. An atom is superseded only
+ * when ALL of these hold:
+ *   - `type = 'atom'`, live, in the SAME source as the write;
+ *   - `source_slug` EQUALS this page's slug. This is the strict subset of
+ *     `isCompatibleAtomBinding`: that predicate also adopts a pre-binding-era
+ *     row (no `source_slug`/`source_path`) for upsert, but such a row is not
+ *     bound to THIS page, so it is never reaped. Transcript-lane atoms carry
+ *     `source_path` and no `source_slug`, so they cannot match either;
+ *   - `source_hash` is present, is not the in-flight `pending:` marker, and
+ *     differs from the page's current hash16 — the page's OWN current content
+ *     is the staleness authority, judged inside the run that just wrote it;
+ *   - the slug was NOT written by this run for this page (the `keepSlugs`
+ *     exclusion) — a same-title atom is refreshed in place, not superseded.
+ *
+ * Soft-delete via `softDeletePages`, so the rows stay recoverable inside the
+ * usual purge window rather than being destroyed. Returns the number of rows
+ * actually flipped active → soft-deleted. `dryRun` runs the SELECT only and
+ * returns the would-be count without touching a row.
+ *
+ * Atoms whose source page was DELETED (the doctor's `source_gone` bucket) are
+ * out of scope: this only ever runs for a page that was just re-extracted.
+ */
+async function supersedeStaleAtomsForPage(
+  engine: BrainEngine,
+  args: { sourceId: string; pageSlug: string; hash16: string; keepSlugs: string[]; dryRun: boolean },
+): Promise<number> {
+  const rows = await engine.executeRaw<{ slug: string }>(
+    `SELECT slug
+       FROM pages
+      WHERE source_id = $1
+        AND type = 'atom'
+        AND deleted_at IS NULL
+        AND frontmatter->>'source_slug' = $2
+        AND frontmatter->>'source_hash' IS NOT NULL
+        AND frontmatter->>'source_hash' NOT LIKE 'pending:%'
+        AND frontmatter->>'source_hash' <> $3
+        AND NOT (slug = ANY($4::text[]))`,
+    [args.sourceId, args.pageSlug, args.hash16, args.keepSlugs],
+  );
+  const slugs = rows.map(r => r.slug);
+  if (args.dryRun || slugs.length === 0) return slugs.length;
+  // softDeletePages is a single-batch primitive — oversized input throws.
+  let superseded = 0;
+  for (let i = 0; i < slugs.length; i += DELETE_BATCH_SIZE) {
+    const flipped = await engine.softDeletePages(slugs.slice(i, i + DELETE_BATCH_SIZE), {
+      sourceId: args.sourceId,
+    });
+    superseded += flipped.length;
+  }
+  return superseded;
+}
+
+/**
  * The exact two-step model resolution `runPhaseExtractAtoms` uses:
  * `models.dream.extract_atoms` DB config wins if set (same plain-`||`
  * truthiness as always — a whitespace-only value IS "configured"), else the
@@ -726,6 +791,7 @@ export async function runPhaseExtractAtoms(
 
   // 4. Per work-item: extract atoms via the configured extract_atoms model
   let totalAtomsExtracted = 0;
+  let atomsSuperseded = 0;
   let transcriptsProcessed = 0;
   let pagesProcessed = 0;
   let transcriptsSkipped = 0;
@@ -1082,11 +1148,52 @@ export async function runPhaseExtractAtoms(
             WHERE source_id = $2 AND type = 'atom' AND slug = ANY($3::text[]) AND deleted_at IS NULL`,
           [hash16, sourceId, importedSlugs],
         );
+        // #4566 follow-through: the replacement set is live and stamped, so
+        // whatever this page's PREVIOUS content produced is now superseded.
+        // Runs after the flip, so the rows just written carry the current
+        // hash and are excluded by the predicate as well as by keepSlugs.
+        // Best-effort, like the receipt/rollup writers below: the extraction
+        // itself already committed, and reconciliation converges on the next
+        // re-extraction, so a failure here must not fail the item.
+        if (item.kind === 'page') {
+          try {
+            atomsSuperseded += await supersedeStaleAtomsForPage(engine, {
+              sourceId, pageSlug: item.slug, hash16, keepSlugs: importedSlugs, dryRun: false,
+            });
+          } catch (err) {
+            console.error(
+              `[extract_atoms] supersede stale atoms failed for ${item.slug}: ${(err as Error).message}`,
+            );
+          }
+        }
         if (item.kind === 'page') {
           await stampAtomsScanHash(item);
         }
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting
+        // Report-only twin of the reconciliation above. resolvePageAtomSlug is
+        // read-only, so the would-be write set can be resolved under dry-run —
+        // without it the count would include atoms a real run would refresh in
+        // place rather than supersede.
+        if (item.kind === 'page') {
+          try {
+            const wouldWrite: string[] = [];
+            for (const atom of atoms) {
+              wouldWrite.push(await resolvePageAtomSlug(engine, atom.title, item.slug, sourceId));
+            }
+            atomsSuperseded += await supersedeStaleAtomsForPage(engine, {
+              sourceId,
+              pageSlug: item.slug,
+              hash16: item.contentHash.slice(0, 16),
+              keepSlugs: wouldWrite,
+              dryRun: true,
+            });
+          } catch (err) {
+            console.error(
+              `[extract_atoms] supersede dry-run count failed for ${item.slug}: ${(err as Error).message}`,
+            );
+          }
+        }
       }
       if (item.kind === 'transcript') transcriptsProcessed++;
       else pagesProcessed++;
@@ -1190,12 +1297,14 @@ export async function runPhaseExtractAtoms(
       `extract_atoms: ${totalAtomsExtracted} atoms from ` +
       `${transcriptsProcessed}/${transcripts.length} transcripts + ` +
       `${pagesProcessed}/${pages.length} pages` +
+      (atomsSuperseded > 0 ? ` (${atomsSuperseded} superseded)` : '') +
       (failures.length > 0 ? ` (${failures.length} failed)` : '') +
       (transcriptsSkipped + pagesSkipped > 0
         ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
         : ''),
     details: {
       atoms_extracted: totalAtomsExtracted,
+      atoms_superseded: atomsSuperseded,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,
       transcripts_skipped_budget: transcriptsSkipped,
