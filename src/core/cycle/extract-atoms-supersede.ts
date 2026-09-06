@@ -50,6 +50,14 @@ import { normForGrounding } from './synthesize-verify.ts';
  * whole page rather than the model's truncated cut. Both choices err toward
  * "still present", i.e. toward keeping the atom.
  *
+ * `currentContent` is the snapshot the phase read before the model call, so
+ * the query is gated on the live page STILL carrying `hash16`: if the page was
+ * edited while the model was thinking, the snapshot no longer describes it and
+ * the whole reconciliation yields nothing rather than judging a claim against
+ * text that has moved. (A write landing between this SELECT and the
+ * soft-delete below is still possible; the soft-delete is recoverable inside
+ * the purge window, and the edit re-eligibilizes the page for extraction.)
+ *
  * Soft-delete via `softDeletePages`, so rows stay recoverable inside the usual
  * purge window rather than being destroyed. Returns the number of rows
  * actually flipped active → soft-deleted. `dryRun` runs the SELECT only and
@@ -58,7 +66,7 @@ import { normForGrounding } from './synthesize-verify.ts';
  * Atoms whose source page was DELETED (the doctor's `source_gone` bucket) are
  * out of scope: this only ever runs for a page that was just re-extracted.
  */
-export async function supersedeStaleAtomsForPage(
+async function supersedeStaleAtomsForPage(
   engine: BrainEngine,
   args: {
     sourceId: string;
@@ -81,7 +89,12 @@ export async function supersedeStaleAtomsForPage(
         AND frontmatter->>'source_hash' IS NOT NULL
         AND frontmatter->>'source_hash' NOT LIKE 'pending:%'
         AND frontmatter->>'source_hash' <> $3
-        AND NOT (slug = ANY($4::text[]))`,
+        AND NOT (slug = ANY($4::text[]))
+        AND EXISTS (
+          SELECT 1 FROM pages p
+           WHERE p.source_id = $1 AND p.slug = $2 AND p.deleted_at IS NULL
+             AND substring(p.content_hash from 1 for 16) = $3
+        )`,
     [args.sourceId, args.pageSlug, args.hash16, args.keepSlugs],
   );
   const currentNorm = normForGrounding(args.currentContent);
@@ -98,4 +111,29 @@ export async function supersedeStaleAtomsForPage(
     superseded += flipped.length;
   }
   return superseded;
+}
+
+/**
+ * Bind the reconciler to one phase run. The returned function is a no-op for
+ * transcript items (a transcript is a file, not a page, so nothing is bound to
+ * it) and otherwise returns how many of the page's atoms were retired.
+ *
+ * It is allowed to THROW: callers must run it before the item's completion
+ * markers, on the same footing as the provenance-edge flush. Both markers (the
+ * `source_hash` flip and `atoms_scan_hash`) make the page undiscoverable for
+ * this content, so a reconciliation that failed after them could never be
+ * retried; failing first leaves the provisional hashes in place and the next
+ * run redoes the whole item.
+ */
+export function createAtomReconciler(engine: BrainEngine, sourceId: string, dryRun: boolean) {
+  return async (
+    item: { kind: string; slug?: string; content: string; contentHash: string },
+    keepSlugs: string[],
+  ): Promise<number> => {
+    if (item.kind !== 'page' || !item.slug) return 0;
+    return supersedeStaleAtomsForPage(engine, {
+      sourceId, pageSlug: item.slug, hash16: item.contentHash.slice(0, 16),
+      currentContent: item.content, keepSlugs, dryRun,
+    });
+  };
 }

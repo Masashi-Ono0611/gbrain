@@ -72,7 +72,7 @@ import { BudgetExhausted, BudgetTracker, isModelPriceable } from '../budget/budg
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { createHash } from 'crypto';
-import { supersedeStaleAtomsForPage } from './extract-atoms-supersede.ts';
+import { createAtomReconciler } from './extract-atoms-supersede.ts';
 import { slugifySegment } from '../sync.ts';
 import { resolveTierDefault } from '../model-config.ts';
 import { normalizeForGrounding } from './synthesize-verify.ts';
@@ -882,28 +882,10 @@ export async function runPhaseExtractAtoms(
     }
   }
 
-  /**
-   * #4566 follow-through: reclaim atoms this page's CURRENT content no longer
-   * supports (evidence rule: see supersedeStaleAtomsForPage). Gets the FULL
-   * item content, not the model's cut. A failure lands in `failures` instead
-   * of throwing: the extraction committed, but the page is not re-discovered
-   * for this hash, so a silent log would hide a reconciliation that never ran.
-   */
-  async function reconcilePageAtoms(
-    item: { kind: string; slug?: string; content: string; contentHash: string },
-    keepSlugs: string[],
-  ): Promise<void> {
-    if (item.kind !== 'page' || !item.slug) return;
-    try {
-      atomsSuperseded += await supersedeStaleAtomsForPage(engine, {
-        sourceId, pageSlug: item.slug, hash16: item.contentHash.slice(0, 16),
-        currentContent: item.content, keepSlugs, dryRun: opts.dryRun === true,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      failures.push({ source: item.slug, error: `atom reconciliation failed: ${msg}` });
-    }
-  }
+  // #4566 follow-through: retire the atoms a page's CURRENT content no longer
+  // supports. Evidence rule, throw-before-the-completion-markers contract and
+  // dry-run semantics all live in the reconciler module.
+  const reconcileAtoms = createAtomReconciler(engine, sourceId, opts.dryRun === true);
 
   await withBudgetTracker(budgetTracker, async () => {
   for (const item of work) {
@@ -979,14 +961,14 @@ export async function runPhaseExtractAtoms(
         // Only stamped after a SUCCESSFUL chat call — LLM failures take the
         // catch path below and stay retryable, and malformed output is
         // counted above (gbrain#4148), never stamped as success.
+        // Before the stamp: an edit that removed every extractable claim must
+        // still retire the atoms whose quotes it deleted, and a failure here
+        // has to leave the page unstamped so the next run retries. Nothing was
+        // written, so nothing is exempt.
+        atomsSuperseded += await reconcileAtoms(item, []);
         if (!opts.dryRun && item.kind === 'page') {
           await stampAtomsScanHash(item);
         }
-        // Stamped done, so this is the page's last reconciliation chance for
-        // this content: an edit that removed every extractable claim must
-        // still retire the atoms whose quotes it deleted. Nothing was written,
-        // so nothing is exempt.
-        await reconcilePageAtoms(item, []);
         if (item.kind === 'transcript') transcriptsProcessed++;
         else pagesProcessed++;
         continue;
@@ -1102,6 +1084,11 @@ export async function runPhaseExtractAtoms(
         if (provenanceLinks.length > 0) {
           await engine.addLinksBatch(provenanceLinks, { auditSite: 'cycle.extract_atoms.provenance' }); // gbrain-allow-direct-insert: atom-provenance edges derived from the extraction itself (no markdown body to reconcile from)
         }
+        // #4566: retire what this page no longer supports, on the same
+        // before-the-flip footing as the provenance flush. The rows just
+        // written are exempt twice over — they are in importedSlugs, and their
+        // provisional `pending:` hashes are excluded by the predicate.
+        atomsSuperseded += await reconcileAtoms(item, importedSlugs);
         // Completion receipt: flip provisional → real in one statement (only
         // after every atom AND provenance edge persisted), then stamp the
         // source page. A crash between flip and stamp degrades to the legacy
@@ -1112,9 +1099,6 @@ export async function runPhaseExtractAtoms(
             WHERE source_id = $2 AND type = 'atom' AND slug = ANY($3::text[]) AND deleted_at IS NULL`,
           [hash16, sourceId, importedSlugs],
         );
-        // AFTER the flip on purpose: the rows just written already carry the
-        // current hash, so the reconciliation predicate excludes them too.
-        await reconcilePageAtoms(item, importedSlugs);
         if (item.kind === 'page') await stampAtomsScanHash(item);
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting
@@ -1124,7 +1108,7 @@ export async function runPhaseExtractAtoms(
         if (item.kind === 'page') {
           const wouldWrite: string[] = [];
           for (const a of atoms) wouldWrite.push(await resolvePageAtomSlug(engine, a.title, item.slug, sourceId));
-          await reconcilePageAtoms(item, wouldWrite);
+          atomsSuperseded += await reconcileAtoms(item, wouldWrite);
         }
       }
       if (item.kind === 'transcript') transcriptsProcessed++;
