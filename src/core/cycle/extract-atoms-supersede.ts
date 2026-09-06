@@ -34,9 +34,12 @@ import { normForGrounding } from './synthesize-verify.ts';
  *     such a row is not bound to THIS page, so it is never reaped.
  *     Transcript-lane atoms carry `source_path` and no `source_slug`, so they
  *     cannot match either;
- *   - `source_hash` is present, is not the in-flight `pending:` marker, and
- *     differs from the page's current hash16 — the page's OWN current content
- *     is the staleness authority, judged inside the run that just wrote it;
+ *   - `source_hash` is present and is neither the page's current hash16 nor
+ *     THIS run's in-flight `pending:<hash16>` marker — the page's OWN current
+ *     content is the staleness authority, judged inside the run that just
+ *     wrote it. A `pending:` row left behind by an INTERRUPTED earlier run is
+ *     deliberately eligible: nothing else ever reclaims it, and it is judged
+ *     on the same quote evidence as any other row;
  *   - the slug was NOT written by this run for this page (`keepSlugs`) — a
  *     same-title atom is refreshed in place, not superseded;
  *   - the atom carries `source_quote_verified: true` AND that quote is absent
@@ -51,12 +54,14 @@ import { normForGrounding } from './synthesize-verify.ts';
  * "still present", i.e. toward keeping the atom.
  *
  * `currentContent` is the snapshot the phase read before the model call, so
- * the query is gated on the live page STILL carrying `hash16`: if the page was
+ * the work is gated on the live page STILL carrying `hash16`: if the page was
  * edited while the model was thinking, the snapshot no longer describes it and
- * the whole reconciliation yields nothing rather than judging a claim against
- * text that has moved. (A write landing between this SELECT and the
- * soft-delete below is still possible; the soft-delete is recoverable inside
- * the purge window, and the edit re-eligibilizes the page for extraction.)
+ * the reconciliation yields nothing rather than judging a claim against text
+ * that has moved. When there IS something to retire, the write re-runs the
+ * whole judgement inside a transaction that holds a `FOR UPDATE` row lock on
+ * the source page, so an edit cannot land between the evidence check and the
+ * soft-delete either. Pages with nothing to retire — the overwhelming majority
+ * — never open a transaction, so the batch phase keeps paying one SELECT.
  *
  * Soft-delete via `softDeletePages`, so rows stay recoverable inside the usual
  * purge window rather than being destroyed. Returns the number of rows
@@ -66,17 +71,17 @@ import { normForGrounding } from './synthesize-verify.ts';
  * Atoms whose source page was DELETED (the doctor's `source_gone` bucket) are
  * out of scope: this only ever runs for a page that was just re-extracted.
  */
-async function supersedeStaleAtomsForPage(
-  engine: BrainEngine,
-  args: {
-    sourceId: string;
-    pageSlug: string;
-    hash16: string;
-    currentContent: string;
-    keepSlugs: string[];
-    dryRun: boolean;
-  },
-): Promise<number> {
+interface SupersedeArgs {
+  sourceId: string;
+  pageSlug: string;
+  hash16: string;
+  currentContent: string;
+  keepSlugs: string[];
+  dryRun: boolean;
+}
+
+/** The evidence query: which of this page's atoms its current text no longer supports. */
+async function findUnsupportedAtoms(engine: BrainEngine, args: SupersedeArgs): Promise<string[]> {
   const rows = await engine.executeRaw<{ slug: string; quote: string | null; verified: string | null }>(
     `SELECT slug,
             frontmatter->>'source_quote' AS quote,
@@ -87,7 +92,7 @@ async function supersedeStaleAtomsForPage(
         AND deleted_at IS NULL
         AND frontmatter->>'source_slug' = $2
         AND frontmatter->>'source_hash' IS NOT NULL
-        AND frontmatter->>'source_hash' NOT LIKE 'pending:%'
+        AND frontmatter->>'source_hash' <> ('pending:' || $3)
         AND frontmatter->>'source_hash' <> $3
         AND NOT (slug = ANY($4::text[]))
         AND EXISTS (
@@ -98,19 +103,46 @@ async function supersedeStaleAtomsForPage(
     [args.sourceId, args.pageSlug, args.hash16, args.keepSlugs],
   );
   const currentNorm = normForGrounding(args.currentContent);
-  const slugs = rows
+  return rows
     .filter(r => r.verified === 'true' && !!r.quote && !currentNorm.includes(normForGrounding(r.quote)))
     .map(r => r.slug);
-  if (args.dryRun || slugs.length === 0) return slugs.length;
-  // softDeletePages is a single-batch primitive — oversized input throws.
-  let superseded = 0;
-  for (let i = 0; i < slugs.length; i += DELETE_BATCH_SIZE) {
-    const flipped = await engine.softDeletePages(slugs.slice(i, i + DELETE_BATCH_SIZE), {
-      sourceId: args.sourceId,
-    });
-    superseded += flipped.length;
-  }
-  return superseded;
+}
+
+async function supersedeStaleAtomsForPage(
+  engine: BrainEngine,
+  args: SupersedeArgs,
+): Promise<number> {
+  if (args.dryRun) return (await findUnsupportedAtoms(engine, args)).length;
+  // Fast path first: the overwhelming majority of re-extracted pages have
+  // nothing to retire, and this is a batch phase — one plain SELECT per page,
+  // no transaction. Only a page that actually has candidates pays for the
+  // locked re-check below.
+  if ((await findUnsupportedAtoms(engine, args)).length === 0) return 0;
+  return engine.transaction(async (tx) => {
+    // Take the "page still carries hash16" gate as a row lock: a concurrent
+    // edit to this page now waits for the commit below instead of slipping in
+    // between the evidence check and the soft-delete.
+    const held = await tx.executeRaw<{ ok: number }>(
+      `SELECT 1 AS ok FROM pages
+        WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL
+          AND substring(content_hash from 1 for 16) = $3
+        FOR UPDATE`,
+      [args.sourceId, args.pageSlug, args.hash16],
+    );
+    if (held.length === 0) return 0;
+    // Re-derived under the lock, not reused from the fast path: the lock is
+    // what makes this list current.
+    const slugs = await findUnsupportedAtoms(tx, args);
+    // softDeletePages is a single-batch primitive — oversized input throws.
+    let superseded = 0;
+    for (let i = 0; i < slugs.length; i += DELETE_BATCH_SIZE) {
+      const flipped = await tx.softDeletePages(slugs.slice(i, i + DELETE_BATCH_SIZE), {
+        sourceId: args.sourceId,
+      });
+      superseded += flipped.length;
+    }
+    return superseded;
+  });
 }
 
 /**

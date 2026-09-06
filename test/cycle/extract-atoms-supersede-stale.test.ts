@@ -372,22 +372,46 @@ describe('extract_atoms retires atoms its source page no longer supports (#4566 
       },
     });
 
+    // The run really did reach reconciliation — it succeeded and imported its
+    // atoms; the zero count is the guard firing, not an early exception.
+    expect(result.status).toBe('ok');
+    expect(result.details?.atoms_extracted).toBe(2);
     expect(result.details?.atoms_superseded).toBe(0);
     expect((await atomRow(T_OLD, p))!.deleted_at).toBeNull();
+  }, 120_000);
+
+  test('(i) a pending row abandoned by an interrupted earlier run is reclaimable', async () => {
+    const f = await seed('i');
+    const p = f.p;
+    // An interrupted run leaves atoms stamped `pending:<its hash>`; nothing
+    // else ever reclaims them, so only THIS run's marker is exempt.
+    await engine.executeRaw(
+      `UPDATE pages SET frontmatter = frontmatter || jsonb_build_object('source_hash', 'pending:aaaaaaaaaaaaaaaa')
+        WHERE type = 'atom' AND title = $1 AND frontmatter->>'source_slug' = $2`,
+      [T_OLD, p],
+    );
+    expect((await atomRow(T_OLD, p))!.source_hash).toBe('pending:aaaaaaaaaaaaaaaa');
+
+    const result = await reextract(f);
+    expect(result.details?.atoms_superseded).toBe(1);
+    expect((await atomRow(T_OLD, p))!.deleted_at).not.toBeNull();
   }, 120_000);
 
   test('(g) a reconciliation failure leaves the page retryable, and the retry finishes it', async () => {
     const f = await seed('g');
     const p = f.p;
-    const original = engine.softDeletePages.bind(engine);
     let failed;
     try {
-      (engine as { softDeletePages: unknown }).softDeletePages = async () => {
+      // Shadow the prototype method with an own property, and DELETE it to
+      // restore: re-assigning an engine-BOUND copy would make the reconciler's
+      // transaction write on the outer connection instead of its own and
+      // self-deadlock against the row lock it is holding.
+      (engine as { softDeletePages?: unknown }).softDeletePages = async () => {
         throw new Error('injected soft-delete failure');
       };
       failed = await reextract(f);
     } finally {
-      (engine as { softDeletePages: unknown }).softDeletePages = original;
+      delete (engine as { softDeletePages?: unknown }).softDeletePages;
     }
 
     // Surfaced, not swallowed.
