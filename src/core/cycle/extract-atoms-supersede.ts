@@ -80,8 +80,18 @@ interface SupersedeArgs {
   dryRun: boolean;
 }
 
-/** The evidence query: which of this page's atoms its current text no longer supports. */
-async function findUnsupportedAtoms(engine: BrainEngine, args: SupersedeArgs): Promise<string[]> {
+/**
+ * The evidence query: which of this page's atoms its current text no longer
+ * supports. `lock` adds `FOR UPDATE` so the transactional pass holds the
+ * candidate atom rows themselves — otherwise a concurrent import could refresh
+ * an atom's quote between the judgement and the soft-delete, and the delete
+ * (which matches on slug alone) would retire a row that is supported again.
+ */
+async function findUnsupportedAtoms(
+  engine: BrainEngine,
+  args: SupersedeArgs,
+  lock = false,
+): Promise<string[]> {
   const rows = await engine.executeRaw<{ slug: string; quote: string | null; verified: string | null }>(
     `SELECT slug,
             frontmatter->>'source_quote' AS quote,
@@ -99,7 +109,7 @@ async function findUnsupportedAtoms(engine: BrainEngine, args: SupersedeArgs): P
           SELECT 1 FROM pages p
            WHERE p.source_id = $1 AND p.slug = $2 AND p.deleted_at IS NULL
              AND substring(p.content_hash from 1 for 16) = $3
-        )`,
+        )${lock ? '\n        FOR UPDATE' : ''}`,
     [args.sourceId, args.pageSlug, args.hash16, args.keepSlugs],
   );
   const currentNorm = normForGrounding(args.currentContent);
@@ -132,7 +142,7 @@ async function supersedeStaleAtomsForPage(
     if (held.length === 0) return 0;
     // Re-derived under the lock, not reused from the fast path: the lock is
     // what makes this list current.
-    const slugs = await findUnsupportedAtoms(tx, args);
+    const slugs = await findUnsupportedAtoms(tx, args, true);
     // softDeletePages is a single-batch primitive — oversized input throws.
     let superseded = 0;
     for (let i = 0; i < slugs.length; i += DELETE_BATCH_SIZE) {
