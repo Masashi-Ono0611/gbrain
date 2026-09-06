@@ -101,6 +101,7 @@ import { derivedGateInput } from '../trust/derived-gate.ts';
 import { ATOM_TYPES, ATOMS_RESPONSE_SCHEMA } from './extract-atoms-schema.ts';
 import { parseAtomsOutcome } from './extract-atoms-parse.ts';
 export { parseAtomsOutcome, parseAtomsResponse, type AtomsParseOutcome } from './extract-atoms-parse.ts';
+import { countSourceChangedAtoms } from './extract-atoms-source-drift.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 // #4529 + #4540: per-item extractor caps, overridable via
@@ -871,6 +872,7 @@ export async function runPhaseExtractAtoms(
         reason: 'no_work',
         source_id: sourceId,
         atoms_extracted: 0,
+        atoms_source_changed: 0,
         transcripts_processed: 0,
         transcripts_total: 0,
         transcripts_skipped_budget: 0,
@@ -887,6 +889,8 @@ export async function runPhaseExtractAtoms(
 
   // 4. Per work-item: extract atoms via the configured extract_atoms model
   let totalAtomsExtracted = 0;
+  // Read-only drift visibility; see ./extract-atoms-source-drift.ts.
+  let atomsSourceChanged = 0;
   let transcriptsProcessed = 0;
   let pagesProcessed = 0;
   let transcriptsSkipped = 0;
@@ -1154,6 +1158,10 @@ export async function runPhaseExtractAtoms(
           else if (!origin && item.kind === 'transcript') await stampTranscriptTombstone(engine, sourceId, item.filePath, item.contentHash);
           await commitAtomsWatermark(item, input, published);
         }
+        // Zero yield ≠ zero atoms: earlier runs can have left stale rows.
+        if (item.kind === 'page') {
+          atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
+        }
         if (item.kind === 'transcript') transcriptsProcessed++;
         else pagesProcessed++;
         continue;
@@ -1301,7 +1309,25 @@ export async function runPhaseExtractAtoms(
         throwIfAborted(opts.signal, 'extract_atoms');
         // #6503: a cut item keeps its atoms provisional (`pending:<hash>`, the upsert path when it runs
         // again), retires nothing and records its partial disposition instead of a completion stamp.
-        const retired = truncated ? [] : await completeUnmanagedItem(engine, sourceId, item, hash16, importedSlugs);
+        const retired = truncated ? [] : await completeUnmanagedItem(
+          engine,
+          sourceId,
+          item,
+          hash16,
+          importedSlugs,
+          item.kind === 'page'
+            ? async () => {
+                // Preserve the pre-cleanup drift population after receipts flip,
+                // before the upstream helper retires stale atoms.
+                atomsSourceChanged += await countSourceChangedAtoms(
+                  engine,
+                  sourceId,
+                  item.slug,
+                  item.contentHash.slice(0, 16),
+                );
+              }
+            : undefined,
+        );
         await atomFiles?.write(importedSlugs, retired);
         if (truncated) await recordPartialDisposition(engine, sourceId, item, maxInputChars);
         else if (item.kind === 'page') await stampAtomsScanHash(item);
@@ -1309,6 +1335,11 @@ export async function runPhaseExtractAtoms(
         }
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting
+      }
+      // Dry-run wrote nothing, so report the pre-run live population. Normal
+      // writes counted after receipt completion and before upstream cleanup.
+      if (opts.dryRun && item.kind === 'page') {
+        atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
       }
       if (item.kind === 'transcript') transcriptsProcessed++;
       else pagesProcessed++;
@@ -1429,9 +1460,11 @@ export async function runPhaseExtractAtoms(
       (transcriptsSkipped + pagesSkipped > 0
         ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
         : '') +
-      (inputTruncated > 0 ? ` (${inputTruncated} input-truncated: the model did not read the tail)` : ''),
+      (inputTruncated > 0 ? ` (${inputTruncated} input-truncated: the model did not read the tail)` : '') +
+      (atomsSourceChanged > 0 ? ` (${atomsSourceChanged} source-changed atoms)` : ''),
     details: {
       atoms_extracted: totalAtomsExtracted,
+      atoms_source_changed: atomsSourceChanged,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,
       transcripts_skipped_budget: transcriptsSkipped,
@@ -1466,8 +1499,10 @@ export async function runPhaseExtractAtoms(
  * produced that this one did not. Returns the retired slugs.
  */
 async function completeUnmanagedItem(engine: BrainEngine, sourceId: string,
-  item: { kind: 'transcript'; filePath: string } | ({ kind: 'page' } & AtomPageInput), hash16: string, importedSlugs: string[]): Promise<string[]> {
+  item: { kind: 'transcript'; filePath: string } | ({ kind: 'page' } & AtomPageInput), hash16: string, importedSlugs: string[],
+  beforeRetire?: () => Promise<void>): Promise<string[]> {
   await completeAtomReceipts(engine, sourceId, importedSlugs, hash16, item.kind === 'page' ? item : undefined);
+  await beforeRetire?.();
   return retireStaleAtoms(engine, sourceId, item.kind === 'page'
     ? { key: 'source_slug', value: item.slug } : { key: 'source_path', value: item.filePath }, hash16, importedSlugs);
 }
