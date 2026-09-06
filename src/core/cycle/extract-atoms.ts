@@ -93,6 +93,7 @@ import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
 import { AtomPageStateError, completeAtomReceipts, readAtomPageIdentity, writeAtomPageState, type AtomPageInput } from './extract-atoms-page-state.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { ATOM_TYPES, ATOMS_RESPONSE_SCHEMA } from './extract-atoms-schema.ts';
+import { countSourceChangedAtoms } from './extract-atoms-source-drift.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 // #4529 + #4540: per-item extractor caps, overridable via
@@ -858,6 +859,7 @@ export async function runPhaseExtractAtoms(
         reason: 'no_work',
         source_id: sourceId,
         atoms_extracted: 0,
+        atoms_source_changed: 0,
         transcripts_processed: 0,
         transcripts_total: 0,
         transcripts_skipped_budget: 0,
@@ -874,6 +876,8 @@ export async function runPhaseExtractAtoms(
 
   // 4. Per work-item: extract atoms via the configured extract_atoms model
   let totalAtomsExtracted = 0;
+  // Read-only drift visibility; see ./extract-atoms-source-drift.ts.
+  let atomsSourceChanged = 0;
   let transcriptsProcessed = 0;
   let pagesProcessed = 0;
   let transcriptsSkipped = 0;
@@ -1168,6 +1172,10 @@ export async function runPhaseExtractAtoms(
           else if (item.kind === 'page') await stampAtomsScanHash(item);
           else await stampTranscriptTombstone(item.filePath, item.contentHash);
         }
+        // Zero yield ≠ zero atoms: earlier runs can have left stale rows.
+        if (item.kind === 'page') {
+          atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
+        }
         if (item.kind === 'transcript') transcriptsProcessed++;
         else pagesProcessed++;
         continue;
@@ -1315,6 +1323,11 @@ export async function runPhaseExtractAtoms(
         // atom-rows-mean-done semantics — safe, not lossy.
         throwIfAborted(opts.signal, 'extract_atoms');
         await completeAtomReceipts(engine, sourceId, importedSlugs, hash16, item.kind === 'page' ? item : undefined);
+        if (item.kind === 'page') {
+          // Preserve the pre-cleanup drift population in the diagnostic. The
+          // following stale-atom retirement remains the upstream write contract.
+          atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
+        }
         // C-14: atoms are keyed by LLM-chosen titles, which drift between
         // extractions. Once this extraction is complete, retire the atoms an
         // earlier extraction of the same source produced that this one did not.
@@ -1326,6 +1339,11 @@ export async function runPhaseExtractAtoms(
         }
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting
+      }
+      // Dry-run wrote nothing, so report the pre-run live population. Normal
+      // writes counted after receipt completion and before upstream cleanup.
+      if (opts.dryRun && item.kind === 'page') {
+        atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
       }
       if (item.kind === 'transcript') transcriptsProcessed++;
       else pagesProcessed++;
@@ -1445,9 +1463,11 @@ export async function runPhaseExtractAtoms(
       (failures.length > 0 ? ` (${failures.length} failed)` : '') +
       (transcriptsSkipped + pagesSkipped > 0
         ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
-        : ''),
+        : '') +
+      (atomsSourceChanged > 0 ? ` (${atomsSourceChanged} source-changed atoms)` : ''),
     details: {
       atoms_extracted: totalAtomsExtracted,
+      atoms_source_changed: atomsSourceChanged,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,
       transcripts_skipped_budget: transcriptsSkipped,
