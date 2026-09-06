@@ -1080,11 +1080,18 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
           const { isFederatedV2Enabled } = await import('../core/feature-flags.ts');
           if (await isFederatedV2Enabled(engine)) {
             const { loadAllSources, sourceConfigHasRemoteUrl } = await import('../core/sources-load.ts');
+            const { isSyncDisabledConfig } = await import('../core/sync-policy.ts');
             const sources = await loadAllSources(engine);
             const intervalMs = baseInterval * 1000;
             const now = Date.now();
             for (const src of sources) {
               if (!src.local_path) continue;
+              // #4399: skip a syncEnabled:false source before it ever reaches
+              // the queue — performSync's choke-point check (sync-policy.ts)
+              // would refuse it anyway, but checking here avoids dispatching
+              // a job that's guaranteed to be thrown away, and the log noise
+              // that comes with it.
+              if (isSyncDisabledConfig(src.config)) continue;
               // #3696: a RELATIVE local_path is meaningless in the daemon
               // (cwd is launchd's, not the registering shell's) — dispatching
               // it would sync a phantom path. Skip loudly; the fix is

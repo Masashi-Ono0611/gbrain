@@ -135,6 +135,7 @@ import {
   resolveStallAbortSeconds,
   composeAbortSignals,
 } from '../core/sync-reconcile.ts';
+import { isSyncDisabledConfig, isSyncDisabledForSource, SyncDisabledError } from '../core/sync-policy.ts';
 
 /**
  * v0.42.x (#1794) -- resumable incremental sync checkpoint.
@@ -599,8 +600,34 @@ See also:
 // runBreakLock, buildPartialResult) was peeled to src/core/sync-lock.ts
 // (pure move). Re-exported so existing importers keep working.
 export { SyncLockBusyError, runBreakLock } from '../core/sync-lock.ts';
+// #4399: single choke-point enforcement of config.syncEnabled=false. See
+// src/core/sync-policy.ts for the rationale. Re-exported so callers (e.g.
+// the `sync` job worker in jobs.ts) can catch it alongside SyncLockBusyError
+// without importing sync-policy.ts directly.
+export { SyncDisabledError } from '../core/sync-policy.ts';
 
 export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
+  // #4399: syncEnabled:false is a hard, unconditional exclusion — checked
+  // HERE, before either lock path below, because performSync is the one
+  // function every sync execution path funnels through (CLI single-source,
+  // the minion `sync` job, autopilot's freshness dispatcher, cycle.ts). A
+  // per-caller check (as sync-cost-gate.ts and the `sync --all` fan-out
+  // filter already had) can't cover every entry point; this can. No bypass
+  // flag — an explicit `gbrain sync --source X` on a disabled source is
+  // refused the same as an automated dispatch.
+  //
+  // Resolve `opts.sourceId ?? DEFAULT_SOURCE_ID` — the same fallback every
+  // other write site in this file uses (softDeletePages, rename-reconcile,
+  // the failure ledger, ...) — rather than gating on `opts.sourceId` being
+  // set. A bare `gbrain sync` / a minion `sync` job with no sourceId still
+  // writes pages under source_id='default' via the pre-v0.17 global-config
+  // path; skipping the check when sourceId is merely omitted would let a
+  // disabled 'default' source sync through that path (caught in review).
+  const effectiveSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
+  if (await isSyncDisabledForSource(engine, effectiveSourceId)) {
+    throw new SyncDisabledError(effectiveSourceId);
+  }
+
   // v0.22.13 CODEX-2: cross-process writer lock prevents two concurrent
   // syncs from racing on the same last_commit anchor (last writer wins,
   // bookmark regresses, silent corruption).
@@ -4818,10 +4845,7 @@ See also:
     //     performSync get the [<source-id>] prefix under parallel mode (D6)
     //   - stable JSON envelope {schema_version:1, sources, ...} when --json
     // v0.41.31: v2Enabled resolved once above (cost gate). Reused here.
-    const activeSources = sources.filter((s) => {
-      const cfg = (s.config || {}) as { syncEnabled?: boolean };
-      return cfg.syncEnabled !== false;
-    });
+    const activeSources = sources.filter((s) => !isSyncDisabledConfig(s.config));
     const disabledCount = sources.length - activeSources.length;
     const humanSink: NodeJS.WriteStream = jsonOut ? process.stderr : process.stdout;
     const writeHuman = (line: string) => humanSink.write(line + '\n');

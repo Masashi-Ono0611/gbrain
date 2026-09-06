@@ -102,6 +102,29 @@ describe('autopilot.ts ↔ dispatchPerSource wiring', () => {
     expect(freshnessBlock).toContain('pull: sourceConfigHasRemoteUrl(src.config)');
   });
 
+  test('#4399: freshness sync dispatch skips a syncEnabled:false source BEFORE queuing a job', () => {
+    // Behavioral coverage for this exact skip lives in
+    // test/sync-disabled-classification.test.ts (performSync's choke-point
+    // check, which every dispatch here ultimately funnels through). Real
+    // execution of THIS loop needs the full runAutopilot() daemon (per this
+    // file's own header comment), so — same convention as the sibling
+    // 'freshness sync dispatch uses the parsed source config' test above —
+    // this pins the static shape: the disabled-source skip must sit between
+    // the loop's local_path guard and the actual queue.add/idempotency_key
+    // call, so it can never fire too late to prevent the enqueue.
+    const loopIdx = AUTOPILOT_SRC.indexOf('for (const src of sources) {');
+    const localPathIdx = AUTOPILOT_SRC.indexOf('if (!src.local_path) continue;', loopIdx);
+    const disabledIdx = AUTOPILOT_SRC.indexOf('isSyncDisabledConfig(src.config)', localPathIdx);
+    const freshnessIdx = AUTOPILOT_SRC.indexOf('idempotency_key: `autopilot-sync:');
+    expect(loopIdx).toBeGreaterThan(-1);
+    expect(localPathIdx).toBeGreaterThan(loopIdx);
+    expect(disabledIdx).toBeGreaterThan(localPathIdx);
+    expect(disabledIdx).toBeLessThan(freshnessIdx);
+    // The check must actually skip (continue), not just observe.
+    const disabledLine = AUTOPILOT_SRC.slice(disabledIdx - 4, disabledIdx + 60);
+    expect(disabledLine).toMatch(/if \(isSyncDisabledConfig\(src\.config\)\) continue;/);
+  });
+
   test('#4046: targeted dispatch scopes stable recommendation keys to the interval', () => {
     expect(AUTOPILOT_SRC).toContain(
       'idempotency_key: autopilotRemediationIdempotencyKey(step.idempotency_key, slot)',

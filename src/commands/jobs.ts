@@ -2155,13 +2155,24 @@ export async function registerBuiltinHandlers(
       // without this tick polluting the failed-jobs count + supervisor crash
       // metrics. The next scheduled tick resumes against the (by then
       // advanced) anchor.
-      const { SyncLockBusyError } = await import('./sync.ts');
+      const { SyncLockBusyError, SyncDisabledError } = await import('./sync.ts');
       if (err instanceof SyncLockBusyError) {
         console.error(
           `[sync] skipped: sync already in progress for ${sourceId ?? 'default'} ` +
           `(lock ${err.lockKey} held).`,
         );
         return { skipped: true, reason: 'sync_in_progress', source_id: sourceId ?? 'default' };
+      }
+      // #4399: performSync's choke-point check refuses a syncEnabled:false
+      // source unconditionally. Autopilot's freshness dispatcher already
+      // skips these before enqueueing (defense in depth), but a job queued
+      // before the source was disabled, or one submitted directly, would
+      // otherwise fail the job and pollute the failed-jobs count for a
+      // deliberate user exclusion — SKIP cleanly instead, same treatment as
+      // SyncLockBusyError above.
+      if (err instanceof SyncDisabledError) {
+        console.error(`[sync] skipped: sync disabled for ${sourceId ?? 'default'} (config.syncEnabled=false).`);
+        return { skipped: true, reason: 'sync_disabled', source_id: sourceId ?? 'default' };
       }
       throw err;
     }

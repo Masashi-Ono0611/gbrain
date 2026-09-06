@@ -38,6 +38,7 @@ import {
   type EmbedBackfillWorkerSurface,
 } from './minions/embed-backfill-admission.ts';
 import { git, hasOriginRemote, isDetachedHead, unique } from './sync-git.ts';
+import { isSyncDisabledConfig } from './sync-policy.ts';
 
 /**
  * Walk ONE source's working tree and sum tokens for every syncable file.
@@ -210,8 +211,8 @@ export function estimateInlineNewTokens(
 
   for (const src of sources) {
     if (!src.local_path) continue;
-    const cfg = (src.config || {}) as { syncEnabled?: boolean; strategy?: 'markdown' | 'code' | 'auto' };
-    if (cfg.syncEnabled === false) continue;
+    if (isSyncDisabledConfig(src.config)) continue;
+    const cfg = (src.config || {}) as { strategy?: 'markdown' | 'code' | 'auto' };
     const strategy = cfg.strategy ?? 'markdown';
     const localPath = src.local_path;
 
