@@ -100,6 +100,7 @@ import { heldForInput } from '../generations/publish.ts';
 import { ATOM_TYPES, ATOMS_RESPONSE_SCHEMA } from './extract-atoms-schema.ts';
 import { parseAtomsOutcome } from './extract-atoms-parse.ts';
 export { parseAtomsOutcome, parseAtomsResponse, type AtomsParseOutcome } from './extract-atoms-parse.ts';
+import { countSourceChangedAtoms } from './extract-atoms-source-drift.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 // #4529 + #4540: per-item extractor caps, overridable via
@@ -881,6 +882,7 @@ export async function runPhaseExtractAtoms(
         reason: 'no_work',
         source_id: sourceId,
         atoms_extracted: 0,
+        atoms_source_changed: 0,
         transcripts_processed: 0,
         transcripts_total: 0,
         transcripts_skipped_budget: 0,
@@ -897,6 +899,8 @@ export async function runPhaseExtractAtoms(
 
   // 4. Per work-item: extract atoms via the configured extract_atoms model
   let totalAtomsExtracted = 0;
+  // Read-only drift visibility; see ./extract-atoms-source-drift.ts.
+  let atomsSourceChanged = 0;
   let transcriptsProcessed = 0;
   let pagesProcessed = 0;
   let transcriptsSkipped = 0;
@@ -1169,6 +1173,10 @@ export async function runPhaseExtractAtoms(
           else if (!origin && item.kind === 'transcript') await stampTranscriptTombstone(engine, sourceId, item.filePath, item.contentHash);
           await commitAtomsWatermark(item, input, published);
         }
+        // Zero yield ≠ zero atoms: earlier runs can have left stale rows.
+        if (item.kind === 'page') {
+          atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
+        }
         if (item.kind === 'transcript') transcriptsProcessed++;
         else pagesProcessed++;
         continue;
@@ -1310,6 +1318,11 @@ export async function runPhaseExtractAtoms(
           await commitAtomsWatermark(item, input, published);
         } else {
         throwIfAborted(opts.signal, 'extract_atoms');
+        // Diagnostic only: capture drift before generation publication can retire
+        // old atoms. The count never participates in publication or retry decisions.
+        if (!truncated && item.kind === 'page') {
+          atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, hash16);
+        }
         const outcome = await publishUnmanagedAtoms(engine, sourceId, item, unmanagedAtoms, provenanceLinks, { partial: truncated, runId, originLabel });
         if (outcome.state === 'held') continue;
         await atomFiles?.write(unmanagedAtoms.map(atom => atom.slug), outcome.retired);
@@ -1319,6 +1332,11 @@ export async function runPhaseExtractAtoms(
         }
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting
+      }
+      // Dry-run wrote nothing, so report the pre-run live population. Normal
+      // complete unmanaged writes counted before generation publication and retirement.
+      if (opts.dryRun && item.kind === 'page') {
+        atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
       }
       if (item.kind === 'transcript') transcriptsProcessed++;
       else pagesProcessed++;
@@ -1440,9 +1458,11 @@ export async function runPhaseExtractAtoms(
       (transcriptsSkipped + pagesSkipped > 0
         ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
         : '') +
-      (inputTruncated > 0 ? ` (${inputTruncated} input-truncated: the model did not read the tail)` : ''),
+      (inputTruncated > 0 ? ` (${inputTruncated} input-truncated: the model did not read the tail)` : '') +
+      (atomsSourceChanged > 0 ? ` (${atomsSourceChanged} source-changed atoms)` : ''),
     details: {
       atoms_extracted: totalAtomsExtracted,
+      atoms_source_changed: atomsSourceChanged,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,
       transcripts_skipped_budget: transcriptsSkipped,
