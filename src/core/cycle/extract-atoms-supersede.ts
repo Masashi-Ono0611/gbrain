@@ -7,10 +7,11 @@ import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
 import { normForGrounding } from './synthesize-verify.ts';
 
 /**
- * A normalized quote shorter than this is not evidence enough to destroy a
- * row: at that length an accidental substring match (or miss) is as likely as
- * a real one, and the atom is cheap to keep and expensive to lose. Retirement
- * skips these; they stay live with their stale binding.
+ * A normalized quote shorter than this (under EITHER fold) is not evidence
+ * enough to destroy a row: at that length an accidental substring match — or
+ * miss — is as likely as a real one, and the atom is cheap to keep and
+ * expensive to lose. Retirement skips these; they stay live with their stale
+ * binding.
  */
 const MIN_RETIREMENT_QUOTE_CHARS = 8;
 
@@ -32,11 +33,14 @@ const MIN_RETIREMENT_QUOTE_CHARS = 8;
  * markers at line start, `[text](url)` → text, `<url>` → url, emphasis and
  * code marks), then the shared fold + whitespace collapse.
  *
- * Applied to BOTH sides — quote and page — so every transform above is
- * symmetric: it can only ever ADD matches relative to the grounding fold,
- * never remove one. That direction is the point. This function may keep an
- * atom the strict fold would have retired; it cannot retire one the strict
- * fold would have kept.
+ * It is applied to BOTH sides, but symmetry alone does NOT make it a superset
+ * of the strict fold: a quote that starts mid-link (`[Procurement](https://ex`
+ * — the model's span cut through the syntax) keeps its literal brackets while
+ * the page's copy folds to `Procurement`, and the strict fold would have found
+ * that text. So the caller does not REPLACE the strict test with this one — it
+ * requires BOTH to report the quote absent before retiring. The permissive
+ * fold can then only ever save an atom, never condemn one, by construction
+ * rather than by regex reasoning.
  */
 function normForRetirement(s: string): string {
   return normForGrounding(
@@ -95,15 +99,15 @@ function normForRetirement(s: string): string {
  * Presence is a plain normalized-containment test over the page's FULL current
  * content — deliberately looser than extract-atoms' `locateQuote` (which also
  * demands character-aligned boundaries and uniqueness), applied to the whole
- * page rather than the model's truncated cut, and normalized by
- * `normForRetirement` (NFKC + markdown-syntax fold) rather than the strict
- * grounding fold. All three choices err toward "still present", i.e. toward
- * keeping the atom.
+ * page rather than the model's truncated cut, and run under TWO folds (the
+ * strict grounding one and `normForRetirement`'s NFKC + markdown fold): either
+ * one finding the quote keeps the atom. All three choices err toward "still
+ * present", i.e. toward keeping the atom.
  *
  * RE-ANCHORING. A run that retires anything also repoints the atoms it KEPT on
- * evidence — same page, stale `source_hash`, verified quote still present — at
- * the hash just reconciled. Two reasons, and both are about not making the
- * retirement permanent:
+ * VERBATIM evidence — same page, stale `source_hash`, verified quote still
+ * present under the STRICT fold — at the hash just reconciled. Two reasons,
+ * and both are about not making the retirement permanent:
  *   - It is truthful. The atom is supported by the content at THIS hash; the
  *     hash it carried says only which pass minted it.
  *   - `discoverExtractablePages` skips a page when any live atom already
@@ -113,12 +117,31 @@ function normForRetirement(s: string): string {
  *     re-derived and the purge window ends them. Re-anchoring frees the old
  *     hash, the revert re-discovers the page, and the deterministic atom slug
  *     makes the re-import revive the soft-deleted row in place.
- * Only the evidenced set moves: an atom with no quote (or an unverified one)
- * has nothing to justify a new binding, so it keeps its hash and can still
- * mask an older one — the residual, narrowed to rows this reconciler would
- * never retire anyway. Runs that retire nothing re-anchor nothing: without a
- * retirement the old hash's extraction is still fully represented, and the
- * common no-op page must not pay a write.
+ * Only the verbatim-evidenced set moves. An atom with no quote, an unverified
+ * one, or one the permissive fold alone could find keeps its hash — and can
+ * still mask an older one. That residual is deliberate: those rows have no
+ * evidence strong enough to restate their provenance, and they are rows this
+ * reconciler would never retire anyway. Runs that retire nothing re-anchor
+ * nothing: without a retirement the old hash's extraction is still fully
+ * represented, and the common no-op page must not pay a write.
+ *
+ * The one contract this costs: the reconciliation deliberately lands BEFORE
+ * the item's completion markers so a failure leaves the page retryable, and a
+ * re-anchored row carries the current hash from that moment on. If the
+ * provisional→real flip that follows then fails, discovery skips the page
+ * (any live atom at the current hash makes it "already extracted") and this
+ * run's `pending:` rows wait for the next edit to that page instead of the
+ * next run. That window is the flip's own pre-existing crash window widened by
+ * two statements, it strands nothing that a later pass cannot reclaim (a
+ * `pending:` row is explicitly eligible here), and closing it properly means
+ * teaching discovery about incomplete runs — a change to the phase's
+ * eligibility rule, not to this reconciler.
+ *
+ * Revival after a revert is in-place for atoms at the current deterministic
+ * slug. A pre-#4733 LEGACY-slug atom is re-minted at the new-format slug
+ * instead: `resolvePageAtomSlug` adopts a legacy row only while it is live, so
+ * a retired one is invisible to it. The claim comes back either way; the row
+ * identity does not.
  *
  * `currentContent` is the snapshot the phase read before the model call, so
  * the work is gated on the live page STILL carrying `hash16`: if the page was
@@ -189,15 +212,29 @@ async function classifyStaleAtoms(
         )${lock ? '\n        FOR UPDATE' : ''}`,
     [args.sourceId, args.pageSlug, args.hash16, args.keepSlugs],
   );
-  const currentNorm = normForRetirement(args.currentContent);
+  // Two folds, both of which must miss before a row is retired: the strict
+  // grounding one (what the rest of the phase means by "quoted from here") and
+  // the permissive retirement one (cosmetic edits are not deletions).
+  const currentStrict = normForGrounding(args.currentContent);
+  const currentFolded = normForRetirement(args.currentContent);
   const verdict: Verdict = { retire: [], reanchor: [] };
   for (const r of rows) {
     // No verified quote → no evidence in either direction: neither retire nor
     // re-anchor, so the row keeps whatever binding it has.
     if (r.verified !== 'true' || !r.quote) continue;
-    const quote = normForRetirement(r.quote);
-    if (quote.length < MIN_RETIREMENT_QUOTE_CHARS) continue;
-    (currentNorm.includes(quote) ? verdict.reanchor : verdict.retire).push(r.slug);
+    const strict = normForGrounding(r.quote);
+    const folded = normForRetirement(r.quote);
+    if (Math.min(strict.length, folded.length) < MIN_RETIREMENT_QUOTE_CHARS) continue;
+    // Verbatim-present under the strict fold: strong enough to REBIND the row.
+    if (currentStrict.includes(strict)) { verdict.reanchor.push(r.slug); continue; }
+    // Present only under the permissive fold: strong enough to KEEP the row,
+    // not to restate its provenance. That fold is deliberately lossy (it drops
+    // `_`, and NFKC rewrites `x²` to `x2`), so a match can mean the page still
+    // carries the claim OR that an edit changed a token the fold erased. Keep
+    // — the destructive direction needs the evidence — but leave the binding
+    // alone so `atom_provenance_drift` still reports the row.
+    if (currentFolded.includes(folded)) continue;
+    verdict.retire.push(r.slug);
   }
   return verdict;
 }
