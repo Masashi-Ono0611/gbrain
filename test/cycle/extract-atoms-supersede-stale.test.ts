@@ -131,13 +131,17 @@ type AtomRow = {
   source_hash: string | null;
   source_slug: string | null;
   verified: string | null;
+  quote: string | null;
+  offset: [number, number] | null;
 };
 
 const ATOM_COLS = `slug, title, deleted_at::text AS deleted_at, updated_at::text AS updated_at,
                    content_hash,
                    frontmatter->>'source_hash' AS source_hash,
                    frontmatter->>'source_slug' AS source_slug,
-                   frontmatter->>'source_quote_verified' AS verified`;
+                   frontmatter->>'source_quote_verified' AS verified,
+                   frontmatter->>'source_quote' AS quote,
+                   frontmatter->'source_quote_offset' AS offset`;
 
 /** Complete source and atom rows, including all frontmatter and timestamps. */
 async function reconciliationSnapshot(pageSlug: string) {
@@ -150,7 +154,20 @@ async function reconciliationSnapshot(pageSlug: string) {
 
 function isReanchorUpdate(sql: string): boolean {
   return /^\s*UPDATE pages/.test(sql)
-    && sql.includes("jsonb_build_object('source_hash', $3::text)");
+    && sql.includes("'source_quote_offset', jsonb_build_array");
+}
+
+function isFlipUpdate(sql: string): boolean {
+  return /^\s*UPDATE pages/.test(sql)
+    && sql.includes("jsonb_build_object('source_hash', $1::text)");
+}
+
+async function atomsAtHash(slug: string, hash: string) {
+  return engine.executeRaw(
+    `SELECT slug FROM pages WHERE source_id = 'default' AND type = 'atom'
+      AND frontmatter->>'source_slug' = $1 AND frontmatter->>'source_hash' = $2
+      AND deleted_at IS NULL`, [slug, hash],
+  );
 }
 
 /** One atom, keyed by title + binding (T_SHARED exists for both P and Q). */
@@ -285,6 +302,10 @@ describe('extract_atoms retires atoms its source page no longer supports (#4566 
     expect(keeper!.source_hash).not.toBe(keeperBefore.source_hash);
     expect(keeper!.source_hash).toBe((await atomRow(T_SHARED, p))!.source_hash);
     expect(result.details?.atoms_reanchored).toBe(1);
+    expect(result.details?.atoms_retirement_blocked).toBe(0);
+    expect(keeper!.verified).toBe('true');
+    expect(keeper!.offset).not.toEqual(keeperBefore.offset);
+    expect(body2(f.ns).slice(...keeper!.offset!)).toBe(keeper!.quote!);
   }, 120_000);
 
   test('(b) atoms bound elsewhere — sibling page Q, pre-binding era — are untouched', async () => {
@@ -446,6 +467,7 @@ describe('extract_atoms retires atoms its source page no longer supports (#4566 
     let deletedSlugs: string[] = [];
     let deleteEngine: PGLiteEngine | undefined;
     let reanchorCompleted = false;
+    let flipEngine: PGLiteEngine | undefined;
     let failed;
     try {
       // Shadow the prototype method with an own property, and DELETE it to
@@ -454,12 +476,15 @@ describe('extract_atoms retires atoms its source page no longer supports (#4566 
       // self-deadlock against the row lock it is holding.
       engine.softDeletePages = async function (slugs, opts) {
         const deleted = await PGLiteEngine.prototype.softDeletePages.call(this, slugs, opts);
+        expect(flipEngine).toBeDefined();
+        expect(this).toBe(flipEngine!);
         deleteEngine = this;
         deletedSlugs.push(...deleted);
         return deleted;
       };
       engine.executeRaw = async function <T>(sql: string, params?: unknown[]): Promise<T[]> {
         const rows = await PGLiteEngine.prototype.executeRaw.call(this, sql, params) as T[];
+        if (isFlipUpdate(sql)) flipEngine = this;
         if (isReanchorUpdate(sql)) {
           expect(this === deleteEngine).toBe(true);
           expect(this).not.toBe(engine);
@@ -490,6 +515,14 @@ describe('extract_atoms retires atoms its source page no longer supports (#4566 
     expect((await atomRow(T_KEEPER, p))!.deleted_at).toBeNull();
     expect((await atomRow(T_KEEPER, p))!.source_hash).toBe(keeperBefore.source_hash);
     expect(await atomRow(T_KEEPER, p)).toEqual(keeperBefore);
+
+    // The flip really executed first, but rolled back with the later failure.
+    expect(flipEngine).toBeDefined();
+    expect(flipEngine).not.toBe(engine);
+    const h2 = (await engine.getPage(p, { sourceId: 'default' }))!.content_hash!.slice(0, 16);
+    expect((await atomRow(T_SHARED, p))!.source_hash).toBe(`pending:${h2}`);
+    expect((await atomRow(T_NEW, p))!.source_hash).toBe(`pending:${h2}`);
+    expect(await atomsAtHash(p, h2)).toEqual([]);
 
     // And still retryable: the completion markers were never written, so REAL
     // discovery (not the _pages seam) still offers the page.
@@ -552,6 +585,26 @@ describe('(j) a cosmetically edited page keeps its atoms', () => {
       ns: 'j-balanced-link',
       quoted: 'Use the prototype for procurement.',
       pageCopy: 'Use [the prototype](https://example.invalid/a_(b)) for procurement.',
+    },
+    {
+      ns: 'j-reference-link',
+      quoted: 'Use the prototype for procurement.',
+      pageCopy: 'Use [the prototype][demo] for procurement.\n[demo]: https://example.invalid/demo\n',
+    },
+    {
+      ns: 'j-collapsed-reference',
+      quoted: 'Use the prototype for procurement.',
+      pageCopy: 'Use [the prototype][] for procurement.\n[the prototype]: <https://example.invalid/demo> "Demo"\n',
+    },
+    {
+      ns: 'j-reference-image',
+      quoted: 'Use the prototype for procurement.',
+      pageCopy: 'Use ![the prototype][demo] for procurement.\n[demo]: https://example.invalid/demo\n',
+    },
+    {
+      ns: 'j-definition-only',
+      quoted: 'Use the prototype for procurement. Review the demo before buying.',
+      pageCopy: 'Use the prototype for procurement.\n[demo]: <https://example.invalid/demo> "Demo"\nReview the demo before buying.',
     },
     {
       ns: 'j-mid-link',
@@ -749,4 +802,113 @@ describe('(l) a wide page retires and re-anchors every eligible atom in one pass
     );
     expect(rows).toEqual([{ total: 2 * candidates, retired: candidates, reanchored: candidates }]);
   }, 180_000);
+});
+
+
+describe('(m) blockers defer all retirement and re-anchoring for the page', () => {
+  for (const kind of ['cosmetic', 'unverified', 'missing', 'ambiguous'] as const) {
+    test(`${kind} keeper blocks retirement and preserves the original atoms across a revert`, async () => {
+      const ns = `m-${kind}`;
+      const slug = `writings/2026-07-01-${ns}`;
+      const gone = 'The old procurement claim is explicitly present.';
+      const kept = 'A working prototype survives the procurement review.';
+      const original = body([gone, kept, Q_KEEPER], ns);
+      const h1 = await putAndHash(slug, ns, original);
+      await runOne(slug, original, h1, [[`${ns} gone`, gone], [ns, kept], [`${ns} locatable`, Q_KEEPER]]);
+      expect((await atomRow(ns, slug))!.verified).toBe('true');
+      if (kind === 'unverified' || kind === 'missing') {
+        await engine.executeRaw(
+          `UPDATE pages SET frontmatter = CASE WHEN $2 = 'missing'
+             THEN frontmatter - 'source_quote'
+             ELSE frontmatter || jsonb_build_object('source_quote_verified', false) END
+           WHERE slug = $1 AND source_id = 'default'`,
+          [(await atomRow(ns, slug))!.slug, kind],
+        );
+      }
+      const before = await atomRow(ns, slug);
+      const goneBefore = await atomRow(`${ns} gone`, slug);
+      const locatableBefore = await atomRow(`${ns} locatable`, slug);
+      const copy = kind === 'cosmetic' ? kept.replace('prototype', '**prototype**')
+        : kind === 'ambiguous' ? `${kept} ${kept}` : kept;
+      const edited = body([copy, Q_KEEPER], `${ns} edited`);
+      const r = await editAndReconcile(slug, ns, edited);
+      expect(r.status).toBe('ok');
+      expect(r.details?.atoms_superseded).toBe(0);
+      expect(r.details?.atoms_reanchored).toBe(0);
+      expect(r.details?.atoms_retirement_blocked).toBe(1);
+      expect(r.summary).toContain('1 retirement blocked');
+      expect(await atomRow(ns, slug)).toEqual(before);
+      expect(await atomRow(`${ns} gone`, slug)).toEqual(goneBefore);
+      expect(await atomRow(`${ns} locatable`, slug)).toEqual(locatableBefore);
+      await putAndHash(slug, ns, original);
+      // A blocker must retain H1, so unchanged discovery still skips H1.
+      // No atom was retired: the restored claim needs no recovery or revival.
+      expect((await discoverExtractablePages(engine, 'default')).some(p => p.slug === slug)).toBe(false);
+      expect((await atomRow(`${ns} gone`, slug))!.deleted_at).toBeNull();
+    }, 120_000);
+  }
+
+  test('dry-run counts blockers without changing any rows or flipping imported hashes', async () => {
+    const f = await seed('m-dry');
+    const edited = body2(f.ns).replace(Q_KEEPER, Q_KEEPER.replace('Procurement', '**Procurement**'));
+    const h2 = await putAndHash(f.p, f.ns, edited);
+    const before = await reconciliationSnapshot(f.p);
+    const r = await runPhaseExtractAtoms(engine, {
+      dryRun: true, _transcripts: [],
+      _pages: [{ slug: f.p, content: edited, contentHash: h2 }],
+      _chat: stubChat([[T_SHARED, Q_SHARED], [T_NEW, Q_NEW]]),
+    });
+    expect(r.details?.atoms_superseded).toBe(0);
+    expect(r.details?.atoms_reanchored).toBe(0);
+    expect(r.details?.atoms_retirement_blocked).toBe(1);
+    expect(r.summary).toContain('1 retirement blocked');
+    expect(await reconciliationSnapshot(f.p)).toEqual(before);
+  }, 120_000);
+});
+
+describe('(n) the completion flip shares the reconciliation transaction', () => {
+  test('a flip failure rolls back its hash writes and leaves retirement and re-anchoring untouched', async () => {
+    const f = await seed('n');
+    const retiredBefore = await atomRow(T_OLD, f.p);
+    const keeperBefore = await atomRow(T_KEEPER, f.p);
+    let flipRan = false;
+    let deleteRan = false;
+    let reanchorRan = false;
+    let failed;
+    try {
+      engine.softDeletePages = async function (slugs, opts) {
+        deleteRan = true;
+        return PGLiteEngine.prototype.softDeletePages.call(this, slugs, opts);
+      };
+      engine.executeRaw = async function <T>(sql: string, params?: unknown[]): Promise<T[]> {
+        const rows = await PGLiteEngine.prototype.executeRaw.call(this, sql, params) as T[];
+        if (isReanchorUpdate(sql)) reanchorRan = true;
+        if (isFlipUpdate(sql)) {
+          expect(this).not.toBe(engine);
+          flipRan = true;
+          throw new Error('injected completion flip failure');
+        }
+        return rows;
+      };
+      failed = await reextract(f);
+    } finally {
+      delete (engine as { softDeletePages?: unknown }).softDeletePages;
+      delete (engine as { executeRaw?: unknown }).executeRaw;
+    }
+    expect(flipRan).toBe(true);
+    expect(deleteRan).toBe(false);
+    expect(reanchorRan).toBe(false);
+    expect(failed.status).toBe('warn');
+    expect(failed.details?.atoms_superseded).toBe(0);
+    expect(failed.details?.atoms_reanchored).toBe(0);
+    const failures = failed.details?.failures as Array<{ source: string; error: string }>;
+    expect(failures.some(r => r.source === f.p && r.error.includes('injected completion flip failure'))).toBe(true);
+    expect(await atomRow(T_OLD, f.p)).toEqual(retiredBefore);
+    expect(await atomRow(T_KEEPER, f.p)).toEqual(keeperBefore);
+    const h2 = (await engine.getPage(f.p, { sourceId: 'default' }))!.content_hash!.slice(0, 16);
+    expect((await atomRow(T_SHARED, f.p))!.source_hash).toBe(`pending:${h2}`);
+    expect((await atomRow(T_NEW, f.p))!.source_hash).toBe(`pending:${h2}`);
+    expect(await atomsAtHash(f.p, h2)).toEqual([]);
+    expect((await discoverExtractablePages(engine, 'default')).some(p => p.slug === f.p)).toBe(true);
+  }, 120_000);
 });

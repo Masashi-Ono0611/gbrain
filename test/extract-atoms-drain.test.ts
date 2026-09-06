@@ -202,13 +202,13 @@ describe('shared wiring helper holds the cycle lock (5A)', () => {
   // destructive count has to be READ from its details, not dropped on the
   // floor. Run the real adapter with a stubbed phase and lock; restore every
   // spy so the shared module exports remain usable by neighboring tests.
-  it('runBatch maps the phase details\' retired/re-anchored atom counts', async () => {
+  it('runBatch maps the phase details\' retired/re-anchored/blocked atom counts', async () => {
     const phase = await import('../src/core/cycle/extract-atoms.ts');
     const locks = await import('../src/core/db-lock.ts');
     const lock = spyOn(locks, 'withRefreshingLock').mockImplementation(async (_engine, _id, work) => work());
     const batch = spyOn(phase, 'runPhaseExtractAtoms').mockResolvedValue({
       phase: 'extract_atoms', status: 'ok', summary: 'stubbed phase', duration_ms: 0,
-      details: { atoms_extracted: 1, pages_processed: 1, atoms_superseded: 2, atoms_reanchored: 7 },
+      details: { atoms_extracted: 1, pages_processed: 1, atoms_superseded: 2, atoms_reanchored: 7, atoms_retirement_blocked: 4 },
     });
     const backlog = spyOn(phase, 'countExtractAtomsBacklog').mockImplementation(seq([1, 0, 0]));
     try {
@@ -224,6 +224,7 @@ describe('shared wiring helper holds the cycle lock (5A)', () => {
       expect(result.stopped).toBe('drained');
       expect(result.superseded).toBe(2);
       expect(result.reanchored).toBe(7);
+      expect(result.retirement_blocked).toBe(4);
     } finally {
       backlog.mockRestore();
       batch.mockRestore();
@@ -288,11 +289,11 @@ describe('#2144: zero-yield tombstone progress semantics', () => {
   // #4566 — the drain lane is where extract_atoms runs nightly, so the only
   // DESTRUCTIVE number the phase produces has to survive the adapter into
   // `--json`. Missing values (the pre-#4566 adapter shape) count as 0.
-  it('sums the retired/re-anchored atom counts across batches, defaulting absent ones to 0', async () => {
+  it('sums the retired/re-anchored/blocked atom counts across batches, defaulting absent ones to 0', async () => {
     const counts = [
-      { extracted: 1, skipped: 0, superseded: 2, reanchored: 1 },
+      { extracted: 1, skipped: 0, superseded: 2, reanchored: 1, retirement_blocked: 2 },
       { extracted: 1, skipped: 0 },
-      { extracted: 1, skipped: 0, superseded: 3, reanchored: 6 },
+      { extracted: 1, skipped: 0, superseded: 3, reanchored: 6, retirement_blocked: 3 },
     ];
     let i = 0;
     const result = await runExtractAtomsDrain(
@@ -307,6 +308,7 @@ describe('#2144: zero-yield tombstone progress semantics', () => {
     expect(result.batches).toBe(3);
     expect(result.superseded).toBe(5);
     expect(result.reanchored).toBe(7);
+    expect(result.retirement_blocked).toBe(5);
   });
 
   it('stops no_progress when a zero-atom batch leaves the backlog flat', async () => {
