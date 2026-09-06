@@ -34,6 +34,14 @@
  *   (g) a reconciliation failure leaves the page RETRYABLE — it lands before
  *       the completion markers, so real discovery still returns the page and
  *       the next run finishes the job.
+ *   (j) a cosmetic edit is not evidence: NFKC-equal text (NFD re-encode,
+ *       full-width punctuation) and markdown reshaping (emphasis, a link,
+ *       re-bulleting) keep their atoms, while a genuinely deleted sentence
+ *       still retires — the reverse control that keeps (j) honest.
+ *   (k) a retirement is not permanent: reverting the page re-discovers it and
+ *       the re-extraction revives the retired atom in place, because the atoms
+ *       kept on evidence were re-anchored to the hash that retired it.
+ *   (l) no cap: 200 stale atoms on one page retire in a single pass.
  *
  * Every case seeds its own page namespace and drives the phase with the page's
  * REAL persisted content hash, so the reconciliation's "page still carries
@@ -274,7 +282,13 @@ describe('extract_atoms retires atoms its source page no longer supports (#4566 
 
     const keeper = await atomRow(T_KEEPER, p);
     expect(keeper!.deleted_at).toBeNull();
-    expect(keeper!.source_hash).toBe(keeperBefore.source_hash); // still stale, still kept
+    // Kept on evidence — and therefore RE-ANCHORED: its quote is in the body
+    // at the new hash, and a live atom still carrying the OLD hash would mask
+    // that content in discovery forever, so a revert could never re-earn what
+    // this run retired (case (j)).
+    expect(keeper!.source_hash).not.toBe(keeperBefore.source_hash);
+    expect(keeper!.source_hash).toBe((await atomRow(T_SHARED, p))!.source_hash);
+    expect(result.details?.atoms_reanchored).toBe(1);
   }, 120_000);
 
   test('(b) atoms bound elsewhere — sibling page Q, pre-binding era — are untouched', async () => {
@@ -334,6 +348,7 @@ describe('extract_atoms retires atoms its source page no longer supports (#4566 
     const again = await reextract(f);
     expect(again.status).toBe('ok');
     expect(again.details?.atoms_superseded).toBe(0);
+    expect(again.details?.atoms_reanchored).toBe(0); // no retirement, no re-binding
     expect(String(again.summary)).not.toContain('superseded');
     expect(await bindingSnapshot()).toEqual(before);
   }, 120_000);
@@ -434,4 +449,190 @@ describe('extract_atoms retires atoms its source page no longer supports (#4566 
     expect((await atomRow(T_OLD, p))!.deleted_at).not.toBeNull();
     expect((await discoverExtractablePages(engine, 'default')).some(d => d.slug === p)).toBe(false);
   }, 120_000);
+});
+
+/**
+ * Probe-derived: an independent adversarial probe of this branch found the
+ * retirement gate destroying atoms over edits that changed only bytes, and
+ * making a retirement permanent across a revert. These cases pin both fixes
+ * (and the reverse control that keeps them from passing vacuously).
+ */
+
+/** Drive the phase over one page with a stubbed model reply. */
+async function runOne(slug: string, content: string, contentHash: string, pairs: Pair[]) {
+  return runPhaseExtractAtoms(engine, {
+    _transcripts: [],
+    _pages: [{ slug, content, contentHash }],
+    _chat: stubChat(pairs),
+  });
+}
+
+/** A page whose body carries `quoted`, with one atom verified against it. */
+async function seedVerified(ns: string, quoted: string, title: string): Promise<[slug: string, body: string]> {
+  const slug = `writings/2026-07-01-${ns}`;
+  const b = body([quoted], ns);
+  const h = await putAndHash(slug, `P ${ns}`, b);
+  const first = await runOne(slug, b, h, [[title, quoted]]);
+  expect(first.status).toBe('ok');
+  // Load-bearing: an unverified quote makes every assertion below vacuous.
+  expect((await atomRow(title, slug))!.verified).toBe('true');
+  expect((await atomRow(title, slug))!.deleted_at).toBeNull();
+  return [slug, b];
+}
+
+/** Re-put an edited body and reconcile it in the zero-yield lane (nothing exempt). */
+async function editAndReconcile(slug: string, ns: string, edited: string) {
+  const h = await putAndHash(slug, `P ${ns}`, edited);
+  return runOne(slug, edited, h, []);
+}
+
+describe('(j) a cosmetically edited page keeps its atoms', () => {
+  test('NFD re-encoding of Japanese prose is not a deleted claim', async () => {
+    const quoted = 'ダミーのプロトタイプでも購買部長は納得する。';
+    const [slug, seeded] = await seedVerified('j-nfd', quoted, 'JP claim');
+    // Same visible text, decomposed — what a re-import from an NFD-producing
+    // source (macOS filesystem, some clipboard paths) yields.
+    const edited = seeded.normalize('NFD');
+    expect(edited).not.toBe(seeded);
+
+    const r = await editAndReconcile(slug, 'j-nfd', edited);
+    expect(r.details?.atoms_superseded).toBe(0);
+    expect((await atomRow('JP claim', slug))!.deleted_at).toBeNull();
+  }, 120_000);
+
+  test('half-width → full-width punctuation is not a deleted claim', async () => {
+    const quoted = 'The pilot budget (approved in Q2) outlives its quarter.';
+    const [slug, seeded] = await seedVerified('j-width', quoted, 'Width claim');
+    const edited = seeded.replace(/\(/g, '（').replace(/\)/g, '）');
+
+    const r = await editAndReconcile(slug, 'j-width', edited);
+    expect(r.details?.atoms_superseded).toBe(0);
+    expect((await atomRow('Width claim', slug))!.deleted_at).toBeNull();
+  }, 120_000);
+
+  test('emphasis added inside the quoted span is not a deleted claim', async () => {
+    const quoted = 'A working prototype survives the procurement review here.';
+    const [slug, seeded] = await seedVerified('j-em', quoted, 'Emphasis claim');
+    const edited = seeded.replace('prototype', '**prototype**');
+
+    const r = await editAndReconcile(slug, 'j-em', edited);
+    expect(r.details?.atoms_superseded).toBe(0);
+    expect((await atomRow('Emphasis claim', slug))!.deleted_at).toBeNull();
+  }, 120_000);
+
+  test('a link wrapped around a quoted word is not a deleted claim', async () => {
+    const quoted = 'Procurement decides long before the demo is booked.';
+    const [slug, seeded] = await seedVerified('j-link', quoted, 'Link claim');
+    const edited = seeded.replace('Procurement', '[Procurement](https://example.invalid/p)');
+
+    const r = await editAndReconcile(slug, 'j-link', edited);
+    expect(r.details?.atoms_superseded).toBe(0);
+    expect((await atomRow('Link claim', slug))!.deleted_at).toBeNull();
+  }, 120_000);
+
+  test('reflowing and then re-bulleting a two-sentence quote is not a deleted claim', async () => {
+    const quoted = 'Enterprise buyers want tangible prototypes here. Pilot budgets outlive the quarter here.';
+    const [slug] = await seedVerified('j-flow', quoted, 'Span claim');
+
+    // (i) pure whitespace reflow — the strict grounding fold already handled
+    // this one; it is the control for the markdown folds.
+    const reflow = [
+      'Enterprise buyers want tangible prototypes here.\n\n   Pilot budgets outlive the quarter here.',
+      FILLER, 'Filed under revision marker j-flow reflow.',
+    ].join('\n');
+    const rR = await editAndReconcile(slug, 'j-flow', reflow);
+    expect(rR.details?.atoms_superseded).toBe(0);
+    expect((await atomRow('Span claim', slug))!.deleted_at).toBeNull();
+
+    // (ii) the same two sentences as list items. Claims unchanged.
+    const bulleted = [
+      '- Enterprise buyers want tangible prototypes here.',
+      '- Pilot budgets outlive the quarter here.',
+      FILLER, 'Filed under revision marker j-flow bullets.',
+    ].join('\n');
+    const rB = await editAndReconcile(slug, 'j-flow', bulleted);
+    expect(rB.details?.atoms_superseded).toBe(0);
+    expect((await atomRow('Span claim', slug))!.deleted_at).toBeNull();
+  }, 120_000);
+
+  test('reverse control: a genuinely deleted sentence IS still retired', async () => {
+    // Without this the whole (j) group could pass on a reconciler that never
+    // retires anything.
+    const quoted = 'Renders close deals faster than anything physical here.';
+    const [slug] = await seedVerified('j-control', quoted, 'Gone claim');
+    const edited = body(['A wholly different claim now stands in its place.'], 'j-control edited');
+
+    const r = await editAndReconcile(slug, 'j-control', edited);
+    expect(r.details?.atoms_superseded).toBe(1);
+    expect((await atomRow('Gone claim', slug))!.deleted_at).not.toBeNull();
+  }, 120_000);
+});
+
+describe('(k) a retirement survives a revert', () => {
+  test('reverting the page re-discovers it and the re-extraction revives the atom', async () => {
+    const ns = 'k';
+    const slug = `writings/2026-07-01-${ns}`;
+    const qA = 'Enterprise buyers want tangible prototypes in the k body.';
+    const qB = 'Renders close deals faster than anything physical in the k body.';
+    const qK = 'Procurement decides long before the demo in the k body.';
+
+    const b1 = body([qA, qB, qK], `${ns} one`);
+    const h1 = await putAndHash(slug, `P ${ns}`, b1);
+    const first = await runOne(slug, b1, h1, [['k a', qA], ['k b', qB], ['k k', qK]]);
+    expect(first.details?.atoms_extracted).toBe(3);
+
+    // Edit: qB is gone. Re-emit only 'k a', so 'k k' stays live on evidence
+    // while still carrying h1 — the row that used to mask h1 forever.
+    const b2 = body([qA, qK], `${ns} two`);
+    const h2 = await putAndHash(slug, `P ${ns}`, b2);
+    const second = await runOne(slug, b2, h2, [['k a', qA]]);
+    expect(second.details?.atoms_superseded).toBe(1);
+    expect(second.details?.atoms_reanchored).toBe(1);
+    expect((await atomRow('k b', slug))!.deleted_at).not.toBeNull();
+    expect((await atomRow('k k', slug))!.source_hash).toBe(h2);
+
+    // Revert the page to its original body: no live atom carries h1 any more,
+    // so discovery offers the page again...
+    await putAndHash(slug, `P ${ns}`, b1);
+    expect((await discoverExtractablePages(engine, 'default')).some(d => d.slug === slug)).toBe(true);
+
+    // ...and re-extracting it revives the retired atom in place (deterministic
+    // slug → upsert, not a duplicate).
+    const retiredSlug = (await atomRow('k b', slug))!.slug;
+    const third = await runOne(slug, b1, h1, [['k b', qB]]);
+    expect(third.status).toBe('ok');
+    const revived = await atomRow('k b', slug);
+    expect(revived!.slug).toBe(retiredSlug);
+    expect(revived!.deleted_at).toBeNull();
+  }, 120_000);
+});
+
+describe('(l) a wide page retires every stale atom in one pass', () => {
+  test('200 stale atoms on one page, no cap and no leftovers', async () => {
+    const ns = 'l';
+    const slug = `writings/2026-07-01-${ns}`;
+    await putAndHash(slug, `P ${ns}`, body(['The l original claim stands here plainly.'], `${ns} one`));
+    for (let i = 0; i < 200; i++) {
+      await engine.putPage(`atoms/2026-07-01/l-${String(i).padStart(3, '0')}`, {
+        type: 'atom', title: `l atom ${i}`,
+        compiled_truth: `Atom ${i}.`, timeline: '',
+        frontmatter: {
+          source_slug: slug, source_hash: 'ffffffffffffffff',
+          source_quote: `Absent sentence number ${i} that no page contains at all.`,
+          source_quote_verified: true,
+        },
+      });
+    }
+
+    const edited = body(['A rewritten l body sharing nothing with the first.'], `${ns} two`);
+    const r = await editAndReconcile(slug, ns, edited);
+    expect(r.status).toBe('ok');
+    // DELETE_BATCH_SIZE chunking must not drop the tail.
+    expect(r.details?.atoms_superseded).toBe(200);
+    const live = await engine.executeRaw<{ n: string }>(
+      `SELECT count(*)::text AS n FROM pages
+        WHERE type = 'atom' AND slug LIKE 'atoms/2026-07-01/l-%' AND deleted_at IS NULL`,
+    );
+    expect(live[0]!.n).toBe('0');
+  }, 180_000);
 });
