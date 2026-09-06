@@ -882,6 +882,29 @@ export async function runPhaseExtractAtoms(
     }
   }
 
+  /**
+   * #4566 follow-through: reclaim atoms this page's CURRENT content no longer
+   * supports (evidence rule: see supersedeStaleAtomsForPage). Gets the FULL
+   * item content, not the model's cut. A failure lands in `failures` instead
+   * of throwing: the extraction committed, but the page is not re-discovered
+   * for this hash, so a silent log would hide a reconciliation that never ran.
+   */
+  async function reconcilePageAtoms(
+    item: { kind: string; slug?: string; content: string; contentHash: string },
+    keepSlugs: string[],
+  ): Promise<void> {
+    if (item.kind !== 'page' || !item.slug) return;
+    try {
+      atomsSuperseded += await supersedeStaleAtomsForPage(engine, {
+        sourceId, pageSlug: item.slug, hash16: item.contentHash.slice(0, 16),
+        currentContent: item.content, keepSlugs, dryRun: opts.dryRun === true,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      failures.push({ source: item.slug, error: `atom reconciliation failed: ${msg}` });
+    }
+  }
+
   await withBudgetTracker(budgetTracker, async () => {
   for (const item of work) {
     await maybeYield();
@@ -959,6 +982,11 @@ export async function runPhaseExtractAtoms(
         if (!opts.dryRun && item.kind === 'page') {
           await stampAtomsScanHash(item);
         }
+        // Stamped done, so this is the page's last reconciliation chance for
+        // this content: an edit that removed every extractable claim must
+        // still retire the atoms whose quotes it deleted. Nothing was written,
+        // so nothing is exempt.
+        await reconcilePageAtoms(item, []);
         if (item.kind === 'transcript') transcriptsProcessed++;
         else pagesProcessed++;
         continue;
@@ -1084,43 +1112,19 @@ export async function runPhaseExtractAtoms(
             WHERE source_id = $2 AND type = 'atom' AND slug = ANY($3::text[]) AND deleted_at IS NULL`,
           [hash16, sourceId, importedSlugs],
         );
-        // #4566 follow-through: the replacement set is live and stamped, so
-        // this page's PREVIOUS atoms are now superseded. AFTER the flip on
-        // purpose (the rows just written already carry the current hash).
-        // Best-effort like the receipt/rollup writers below — the extraction
-        // committed, and reconciliation converges on the next re-extraction.
-        if (item.kind === 'page') {
-          try {
-            atomsSuperseded += await supersedeStaleAtomsForPage(engine, {
-              sourceId, pageSlug: item.slug, hash16, keepSlugs: importedSlugs, dryRun: false,
-            });
-          } catch (err) {
-            console.error(
-              `[extract_atoms] supersede stale atoms failed for ${item.slug}: ${(err as Error).message}`,
-            );
-          }
-          await stampAtomsScanHash(item);
-        }
+        // AFTER the flip on purpose: the rows just written already carry the
+        // current hash, so the reconciliation predicate excludes them too.
+        await reconcilePageAtoms(item, importedSlugs);
+        if (item.kind === 'page') await stampAtomsScanHash(item);
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting
-        // Report-only twin of the above. resolvePageAtomSlug is read-only, so
-        // the would-be write set resolves under dry-run too — without it the
-        // count would include atoms a real run refreshes in place.
+        // Report-only twin. resolvePageAtomSlug is read-only, so the would-be
+        // write set resolves under dry-run too — without it the count would
+        // include atoms a real run refreshes in place.
         if (item.kind === 'page') {
-          try {
-            const wouldWrite: string[] = [];
-            for (const atom of atoms) {
-              wouldWrite.push(await resolvePageAtomSlug(engine, atom.title, item.slug, sourceId));
-            }
-            atomsSuperseded += await supersedeStaleAtomsForPage(engine, {
-              sourceId, pageSlug: item.slug, hash16: item.contentHash.slice(0, 16),
-              keepSlugs: wouldWrite, dryRun: true,
-            });
-          } catch (err) {
-            console.error(
-              `[extract_atoms] supersede dry-run count failed for ${item.slug}: ${(err as Error).message}`,
-            );
-          }
+          const wouldWrite: string[] = [];
+          for (const a of atoms) wouldWrite.push(await resolvePageAtomSlug(engine, a.title, item.slug, sourceId));
+          await reconcilePageAtoms(item, wouldWrite);
         }
       }
       if (item.kind === 'transcript') transcriptsProcessed++;
