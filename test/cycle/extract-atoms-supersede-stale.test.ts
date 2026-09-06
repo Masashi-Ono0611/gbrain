@@ -27,8 +27,8 @@
  *       invalidated atom — so (b) cannot pass vacuously on a no-op.
  *   (d) dry-run: no row changes at all, and the reported would-be count
  *       excludes a title this run would refresh in place.
- *   (e) idempotency: an identical re-run retires nothing and moves no atom in
- *       or out of the live set.
+ *   (e) a changed hash with every quote preserved retires nothing and leaves
+ *       an omitted atom's old binding alone.
  *   (f) the zero-yield lane reconciles too: an edit that leaves no extractable
  *       claim still retires the atoms whose quotes it deleted.
  *   (g) a reconciliation failure leaves the page RETRYABLE — it lands before
@@ -41,7 +41,7 @@
  *   (k) a retirement is not permanent: reverting the page re-discovers it and
  *       the re-extraction revives the retired atom in place, because the atoms
  *       kept on evidence were re-anchored to the hash that retired it.
- *   (l) no cap: 200 stale atoms on one page retire in a single pass.
+ *   (l) deletion and re-anchoring each process two full batches plus a tail.
  *
  * Every case seeds its own page namespace and drives the phase with the page's
  * REAL persisted content hash, so the reconciliation's "page still carries
@@ -51,6 +51,7 @@
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { DELETE_BATCH_SIZE } from '../../src/core/engine-constants.ts';
 import { runPhaseExtractAtoms, discoverExtractablePages } from '../../src/core/cycle/extract-atoms.ts';
 import type { ChatResult, ChatOpts } from '../../src/core/ai/gateway.ts';
 
@@ -138,23 +139,18 @@ const ATOM_COLS = `slug, title, deleted_at::text AS deleted_at, updated_at::text
                    frontmatter->>'source_slug' AS source_slug,
                    frontmatter->>'source_quote_verified' AS verified`;
 
-/** Every atom row in the brain, full enough that any write shows up. */
-async function atomSnapshot(): Promise<AtomRow[]> {
-  return await engine.executeRaw<AtomRow>(
-    `SELECT ${ATOM_COLS} FROM pages WHERE type = 'atom' ORDER BY slug`,
+/** Complete source and atom rows, including all frontmatter and timestamps. */
+async function reconciliationSnapshot(pageSlug: string) {
+  return engine.executeRaw(
+    `SELECT * FROM pages WHERE type = 'atom' OR (source_id = 'default' AND slug = $1)
+      ORDER BY source_id, slug`,
+    [pageSlug],
   );
 }
 
-/**
- * The state this reconciliation owns: identity, liveness, binding. A re-run
- * legitimately re-imports each atom (extracted_at moves, so content_hash and
- * updated_at move with it) — that is the pre-existing upsert, not a retirement,
- * so the idempotency case asserts stillness on THIS projection.
- */
-async function bindingSnapshot(): Promise<Array<Omit<AtomRow, 'updated_at' | 'content_hash'>>> {
-  return (await atomSnapshot()).map(({ slug, title, deleted_at, source_hash, source_slug, verified }) => ({
-    slug, title, deleted_at, source_hash, source_slug, verified,
-  }));
+function isReanchorUpdate(sql: string): boolean {
+  return /^\s*UPDATE pages/.test(sql)
+    && sql.includes("jsonb_build_object('source_hash', $3::text)");
 }
 
 /** One atom, keyed by title + binding (T_SHARED exists for both P and Q). */
@@ -318,7 +314,6 @@ describe('extract_atoms retires atoms its source page no longer supports (#4566 
     const f = await seed('d');
     const p = f.p;
     await reextract(f);
-    const before = await atomSnapshot();
 
     // body3 drops BOTH Q_SHARED and Q_NEW, so both of those atoms' quotes are
     // gone. T_SHARED is re-emitted (with a quote from the new body), so the
@@ -327,30 +322,58 @@ describe('extract_atoms retires atoms its source page no longer supports (#4566 
     // written-this-run exclusion the count would be 2.
     const b3 = body3(f.ns);
     const h3 = await putAndHash(p, `P ${f.ns}`, b3);
-    const result = await runPhaseExtractAtoms(engine, {
-      dryRun: true,
-      _transcripts: [],
-      _pages: [{ slug: p, content: b3, contentHash: h3 }],
-      _chat: stubChat([[T_SHARED, Q_THIRD]]),
-    });
+    const before = await reconciliationSnapshot(p);
+    let deleteCalls = 0;
+    let reanchorCalls = 0;
+    let result;
+    try {
+      // Unbound wrappers preserve the transaction engine's `this` as well.
+      engine.softDeletePages = async function (slugs, opts) {
+        deleteCalls++;
+        return PGLiteEngine.prototype.softDeletePages.call(this, slugs, opts);
+      };
+      engine.executeRaw = async function <T>(sql: string, params?: unknown[]): Promise<T[]> {
+        if (isReanchorUpdate(sql)) reanchorCalls++;
+        return PGLiteEngine.prototype.executeRaw.call(this, sql, params) as Promise<T[]>;
+      };
+      result = await runPhaseExtractAtoms(engine, {
+        dryRun: true,
+        _transcripts: [],
+        _pages: [{ slug: p, content: b3, contentHash: h3 }],
+        _chat: stubChat([[T_SHARED, Q_THIRD]]),
+      });
+    } finally {
+      delete (engine as { softDeletePages?: unknown }).softDeletePages;
+      delete (engine as { executeRaw?: unknown }).executeRaw;
+    }
     expect(result.status).toBe('ok');
     expect(result.details?.dry_run).toBe(true);
     expect(result.details?.atoms_superseded).toBe(1);
-    expect(await atomSnapshot()).toEqual(before);
+    expect(result.details?.atoms_reanchored).toBe(1);
+    expect(deleteCalls).toBe(0);
+    expect(reanchorCalls).toBe(0);
+    expect(await reconciliationSnapshot(p)).toEqual(before);
   }, 120_000);
 
-  test('(e) an identical re-run retires nothing and moves no atom in or out of the live set', async () => {
+  test('(e) a changed hash with every quote preserved does not re-bind an omitted atom', async () => {
     const f = await seed('e');
     const p = f.p;
-    await reextract(f);
-    const before = await bindingSnapshot();
+    const before = (await atomRow(T_KEEPER, p))!;
+    expect(before.verified).toBe('true');
+    const edited = body([Q_SHARED, Q_OLD, Q_KEEPER], `${f.ns} revised metadata`);
+    const h2 = await putAndHash(p, `P ${f.ns}`, edited);
+    expect(h2).not.toBe(before.source_hash);
 
-    const again = await reextract(f);
+    const again = await runOne(p, edited, h2, [[T_SHARED, Q_SHARED], [T_OLD, Q_OLD]]);
     expect(again.status).toBe('ok');
+    expect(again.details?.atoms_extracted).toBe(2);
     expect(again.details?.atoms_superseded).toBe(0);
     expect(again.details?.atoms_reanchored).toBe(0); // no retirement, no re-binding
     expect(String(again.summary)).not.toContain('superseded');
-    expect(await bindingSnapshot()).toEqual(before);
+    expect(await atomRow(T_KEEPER, p)).toEqual(before);
+    expect((await atomRow(T_KEEPER, p))!.source_hash).toBe(before.source_hash);
+    expect((await atomRow(T_OLD, p))!.deleted_at).toBeNull();
+    expect((await atomRow(T_SHARED, p))!.deleted_at).toBeNull();
   }, 120_000);
 
   test('(f) the zero-yield lane reconciles: an edit that yields no atoms still retires', async () => {
@@ -418,25 +441,55 @@ describe('extract_atoms retires atoms its source page no longer supports (#4566 
   test('(g) a reconciliation failure leaves the page retryable, and the retry finishes it', async () => {
     const f = await seed('g');
     const p = f.p;
+    const retiredBefore = (await atomRow(T_OLD, p))!;
+    const keeperBefore = (await atomRow(T_KEEPER, p))!;
+    let deletedSlugs: string[] = [];
+    let deleteEngine: PGLiteEngine | undefined;
+    let reanchorCompleted = false;
     let failed;
     try {
       // Shadow the prototype method with an own property, and DELETE it to
       // restore: re-assigning an engine-BOUND copy would make the reconciler's
       // transaction write on the outer connection instead of its own and
       // self-deadlock against the row lock it is holding.
-      (engine as { softDeletePages?: unknown }).softDeletePages = async () => {
-        throw new Error('injected soft-delete failure');
+      engine.softDeletePages = async function (slugs, opts) {
+        const deleted = await PGLiteEngine.prototype.softDeletePages.call(this, slugs, opts);
+        deleteEngine = this;
+        deletedSlugs.push(...deleted);
+        return deleted;
+      };
+      engine.executeRaw = async function <T>(sql: string, params?: unknown[]): Promise<T[]> {
+        const rows = await PGLiteEngine.prototype.executeRaw.call(this, sql, params) as T[];
+        if (isReanchorUpdate(sql)) {
+          expect(this === deleteEngine).toBe(true);
+          expect(this).not.toBe(engine);
+          expect(deletedSlugs).toEqual([retiredBefore.slug]);
+          expect(rows as Array<{ slug: string }>).toEqual([{ slug: keeperBefore.slug }]);
+          // Fail AFTER both writes actually ran on the same transaction.
+          // Without rollback, both the deletion and the new binding leak.
+          reanchorCompleted = true;
+          throw new Error('injected re-anchor failure');
+        }
+        return rows;
       };
       failed = await reextract(f);
     } finally {
       delete (engine as { softDeletePages?: unknown }).softDeletePages;
+      delete (engine as { executeRaw?: unknown }).executeRaw;
     }
 
     // Surfaced, not swallowed.
+    expect(reanchorCompleted).toBe(true);
     expect(failed.status).toBe('warn');
     const failures = failed.details?.failures as Array<{ source: string; error: string }>;
-    expect(failures.some(f => f.source === p && f.error.includes('injected soft-delete failure'))).toBe(true);
+    expect(failures.some(f => f.source === p && f.error.includes('injected re-anchor failure'))).toBe(true);
     expect(failed.details?.atoms_superseded).toBe(0);
+    expect(failed.details?.atoms_reanchored).toBe(0);
+    expect((await atomRow(T_OLD, p))!.deleted_at).toBeNull();
+    expect(await atomRow(T_OLD, p)).toEqual(retiredBefore);
+    expect((await atomRow(T_KEEPER, p))!.deleted_at).toBeNull();
+    expect((await atomRow(T_KEEPER, p))!.source_hash).toBe(keeperBefore.source_hash);
+    expect(await atomRow(T_KEEPER, p)).toEqual(keeperBefore);
 
     // And still retryable: the completion markers were never written, so REAL
     // discovery (not the _pages seam) still offers the page.
@@ -446,7 +499,9 @@ describe('extract_atoms retires atoms its source page no longer supports (#4566 
     const retry = await reextract(f);
     expect(retry.status).toBe('ok');
     expect(retry.details?.atoms_superseded).toBe(1);
+    expect(retry.details?.atoms_reanchored).toBe(1);
     expect((await atomRow(T_OLD, p))!.deleted_at).not.toBeNull();
+    expect((await atomRow(T_KEEPER, p))!.source_hash).not.toBe(keeperBefore.source_hash);
     expect((await discoverExtractablePages(engine, 'default')).some(d => d.slug === p)).toBe(false);
   }, 120_000);
 });
@@ -487,6 +542,35 @@ async function editAndReconcile(slug: string, ns: string, edited: string) {
 }
 
 describe('(j) a cosmetically edited page keeps its atoms', () => {
+  for (const { ns, quoted, pageCopy } of [
+    {
+      ns: 'j-bullet-boundary',
+      quoted: 'Results: - Alpha is enabled.',
+      pageCopy: 'Results:\n- Alpha is enabled.',
+    },
+    {
+      ns: 'j-balanced-link',
+      quoted: 'Use the prototype for procurement.',
+      pageCopy: 'Use [the prototype](https://example.invalid/a_(b)) for procurement.',
+    },
+    {
+      ns: 'j-mid-link',
+      quoted: '[Procurement](https://ex',
+      pageCopy: '[Procurement](https://example.invalid/p) decides before the demo.',
+    },
+  ]) {
+    test(`${ns}: a supported quote survives markdown normalization boundaries`, async () => {
+      const [slug, seeded] = await seedVerified(ns, quoted, ns);
+      const before = (await atomRow(ns, slug))!;
+      const edited = seeded.replace(quoted, pageCopy);
+      const r = await editAndReconcile(slug, ns, edited);
+      expect(r.status).toBe('ok');
+      expect(r.details?.atoms_superseded).toBe(0);
+      expect((await atomRow(ns, slug))!.deleted_at).toBeNull();
+      expect((await atomRow(ns, slug))!.source_hash).toBe(before.source_hash);
+    }, 120_000);
+  }
+
   test('NFD re-encoding of Japanese prose is not a deleted claim', async () => {
     const quoted = 'ダミーのプロトタイプでも購買部長は納得する。';
     const [slug, seeded] = await seedVerified('j-nfd', quoted, 'JP claim');
@@ -607,32 +691,62 @@ describe('(k) a retirement survives a revert', () => {
   }, 120_000);
 });
 
-describe('(l) a wide page retires every stale atom in one pass', () => {
-  test('200 stale atoms on one page, no cap and no leftovers', async () => {
+describe('(l) a wide page retires and re-anchors every eligible atom in one pass', () => {
+  test('two full batches plus one tail row on both mutation paths', async () => {
     const ns = 'l';
     const slug = `writings/2026-07-01-${ns}`;
-    await putAndHash(slug, `P ${ns}`, body(['The l original claim stands here plainly.'], `${ns} one`));
-    for (let i = 0; i < 200; i++) {
-      await engine.putPage(`atoms/2026-07-01/l-${String(i).padStart(3, '0')}`, {
-        type: 'atom', title: `l atom ${i}`,
-        compiled_truth: `Atom ${i}.`, timeline: '',
-        frontmatter: {
-          source_slug: slug, source_hash: 'ffffffffffffffff',
-          source_quote: `Absent sentence number ${i} that no page contains at all.`,
-          source_quote_verified: true,
-        },
-      });
-    }
-
-    const edited = body(['A rewritten l body sharing nothing with the first.'], `${ns} two`);
-    const r = await editAndReconcile(slug, ns, edited);
-    expect(r.status).toBe('ok');
-    // DELETE_BATCH_SIZE chunking must not drop the tail.
-    expect(r.details?.atoms_superseded).toBe(200);
-    const live = await engine.executeRaw<{ n: string }>(
-      `SELECT count(*)::text AS n FROM pages
-        WHERE type = 'atom' AND slug LIKE 'atoms/2026-07-01/l-%' AND deleted_at IS NULL`,
+    const candidates = 2 * DELETE_BATCH_SIZE + 1;
+    const gone = 'The l original claim stands here plainly.';
+    const kept = 'The l preserved claim still stands here plainly.';
+    const h1 = await putAndHash(slug, `P ${ns}`, body([gone, kept], `${ns} one`));
+    // One bulk INSERT keeps 2,002 fixture rows cheap; each group contains
+    // 1,001 distinct atoms with a verified quote from the original body.
+    await engine.executeRaw(
+      `INSERT INTO pages (source_id, slug, type, title, compiled_truth, frontmatter)
+       SELECT 'default', 'atoms/2026-07-01/l-' || kind || '-' || i, 'atom',
+              'l ' || kind || ' atom ' || i, 'Atom ' || i,
+              jsonb_build_object('source_slug', $1::text, 'source_hash', $2::text,
+                                 'source_quote', quote, 'source_quote_verified', true)
+         FROM generate_series(1, $3::int) AS s(i)
+         CROSS JOIN (VALUES ('retire', $4::text), ('keep', $5::text)) AS groups(kind, quote)`,
+      [slug, h1, candidates, gone, kept],
     );
-    expect(live[0]!.n).toBe('0');
+
+    const edited = body([kept], `${ns} two`);
+    const h2 = await putAndHash(slug, `P ${ns}`, edited);
+    expect(h2).not.toBe(h1);
+    const deleteBatches: number[] = [];
+    const reanchorBatches: number[] = [];
+    let r;
+    try {
+      engine.softDeletePages = async function (slugs, opts) {
+        deleteBatches.push(slugs.length);
+        return PGLiteEngine.prototype.softDeletePages.call(this, slugs, opts);
+      };
+      engine.executeRaw = async function <T>(sql: string, params?: unknown[]): Promise<T[]> {
+        if (isReanchorUpdate(sql)) reanchorBatches.push((params![3] as string[]).length);
+        return PGLiteEngine.prototype.executeRaw.call(this, sql, params) as Promise<T[]>;
+      };
+      r = await runOne(slug, edited, h2, []);
+    } finally {
+      delete (engine as { softDeletePages?: unknown }).softDeletePages;
+      delete (engine as { executeRaw?: unknown }).executeRaw;
+    }
+    expect(r.status).toBe('ok');
+    expect(deleteBatches).toEqual([DELETE_BATCH_SIZE, DELETE_BATCH_SIZE, 1]);
+    expect(reanchorBatches).toEqual([DELETE_BATCH_SIZE, DELETE_BATCH_SIZE, 1]);
+    expect(r.details?.atoms_superseded).toBe(candidates);
+    expect(r.details?.atoms_reanchored).toBe(candidates);
+    const rows = await engine.executeRaw<{ total: number; retired: number; reanchored: number }>(
+      `SELECT count(*)::int AS total,
+              count(*) FILTER (WHERE slug LIKE 'atoms/2026-07-01/l-retire-%'
+                AND deleted_at IS NOT NULL AND frontmatter->>'source_hash' = $2)::int AS retired,
+              count(*) FILTER (WHERE slug LIKE 'atoms/2026-07-01/l-keep-%'
+                AND deleted_at IS NULL AND frontmatter->>'source_hash' = $3)::int AS reanchored
+         FROM pages WHERE source_id = 'default' AND type = 'atom'
+           AND frontmatter->>'source_slug' = $1`,
+      [slug, h1, h2],
+    );
+    expect(rows).toEqual([{ total: 2 * candidates, retired: candidates, reanchored: candidates }]);
   }, 180_000);
 });

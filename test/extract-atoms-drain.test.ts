@@ -8,14 +8,16 @@
  *  - a busy lock (withLock throws) propagates so the caller reports skipped
  */
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, spyOn } from 'bun:test';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import {
   runExtractAtomsDrain,
+  runExtractAtomsDrainForSource,
   type ExtractAtomsDrainDeps,
 } from '../src/core/cycle/extract-atoms-drain.ts';
 import { isProtectedJobName, PROTECTED_JOB_NAMES } from '../src/core/minions/protected-names.ts';
+import type { BrainEngine } from '../src/core/engine.ts';
 
 function seq(values: Array<number | null>): () => Promise<number | null> {
   let i = 0;
@@ -198,12 +200,35 @@ describe('shared wiring helper holds the cycle lock (5A)', () => {
   // same 'warn' value — the exact discard the issue reports).
   // #4566 — the wiring adapter is what a real drain runs; the phase's
   // destructive count has to be READ from its details, not dropped on the
-  // floor. (The adapter itself needs a live engine + lock, so this reads the
-  // mapping; the pure-loop case above pins the arithmetic.)
-  it('runBatch maps the phase details\' retired/re-anchored atom counts', () => {
-    const runBatchBlock = src.slice(src.indexOf('runBatch: async () => {'));
-    expect(runBatchBlock).toContain("superseded: Number(d.atoms_superseded ?? 0)");
-    expect(runBatchBlock).toContain("reanchored: Number(d.atoms_reanchored ?? 0)");
+  // floor. Run the real adapter with a stubbed phase and lock; restore every
+  // spy so the shared module exports remain usable by neighboring tests.
+  it('runBatch maps the phase details\' retired/re-anchored atom counts', async () => {
+    const phase = await import('../src/core/cycle/extract-atoms.ts');
+    const locks = await import('../src/core/db-lock.ts');
+    const lock = spyOn(locks, 'withRefreshingLock').mockImplementation(async (_engine, _id, work) => work());
+    const batch = spyOn(phase, 'runPhaseExtractAtoms').mockResolvedValue({
+      phase: 'extract_atoms', status: 'ok', summary: 'stubbed phase', duration_ms: 0,
+      details: { atoms_extracted: 1, pages_processed: 1, atoms_superseded: 2, atoms_reanchored: 7 },
+    });
+    const backlog = spyOn(phase, 'countExtractAtomsBacklog').mockImplementation(seq([1, 0, 0]));
+    try {
+      const engine = {} as BrainEngine;
+      const result = await runExtractAtomsDrainForSource(engine, {
+        sourceId: 'default', windowSeconds: 60,
+      });
+      expect(batch).toHaveBeenCalledTimes(1);
+      expect(batch).toHaveBeenCalledWith(engine, {
+        sourceId: 'default', dryRun: false, brainDir: undefined,
+      });
+      expect(result.batches).toBe(1);
+      expect(result.stopped).toBe('drained');
+      expect(result.superseded).toBe(2);
+      expect(result.reanchored).toBe(7);
+    } finally {
+      backlog.mockRestore();
+      batch.mockRestore();
+      lock.mockRestore();
+    }
   });
 
   it('runBatch derives providerFailure from failures.length + zero processed items, not r.status', () => {
@@ -267,7 +292,7 @@ describe('#2144: zero-yield tombstone progress semantics', () => {
     const counts = [
       { extracted: 1, skipped: 0, superseded: 2, reanchored: 1 },
       { extracted: 1, skipped: 0 },
-      { extracted: 1, skipped: 0, superseded: 3, reanchored: 4 },
+      { extracted: 1, skipped: 0, superseded: 3, reanchored: 6 },
     ];
     let i = 0;
     const result = await runExtractAtomsDrain(
@@ -281,7 +306,7 @@ describe('#2144: zero-yield tombstone progress semantics', () => {
     );
     expect(result.batches).toBe(3);
     expect(result.superseded).toBe(5);
-    expect(result.reanchored).toBe(5);
+    expect(result.reanchored).toBe(7);
   });
 
   it('stops no_progress when a zero-atom batch leaves the backlog flat', async () => {
