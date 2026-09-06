@@ -99,6 +99,7 @@ export interface ExtractAtomsDrainDeps {
      */
     superseded?: number;
     reanchored?: number;
+    retirement_blocked?: number;
     providerFailure?: boolean;
     failureCount?: number;
     firstError?: string;
@@ -149,6 +150,8 @@ export interface ExtractAtomsDrainResult {
    */
   superseded: number;
   reanchored: number;
+  /** Always emitted by the drain; optional for callers constructing older summaries. */
+  retirement_blocked?: number;
   /** Eligible pages still pending after the window. null if the count errored. */
   remaining: number | null;
   /** Batches actually processed. */
@@ -191,6 +194,7 @@ export async function runExtractAtomsDrain(
     let skipped = 0;
     let superseded = 0;
     let reanchored = 0;
+    let retirement_blocked = 0;
     let batches = 0;
     let stopped: ExtractAtomsDrainResult['stopped'] = 'window';
     // issue #3218: latched once any batch reports providerFailure — drives
@@ -214,6 +218,7 @@ export async function runExtractAtomsDrain(
       skipped += r.skipped;
       superseded += nonNegativeCount(r.superseded);
       reanchored += nonNegativeCount(r.reanchored);
+      retirement_blocked += nonNegativeCount(r.retirement_blocked);
       batches++;
       // #4730: preserve typed per-item records (bounded, sanitized) while
       // keeping failure_count exact and reconcilable — count-only adapters
@@ -296,6 +301,7 @@ export async function runExtractAtomsDrain(
       skipped,
       superseded,
       reanchored,
+      retirement_blocked,
       remaining,
       batches,
       stopped,
@@ -398,6 +404,7 @@ export async function runExtractAtomsDrainForSource(
           // lane deletes rows it never reports.
           superseded: Number(d.atoms_superseded ?? 0),
           reanchored: Number(d.atoms_reanchored ?? 0),
+          retirement_blocked: Number(d.atoms_retirement_blocked ?? 0),
           providerFailure: failures.length > 0 && itemsSucceeded === 0,
           failureCount: failures.length,
           failures: typedFailures,

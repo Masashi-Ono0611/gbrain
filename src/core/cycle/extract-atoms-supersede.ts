@@ -4,14 +4,15 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
+import { locateQuote } from './extract-atoms.ts';
 import { normForGrounding } from './synthesize-verify.ts';
 
 /**
  * A normalized quote shorter than this (under EITHER fold) is not evidence
  * enough to destroy a row: at that length an accidental substring match — or
  * miss — is as likely as a real one, and the atom is cheap to keep and
- * expensive to lose. Retirement skips these; they stay live with their stale
- * binding.
+ * expensive to lose. Retirement skips these; unless locatable, they block
+ * retirement and stay live with their stale binding.
  */
 const MIN_RETIREMENT_QUOTE_CHARS = 8;
 
@@ -30,8 +31,9 @@ const MIN_RETIREMENT_QUOTE_CHARS = 8;
  *
  * So, in order: NFKC (composes NFD, folds full-width forms to ASCII), strip
  * the markdown syntax that carries no meaning (blockquote/heading/list
- * markers at line start, `[text](url)` → text, `<url>` → url, emphasis and
- * code marks), then the shared fold + whitespace collapse.
+ * markers at line start, inline/reference links → text, reference definitions,
+ * `<url>` → url, emphasis and code marks), then the shared fold + whitespace
+ * collapse.
  *
  * It is applied to BOTH sides, but symmetry alone does NOT make it a superset
  * of the strict fold: a quote that starts mid-link (`[Procurement](https://ex`
@@ -54,6 +56,8 @@ function normForRetirement(s: string): string {
       // that allowance the fold stopped at the inner `)` and left a stray `)`
       // in the page text, so a supported quote read as absent and was retired.
       .replace(/!?\[([^\]\n]*)\]\((?:[^()\n]|\([^()\n]*\))*\)/g, '$1')
+      .replace(/^[ \t]*\[[^\]\n]+\]:[ \t]*(?:<[^>\n]+>|[^\s<>]+)[^\n]*(?:\n|$)/gm, '') // reference definitions
+      .replace(/!?\[([^\]\n]*)\]\[[^\]\n]*\]/g, '$1') // reference links / images
       .replace(/<((?:https?|mailto):[^>\s]+)>/g, '$1')      // <url> → url
       .replace(/[`*_~]/g, ''),                              // emphasis / code marks
   );
@@ -108,38 +112,24 @@ function normForRetirement(s: string): string {
  * one finding the quote keeps the atom. All three choices err toward "still
  * present", i.e. toward keeping the atom.
  *
- * RE-ANCHORING. A run that retires anything also repoints the atoms it KEPT on
- * VERBATIM evidence — same page, stale `source_hash`, verified quote still
- * present under the STRICT fold — at the hash just reconciled. Two reasons,
- * and both are about not making the retirement permanent:
- *   - It is truthful. The atom is supported by the content at THIS hash; the
- *     hash it carried says only which pass minted it.
- *   - `discoverExtractablePages` skips a page when any live atom already
- *     carries its current hash. A kept atom still holding the OLD hash
- *     therefore masks the old content forever: revert the page and discovery
- *     says "already extracted", so the atoms retired at the new hash are never
- *     re-derived and the purge window ends them. Re-anchoring frees the old
- *     hash, the revert re-discovers the page, and the deterministic atom slug
- *     makes the re-import revive the soft-deleted row in place.
- * Only the verbatim-evidenced set moves. An atom with no quote, an unverified
- * one, or one the permissive fold alone could find keeps its hash — and can
- * still mask an older one. That residual is deliberate: those rows have no
- * evidence strong enough to restate their provenance, and they are rows this
- * reconciler would never retire anyway. Runs that retire nothing re-anchor
- * nothing: without a retirement the old hash's extraction is still fully
- * represented, and the common no-op page must not pay a write.
+ * RE-ANCHORING. A run that retires anything also repoints every keeper
+ * whose verified quote can be located by extraction's `locateQuote`, updating
+ * both source_hash and source_quote_offset and keeping verification true.
+ * Containment under either fold alone is NOT enough: the locator requires
+ * unique, character-aligned evidence in the current content.
  *
- * The one contract this costs: the reconciliation deliberately lands BEFORE
- * the item's completion markers so a failure leaves the page retryable, and a
- * re-anchored row carries the current hash from that moment on. If the
- * provisional→real flip that follows then fails, discovery skips the page
- * (any live atom at the current hash makes it "already extracted") and this
- * run's `pending:` rows wait for the next edit to that page instead of the
- * next run. That window is the flip's own pre-existing crash window widened by
- * two statements, it strands nothing that a later pass cannot reclaim (a
- * `pending:` row is explicitly eligible here), and closing it properly means
- * teaching discovery about incomplete runs — a change to the phase's
- * eligibility rule, not to this reconciler.
+ * Revert-recovery requires the page's old hash to be fully released: discovery
+ * skips content when any live atom already carries its hash. Retirement is
+ * therefore deferred until every other stale-bound atom can be re-verified
+ * against the current content at extraction standard. A missing/unverified
+ * quote, fold-only match, ambiguous locator, or insufficient retirement
+ * evidence is a BLOCKER. Any blocker means no retirement and no re-anchoring
+ * for this page; the original atoms remain live even after a revert. Runs with
+ * no retirement also leave keeper bindings alone.
+ *
+ * The provisional→real hash flip shares the reconciliation transaction,
+ * ordered flip → retire → re-anchor. A failure anywhere rolls all three back,
+ * leaving imported atoms pending and the page retryable.
  *
  * Revival after a revert is in-place for atoms at the current deterministic
  * slug. A pre-#4733 LEGACY-slug atom is re-minted at the new-format slug
@@ -155,11 +145,11 @@ function normForRetirement(s: string): string {
  * whole judgement inside a transaction that holds a `FOR UPDATE` row lock on
  * the source page, so an edit cannot land between the evidence check and the
  * soft-delete either. Pages with nothing to retire — the overwhelming majority
- * — never open a transaction, so the batch phase keeps paying one SELECT.
+ * — pay one SELECT plus only the completion flip transaction when needed.
  *
  * Soft-delete via `softDeletePages`, so rows stay recoverable inside the usual
  * purge window rather than being destroyed. Returns how many rows were
- * actually flipped active → soft-deleted and how many were re-anchored.
+ * actually flipped active → soft-deleted, re-anchored, or blocked retirement.
  * `dryRun` runs the SELECT only and returns the would-be counts without
  * touching a row.
  *
@@ -173,6 +163,7 @@ interface SupersedeArgs {
   currentContent: string;
   keepSlugs: string[];
   dryRun: boolean;
+  flip?: (tx: BrainEngine) => Promise<void>;
 }
 
 /** One page's stale-bound atoms, split by what the current content says. */
@@ -180,7 +171,8 @@ interface Verdict {
   /** Verified quote no longer in the page → soft-delete. */
   retire: string[];
   /** Verified quote still in the page → repoint at the current hash. */
-  reanchor: string[];
+  reanchor: Array<{ slug: string; start: number; end: number }>;
+  blocked: number;
 }
 
 /**
@@ -221,23 +213,18 @@ async function classifyStaleAtoms(
   // the permissive retirement one (cosmetic edits are not deletions).
   const currentStrict = normForGrounding(args.currentContent);
   const currentFolded = normForRetirement(args.currentContent);
-  const verdict: Verdict = { retire: [], reanchor: [] };
+  const verdict: Verdict = { retire: [], reanchor: [], blocked: 0 };
   for (const r of rows) {
-    // No verified quote → no evidence in either direction: neither retire nor
-    // re-anchor, so the row keeps whatever binding it has.
-    if (r.verified !== 'true' || !r.quote) continue;
+    if (r.verified !== 'true' || !r.quote) { verdict.blocked++; continue; }
+    const loc = locateQuote(args.currentContent, r.quote);
+    if (loc) { verdict.reanchor.push({ slug: r.slug, ...loc }); continue; }
     const strict = normForGrounding(r.quote);
     const folded = normForRetirement(r.quote);
-    if (Math.min(strict.length, folded.length) < MIN_RETIREMENT_QUOTE_CHARS) continue;
-    // Verbatim-present under the strict fold: strong enough to REBIND the row.
-    if (currentStrict.includes(strict)) { verdict.reanchor.push(r.slug); continue; }
-    // Present only under the permissive fold: strong enough to KEEP the row,
-    // not to restate its provenance. That fold is deliberately lossy (it drops
-    // `_`, and NFKC rewrites `x²` to `x2`), so a match can mean the page still
-    // carries the claim OR that an edit changed a token the fold erased. Keep
-    // — the destructive direction needs the evidence — but leave the binding
-    // alone so `atom_provenance_drift` still reports the row.
-    if (currentFolded.includes(folded)) continue;
+    if (Math.min(strict.length, folded.length) < MIN_RETIREMENT_QUOTE_CHARS
+      || currentStrict.includes(strict) || currentFolded.includes(folded)) {
+      verdict.blocked++;
+      continue;
+    }
     verdict.retire.push(r.slug);
   }
   return verdict;
@@ -246,27 +233,32 @@ async function classifyStaleAtoms(
 /**
  * Repoint kept-but-stale atoms at the hash just reconciled. Runs INSIDE the
  * retirement transaction (same row locks, same all-or-nothing rollback), and
- * touches only `frontmatter.source_hash` — not `updated_at`, matching
+ * refreshes the hash, quote offsets and verification — not `updated_at`, matching
  * `softDeletePages`, so a reconciliation does not read downstream as a content
  * edit. Returns the rows actually repointed.
  */
 async function reanchorAtoms(
   tx: BrainEngine,
   args: SupersedeArgs,
-  slugs: string[],
+  anchors: Verdict['reanchor'],
 ): Promise<number> {
   let moved = 0;
-  for (let i = 0; i < slugs.length; i += DELETE_BATCH_SIZE) {
+  for (let i = 0; i < anchors.length; i += DELETE_BATCH_SIZE) {
+    const batch = anchors.slice(i, i + DELETE_BATCH_SIZE);
     const rows = await tx.executeRaw<{ slug: string }>(
       `UPDATE pages
-          SET frontmatter = frontmatter || jsonb_build_object('source_hash', $3::text)
+          SET frontmatter = frontmatter || jsonb_build_object('source_hash', $3::text,
+                'source_quote_offset', jsonb_build_array(loc.start_offset, loc.end_offset),
+                'source_quote_verified', true)
+         FROM unnest($4::text[], $5::int[], $6::int[]) AS loc(slug, start_offset, end_offset)
         WHERE source_id = $1
           AND type = 'atom'
           AND deleted_at IS NULL
           AND frontmatter->>'source_slug' = $2
-          AND slug = ANY($4::text[])
-        RETURNING slug`,
-      [args.sourceId, args.pageSlug, args.hash16, slugs.slice(i, i + DELETE_BATCH_SIZE)],
+          AND pages.slug = loc.slug
+        RETURNING pages.slug`,
+      [args.sourceId, args.pageSlug, args.hash16, batch.map(a => a.slug),
+        batch.map(a => a.start), batch.map(a => a.end)],
     );
     moved += rows.length;
   }
@@ -276,27 +268,26 @@ async function reanchorAtoms(
 export interface ReconcileCounts {
   superseded: number;
   reanchored: number;
+  blocked: number;
 }
 
-const NOTHING: ReconcileCounts = { superseded: 0, reanchored: 0 };
+const NOTHING: ReconcileCounts = { superseded: 0, reanchored: 0, blocked: 0 };
 
 async function supersedeStaleAtomsForPage(
   engine: BrainEngine,
   args: SupersedeArgs,
 ): Promise<ReconcileCounts> {
+  const initial = await classifyStaleAtoms(engine, args);
   if (args.dryRun) {
-    const would = await classifyStaleAtoms(engine, args);
-    // Report the same coupling a real run applies: no retirement, no
-    // re-anchoring.
-    return would.retire.length === 0
-      ? NOTHING
-      : { superseded: would.retire.length, reanchored: would.reanchor.length };
+    return initial.blocked > 0 || initial.retire.length === 0
+      ? { ...NOTHING, blocked: initial.blocked }
+      : { superseded: initial.retire.length, reanchored: initial.reanchor.length, blocked: 0 };
   }
-  // Fast path first: the overwhelming majority of re-extracted pages have
-  // nothing to retire, and this is a batch phase — one plain SELECT per page,
-  // no transaction. Only a page that actually has candidates pays for the
-  // locked re-check below.
-  if ((await classifyStaleAtoms(engine, args)).retire.length === 0) return NOTHING;
+  // No retirement possible: only the completion flip needs a transaction.
+  if (initial.retire.length === 0 || initial.blocked > 0) {
+    if (args.flip) await engine.transaction(args.flip);
+    return { ...NOTHING, blocked: initial.blocked };
+  }
   return engine.transaction(async (tx) => {
     // Take the "page still carries hash16" gate as a row lock: a concurrent
     // edit to this page now waits for the commit below instead of slipping in
@@ -308,13 +299,17 @@ async function supersedeStaleAtomsForPage(
         FOR UPDATE`,
       [args.sourceId, args.pageSlug, args.hash16],
     );
-    if (held.length === 0) return NOTHING;
+    if (held.length === 0) {
+      await args.flip?.(tx);
+      return NOTHING;
+    }
     // Re-derived under the lock, not reused from the fast path: the lock is
     // what makes this list current.
-    const { retire, reanchor } = await classifyStaleAtoms(tx, args, true);
+    const { retire, reanchor, blocked } = await classifyStaleAtoms(tx, args, true);
+    await args.flip?.(tx);
     // The lock may have revealed that nothing is unsupported after all —
     // then this is a no-op run and the kept atoms' bindings stay put.
-    if (retire.length === 0) return NOTHING;
+    if (retire.length === 0 || blocked > 0) return { ...NOTHING, blocked };
     // softDeletePages is a single-batch primitive — oversized input throws.
     let superseded = 0;
     for (let i = 0; i < retire.length; i += DELETE_BATCH_SIZE) {
@@ -323,32 +318,32 @@ async function supersedeStaleAtomsForPage(
       });
       superseded += flipped.length;
     }
-    return { superseded, reanchored: await reanchorAtoms(tx, args, reanchor) };
+    return { superseded, reanchored: await reanchorAtoms(tx, args, reanchor), blocked: 0 };
   });
 }
 
 /**
- * Bind the reconciler to one phase run. The returned function is a no-op for
- * transcript items (a transcript is a file, not a page, so nothing is bound to
- * it) and otherwise returns how many of the page's atoms were retired and how
- * many were re-anchored.
+ * Bind the reconciler to one phase run. Transcript items only run the supplied
+ * completion flip (a transcript is a file, not a page, so nothing is bound to
+ * it). Page items return retired, re-anchored and blocker counts.
  *
- * It is allowed to THROW: callers must run it before the item's completion
- * markers, on the same footing as the provenance-edge flush. Both markers (the
- * `source_hash` flip and `atoms_scan_hash`) make the page undiscoverable for
- * this content, so a reconciliation that failed after them could never be
- * retried; failing first leaves the provisional hashes in place and the next
- * run redoes the whole item.
+ * It is allowed to THROW. The caller supplies the completion flip so it
+ * commits atomically with retirement and re-anchoring, then stamps the page
+ * only after this function succeeds. Dry-run never invokes the flip.
  */
 export function createAtomReconciler(engine: BrainEngine, sourceId: string, dryRun: boolean) {
   return async (
     item: { kind: string; slug?: string; content: string; contentHash: string },
     keepSlugs: string[],
+    flip?: (tx: BrainEngine) => Promise<void>,
   ): Promise<ReconcileCounts> => {
-    if (item.kind !== 'page' || !item.slug) return NOTHING;
+    if (item.kind !== 'page' || !item.slug) {
+      if (!dryRun) await flip?.(engine);
+      return NOTHING;
+    }
     return supersedeStaleAtomsForPage(engine, {
       sourceId, pageSlug: item.slug, hash16: item.contentHash.slice(0, 16),
-      currentContent: item.content, keepSlugs, dryRun,
+      currentContent: item.content, keepSlugs, dryRun, flip,
     });
   };
 }

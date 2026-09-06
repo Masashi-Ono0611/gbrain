@@ -729,6 +729,7 @@ export async function runPhaseExtractAtoms(
   let totalAtomsExtracted = 0;
   let atomsSuperseded = 0;
   let atomsReanchored = 0;
+  let atomsRetirementBlocked = 0;
   let transcriptsProcessed = 0;
   let pagesProcessed = 0;
   let transcriptsSkipped = 0;
@@ -887,9 +888,10 @@ export async function runPhaseExtractAtoms(
   // supports. Evidence rule, throw-before-the-completion-markers contract and
   // dry-run semantics all live in the reconciler module.
   const reconcileAtoms = createAtomReconciler(engine, sourceId, opts.dryRun === true);
-  const countReconciled = (c: { superseded: number; reanchored: number }) => {
+  const countReconciled = (c: { superseded: number; reanchored: number; blocked: number }) => {
     atomsSuperseded += c.superseded;
     atomsReanchored += c.reanchored;
+    atomsRetirementBlocked += c.blocked;
   };
 
   await withBudgetTracker(budgetTracker, async () => {
@@ -1089,21 +1091,16 @@ export async function runPhaseExtractAtoms(
         if (provenanceLinks.length > 0) {
           await engine.addLinksBatch(provenanceLinks, { auditSite: 'cycle.extract_atoms.provenance' }); // gbrain-allow-direct-insert: atom-provenance edges derived from the extraction itself (no markdown body to reconcile from)
         }
-        // #4566: retire what this page no longer supports, on the same
-        // before-the-flip footing as the provenance flush. The rows just
-        // written are exempt twice over — they are in importedSlugs, and their
-        // provisional `pending:` hashes are excluded by the predicate.
-        countReconciled(await reconcileAtoms(item, importedSlugs));
-        // Completion receipt: flip provisional → real in one statement (only
-        // after every atom AND provenance edge persisted), then stamp the
-        // source page. A crash between flip and stamp degrades to the legacy
-        // atom-rows-mean-done semantics — safe, not lossy.
-        await engine.executeRaw(
-          `UPDATE pages
-              SET frontmatter = frontmatter || jsonb_build_object('source_hash', $1::text)
-            WHERE source_id = $2 AND type = 'atom' AND slug = ANY($3::text[]) AND deleted_at IS NULL`,
-          [hash16, sourceId, importedSlugs],
-        );
+        // Commit completion and reconciliation together: flip → retire →
+        // re-anchor. Any failure keeps imported atoms pending and retryable.
+        countReconciled(await reconcileAtoms(item, importedSlugs, async (tx) => {
+          await tx.executeRaw(
+            `UPDATE pages
+                SET frontmatter = frontmatter || jsonb_build_object('source_hash', $1::text)
+              WHERE source_id = $2 AND type = 'atom' AND slug = ANY($3::text[]) AND deleted_at IS NULL`,
+            [hash16, sourceId, importedSlugs],
+          );
+        }));
         if (item.kind === 'page') await stampAtomsScanHash(item);
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting
@@ -1219,6 +1216,7 @@ export async function runPhaseExtractAtoms(
       `${transcriptsProcessed}/${transcripts.length} transcripts + ` +
       `${pagesProcessed}/${pages.length} pages` +
       (atomsSuperseded > 0 ? ` (${atomsSuperseded} superseded)` : '') +
+      (atomsRetirementBlocked > 0 ? ` (${atomsRetirementBlocked} retirement blocked)` : '') +
       (failures.length > 0 ? ` (${failures.length} failed)` : '') +
       (transcriptsSkipped + pagesSkipped > 0
         ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
@@ -1227,6 +1225,7 @@ export async function runPhaseExtractAtoms(
       atoms_extracted: totalAtomsExtracted,
       atoms_superseded: atomsSuperseded,
       atoms_reanchored: atomsReanchored,
+      atoms_retirement_blocked: atomsRetirementBlocked,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,
       transcripts_skipped_budget: transcriptsSkipped,
