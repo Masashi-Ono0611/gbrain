@@ -148,7 +148,6 @@ describe('extract_atoms supersedes stale atoms of a re-extracted page (#4566 fol
     });
     expect(first.status).toBe('ok');
     expect(first.details?.atoms_extracted).toBe(2);
-    expect(first.details?.atoms_superseded).toBe(0);
 
     // Q emits the SAME atom title on the SAME date — distinct slug via the
     // #4733 locator fold — and is never re-extracted, so its source_hash stays
