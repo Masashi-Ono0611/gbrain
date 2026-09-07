@@ -1303,12 +1303,26 @@ async function runPhaseSync(
     // work; surfacing 'fail' would paint a healthy cron contention red and (with
     // the heartbeat-aware takeover) this is now the expected outcome when a long
     // sync overruns into the next cron tick. Report it as a skip.
-    const { SyncLockBusyError } = await import('../commands/sync.ts');
+    const { SyncLockBusyError, SyncDisabledError } = await import('../commands/sync.ts');
     if (e instanceof SyncLockBusyError) {
       return { phase: 'sync', status: 'skipped', duration_ms: 0, summary: 'sync already in progress elsewhere — skipped', details: { syncStatus: 'lock_busy' } };
     }
     if ((e as { code?: unknown } | null)?.code === 'sync_not_applicable') {
       return { phase: 'sync', status: 'skipped', duration_ms: 0, summary: (e as Error).message, details: { reason: 'sync_not_applicable' } };
+    }
+    // #4399 (review finding): a source with config.syncEnabled=false is a
+    // deliberate, permanent exclusion (see sync-policy.ts), not a phase
+    // failure. Without this, a cycle scoped to a disabled source reports
+    // 'fail' forever — the same "erodes the check's signal" problem #4399
+    // itself calls out for cycle_freshness, just via the sync phase instead.
+    if (e instanceof SyncDisabledError) {
+      return {
+        phase: 'sync',
+        status: 'skipped',
+        duration_ms: 0,
+        summary: 'sync disabled for this source (config.syncEnabled=false) — skipped',
+        details: { syncStatus: 'sync_disabled' },
+      };
     }
     return {
       phase: 'sync',
