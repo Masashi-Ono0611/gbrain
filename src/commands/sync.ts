@@ -127,7 +127,6 @@ import {
   resolveSlugRootMode,
   type SlugRootMode,
 } from '../core/sync-anchor.ts';
-import { isSyncDisabledConfig } from '../core/sync-policy.ts';
 import {
   SyncLockBusyError,
   formatLockBusyMessage,
@@ -142,6 +141,7 @@ import {
   resolveStallAbortSeconds,
   composeAbortSignals,
 } from '../core/sync-reconcile.ts';
+import { isSyncDisabledConfig, isSyncDisabledForSource, SyncDisabledError } from '../core/sync-policy.ts';
 
 /**
  * v0.42.x (#1794) -- resumable incremental sync checkpoint.
@@ -612,8 +612,34 @@ See also:
 // runBreakLock, buildPartialResult) was peeled to src/core/sync-lock.ts
 // (pure move). Re-exported so existing importers keep working.
 export { SyncLockBusyError, runBreakLock } from '../core/sync-lock.ts';
+// #4399: single choke-point enforcement of config.syncEnabled=false. See
+// src/core/sync-policy.ts for the rationale. Re-exported so callers (e.g.
+// the `sync` job worker in jobs.ts) can catch it alongside SyncLockBusyError
+// without importing sync-policy.ts directly.
+export { SyncDisabledError } from '../core/sync-policy.ts';
 
 export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
+  // #4399: syncEnabled:false is a hard, unconditional exclusion — checked
+  // HERE, before either lock path below, because performSync is the one
+  // function every sync execution path funnels through (CLI single-source,
+  // the minion `sync` job, autopilot's freshness dispatcher, cycle.ts). A
+  // per-caller check (as sync-cost-gate.ts and the `sync --all` fan-out
+  // filter already had) can't cover every entry point; this can. No bypass
+  // flag — an explicit `gbrain sync --source X` on a disabled source is
+  // refused the same as an automated dispatch.
+  //
+  // Resolve `opts.sourceId ?? DEFAULT_SOURCE_ID` — the same fallback every
+  // other write site in this file uses (softDeletePages, rename-reconcile,
+  // the failure ledger, ...) — rather than gating on `opts.sourceId` being
+  // set. A bare `gbrain sync` / a minion `sync` job with no sourceId still
+  // writes pages under source_id='default' via the pre-v0.17 global-config
+  // path; skipping the check when sourceId is merely omitted would let a
+  // disabled 'default' source sync through that path (caught in review).
+  const effectiveSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
+  if (await isSyncDisabledForSource(engine, effectiveSourceId)) {
+    throw new SyncDisabledError(effectiveSourceId);
+  }
+
   assertSourceFilesystemActive(true);
   const jobSignal = currentJobSignal();
   if (jobSignal?.aborted) throw jobSignal.reason ?? new Error('Sync job cancelled');
