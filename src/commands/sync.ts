@@ -365,6 +365,7 @@ export { writeSyncAnchor } from '../core/sync-anchor.ts';
 // runBreakLock, buildPartialResult) was peeled to src/core/sync-lock.ts
 // (pure move). Re-exported so existing importers keep working.
 export { SyncLockBusyError, runBreakLock } from '../core/sync-lock.ts';
+export { SyncDisabledError } from '../core/sync-policy.ts';
 
 // The reconcile + deadline cluster (planReconcileDeletes, the #2828
 // mass-delete valve, resolveSyncHardDeadline, composeAbortSignals, ...) was
