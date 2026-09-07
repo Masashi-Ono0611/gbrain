@@ -271,9 +271,8 @@ export async function dispatchFreshnessSyncs(
           continue;
         }
         if (!src.local_path) continue;
-        // #4399: config.syncEnabled=false excludes a source from AUTOMATIC
-        // sync (this loop, the full-cycle fan-out, `sync --all`); an
-        // explicit `gbrain sync --source <id>` is unaffected.
+        // #4399: skip before enqueueing; performSync also refuses disabled
+        // sources, including an explicit single-source sync.
         if (isSyncDisabledConfig(src.config)) continue;
         if (skipActivationPendingSync(activationPending, src.id, 'freshness_sync_skipped', jsonMode, (l) => process.stderr.write(l + '\n'))) continue; // #5198
         // A local_path this machine cannot use — relative (#3696: cwd is

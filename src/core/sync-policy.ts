@@ -1,19 +1,18 @@
 /**
  * The single predicate for `config.syncEnabled === false` (#4399).
  *
- * The flag means "excluded from AUTOMATIC/bulk sync": the `sync --all` fan-out
- * filter (sync.ts), autopilot's freshness dispatcher (autopilot.ts), the
+ * The flag excludes a source from all syncs: the `sync --all` fan-out
+ * filter (sync/run.ts), autopilot's freshness dispatcher (autopilot-dispatch.ts), the
  * full-cycle fan-out (autopilot-fanout.ts) and the `sync_enabled` column of
  * the sources status report (sync-status-report.ts, fed RAW `SELECT config`
- * rows) all read it here so they cannot drift apart. It deliberately does
- * NOT gate performSync() itself — an
- * explicit `gbrain sync --source <id>` naming a disabled source still runs.
- * (sync-cost-gate.ts keeps its own inline check: it also feeds the explicit
- * single-source cost preview.)
+ * rows) all read it here so they cannot drift apart. Local patch 117 also
+ * enforces this at performSync(), including explicit single-source sync and
+ * jobs queued before disabling a source. Disabled jobs and cycle sync phases
+ * report a deliberate skip; there is no bypass flag.
  */
 
 import type { BrainEngine } from './engine.ts';
-import { parseSourceConfig } from './sources-load.ts';
+import { fetchSource, parseSourceConfig } from './sources-load.ts';
 
 /**
  * True iff `config` explicitly sets `syncEnabled: false`. parseSourceConfig
@@ -22,6 +21,27 @@ import { parseSourceConfig } from './sources-load.ts';
  */
 export function isSyncDisabledConfig(config: unknown): boolean {
   return parseSourceConfig(config).syncEnabled === false;
+}
+
+/** Look up the source at the performSync choke point. Missing rows remain allowed;
+ * genuine lookup failures propagate so a disabled source cannot slip through. */
+export async function isSyncDisabledForSource(
+  engine: BrainEngine,
+  sourceId: string | undefined,
+): Promise<boolean> {
+  if (!sourceId) return false;
+  const source = await fetchSource(engine, sourceId);
+  return source ? isSyncDisabledConfig(source.config) : false;
+}
+
+/** Deliberate hard exclusion, classified as a skip by automatic callers. */
+export class SyncDisabledError extends Error {
+  readonly sourceId: string;
+  constructor(sourceId: string) {
+    super(`Sync is disabled for source "${sourceId}" (config.syncEnabled=false)`);
+    this.name = 'SyncDisabledError';
+    this.sourceId = sourceId;
+  }
 }
 
 /**
