@@ -24,6 +24,8 @@ import { assertSyncApplicable } from '../../core/sync-applicability.ts';
 import { performPlainDirectorySync, plainDirectorySyncRoot } from './plain-directory.ts';
 import { noteIdentityDowngrades } from '../../core/sync-identity-downgrades.ts';
 import { SyncLockBusyError, formatLockBusyMessage, buildPartialResult } from '../../core/sync-lock.ts';
+import { isSyncDisabledForSource, SyncDisabledError } from '../../core/sync-policy.ts';
+import { DEFAULT_SOURCE_ID } from '../../core/sync.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
 import type { IdleSkip } from '../../core/persistence/sync-idle-skips.ts';
 import { runConnectorSync } from './connector.ts';
@@ -33,6 +35,12 @@ import { isConnectorSourceKind } from '../../core/persistence/connector-kinds.ts
 import { ignoredPrivacyLabelRunNotice } from '../../core/search/ignored-privacy-labels.ts';
 
 export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
+  // Local patch 117: enforce even for explicit single-source calls and the
+  // implicit default source, before either lock path or managed dispatch.
+  const effectiveSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
+  if (await isSyncDisabledForSource(engine, effectiveSourceId)) {
+    throw new SyncDisabledError(effectiveSourceId);
+  }
   const since = opts.dryRun ? null : await syncStartedAt(engine);
   const result = await routeSync(engine, opts);
   if (!opts.dryRun && result.status !== 'dry_run') await syncIdentityDecisions(engine, opts.sourceId ?? 'default', serr, result.status === 'first_sync' ? 'all' : await changedSlugs(engine, opts.sourceId ?? 'default', result, since));
