@@ -4,6 +4,7 @@ import type { SyncOpts, SyncResult } from '../../commands/sync.ts';
 import { loadConfig } from '../config.ts';
 import { OperationError } from '../ops/contract.ts';
 import { currentJobSignal } from '../minions/submission-authority.ts';
+import { isSyncDisabledForSource, SyncDisabledError } from '../sync-policy.ts';
 import { digest } from './digest.ts';
 import { getWriteRequest, admitWrite } from './journal.ts';
 import { assertPersistenceAccepting, foregroundWriteCompletions, startPersistenceConsumer, waitForWrite } from './service.ts';
@@ -73,6 +74,10 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string): Pr
 
 /** One immutable page is admitted at a time; foreground writes can never sit behind a whole scan. */
 export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, slice?: { maxPages: number; maxMs: number }): Promise<SyncResult> {
+  // Local patch 117 (#4399): config.syncEnabled=false is an unconditional exclusion. performSync() checks it
+  // before delegating here, but runAuthenticatedSyncSlice calls this function directly, so it is enforced here too.
+  const disabledSourceId = opts.sourceId ?? 'default';
+  if (await isSyncDisabledForSource(engine, disabledSourceId)) throw new SyncDisabledError(disabledSourceId);
   assertPersistenceAccepting(engine);
   validateManagedSyncOptions(opts);
   const context = await resolveManagedSyncContext(engine, opts);
