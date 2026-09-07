@@ -401,7 +401,7 @@ export async function dispatchFreshnessSyncs(
         if (!src.local_path) continue;
         // #4399 / #5198 / P4.2 (supersedes #6465): one predicate decides whether AUTOMATIC sync runs for this source
         // (disabled config, claim awaiting activation, gbrain-owned content directory where sync does not apply); the
-        // reason is stated once per source and reason, and an explicit `gbrain sync --source <id>` is unaffected.
+        // reason is stated once per source and reason; performSync also enforces the disabled flag for every entry point.
         const skip = await automaticSyncSkip(engine, src, activationPending);
         if (skip?.reason !== 'sync_disabled') reportAutomaticSyncSkip(src.id, skip, 'freshness_sync_skipped', jsonMode, (l) => process.stderr.write(l + '\n'));
         if (skip) decisions.push({ source_id: src.id, outcome: 'skipped' });
