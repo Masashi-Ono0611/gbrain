@@ -46,6 +46,7 @@ import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
 import { inspectLock } from '../core/db-lock.ts';
 import { registerCleanup } from '../core/process-cleanup.ts';
 import { loadAllSources, sourceConfigHasRemoteUrl, sourceLocalPathSkipWarning, relativeSourceLocalPathSkipWarning } from '../core/sources-load.ts';
+import { isSyncDisabledConfig } from '../core/sync-policy.ts';
 import { resolveAutopilotDispatchTimeoutMs } from './autopilot-timeout.ts';
 import {
   autopilotRemediationIdempotencyKey,
@@ -1086,6 +1087,12 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
             const now = Date.now();
             for (const src of sources) {
               if (!src.local_path) continue;
+              // #4399: skip a syncEnabled:false source before it ever reaches
+              // the queue — performSync's choke-point check (sync-policy.ts)
+              // would refuse it anyway, but checking here avoids dispatching
+              // a job that's guaranteed to be thrown away, and the log noise
+              // that comes with it.
+              if (isSyncDisabledConfig(src.config)) continue;
               // A local_path this machine cannot use — relative (#3696: cwd is
               // launchd's, not the registering shell's) or absent on disk and
               // not a managed clone sync can re-create — would sync a phantom
