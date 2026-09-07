@@ -23,6 +23,8 @@ import { assertSyncApplicable } from '../../core/sync-applicability.ts';
 import { performPlainDirectorySync, plainDirectorySyncRoot } from './plain-directory.ts';
 import { noteIdentityDowngrades } from '../../core/sync-identity-downgrades.ts';
 import { SyncLockBusyError, formatLockBusyMessage, buildPartialResult } from '../../core/sync-lock.ts';
+import { isSyncDisabledForSource, SyncDisabledError } from '../../core/sync-policy.ts';
+import { DEFAULT_SOURCE_ID } from '../../core/sync.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
 import type { IdleSkip } from '../../core/persistence/sync-idle-skips.ts';
 import { runConnectorSync } from './connector.ts';
@@ -30,6 +32,12 @@ import { performSyncInner } from './incremental.ts';
 import { isConnectorSourceKind } from '../../core/persistence/connector-kinds.ts';
 
 export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
+  // Local patch 117: enforce even for explicit single-source calls and the
+  // implicit default source, before either lock path or managed dispatch.
+  const effectiveSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
+  if (await isSyncDisabledForSource(engine, effectiveSourceId)) {
+    throw new SyncDisabledError(effectiveSourceId);
+  }
   assertSyncDispatchActive();
   const inheritedSignal = currentSourceFilesystemSignal();
   if (inheritedSignal) opts = { ...opts, signal: opts.signal ? AbortSignal.any([opts.signal, inheritedSignal]) : inheritedSignal };

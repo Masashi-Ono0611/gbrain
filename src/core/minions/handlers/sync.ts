@@ -130,7 +130,7 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
       // without this tick polluting the failed-jobs count + supervisor crash
       // metrics. The next scheduled tick resumes against the (by then
       // advanced) anchor.
-      const { SyncLockBusyError } = await import('../../../commands/sync.ts');
+      const { SyncLockBusyError, SyncDisabledError } = await import('../../../commands/sync.ts');
       if (err instanceof SyncLockBusyError) {
         // #6712 PR 1 (folds #6706's live-job guard): one drainer per source is the drain lease; a job that finds it held completes as a skip.
         const id = sourceId ?? 'default';
@@ -151,6 +151,11 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
       if ((err as { code?: unknown } | null)?.code === 'sync_not_applicable') {
         console.error(`[sync] skipped: sync does not apply to ${sourceId ?? 'default'} (gbrain-owned content directory, not a Git checkout).`);
         return { skipped: true, reason: 'sync_not_applicable', source_id: sourceId ?? 'default' };
+      }
+      // A queued or direct job may reach the handler after its source was disabled.
+      if (err instanceof SyncDisabledError) {
+        console.error(`[sync] skipped: sync disabled for ${sourceId ?? 'default'} (config.syncEnabled=false).`);
+        return { skipped: true, reason: 'sync_disabled', source_id: sourceId ?? 'default' };
       }
       throw err;
     }
