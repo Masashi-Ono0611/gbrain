@@ -825,9 +825,12 @@ export async function computeExtractAtomsBacklogCheck(
  * unreferenced.
  *
  * Why this needs a signal: a drifted atom is still returned by search, still
- * carries a `source_quote`, and still reads as sourced — but its quote can no
- * longer be located in any current page. It is the one class of derived page
- * that silently diverges from the corpus it claims to summarize.
+ * carries a `source_quote`, and still reads as sourced — but a changed
+ * source_hash only means the source page (or its record) changed since
+ * extraction. This check does not string-match the quote against current
+ * page content, so it cannot say whether the quote itself survived that
+ * change. It is the one class of derived page whose provenance has silently
+ * gone unverified against the corpus it claims to summarize.
  *
  * Measured on a 17-source brain (30.7k pages, 4.0k atoms) before shipping this:
  * 1,001 of 3,999 atoms (25.0%) had drifted; 932 still had a live source page
