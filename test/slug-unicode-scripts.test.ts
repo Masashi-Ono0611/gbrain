@@ -65,6 +65,19 @@ describe('#3417: non-Latin scripts survive slugification', () => {
   });
 });
 
+describe('uppercase page slugs across JavaScript engines', () => {
+  test('accepts explicit uppercase letters and timestamp slugs', () => {
+    for (const slug of [
+      'notes/Example',
+      'notes/Σ',
+      'notes/Ж',
+      'media/claude-stack-news/2026-09-13T223621-2bf4c0a9-36a9-45aa-b8ee-1a7e2560ded1',
+    ]) {
+      expect(() => validatePageSlug(slug)).not.toThrow();
+    }
+  });
+});
+
 describe('#3417: normalization — NFD (macOS) and NFC (git/Linux) converge', () => {
   test('Hebrew NFD filename produces the same slug as NFC', () => {
     const nfc = 'notes/רשימת קניות.md'.normalize('NFC');
