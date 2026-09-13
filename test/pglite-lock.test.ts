@@ -703,6 +703,40 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
     expect(calls[0][1].join(' ')).toContain(`ProcessId=${FAKE_PID}`);
   });
 
+  test('control: the exact same scenario, WITHOUT a win32 branch, reproduces the pre-fix false negative', () => {
+    // This is the behavioral control for the test above. pglite-lock's own
+    // (now-deleted) `readProcessArgs` had exactly this shape — try `ps`, then
+    // `/proc/<pid>/cmdline`, nothing else — regardless of platform. Neither
+    // API exists on a real Windows host (`ps` is not an installed binary;
+    // `/proc` is not a filesystem), so on real Windows this pre-fix probe
+    // deterministically threw on both attempts and returned null, no matter
+    // what the recorded command or the live process actually was. Simulating
+    // exactly that failure shape here (both probes throw, platform NOT
+    // recognized as win32 so the Get-CimInstance branch is never reached) —
+    // for the IDENTICAL pid/recordedCommand/live-process-holder scenario that
+    // the test above shows the fix correctly classifying as reused — proves
+    // the regression this PR closes: pre-fix, this exact recycled-PID case
+    // read as "not reused" (never reaped) on Windows; post-fix (test above),
+    // it correctly reads as "reused" (reapable).
+    const reused = isPidReusedByOtherProgram(
+      FAKE_PID,
+      '/home/user/.bun/bin/gbrain serve --http',
+      null,
+      null,
+      {
+        // No `platform: 'win32'` — takes the /proc-then-ps branch, the only
+        // branch pglite-lock's own probe had before this fix.
+        readCmdlineFile: () => {
+          throw new Error("ENOENT: no such file or directory, open '/proc/.../cmdline'");
+        },
+        execFile: () => {
+          throw new Error('ENOENT: spawn ps ENOENT (ps is not installed on Windows)');
+        },
+      },
+    );
+    expect(reused).toBe(false); // null cmdline -> fail-safe -> "not reused" -> never reaped
+  });
+
   test('a live win32 gbrain holder (CommandLine quoted by CIM) is never classified as recycled', () => {
     const reused = isPidReusedByOtherProgram(
       FAKE_PID,
