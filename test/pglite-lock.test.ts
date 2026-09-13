@@ -743,6 +743,53 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
     expect(reused).toBe(false); // null cmdline -> fail-safe -> "not reused" -> never reaped
   });
 
+  /**
+   * Byte-for-byte algorithmic snapshot of the DELETED `readProcessArgs` from
+   * src/core/pglite-lock.ts (pre-fix): try `ps -p <pid> -o args=`, then fall
+   * back to reading `/proc/<pid>/cmdline`, nothing else. The only difference
+   * from the deleted original is that the two OS calls are taken as injected
+   * functions instead of calling `execFileSync`/`readFileSync` directly —
+   * the deleted code had no injection seam at all (that seam is this PR's
+   * whole point), so this is the minimal accommodation needed to exercise
+   * the exact old control flow deterministically in a unit test. Kept ONLY
+   * for this regression control, not reachable from production code.
+   */
+  function preFixReadProcessArgs(
+    pid: number,
+    exec: (file: string, args: string[]) => string,
+    readCmdline: (path: string) => string,
+  ): string | null {
+    try {
+      const out = exec('ps', ['-p', String(pid), '-o', 'args=']).trim();
+      if (out.length > 0) return out;
+    } catch { /* fall through to /proc */ }
+    try {
+      const raw = readCmdline(`/proc/${pid}/cmdline`);
+      const args = raw.replace(/\0/g, ' ').trim();
+      if (args.length > 0) return args;
+    } catch { /* unreadable — unknowable */ }
+    return null;
+  }
+
+  test('restoring the literal deleted probe against a real Windows shape returns null (old code, still broken)', () => {
+    // Neither `ps` nor `/proc` exist on a real Windows host: `ps` is not an
+    // installed binary (ENOENT on spawn) and `/proc` is not a filesystem
+    // (ENOENT on open). This is exactly what the deleted `readProcessArgs`
+    // hit on every real Windows machine, for every PID, regardless of
+    // whether that PID had actually been recycled by an unrelated process.
+    const cmdline = preFixReadProcessArgs(
+      FAKE_PID,
+      () => { throw new Error('ENOENT: spawn ps ENOENT (ps is not installed on Windows)'); },
+      () => { throw new Error("ENOENT: no such file or directory, open '/proc/.../cmdline'"); },
+    );
+    expect(cmdline).toBeNull();
+    // null cmdline flows into isPidReusedByOtherProgram's existing,
+    // unmodified fail-safe: unknowable -> not reused -> never reaped. This
+    // is the literal, restored pre-fix code producing the literal pre-fix
+    // (broken) outcome for the same recycled-PID scenario that the
+    // win32-branch test above (real fix, not a reconstruction) resolves.
+  });
+
   test('a live win32 gbrain holder (CommandLine quoted by CIM) is never classified as recycled', () => {
     const reused = isPidReusedByOtherProgram(
       FAKE_PID,
