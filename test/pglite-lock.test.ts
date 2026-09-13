@@ -694,6 +694,13 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
         },
         execFile: (file, args) => {
           calls.push([file, args]);
+          // Command-aware, like a real Windows host: only `powershell.exe`
+          // (the CIM query) succeeds — `ps` is not an installed binary on
+          // Windows, so a probe that (wrongly) tried it would fail here too,
+          // exactly as it would on a real machine.
+          if (file !== 'powershell.exe') {
+            throw new Error(`ENOENT: spawn ${file} ENOENT (not installed on Windows)`);
+          }
           // The dead gbrain holder's PID was recycled by an unrelated
           // Windows service — no "gbrain" and no token overlap with the
           // recorded command.
