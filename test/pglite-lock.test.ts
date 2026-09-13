@@ -711,21 +711,27 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
     // `/proc` is not a filesystem), so on real Windows this pre-fix probe
     // deterministically threw on both attempts and returned null, no matter
     // what the recorded command or the live process actually was. Simulating
-    // exactly that failure shape here (both probes throw, platform NOT
-    // recognized as win32 so the Get-CimInstance branch is never reached) —
-    // for the IDENTICAL pid/recordedCommand/live-process-holder scenario that
-    // the test above shows the fix correctly classifying as reused — proves
-    // the regression this PR closes: pre-fix, this exact recycled-PID case
-    // read as "not reused" (never reaped) on Windows; post-fix (test above),
-    // it correctly reads as "reused" (reapable).
+    // exactly that failure shape here (both probes throw, platform pinned
+    // away from 'win32' so the Get-CimInstance branch is never reached — this
+    // must be explicit: omitting `platform` would default to the actual host
+    // OS, and running this suite ON a real win32 CI runner would then select
+    // the CIM branch instead, which fails for an unrelated reason —
+    // PowerShell erroring — rather than reproducing the pre-fix probe shape)
+    // — for the IDENTICAL pid/recordedCommand/live-process-holder scenario
+    // that the test above shows the fix correctly classifying as reused —
+    // proves the regression this PR closes: pre-fix, this exact recycled-PID
+    // case read as "not reused" (never reaped) on Windows; post-fix (test
+    // above), it correctly reads as "reused" (reapable).
     const reused = isPidReusedByOtherProgram(
       FAKE_PID,
       '/home/user/.bun/bin/gbrain serve --http',
       null,
       null,
       {
-        // No `platform: 'win32'` — takes the /proc-then-ps branch, the only
-        // branch pglite-lock's own probe had before this fix.
+        // Pinned to a non-win32 platform so this deterministically takes the
+        // /proc-then-ps branch, the only branch pglite-lock's own probe had
+        // before this fix, regardless of which OS actually runs the suite.
+        platform: 'linux',
         readCmdlineFile: () => {
           throw new Error("ENOENT: no such file or directory, open '/proc/.../cmdline'");
         },
