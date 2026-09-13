@@ -735,25 +735,49 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
     // proves the regression this PR closes: pre-fix, this exact recycled-PID
     // case read as "not reused" (never reaped) on Windows; post-fix (test
     // above), it correctly reads as "reused" (reapable).
+    //
+    // Pinned to 'darwin', NOT 'linux': isPidReusedByOtherProgram has its own
+    // pre-existing (pre-this-PR) Linux-specific pid_ns/boot_id gate above the
+    // command-line probe — with a null recordedPidNs/recordedBootId (as
+    // above) that gate returns false immediately on a real Linux CI runner,
+    // WITHOUT ever calling readCmdlineFile/execFile below. A `platform:
+    // 'linux'` value here would make this test pass for the wrong reason —
+    // the fail-safe fires from the unrelated namespace gate, not from the
+    // ps/proc-both-throw shape this control exists to prove — silently on
+    // Linux CI while still exercising the intended path on non-Linux
+    // machines. Verified via a red/green control on this repo's own tooling:
+    // forcing process.platform to 'linux' while this test used `platform:
+    // 'linux'` left the injected probes uncalled (cmdlineCalls/execCalls
+    // both 0) even though the assertion below still passed. 'darwin' clears
+    // BOTH the win32 CIM branch and the Linux namespace gate, landing
+    // unconditionally in the /proc-then-ps fallback on every host OS the
+    // suite runs on. The two `toHaveLength(1)` assertions below are the
+    // actual regression guard: they fail loudly if a future change
+    // reintroduces a bypass of this path.
+    const cmdlineCalls: string[] = [];
+    const execCalls: Array<[string, string[]]> = [];
     const reused = isPidReusedByOtherProgram(
       FAKE_PID,
       '/home/user/.bun/bin/gbrain serve --http',
       null,
       null,
       {
-        // Pinned to a non-win32 platform so this deterministically takes the
-        // /proc-then-ps branch, the only branch pglite-lock's own probe had
-        // before this fix, regardless of which OS actually runs the suite.
-        platform: 'linux',
-        readCmdlineFile: () => {
+        platform: 'darwin',
+        readCmdlineFile: (path) => {
+          cmdlineCalls.push(path);
           throw new Error("ENOENT: no such file or directory, open '/proc/.../cmdline'");
         },
-        execFile: () => {
+        execFile: (file, args) => {
+          execCalls.push([file, args]);
           throw new Error('ENOENT: spawn ps ENOENT (ps is not installed on Windows)');
         },
       },
     );
     expect(reused).toBe(false); // null cmdline -> fail-safe -> "not reused" -> never reaped
+    // Prove the fail-safe fired from the probes actually throwing, not from
+    // an earlier unrelated gate short-circuiting before they ran.
+    expect(cmdlineCalls).toHaveLength(1);
+    expect(execCalls).toHaveLength(1);
   });
 
   /**
