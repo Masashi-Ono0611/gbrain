@@ -677,6 +677,10 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
 
   test('recycled PID is detected via Get-CimInstance and the lock is classified as reusable', () => {
     const calls: Array<[string, string[]]> = [];
+    // Tracked (not just made to throw) so an unintended /proc attempt on
+    // win32 is caught by the call-count assertion below, not silently
+    // swallowed by the probe's own try/catch around that branch.
+    const cmdlineCalls: string[] = [];
     const reused = isPidReusedByOtherProgram(
       FAKE_PID,
       '/home/user/.bun/bin/gbrain serve --http',
@@ -684,7 +688,8 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
       null,
       {
         platform: 'win32',
-        readCmdlineFile: () => {
+        readCmdlineFile: (path) => {
+          cmdlineCalls.push(path);
           throw new Error('should not read /proc on win32');
         },
         execFile: (file, args) => {
@@ -697,6 +702,7 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
       },
     );
     expect(reused).toBe(true);
+    expect(cmdlineCalls).toHaveLength(0);
     expect(calls).toHaveLength(1);
     expect(calls[0][0]).toBe('powershell.exe');
     expect(calls[0][1].join(' ')).toContain('Get-CimInstance Win32_Process');
