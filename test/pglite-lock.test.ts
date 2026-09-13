@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, readlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { acquireLock, releaseLock, peekLock, isPidReusedByOtherProgram, type LockHandle } from '../src/core/pglite-lock';
+import { acquireLock, releaseLock, peekLock, isPidReusedByOtherProgram, recordedArgvProvesPidReuse, type LockHandle } from '../src/core/pglite-lock';
 
 const TEST_DIR = join(tmpdir(), 'gbrain-lock-test-' + process.pid);
 
@@ -21,6 +21,9 @@ describe('pglite-lock', () => {
   test('acquires and releases lock', async () => {
     const lock = await acquireLock(TEST_DIR);
     expect(lock.acquired).toBe(true);
+    const record = JSON.parse(readFileSync(join(TEST_DIR, '.gbrain-lock', 'lock'), 'utf-8'));
+    expect(record.argv).toEqual(process.argv.slice(1));
+    expect(record.command).toBe(process.argv.slice(1).join(' '));
     expect(existsSync(join(TEST_DIR, '.gbrain-lock'))).toBe(true);
 
     await releaseLock(lock);
@@ -474,7 +477,7 @@ describe('pglite-lock PID-reuse detection', () => {
     try { return readlinkSync('/proc/self/ns/pid'); } catch { return null; }
   }
 
-  function writeHolderAt(dataDir: string, pid: number, command: string, opts?: { subcommand?: string; bootId?: string | null; pidNs?: string | null }) {
+  function writeHolderAt(dataDir: string, pid: number, command: string, opts?: { subcommand?: string; bootId?: string | null; pidNs?: string | null; argv?: unknown }) {
     const lockDir = join(dataDir, '.gbrain-lock');
     mkdirSync(lockDir, { recursive: true });
     const now = Date.now();
@@ -483,6 +486,7 @@ describe('pglite-lock PID-reuse detection', () => {
       acquired_at: now - 60_000,
       refreshed_at: now - 60_000,
       command,
+      ...(opts?.argv === undefined ? {} : { argv: opts.argv }),
       boot_id: opts?.bootId === undefined ? currentBootId() : opts.bootId,
       pid_ns: opts?.pidNs === undefined ? currentPidNs() : opts.pidNs,
       ...(opts?.subcommand === undefined ? {} : { subcommand: opts.subcommand }),
@@ -507,6 +511,39 @@ describe('pglite-lock PID-reuse detection', () => {
       await new Promise(r => setTimeout(r, 25));
     }
     throw new Error(`child ${pid} never exec'd into ${pattern}`);
+  }
+
+  for (const scriptPath of ['/home/example/Project Space/src/cli.ts', String.raw`C:\Users\Example Person\project\src\cli.ts`]) {
+    test.skipIf(!canProbe)(`structured argv preserves live holder with whitespace path: ${scriptPath}`, async () => {
+      const holder = Bun.spawn(['bash', '-c', 'sleep 60; exit 0', 'bun run src/cli.ts serve --http'], { stdout: 'ignore', stderr: 'ignore' });
+      try {
+        await waitForExec(holder.pid, /cli\.ts/);
+        writeHolderAt(TEST_DIR, holder.pid, `${scriptPath} serve --http`, { argv: [scriptPath, 'serve', '--http'] });
+        await expect(acquireLock(TEST_DIR, { timeoutMs: 1200 })).rejects.toThrow(/Timed out/);
+        expect(JSON.parse(readFileSync(join(TEST_DIR, '.gbrain-lock', 'lock'), 'utf-8')).pid).toBe(holder.pid);
+      } finally { holder.kill(); }
+    }, 15_000);
+  }
+
+  test.skipIf(!canProbe)('structured argv still permits proven unrelated PID reuse', async () => {
+    const holder = Bun.spawn(['sleep', '60'], { stdout: 'ignore', stderr: 'ignore' });
+    try {
+      await waitForExec(holder.pid, /sleep/);
+      writeHolderAt(TEST_DIR, holder.pid, '/home/example/Project Space/src/cli.ts serve', { argv: ['/home/example/Project Space/src/cli.ts', 'serve'] });
+      const lock = await acquireLock(TEST_DIR, { timeoutMs: 5000 });
+      try { expect(lock.reaped).toBe(true); } finally { await releaseLock(lock); }
+    } finally { holder.kill(); }
+  }, 15_000);
+
+  for (const argv of [null, [], [''], [123], ['/some/script.ts', 123]]) {
+    test.skipIf(!canProbe)(`malformed structured argv never proves PID reuse: ${JSON.stringify(argv)}`, async () => {
+      const holder = Bun.spawn(['sleep', '60'], { stdout: 'ignore', stderr: 'ignore' });
+      try {
+        await waitForExec(holder.pid, /sleep/);
+        writeHolderAt(TEST_DIR, holder.pid, 'different-script.ts', { argv });
+        await expect(acquireLock(TEST_DIR, { timeoutMs: 1200 })).rejects.toThrow(/Timed out/);
+      } finally { holder.kill(); }
+    }, 15_000);
   }
 
   test.skipIf(!canProbe)('reaps a lock whose PID was recycled by an unrelated program', async () => {
@@ -991,5 +1028,70 @@ describe('pglite-lock PID-reuse detection — non-Windows probe order (unchanged
     expect(execCalls).toHaveLength(1);
     expect(cmdlineCalls).toHaveLength(1);
     expect(cmdlineCalls[0]).toBe(`/proc/${FAKE_PID}/cmdline`);
+  });
+});
+
+// Pure regression coverage also runs when the sandbox denies process inspection.
+describe('structured lock argv comparison (#5072)', () => {
+  test('keeps a live relative invocation with whitespace in its recorded absolute path', () => {
+    for (const path of ['/home/example/Project Space/src/cli.ts', String.raw`C:\Users\Example Person\project\src\cli.ts`]) {
+      expect(recordedArgvProvesPidReuse('bun run src/cli.ts serve', [path, 'serve'])).toBe(false);
+      expect(recordedArgvProvesPidReuse(`bun "${path}" serve`, [path, 'serve'])).toBe(false);
+    }
+  });
+  test('preserves whitespace in the script basename too', () => {
+    expect(recordedArgvProvesPidReuse('bun "src/my cli.ts" serve', ['/some/Project Space/src/my cli.ts', 'serve'])).toBe(false);
+  });
+  test('rejects ambiguous identities but recognizes an unrelated command', () => {
+    for (const argv of [undefined, null, [], [''], [123], ['script.ts', 123], ['/some/path/']]) {
+      expect(recordedArgvProvesPidReuse('sleep 60', argv)).toBe(false);
+    }
+    expect(recordedArgvProvesPidReuse('sleep 60', ['/some/Project Space/src/cli.ts', 'serve'])).toBe(true);
+  });
+
+  // False-steal hardening (found during #5065 integration review, NOT covered
+  // by the original #5072 patch): the legacy recordedCommand comparison in
+  // isPidReusedByOtherProgram case-folds and accepts both path separators
+  // ONLY on win32 (see the "False-steal hardening" comment on that function).
+  // This argv-based comparison must apply the SAME win32 hardening —
+  // otherwise a newly-written lock (which always carries `argv`) would
+  // reintroduce the exact case-only/backslash-only false-steal that win32
+  // hardening closed for legacy (command-string-only) locks.
+  test('win32: a live holder reported in a different CASE is not classified as recycled', () => {
+    expect(recordedArgvProvesPidReuse(
+      '"C:\\Users\\u\\.bun\\bin\\GBRAIN.EXE" serve --http',
+      ['C:\\Users\\u\\.bun\\bin\\gbrain.exe', 'serve', '--http'],
+      true,
+    )).toBe(false);
+  });
+  test('win32: a live holder with a backslash-only recorded path is not classified as recycled', () => {
+    expect(recordedArgvProvesPidReuse(
+      '"C:\\Users\\u\\AppData\\Local\\bun\\CLI.TS" serve --http',
+      ['C:\\Users\\u\\.bun\\bin\\cli.ts', 'serve', '--http'],
+      true,
+    )).toBe(false);
+  });
+  test('win32: same-case, same-path baseline is still recognized as the same holder', () => {
+    expect(recordedArgvProvesPidReuse(
+      '"C:\\Users\\u\\.bun\\bin\\cli.ts" serve --http',
+      ['C:\\Users\\u\\.bun\\bin\\cli.ts', 'serve', '--http'],
+      true,
+    )).toBe(false);
+  });
+  test('win32 hardening does not weaken precision: a genuinely different program is still reuse', () => {
+    expect(recordedArgvProvesPidReuse(
+      'C:\\Windows\\System32\\svchost.exe -k netsvcs',
+      ['C:\\Users\\u\\.bun\\bin\\gbrain.exe', 'serve', '--http'],
+      true,
+    )).toBe(true);
+  });
+  test('non-win32 stays case-sensitive (no regression to the legacy comparison)', () => {
+    // isWin32 defaults to false — a case-only difference on a NON-Windows
+    // platform is NOT the same class of drift (case IS significant on
+    // POSIX filesystems), so this must NOT be folded.
+    expect(recordedArgvProvesPidReuse(
+      '/home/user/.bun/bin/GBRAIN serve --http',
+      ['/home/user/.bun/bin/gbrain', 'serve', '--http'],
+    )).toBe(true);
   });
 });

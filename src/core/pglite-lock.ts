@@ -344,6 +344,17 @@ function readProcessArgs(pid: number, deps?: ProcessCommandProbeDeps): string | 
  * this PR is the first time it executes on live Windows command lines.
  * `deps` is test-only DI (see `ProcessCommandProbeDeps`); production callers
  * always omit it.
+ *
+ * `recordedArgv` (#5072) is the structured `argv` array a lock records
+ * alongside the legacy whitespace-joined `command` string. `recordedCommand`
+ * cannot preserve argv boundaries when any element itself contains
+ * whitespace (a script path under a Windows username with a space, or a
+ * macOS "Full Name" home directory) — re-splitting it on whitespace then
+ * truncates mid-path, breaking the basename comparison below and
+ * misclassifying a live holder as reused. Newly-written locks always carry
+ * `recordedArgv`, which is compared without any re-splitting
+ * (`recordedArgvProvesPidReuse`); locks written by older gbrain versions
+ * have no `argv` field and fall back to the legacy `recordedCommand` path.
  */
 export function isPidReusedByOtherProgram(
   pid: number,
@@ -351,6 +362,7 @@ export function isPidReusedByOtherProgram(
   recordedPidNs: unknown,
   recordedBootId: unknown,
   deps?: ProcessCommandProbeDeps,
+  recordedArgv?: unknown,
 ): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   // Same-process re-acquire: WE are the recorded holder, so the PID is by
@@ -379,6 +391,11 @@ export function isPidReusedByOtherProgram(
   const norm = (s: string) => (isWin32 ? s.toLowerCase() : s);
   const cmdlineNorm = norm(cmdline);
   if (cmdlineNorm.includes('gbrain')) return false;
+  if (recordedArgv !== undefined) {
+    return recordedArgvProvesPidReuse(cmdline, recordedArgv, isWin32);
+  }
+  // Legacy command-only locks (no `argv` field — written before #5072)
+  // retain their historical whitespace-joined comparison.
   if (typeof recordedCommand === 'string' && recordedCommand.length > 0) {
     const firstToken = recordedCommand.trim().split(/\s+/)[0];
     if (firstToken && cmdlineNorm.includes(norm(firstToken))) return false;
@@ -400,6 +417,33 @@ export function isPidReusedByOtherProgram(
     const baseToken = firstToken ? firstToken.split(sep).pop() : undefined;
     if (baseToken && baseToken.length > 0 && cmdlineNorm.includes(norm(baseToken))) return false;
   }
+  return true;
+}
+
+/**
+ * @internal Pure comparison seam for the `argv`-based holder identity
+ * (#5072) — process liveness and namespace gates run before this in
+ * `isPidReusedByOtherProgram`. Never re-splits `recordedArgv[0]` on
+ * whitespace (unlike the legacy `recordedCommand` string path above), so a
+ * script path containing a space is compared intact. `isWin32` mirrors the
+ * case-fold/backslash-aware hardening applied to the legacy path above
+ * (NTFS is case-insensitive and uses `\`) — without it, this argv-based
+ * path would reintroduce the exact case-only false-steal this file's win32
+ * hardening (above) already closed for legacy locks. A malformed
+ * `recordedArgv` (not an array, empty, non-string element, or a blank
+ * first element) is unknowable, not evidence of reuse — same fail-safe
+ * bias as every other check in this file.
+ */
+export function recordedArgvProvesPidReuse(cmdline: string, recordedArgv: unknown, isWin32 = false): boolean {
+  if (!Array.isArray(recordedArgv) || recordedArgv.length === 0
+    || !recordedArgv.every(arg => typeof arg === 'string')
+    || recordedArgv[0].trim().length === 0) return false;
+  const norm = (s: string) => (isWin32 ? s.toLowerCase() : s);
+  const cmdlineNorm = norm(cmdline);
+  const scriptPath = recordedArgv[0];
+  if (cmdlineNorm.includes(norm(scriptPath))) return false;
+  const scriptName = scriptPath.split(/[\\/]/).pop();
+  if (!scriptName || cmdlineNorm.includes(norm(scriptName))) return false;
   return true;
 }
 
@@ -620,7 +664,7 @@ export async function acquireLock(dataDir: string | undefined, opts?: { timeoutM
         // dead PID (ESRCH) or a PID provably recycled by a non-gbrain program
         // (cmdline mismatch under affirmative same-namespace proof) is.
         const alive = isProcessAlive(lockPid)
-          && !isPidReusedByOtherProgram(lockPid, lockData.command, lockData.pid_ns, lockData.boot_id);
+          && !isPidReusedByOtherProgram(lockPid, lockData.command, lockData.pid_ns, lockData.boot_id, undefined, lockData.argv);
         if (!alive) {
           // Holder process is gone — reap and try to acquire. This verdict is
           // affirmative (kill-0 threw ESRCH; EPERM reads as alive), so no
@@ -692,6 +736,7 @@ export async function acquireLock(dataDir: string | undefined, opts?: { timeoutM
         acquired_at: now,
         refreshed_at: now,
         command: process.argv.slice(1).join(' '),
+        argv: process.argv.slice(1),
         subcommand: parseGlobalFlags(process.argv.slice(2)).rest[0] ?? null,
         pid_ns: readPidNs(),
         boot_id: readBootId(),
