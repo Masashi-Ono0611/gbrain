@@ -33,14 +33,15 @@ export const CJK_RANGES_REGEX = new RegExp(`[${CJK_SLUG_CHARS}]`);
  *          (Hebrew niqqud, Arabic harakat, Thai/Devanagari vowel signs)
  *   \p{N}  numbers (0-9, Arabic-Indic digits, …)
  *
- * Uppercase (\p{Lu}/\p{Lt}) is deliberately excluded: slugifySegment()
- * lowercases before filtering, so validators stay lowercase-canonical.
+ * Uppercase (\p{Lu}) is explicit so validators do not depend on engine-specific
+ * Unicode case folding under the `i` flag. slugifySegment() still lowercases
+ * before filtering; titlecase (\p{Lt}) remains excluded.
  *
  * Distinct from CJK_SLUG_CHARS above, which also drives the
  * countCJKAwareWords density heuristic — do NOT merge the two, or slug
  * grammar changes silently change chunking behavior.
  */
-export const SLUG_WORD_CHARS = '\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}\\p{N}';
+export const SLUG_WORD_CHARS = '\\p{Lu}\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}\\p{N}';
 
 /**
  * Page-slug segment grammar (no anchors): word-char lead, then word-char or
