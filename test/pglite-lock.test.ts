@@ -746,12 +746,14 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
   test('a live win32 gbrain holder (CommandLine quoted by CIM) is never classified as recycled', () => {
     const reused = isPidReusedByOtherProgram(
       FAKE_PID,
-      'gbrain.exe serve --http',
+      '"C:\\Users\\u\\.bun\\bin\\gbrain.exe" serve --http',
       null,
       null,
       {
         platform: 'win32',
-        execFile: () => 'C:\\Users\\u\\.bun\\bin\\gbrain.exe serve --http\r\n',
+        // Win32_Process.CommandLine quotes the executable when its path
+        // contains spaces (e.g. "C:\Program Files\...").
+        execFile: () => '"C:\\Users\\u\\.bun\\bin\\gbrain.exe" serve --http\r\n',
       },
     );
     expect(reused).toBe(false);
