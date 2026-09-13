@@ -306,7 +306,7 @@ export function isPidReusedByOtherProgram(
   // definition not recycled. (Also keeps non-gbrain test harnesses that hold a
   // lock with their own PID from reaping themselves.)
   if (pid === process.pid) return false;
-  if (process.platform === 'linux') {
+  if ((deps?.platform ?? process.platform) === 'linux') {
     // Linux: cmdline evidence is only meaningful within one PID namespace on
     // one host, so EVERY marker must be readable AND matching — pid_ns rules
     // out other containers, boot_id rules out other hosts (pid_ns inode
