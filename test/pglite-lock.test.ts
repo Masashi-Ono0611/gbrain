@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, readlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { acquireLock, releaseLock, peekLock, type LockHandle } from '../src/core/pglite-lock';
+import { acquireLock, releaseLock, peekLock, isPidReusedByOtherProgram, type LockHandle } from '../src/core/pglite-lock';
 
 const TEST_DIR = join(tmpdir(), 'gbrain-lock-test-' + process.pid);
 
@@ -655,4 +655,102 @@ describe('pglite-lock PID-reuse detection', () => {
       squatter.kill();
     }
   }, 15_000);
+});
+
+describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
+  // Before this fix, pglite-lock's own command-line probe had no win32
+  // branch: it tried `ps` (absent on Windows) then `/proc` (absent on
+  // Windows), always landing on `cmdline === null` — "unknowable" — which
+  // `isPidReusedByOtherProgram`'s fail-safe reads as "not reused" (alive).
+  // A dead gbrain holder whose PID got recycled by an unrelated Windows
+  // process therefore NEVER got reaped: the lock wedged until manual
+  // cleanup. These tests inject `platform: 'win32'` via DI so they exercise
+  // the real win32 code path (autopilot-lock's shared `readProcessCommand`,
+  // which queries Get-CimInstance over powershell) on any host OS, instead
+  // of being skipped like the `canProbe`-gated spawn-based tests above (real
+  // `ps`/`/proc` don't exist on Windows, so those tests can never run there).
+  test('recycled PID is detected via Get-CimInstance and the lock is classified as reusable', () => {
+    const calls: Array<[string, string[]]> = [];
+    const reused = isPidReusedByOtherProgram(
+      4242,
+      '/home/user/.bun/bin/gbrain serve --http',
+      null,
+      null,
+      {
+        platform: 'win32',
+        readCmdlineFile: () => {
+          throw new Error('should not read /proc on win32');
+        },
+        execFile: (file, args) => {
+          calls.push([file, args]);
+          // The dead gbrain holder's PID was recycled by an unrelated
+          // Windows service — no "gbrain" and no token overlap with the
+          // recorded command.
+          return 'C:\\Windows\\System32\\svchost.exe -k netsvcs\r\n';
+        },
+      },
+    );
+    expect(reused).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe('powershell.exe');
+    expect(calls[0][1].join(' ')).toContain('Get-CimInstance Win32_Process');
+    expect(calls[0][1].join(' ')).toContain('ProcessId=4242');
+  });
+
+  test('a live win32 gbrain holder (CommandLine quoted by CIM) is never classified as recycled', () => {
+    const reused = isPidReusedByOtherProgram(
+      4242,
+      'gbrain.exe serve --http',
+      null,
+      null,
+      {
+        platform: 'win32',
+        execFile: () => 'C:\\Users\\u\\.bun\\bin\\gbrain.exe serve --http\r\n',
+      },
+    );
+    expect(reused).toBe(false);
+  });
+
+  test('powershell failure on win32 is unknowable, not proof of reuse (fail-safe)', () => {
+    const reused = isPidReusedByOtherProgram(
+      4242,
+      '/home/user/.bun/bin/gbrain serve --http',
+      null,
+      null,
+      {
+        platform: 'win32',
+        execFile: () => {
+          throw new Error('powershell.exe not found');
+        },
+      },
+    );
+    expect(reused).toBe(false);
+  });
+
+  test('empty CIM output (process already gone) is unknowable, not proof of reuse (fail-safe)', () => {
+    const reused = isPidReusedByOtherProgram(
+      4242,
+      '/home/user/.bun/bin/gbrain serve --http',
+      null,
+      null,
+      { platform: 'win32', execFile: () => '' },
+    );
+    expect(reused).toBe(false);
+  });
+
+  test('same-process PID short-circuits before any win32 probe runs', () => {
+    const reused = isPidReusedByOtherProgram(
+      process.pid,
+      'anything',
+      null,
+      null,
+      {
+        platform: 'win32',
+        execFile: () => {
+          throw new Error('must not be called for a same-process PID');
+        },
+      },
+    );
+    expect(reused).toBe(false);
+  });
 });

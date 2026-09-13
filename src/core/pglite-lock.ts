@@ -16,8 +16,8 @@
 
 import { mkdirSync, existsSync, readFileSync, writeFileSync, rmSync, statSync, renameSync, readlinkSync, type Stats } from 'fs';
 import { join } from 'path';
-import { execFileSync } from 'node:child_process';
 import { parseGlobalFlags } from './cli-options.ts';
+import { readProcessCommand, type ProcessCommandProbeDeps } from './autopilot-lock.ts';
 
 const LOCK_DIR_NAME = '.gbrain-lock';
 const LOCK_FILE = 'lock';
@@ -234,30 +234,6 @@ export function isProcessAlive(pid: number): boolean {
 }
 
 /**
- * Read a process's full command line, or null when it can't be determined.
- * `ps -o args=` works on Linux + macOS (same pattern as autopilot-lock's
- * readProcessCommand); the /proc fallback covers minimal Linux containers
- * where `ps` is absent (cf. #4300). Null means "unknowable" — callers must
- * treat it as ALIVE, never as evidence of death.
- */
-function readProcessArgs(pid: number): string | null {
-  try {
-    const out = execFileSync('ps', ['-p', String(pid), '-o', 'args='], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 1000,
-    }).trim();
-    if (out.length > 0) return out;
-  } catch { /* fall through to /proc */ }
-  try {
-    const raw = readFileSync(`/proc/${pid}/cmdline`, 'utf-8');
-    const args = raw.replace(/\0/g, ' ').trim();
-    if (args.length > 0) return args;
-  } catch { /* unreadable — unknowable */ }
-  return null;
-}
-
-/**
  * This process's PID-namespace id (Linux `pid:[inode]`), or null elsewhere.
  * A PID is only meaningful inside the namespace that produced it: a lock
  * written by a holder in ANOTHER container (shared data dir) records a PID
@@ -308,12 +284,22 @@ function readBootId(): string | null {
  * markers (macOS) have no reachable cross-namespace data-dir sharing — a
  * Docker VM's PIDs aren't visible to host `ps` at all — so the cmdline
  * verdict stands alone there.
+ *
+ * The command-line probe itself is autopilot-lock's shared `readProcessCommand`
+ * (Linux /proc, `ps` elsewhere, Get-CimInstance via powershell on win32 —
+ * #4563 — where neither /proc nor `ps` exist). Without that win32 branch,
+ * every Windows holder read back as `cmdline === null` ("unknowable"), which
+ * this function's fail-safe treats as "not reused" — so a dead holder whose
+ * PID got recycled by an unrelated program was never reaped on Windows.
+ * `deps` is test-only DI (see `ProcessCommandProbeDeps`); production callers
+ * always omit it.
  */
-function isPidReusedByOtherProgram(
+export function isPidReusedByOtherProgram(
   pid: number,
   recordedCommand: unknown,
   recordedPidNs: unknown,
   recordedBootId: unknown,
+  deps?: ProcessCommandProbeDeps,
 ): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   // Same-process re-acquire: WE are the recorded holder, so the PID is by
@@ -333,7 +319,7 @@ function isPidReusedByOtherProgram(
     if (recordedPidNs !== ourNs) return false;
     if (recordedBootId !== ourBoot) return false;
   }
-  const cmdline = readProcessArgs(pid);
+  const cmdline = readProcessCommand(pid, deps);
   if (cmdline === null) return false; // unknowable — cannot prove reuse
   if (cmdline.includes('gbrain')) return false;
   if (typeof recordedCommand === 'string' && recordedCommand.length > 0) {
