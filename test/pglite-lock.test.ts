@@ -658,17 +658,23 @@ describe('pglite-lock PID-reuse detection', () => {
 });
 
 describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
-  // Before this fix, pglite-lock's own command-line probe had no win32
-  // branch: it tried `ps` (absent on Windows) then `/proc` (absent on
-  // Windows), always landing on `cmdline === null` — "unknowable" — which
-  // `isPidReusedByOtherProgram`'s fail-safe reads as "not reused" (alive).
-  // A dead gbrain holder whose PID got recycled by an unrelated Windows
-  // process therefore NEVER got reaped: the lock wedged until manual
-  // cleanup. These tests inject `platform: 'win32'` via DI so they exercise
-  // the real win32 code path (autopilot-lock's shared `readProcessCommand`,
-  // which queries Get-CimInstance over powershell) on any host OS, instead
-  // of being skipped like the `canProbe`-gated spawn-based tests above (real
-  // `ps`/`/proc` don't exist on Windows, so those tests can never run there).
+  // Before this fix, pglite-lock's own command-line probe (`readProcessArgs`)
+  // had no win32 branch: it tried `ps` (absent on Windows) then `/proc`
+  // (absent on Windows), always landing on `cmdline === null` —
+  // "unknowable" — which `isPidReusedByOtherProgram`'s fail-safe reads as
+  // "not reused" (alive). A dead gbrain holder whose PID got recycled by an
+  // unrelated Windows process therefore NEVER got reaped: the lock wedged
+  // until manual cleanup. The fix adds a win32 branch to `readProcessArgs`
+  // that delegates to autopilot-lock's shared `readProcessCommand`
+  // (Get-CimInstance over powershell, #4563) WITHOUT touching the existing
+  // non-Windows `ps`-then-`/proc` order at all — every non-win32 platform
+  // keeps its exact prior probe sequence and prior (case-sensitive, `/`-only)
+  // token comparison unchanged; only the win32 branch and the win32-scoped
+  // comparison hardening below are new. These tests inject `platform:
+  // 'win32'` via DI so they exercise the real win32 code path on any host
+  // OS, instead of being skipped like the `canProbe`-gated spawn-based tests
+  // above (real `ps`/`/proc` don't exist on Windows, so those tests can
+  // never run there).
   //
   // Guaranteed distinct from process.pid (the same-process PID short-circuit
   // is a separate branch, tested below) — a hardcoded literal like 4242 could
@@ -718,14 +724,16 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
 
   test('control: the exact same scenario, WITHOUT a win32 branch, reproduces the pre-fix false negative', () => {
     // This is the behavioral control for the test above. pglite-lock's own
-    // (now-deleted) `readProcessArgs` had exactly this shape — try `ps`, then
-    // `/proc/<pid>/cmdline`, nothing else — regardless of platform. Neither
-    // API exists on a real Windows host (`ps` is not an installed binary;
-    // `/proc` is not a filesystem), so on real Windows this pre-fix probe
-    // deterministically threw on both attempts and returned null, no matter
-    // what the recorded command or the live process actually was. Simulating
-    // exactly that failure shape here (both probes throw, platform pinned
-    // away from 'win32' so the Get-CimInstance branch is never reached — this
+    // `readProcessArgs`, on any non-win32 platform, has exactly this shape —
+    // try `ps`, then `/proc/<pid>/cmdline`, nothing else — same as it did
+    // before this fix (unchanged by this PR). Neither API exists on a real
+    // Windows host (`ps` is not an installed binary; `/proc` is not a
+    // filesystem), so pre-fix, `readProcessArgs` had no win32 branch at all
+    // and hit exactly this same both-throw shape on every real Windows
+    // machine, for every PID, regardless of whether that PID had actually
+    // been recycled by an unrelated process. Simulating that failure shape
+    // here (both probes throw, platform pinned away from 'win32' so the
+    // Get-CimInstance branch is never reached — this
     // must be explicit: omitting `platform` would default to the actual host
     // OS, and running this suite ON a real win32 CI runner would then select
     // the CIM branch instead, which fails for an unrelated reason —
@@ -778,53 +786,6 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
     // an earlier unrelated gate short-circuiting before they ran.
     expect(cmdlineCalls).toHaveLength(1);
     expect(execCalls).toHaveLength(1);
-  });
-
-  /**
-   * Byte-for-byte algorithmic snapshot of the DELETED `readProcessArgs` from
-   * src/core/pglite-lock.ts (pre-fix): try `ps -p <pid> -o args=`, then fall
-   * back to reading `/proc/<pid>/cmdline`, nothing else. The only difference
-   * from the deleted original is that the two OS calls are taken as injected
-   * functions instead of calling `execFileSync`/`readFileSync` directly —
-   * the deleted code had no injection seam at all (that seam is this PR's
-   * whole point), so this is the minimal accommodation needed to exercise
-   * the exact old control flow deterministically in a unit test. Kept ONLY
-   * for this regression control, not reachable from production code.
-   */
-  function preFixReadProcessArgs(
-    pid: number,
-    exec: (file: string, args: string[]) => string,
-    readCmdline: (path: string) => string,
-  ): string | null {
-    try {
-      const out = exec('ps', ['-p', String(pid), '-o', 'args=']).trim();
-      if (out.length > 0) return out;
-    } catch { /* fall through to /proc */ }
-    try {
-      const raw = readCmdline(`/proc/${pid}/cmdline`);
-      const args = raw.replace(/\0/g, ' ').trim();
-      if (args.length > 0) return args;
-    } catch { /* unreadable — unknowable */ }
-    return null;
-  }
-
-  test('restoring the literal deleted probe against a real Windows shape returns null (old code, still broken)', () => {
-    // Neither `ps` nor `/proc` exist on a real Windows host: `ps` is not an
-    // installed binary (ENOENT on spawn) and `/proc` is not a filesystem
-    // (ENOENT on open). This is exactly what the deleted `readProcessArgs`
-    // hit on every real Windows machine, for every PID, regardless of
-    // whether that PID had actually been recycled by an unrelated process.
-    const cmdline = preFixReadProcessArgs(
-      FAKE_PID,
-      () => { throw new Error('ENOENT: spawn ps ENOENT (ps is not installed on Windows)'); },
-      () => { throw new Error("ENOENT: no such file or directory, open '/proc/.../cmdline'"); },
-    );
-    expect(cmdline).toBeNull();
-    // null cmdline flows into isPidReusedByOtherProgram's existing,
-    // unmodified fail-safe: unknowable -> not reused -> never reaped. This
-    // is the literal, restored pre-fix code producing the literal pre-fix
-    // (broken) outcome for the same recycled-PID scenario that the
-    // win32-branch test above (real fix, not a reconstruction) resolves.
   });
 
   test('a live win32 gbrain holder (CommandLine quoted by CIM) is never classified as recycled', () => {
@@ -890,5 +851,145 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
     );
     expect(reused).toBe(false);
     expect(calls).toHaveLength(0);
+  });
+
+  // False-steal hardening (maintainer-lens round 2 finding): before this PR,
+  // Windows ALWAYS hit `cmdline === null` and never reached the token
+  // comparison below at all (see the header comment above) — so the
+  // comparison's case-sensitive, `/`-only logic was never exercised against
+  // real Windows command lines. This PR is the first time it runs there.
+  // Windows paths use `\` as well as `/`, and NTFS is case-insensitive, so a
+  // live legitimate holder's recorded command and its live CIM-reported
+  // command line can differ in case or separator style while still being
+  // the SAME process. The exact same class of bug (write-time vs read-time
+  // command-line drift) already caused a real false-steal once on
+  // non-Windows — see the "False-steal hardening" comment on
+  // `isPidReusedByOtherProgram` above.
+  test('false-steal hardening: a live win32 holder reported in a different CASE is not classified as recycled', () => {
+    // CIM reports the executable in a different case than it was recorded
+    // (e.g. an OS/filesystem-driven casing difference) — same live process,
+    // same path, only the case differs. A case-sensitive comparison would
+    // fail every check (the blanket "gbrain" substring check, the full-token
+    // check, and the basename check) and misclassify this live holder as "a
+    // different program", staging its lock for reaping while it is still
+    // running.
+    const reused = isPidReusedByOtherProgram(
+      FAKE_PID,
+      'C:\\Users\\u\\.bun\\bin\\gbrain.exe serve --http',
+      null,
+      null,
+      {
+        platform: 'win32',
+        execFile: () => '"C:\\Users\\u\\.bun\\bin\\GBRAIN.EXE" serve --http\r\n',
+      },
+    );
+    expect(reused).toBe(false);
+  });
+
+  test('false-steal hardening: a live win32 holder with a backslash-only recorded path is not classified as recycled', () => {
+    // Mirrors the real non-Windows false-steal this repo already hit once
+    // (recorded ABSOLUTE script path vs a DIFFERENT absolute path reported
+    // live — see the comment on the basename fallback above): neither side
+    // contains the literal substring "gbrain" (the invoking wrapper is
+    // `cli.ts`, not `gbrain.exe`), so this exercises the basename fallback
+    // specifically, not the blanket "gbrain" check. The recorded command is
+    // an absolute WINDOWS path using ONLY backslashes (no `/` at all) — a
+    // basename extractor that splits on `/` only (the pre-fix, non-Windows
+    // behavior) would treat the ENTIRE path as the "basename" and never
+    // match the live holder's differently-cased, differently-directoried
+    // command line, misclassifying it as reused (a false steal).
+    const reused = isPidReusedByOtherProgram(
+      FAKE_PID,
+      'C:\\Users\\u\\.bun\\bin\\cli.ts serve --http',
+      null,
+      null,
+      {
+        platform: 'win32',
+        execFile: () => '"C:\\Users\\u\\AppData\\Local\\bun\\CLI.TS" serve --http\r\n',
+      },
+    );
+    expect(reused).toBe(false);
+  });
+
+  test('a live win32 holder recorded and reported with the SAME case+path is still not classified as recycled (baseline)', () => {
+    // Positive control for the two false-steal tests above: with no case or
+    // separator drift at all, the pre-existing exact-match path already
+    // handles this correctly. Confirms the hardening above is additive, not
+    // a replacement of already-working exact matching.
+    const reused = isPidReusedByOtherProgram(
+      FAKE_PID,
+      'C:\\Users\\u\\.bun\\bin\\cli.ts serve --http',
+      null,
+      null,
+      {
+        platform: 'win32',
+        execFile: () => '"C:\\Users\\u\\.bun\\bin\\cli.ts" serve --http\r\n',
+      },
+    );
+    expect(reused).toBe(false);
+  });
+});
+
+describe('pglite-lock PID-reuse detection — non-Windows probe order (unchanged by #4563 fix)', () => {
+  // The win32 fix above must not reorder or otherwise touch the probe
+  // sequence on every platform this ran on before: `ps` first, `/proc` only
+  // as a fallback when `ps` fails (cf. #4300 — minimal containers without
+  // `ps`). These tests pin `platform: 'darwin'` (clears both the win32 CIM
+  // branch and the Linux-only pid_ns/boot_id gate — see the 'control' test
+  // above for why 'linux' would be the wrong pin here) and assert call
+  // counts, not just return values, so a future change that silently
+  // reorders or duplicates the probes fails loudly here.
+  const FAKE_PID = process.pid > 1 ? process.pid - 1 : process.pid + 1;
+
+  test('ps success means /proc is never read (probe order preserved)', () => {
+    const execCalls: Array<[string, string[]]> = [];
+    const cmdlineCalls: string[] = [];
+    const reused = isPidReusedByOtherProgram(
+      FAKE_PID,
+      '/home/user/.bun/bin/gbrain serve --http',
+      null,
+      null,
+      {
+        platform: 'darwin',
+        execFile: (file, args) => {
+          execCalls.push([file, args]);
+          return '/home/user/.bun/bin/gbrain serve --http';
+        },
+        readCmdlineFile: (path) => {
+          cmdlineCalls.push(path);
+          throw new Error('must not read /proc when ps succeeds');
+        },
+      },
+    );
+    expect(reused).toBe(false); // live gbrain holder, found via ps
+    expect(execCalls).toHaveLength(1);
+    expect(execCalls[0][0]).toBe('ps');
+    expect(cmdlineCalls).toHaveLength(0);
+  });
+
+  test('ps failure falls back to /proc (probe order preserved)', () => {
+    const execCalls: Array<[string, string[]]> = [];
+    const cmdlineCalls: string[] = [];
+    const reused = isPidReusedByOtherProgram(
+      FAKE_PID,
+      '/home/user/.bun/bin/gbrain serve --http',
+      null,
+      null,
+      {
+        platform: 'darwin',
+        execFile: (file, args) => {
+          execCalls.push([file, args]);
+          throw new Error('ENOENT: spawn ps ENOENT');
+        },
+        readCmdlineFile: (path) => {
+          cmdlineCalls.push(path);
+          return '/home/user/.bun/bin/gbrain\0serve\0--http\0';
+        },
+      },
+    );
+    expect(reused).toBe(false); // live gbrain holder, found via the /proc fallback
+    expect(execCalls).toHaveLength(1);
+    expect(cmdlineCalls).toHaveLength(1);
+    expect(cmdlineCalls[0]).toBe(`/proc/${FAKE_PID}/cmdline`);
   });
 });

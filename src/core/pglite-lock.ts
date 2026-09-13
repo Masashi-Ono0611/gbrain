@@ -15,6 +15,7 @@
  */
 
 import { mkdirSync, existsSync, readFileSync, writeFileSync, rmSync, statSync, renameSync, readlinkSync, type Stats } from 'fs';
+import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { parseGlobalFlags } from './cli-options.ts';
 import { readProcessCommand, type ProcessCommandProbeDeps } from './autopilot-lock.ts';
@@ -266,6 +267,44 @@ function readBootId(): string | null {
 }
 
 /**
+ * Read a process's full command line, or null when it can't be determined.
+ * Non-Windows: `ps -o args=` (Linux + macOS), falling back to
+ * `/proc/<pid>/cmdline` for minimal Linux containers where `ps` is absent
+ * (cf. #4300) — this is the ORIGINAL probe order/implementation, unchanged,
+ * so every platform this ever ran on keeps its exact prior behavior.
+ * Windows: delegates to autopilot-lock's shared `readProcessCommand`
+ * (Get-CimInstance via powershell — #4563), rather than duplicating that
+ * branch here. `readProcessCommand` is called ONLY on win32, so this never
+ * reorders the non-Windows probes above (an earlier version of this fix
+ * routed every platform through the shared function, which reads
+ * `/proc` before `ps` — a behavior change to two already-working platforms
+ * that this narrower version avoids). `deps` is test-only DI; production
+ * callers always omit it. Null means "unknowable" — callers must treat it as
+ * ALIVE, never as evidence of death.
+ */
+function readProcessArgs(pid: number, deps?: ProcessCommandProbeDeps): string | null {
+  if ((deps?.platform ?? process.platform) === 'win32') {
+    return readProcessCommand(pid, deps);
+  }
+  const exec = deps?.execFile ?? execFileSync;
+  try {
+    const out = exec('ps', ['-p', String(pid), '-o', 'args='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1000,
+    }).trim();
+    if (out.length > 0) return out;
+  } catch { /* fall through to /proc */ }
+  try {
+    const readCmdline = deps?.readCmdlineFile ?? readFileSync;
+    const raw = readCmdline(`/proc/${pid}/cmdline`);
+    const args = raw.toString().replace(/\0/g, ' ').trim();
+    if (args.length > 0) return args;
+  } catch { /* unreadable — unknowable */ }
+  return null;
+}
+
+/**
  * PID-reuse detection. `isProcessAlive` (kill-0) only proves SOME process owns
  * the PID — a dead holder's PID can be recycled by an unrelated program
  * (docker-proxy, a shell, a supervisor's next child), which previously wedged
@@ -285,12 +324,24 @@ function readBootId(): string | null {
  * Docker VM's PIDs aren't visible to host `ps` at all — so the cmdline
  * verdict stands alone there.
  *
- * The command-line probe itself is autopilot-lock's shared `readProcessCommand`
- * (Linux /proc, `ps` elsewhere, Get-CimInstance via powershell on win32 —
- * #4563 — where neither /proc nor `ps` exist). Without that win32 branch,
- * every Windows holder read back as `cmdline === null` ("unknowable"), which
- * this function's fail-safe treats as "not reused" — so a dead holder whose
- * PID got recycled by an unrelated program was never reaped on Windows.
+ * The command-line probe itself is `readProcessArgs` above (`ps`/`/proc` on
+ * every platform this ran on before, Get-CimInstance via powershell ONLY on
+ * win32 — #4563 — where neither /proc nor `ps` exist). Without that win32
+ * branch, every Windows holder read back as `cmdline === null`
+ * ("unknowable"), which this function's fail-safe treats as "not reused" —
+ * so a dead holder whose PID got recycled by an unrelated program was never
+ * reaped on Windows.
+ *
+ * The token-comparison below is platform-aware: Windows paths use `\` as
+ * well as `/` and NTFS is case-insensitive, so a live legitimate holder's
+ * recorded command and its live command line can differ only in separator
+ * style or case while still being the SAME process — comparing them
+ * case-sensitively and splitting on `/` only would misclassify that holder
+ * as "a different program" and stage it for reaping (a false-steal: this
+ * exact class of bug already happened once on non-Windows, see the comment
+ * below). This matters now specifically because before this fix, Windows
+ * always hit `cmdline === null` above and NEVER reached this comparison —
+ * this PR is the first time it executes on live Windows command lines.
  * `deps` is test-only DI (see `ProcessCommandProbeDeps`); production callers
  * always omit it.
  */
@@ -306,6 +357,7 @@ export function isPidReusedByOtherProgram(
   // definition not recycled. (Also keeps non-gbrain test harnesses that hold a
   // lock with their own PID from reaping themselves.)
   if (pid === process.pid) return false;
+  const isWin32 = (deps?.platform ?? process.platform) === 'win32';
   if ((deps?.platform ?? process.platform) === 'linux') {
     // Linux: cmdline evidence is only meaningful within one PID namespace on
     // one host, so EVERY marker must be readable AND matching — pid_ns rules
@@ -319,12 +371,17 @@ export function isPidReusedByOtherProgram(
     if (recordedPidNs !== ourNs) return false;
     if (recordedBootId !== ourBoot) return false;
   }
-  const cmdline = readProcessCommand(pid, deps);
+  const cmdline = readProcessArgs(pid, deps);
   if (cmdline === null) return false; // unknowable — cannot prove reuse
-  if (cmdline.includes('gbrain')) return false;
+  // Case-fold and normalize separators ONLY on win32 (NTFS paths are
+  // case-insensitive and use `\`); every other platform keeps the exact
+  // prior case-sensitive, `/`-only comparison unchanged.
+  const norm = (s: string) => (isWin32 ? s.toLowerCase() : s);
+  const cmdlineNorm = norm(cmdline);
+  if (cmdlineNorm.includes('gbrain')) return false;
   if (typeof recordedCommand === 'string' && recordedCommand.length > 0) {
     const firstToken = recordedCommand.trim().split(/\s+/)[0];
-    if (firstToken && cmdline.includes(firstToken)) return false;
+    if (firstToken && cmdlineNorm.includes(norm(firstToken))) return false;
     // False-steal hardening: the recorded first token is often an ABSOLUTE
     // script path (Bun normalizes argv[1]) while `ps`/procfs report the
     // spawn-time RELATIVE form (`bun run src/cli.ts serve …`), so the literal
@@ -333,9 +390,15 @@ export function isPidReusedByOtherProgram(
     // and writing its token to a second PGLite instance the serve never
     // sees. Compare the token's basename too: an unrelated program that
     // genuinely recycled the PID is no more likely to carry `cli.ts` in its
-    // argv than the full path, so precision holds.
-    const baseToken = firstToken ? firstToken.split('/').pop() : undefined;
-    if (baseToken && baseToken.length > 0 && cmdline.includes(baseToken)) return false;
+    // argv than the full path, so precision holds. Split on BOTH `/` and `\`
+    // on win32 (a recorded Windows path like `C:\...\gbrain.exe` has no `/`
+    // at all — splitting on `/` only would leave the whole absolute path as
+    // the "basename" and never match a live holder recorded under a
+    // different directory, e.g. #4563-style path drift between argv and a
+    // CIM-reported CommandLine).
+    const sep = isWin32 ? /[\\/]/ : /\//;
+    const baseToken = firstToken ? firstToken.split(sep).pop() : undefined;
+    if (baseToken && baseToken.length > 0 && cmdlineNorm.includes(norm(baseToken))) return false;
   }
   return true;
 }
