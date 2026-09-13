@@ -669,10 +669,16 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
   // which queries Get-CimInstance over powershell) on any host OS, instead
   // of being skipped like the `canProbe`-gated spawn-based tests above (real
   // `ps`/`/proc` don't exist on Windows, so those tests can never run there).
+  //
+  // Guaranteed distinct from process.pid (the same-process PID short-circuit
+  // is a separate branch, tested below) — a hardcoded literal like 4242 could
+  // coincidentally collide with the test runner's own PID.
+  const FAKE_PID = process.pid > 1 ? process.pid - 1 : process.pid + 1;
+
   test('recycled PID is detected via Get-CimInstance and the lock is classified as reusable', () => {
     const calls: Array<[string, string[]]> = [];
     const reused = isPidReusedByOtherProgram(
-      4242,
+      FAKE_PID,
       '/home/user/.bun/bin/gbrain serve --http',
       null,
       null,
@@ -694,12 +700,12 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0][0]).toBe('powershell.exe');
     expect(calls[0][1].join(' ')).toContain('Get-CimInstance Win32_Process');
-    expect(calls[0][1].join(' ')).toContain('ProcessId=4242');
+    expect(calls[0][1].join(' ')).toContain(`ProcessId=${FAKE_PID}`);
   });
 
   test('a live win32 gbrain holder (CommandLine quoted by CIM) is never classified as recycled', () => {
     const reused = isPidReusedByOtherProgram(
-      4242,
+      FAKE_PID,
       'gbrain.exe serve --http',
       null,
       null,
@@ -713,7 +719,7 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
 
   test('powershell failure on win32 is unknowable, not proof of reuse (fail-safe)', () => {
     const reused = isPidReusedByOtherProgram(
-      4242,
+      FAKE_PID,
       '/home/user/.bun/bin/gbrain serve --http',
       null,
       null,
@@ -729,7 +735,7 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
 
   test('empty CIM output (process already gone) is unknowable, not proof of reuse (fail-safe)', () => {
     const reused = isPidReusedByOtherProgram(
-      4242,
+      FAKE_PID,
       '/home/user/.bun/bin/gbrain serve --http',
       null,
       null,
@@ -739,6 +745,10 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
   });
 
   test('same-process PID short-circuits before any win32 probe runs', () => {
+    // The probe internally catches exceptions, so a thrown execFile alone
+    // would not fail this test if it were (wrongly) invoked — assert zero
+    // calls to actually prove the win32 probe was never reached.
+    const calls: Array<[string, string[]]> = [];
     const reused = isPidReusedByOtherProgram(
       process.pid,
       'anything',
@@ -746,11 +756,13 @@ describe('pglite-lock PID-reuse detection — win32 (#4563)', () => {
       null,
       {
         platform: 'win32',
-        execFile: () => {
+        execFile: (file, args) => {
+          calls.push([file, args]);
           throw new Error('must not be called for a same-process PID');
         },
       },
     );
     expect(reused).toBe(false);
+    expect(calls).toHaveLength(0);
   });
 });
