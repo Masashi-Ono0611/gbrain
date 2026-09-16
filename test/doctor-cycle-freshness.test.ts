@@ -190,22 +190,32 @@ describe('doctor checkCycleFreshness', () => {
     expect(result.message).toMatch(/No federated sources/);
   });
 
-  test('GST-3337: a sync-disabled source reads sync off, never stale or failing, and is never the fix target', async () => {
-    await seed('disabled-example', agoH(72), { syncEnabled: false });
-    await seed('enabled-example', agoH(1), { syncEnabled: true });
+  // #4399: config.syncEnabled=false is already honored by performSync's
+  // choke point and the autopilot freshness dispatcher (#4952) — this
+  // check must not report a deliberately-excluded source as stale either.
+  test('config.syncEnabled=false source excluded even when never cycled', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('frozen', undefined, { syncEnabled: false });
     const result = await checkCycleFreshness(engine, { nowMs: NOW });
     expect(result.status).toBe('ok');
-    expect(result.message).toBe("All 1 federated source(s) cycled recently. Sync off (not checked; only an explicit gbrain sync --source <id> syncs it): 'disabled-example'.");
-    expect(result.fix).toBeUndefined();
+    expect(result.message).toMatch(/No federated sources/);
   });
 
-  test('GST-3337: a stale enabled source is still the fix target beside a sync-disabled one', async () => {
-    await seed('disabled-example', undefined, { syncEnabled: false });
-    await seed('stale-example', agoH(72));
+  test('mixed: syncEnabled=false source excluded, stale enabled source still fails', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('frozen', agoH(72), { syncEnabled: false });
+    await seed('stale', agoH(72));
     const result = await checkCycleFreshness(engine, { nowMs: NOW });
     expect(result.status).toBe('fail');
-    expect(result.message).toContain("'stale-example' last cycled 72h ago");
-    expect(result.message).toContain("Sync off (not checked; only an explicit gbrain sync --source <id> syncs it): 'disabled-example'.");
-    expect(result.fix?.argv).toEqual(expect.arrayContaining(['gbrain', 'dream', '--source', 'stale-example']));
+    expect(result.message).not.toMatch(/frozen/);
+    expect(result.message).toMatch(/stale/);
+  });
+
+  test('config.syncEnabled=true source is unaffected', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('active', agoH(72), { syncEnabled: true });
+    const result = await checkCycleFreshness(engine, { nowMs: NOW });
+    expect(result.status).toBe('fail');
+    expect(result.message).toMatch(/active/);
   });
 });
