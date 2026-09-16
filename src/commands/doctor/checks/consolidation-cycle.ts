@@ -6,6 +6,7 @@
  */
 import type { BrainEngine } from '../../../core/engine.ts';
 import { resolveHoursEnv } from '../../../core/env-number.ts';
+import { isSyncDisabledConfig } from '../../../core/sync-policy.ts';
 import type { Check } from '../../doctor.ts';
 import type { Action } from '../../../core/agent-output.ts';
 import { agentFix, checkError, infoCheck } from '../check-fix.ts';
@@ -144,7 +145,13 @@ export async function checkCycleFreshness(
   opts?: { nowMs?: number },
 ): Promise<Check> {
   try {
-    const sources = await engine.listAllSources({ localPathOnly: true });
+    // #4399: a source the operator has deliberately excluded from automatic
+    // sync (config.syncEnabled=false — already honored by performSync's
+    // choke point and the autopilot freshness dispatcher, #4952) must not
+    // be reported as a stale-cycle [FAIL]/[WARN] here either.
+    const sources = (await engine.listAllSources({ localPathOnly: true })).filter(
+      (s) => !isSyncDisabledConfig(s.config),
+    );
     if (sources.length === 0) {
       return {
         name: 'cycle_freshness',
