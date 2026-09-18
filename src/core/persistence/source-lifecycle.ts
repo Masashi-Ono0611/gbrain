@@ -151,14 +151,21 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     // connection checked out. The final transaction rejects new pending mirrors.
     const manifests=new Map<string,WorktreeManifest>();
     let missingCheckout:string|undefined;
+    // Retirements transfer no canonical bytes; a symlink-blocked manifest walk
+    // must not prevent the registry lifecycle change. Other operations keep it strict.
+    const retirementOp=['archive','remove','purge'].includes(input.operation);
     for(const path of new Set([...bindings.map(binding=>binding.local_path!).filter(Boolean),...(root?[root.worktree]:[])])) {
       if(!existsSync(path)) {
         if(input.operation==='add'&&input.createDirectory&&path===root?.worktree)continue;
         // #5219: retiring may skip a vanished checkout; the transaction proves the source is empty and its sole member.
-        if(['archive','remove','purge'].includes(input.operation)&&!root){missingCheckout=path;continue;}
+        if(retirementOp&&!root){missingCheckout=path;continue;}
         throw missingCheckoutError(input.sourceId,path);
       }
-      const manifest=worktreeManifest(path,{progress:humanManifestProgress()});
+      let manifest:WorktreeManifest;
+      try{manifest=worktreeManifest(path,{progress:humanManifestProgress()});}catch(error){
+        if(!retirementOp||(error as {code?:string}|undefined)?.code!=='writer_manifest_unsafe') throw error;
+        continue;
+      }
       manifests.set(path,manifest);
     }
     // #6099: a rebind compares the new directory in the scope of the current checkout's manifest (Git-tracked files for a Git checkout).
