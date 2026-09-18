@@ -2633,6 +2633,17 @@
             "via": "unsafe"
           }
         ],
+        "requireSafeChunks": [
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          }
+        ],
         "slugPrefix": [
           {
             "paramCount": 3,
