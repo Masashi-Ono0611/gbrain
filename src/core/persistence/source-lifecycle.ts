@@ -105,9 +105,16 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     // Hash canonical bytes while holding native exclusion, without a database
     // connection checked out. The final transaction rejects new pending mirrors.
     const manifests=new Map<string,WorktreeManifest>();
+    // Retirements transfer no canonical bytes; a symlink-blocked manifest walk
+    // must not prevent the registry lifecycle change. Other operations keep it strict.
+    const retirementOp=['archive','remove','purge'].includes(input.operation);
     for(const path of new Set([...bindings.map(binding=>binding.local_path!).filter(Boolean),...(root?[root.worktree]:[])])) {
       if(!existsSync(path)) {if(input.operation==='add'&&input.createDirectory&&path===root?.worktree)continue;throw new OperationError('recovery_required','The canonical checkout is missing; restore its verified manifest first.');}
-      const manifest=worktreeManifest(path,{progress:humanManifestProgress()});
+      let manifest:WorktreeManifest;
+      try{manifest=worktreeManifest(path,{progress:humanManifestProgress()});}catch(error){
+        if(!retirementOp||(error as {code?:string}|undefined)?.code!=='writer_manifest_unsafe') throw error;
+        continue;
+      }
       if(Buffer.byteLength(JSON.stringify(manifest))>1_048_576) throw new OperationError('request_too_large','The verified source manifest exceeds the 1 MiB administration metadata bound.');
       manifests.set(path,manifest);
     }
