@@ -314,6 +314,7 @@ export const SQL_CASES: SqlCase[] = [
     ['sourceIds', (e) => e.listPages({ sourceIds: SRCS })],
     ['includeDeleted', (e) => e.listPages({ includeDeleted: true })],
     ['excludePrivate', (e) => e.listPages({ excludePrivate: true })],
+    ['requireSafeChunks', (e) => e.listPages({ requireSafeChunks: true, excludePrivate: true })],
     ['effective_after', (e) => e.listPages({ effective_after: '2026-01-01' })],
     ['effective_before', (e) => e.listPages({ effective_before: '2026-01-01' })],
     ['sort', (e) => e.listPages({ sort: 'slug' })],
