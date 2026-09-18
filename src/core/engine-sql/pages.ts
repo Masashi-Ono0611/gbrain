@@ -25,6 +25,7 @@ import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion } from '../search/saf
 import { privatePagesFilterFragment, privateSnapshotFilterFragment } from '../search/private-visibility.ts';
 import { quarantineFilterFragment } from '../quarantine.ts';
 import { rederiveHiddenSql } from '../eligibility/sql.ts';
+import { buildVisibilityClause } from '../search/sql-ranking.ts';
 import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, isMissingSchemaObject, warnOncePerProcess } from '../utils.ts';
 import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
 import { jsonbParam, type SqlExecutor } from './executor.ts';
@@ -444,6 +445,9 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
 
     const typeCondition = filters?.type ? sqlFragment`AND p.type = ${filters.type}` : sqlFragment``;
     const tagJoin = filters?.tag ? sqlFragment`JOIN tags t ON t.page_id = p.id` : sqlFragment``;
+    const joins = filters?.requireSafeChunks === true
+      ? sqlFragment`${tagJoin} JOIN sources s ON s.id = p.source_id`
+      : tagJoin;
     const tagCondition = filters?.tag ? sqlFragment`AND t.tag = ${filters.tag}` : sqlFragment``;
     // v0.45.7 keyset (updated_at, slug) supersedes updated_after when set.
     const keyset = filters?.updatedAfterKeyset;
@@ -491,6 +495,14 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
     const privateCondition = filters?.excludePrivate === true
       ? trustedSql(`AND ${privatePagesFilterFragment('p')}`)
       : sqlFragment``;
+    // Opt-in search visibility for canonical bodies in untrusted responses.
+    // Administrative listPages calls retain their existing behavior.
+    const privateAndVisibilityCondition = filters?.requireSafeChunks === true
+      ? sqlFragment`${privateCondition} ${trustedSql(buildVisibilityClause('p', 's', {
+          excludePrivate: filters.excludePrivate,
+          requireSafeChunks: true,
+        }))}`
+      : privateCondition;
     const effectiveAfterCondition = filters?.effective_after
       ? sqlFragment`AND p.effective_date >= ${filters.effective_after}::timestamptz`
       : sqlFragment``;
@@ -509,8 +521,8 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       : sqlFragment`p.*`;
       const { rows } = await exec.run(sqlFragment`
         SELECT ${columns}, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
-        ${tagJoin}
-        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition}${excludedSlugCondition} ${slugAfterCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}${whereCondition}
+        ${joins}
+        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition}${excludedSlugCondition} ${slugAfterCondition} ${sourceCondition} ${deletedCondition} ${privateAndVisibilityCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}${whereCondition}
         ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}
       `);
       return rows.map(rowToPage);

@@ -400,6 +400,14 @@ export interface PageFilters {
   listColumnsOnly?: boolean;
   /** #7159: frontmatter equality (search/frontmatter-where.ts). */
   where?: import('./search/frontmatter-where.ts').FrontmatterWhere;
+  /**
+   * Restrict enumeration to the same live, current, safely indexed page set
+   * exposed by untrusted search. Intended for internal read paths that need
+   * canonical page bodies (for example think's temporal floor) rather than
+   * chunk hits. When true, deleted/quarantined pages, archived sources,
+   * stale text projections, and pre-safe-fence chunk versions are excluded.
+   */
+  requireSafeChunks?: boolean;
 }
 
 /** v0.26.5 — opts for getPage / softDeletePage / restorePage. */
