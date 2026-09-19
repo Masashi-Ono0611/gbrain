@@ -337,7 +337,8 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
 
     const typeCondition = filters?.type ? sqlFragment`AND p.type = ${filters.type}` : sqlFragment``;
     const tagJoin = filters?.tag ? sqlFragment`JOIN tags t ON t.page_id = p.id` : sqlFragment``;
-    const joins = filters?.requireSafeChunks === true
+    const requireVisibility = filters?.requireLiveVisibility === true || filters?.requireSafeChunks === true;
+    const joins = requireVisibility
       ? sqlFragment`${tagJoin} JOIN sources s ON s.id = p.source_id`
       : tagJoin;
     const tagCondition = filters?.tag ? sqlFragment`AND t.tag = ${filters.tag}` : sqlFragment``;
@@ -373,12 +374,11 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
     const privateCondition = filters?.excludePrivate === true
       ? trustedSql(`AND ${privatePagesFilterFragment('p')}`)
       : sqlFragment``;
-    // Opt-in search visibility for canonical bodies in untrusted responses.
-    // Administrative listPages calls retain their existing behavior.
-    const privateAndVisibilityCondition = filters?.requireSafeChunks === true
+    // Opt-in search visibility for canonical bodies; administrative listPages calls retain their existing behavior.
+    const privateAndVisibilityCondition = requireVisibility
       ? sqlFragment`${privateCondition} ${trustedSql(buildVisibilityClause('p', 's', {
-          excludePrivate: filters.excludePrivate,
-          requireSafeChunks: true,
+          excludePrivate: filters?.excludePrivate,
+          requireSafeChunks: filters?.requireSafeChunks === true,
         }))}`
       : privateCondition;
     const effectiveAfterCondition = filters?.effective_after
