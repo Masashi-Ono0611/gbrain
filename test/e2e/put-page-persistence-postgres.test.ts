@@ -94,6 +94,8 @@ d('Postgres put_page persistence', () => {
     const disk = readFileSync(join(root, `${slug}.md`), 'utf8');
     const binding = await getWorktreeBinding(engine, 'default');
     expect(binding).not.toBeNull();
+    // A committed receipt can precede publisher cleanup and Git effect lock release.
+    // Wait for fixture ownership before introducing the contention under test.
     const holder = await acquireWorktree(binding!, 5000);
     expect(holder).not.toBeNull();
     let accepted: Awaited<ReturnType<typeof put>>;
