@@ -32,6 +32,7 @@ import { sanitizeQueryForPrompt } from '../search/expansion.ts';
 import { ensureWellFormed } from '../text-safe.ts';
 import { CJK_SLUG_CHARS } from '../cjk.ts';
 import type { IntentAsk } from '../search/decide-retrieval.ts';
+import { runWithLimit } from '../worker-pool.ts';
 
 export interface ThinkGatherOpts {
   question: string;
@@ -95,6 +96,7 @@ export interface ThinkGatherResult {
  * the reservation is 0 and the merge is byte-identical to appending.
  */
 const WINDOW_FLOOR_RESERVED_SHARE = 0.25;
+const WINDOW_FLOOR_HYDRATE_CONCURRENCY = 8;
 
 const RRF_K = 60;
 
@@ -158,6 +160,7 @@ export async function runGather(
   const visibleLeads = async (rows: Page[]): Promise<string[]> =>
     (await overlaidBoundedRows(engine, await Promise.all(rows.map(async p => ({ slug: p.slug, source_id: p.source_id ?? 'default', compiled_truth: await pageLeadSource(engine, p) ?? '' })))))
       .map(r => opts.remote === false ? r.compiled_truth ?? '' : boundedProjectedPrefix(r.compiled_truth));
+  const floorPageScope = { ...pageScope, requireLiveVisibility: true };
   const pageIdentity = (page: Pick<SearchResult, 'slug' | 'source_id'>) =>
     `${page.source_id ?? 'default'}\0${page.slug}`;
 
@@ -211,7 +214,7 @@ export async function runGather(
     engine.listPages({
       ...(window.startMs !== null ? { effective_after: new Date(window.startMs).toISOString() } : {}),
       ...(window.endMs !== null ? { effective_before: new Date(window.endMs).toISOString() } : {}),
-      limit: 50, ...pageScope,
+      limit: 50, ...floorPageScope,
       excludeSlugPrefixes: resolveHardExcludes(),
     }).then(async pages => {
       // listPages returns stored rows, while getPage returns the canonical
@@ -219,20 +222,28 @@ export async function runGather(
       // durable fact retraction cannot be resurrected from stale raw body
       // text. The revision check rejects a page changed between enumeration
       // and hydration (including withdrawal-driven projection invalidation).
-      const hydrated = await Promise.all(pages.map(async (page, rank) => {
-        const current = await engine.getPage(page.slug, {
-          sourceId: page.source_id ?? 'default',
-          excludePrivate: opts.excludePrivate,
-          requireSafeChunks: opts.remote !== false,
-        });
-        if (!current || current.id !== page.id
-          || current.knowledge_revision !== page.knowledge_revision
-          || current.text_projection_revision !== page.text_projection_revision) return null;
-        return toSearchResult(current, rank, opts.remote === false
-          ? boundedRawPrefix(current.compiled_truth)
-          : boundedProjectedPrefix(current.compiled_truth));
-      }));
-      return hydrated.filter((page): page is SearchResult => page !== null);
+      const hydrated = await runWithLimit({
+        items: pages,
+        limit: WINDOW_FLOOR_HYDRATE_CONCURRENCY,
+        fn: async (page, rank) => {
+          const current = await engine.getPage(page.slug, {
+            sourceId: page.source_id ?? 'default',
+            excludePrivate: opts.excludePrivate,
+          });
+          if (!current || current.id !== page.id
+            || current.knowledge_revision !== page.knowledge_revision
+            || current.text_projection_revision !== page.text_projection_revision) return null;
+          return toSearchResult(current, rank, opts.remote === false
+            ? boundedRawPrefix(current.compiled_truth)
+            : boundedProjectedPrefix(current.compiled_truth));
+        },
+      });
+      const failed = hydrated.filter(result => !result.ok).length;
+      if (failed > 0) {
+        warnings.push('GATHER_WINDOW_FLOOR_PARTIAL_FAILED');
+        process.stderr.write(`[think.gather] window floor dropped ${failed} failed snapshot read(s)\n`);
+      }
+      return hydrated.flatMap(result => result.ok && result.value !== null ? [result.value] : []);
     }).catch((e) => {
       warnings.push('GATHER_WINDOW_FLOOR_FAILED');
       process.stderr.write(`[think.gather] window floor failed: ${(e as Error).message}\n`);
