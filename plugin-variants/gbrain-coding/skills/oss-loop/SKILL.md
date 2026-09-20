@@ -47,6 +47,15 @@ The check must establish all of the following:
 - the GitHub CLI is authenticated for that target;
 - the current branch and working tree are visible before mutation.
 
+## Contract
+
+- Keep the canonical upstream target explicit for every push and pull request.
+- Keep each candidate isolated and independently reviewable.
+- Treat CI as incomplete until every required check is Green; skipped or pending
+  checks remain separate from passed checks.
+- Preserve the user's worktree and report any blocked or unavailable step
+  without silently treating it as success.
+
 ## Loop
 
 1. Read `AGENTS.md`, `CLAUDE.md`, the relevant reference docs, and the
@@ -70,6 +79,27 @@ The check must establish all of the following:
 7. For a fork PR superseded by an upstream PR, close the fork PR with a clear
    supersession note; do not delete branches or force-push without a separate
    authorization.
+
+## Anti-Patterns
+
+- Do not let the current `origin` or checkout decide the publication target.
+- Do not publish to a personal fork when the requested target is upstream.
+- Do not mark a Draft ready because local tests pass while required CI is
+  pending, skipped, stale, or failed.
+- Do not combine unrelated candidate fixes into one PR or hide missing evidence
+  behind a generic "passed" summary.
+
+## Output Format
+
+Report one candidate at a time with:
+
+1. target repository and source branch;
+2. change summary and focused validation;
+3. CI counts split into passed, skipped, pending, and failed;
+4. PR state and the next action.
+
+Use `blocked` or `incomplete` when evidence is missing. Never claim Green until
+all required checks are complete and successful.
 
 ## Reporting
 
