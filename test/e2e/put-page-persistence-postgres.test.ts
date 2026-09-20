@@ -93,11 +93,7 @@ d('Postgres put_page persistence', () => {
     const disk = readFileSync(join(root, `${slug}.md`), 'utf8');
     const binding = await getWorktreeBinding(engine, 'default');
     expect(binding).not.toBeNull();
-    // The first put may still be releasing its native lock when the durable
-    // receipt has become visible. Wait briefly for that normal hand-off rather
-    // than turning scheduler timing into a false failure; once acquired, this
-    // handle still provides the deliberate contention for the assertions below.
-    const holder = await acquireWorktree(binding!, 5_000);
+    const holder = await acquireWorktree(binding!);
     expect(holder).not.toBeNull();
     let accepted: Awaited<ReturnType<typeof put>>;
     try {
