@@ -219,14 +219,15 @@ describe('runNightlyQualityProbe (DI stub harness)', () => {
     });
   });
 
-  test('missing fixture → outcome: error', async () => {
+  test('missing fixture → outcome: skipped_no_fixture with audit row', async () => {
     await withEnv({ GBRAIN_AUDIT_DIR: auditTmp }, async () => {
       const r = await runNightlyQualityProbe(makeDeps({
         resolveRepoRoot: async () => '/this/repo/root/does/not/exist',
       }));
-      expect(r.outcome).toBe('error');
+      expect(r.outcome).toBe('skipped_no_fixture');
+      expect(r.exit_code).toBe(0);
       const events = await readEvents();
-      expect(events[0].outcome).toBe('error');
+      expect(events[0].outcome).toBe('skipped_no_fixture');
       expect(events[0].detail).toContain('not found');
     });
   });
