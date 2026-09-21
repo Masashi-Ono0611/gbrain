@@ -67,5 +67,7 @@ describe('v0.12.2 — JSONB double-encode repair migration', () => {
       .toEqual({ command: '/opt/bin/bun', argsPrefix: ['/repo/src/cli.ts'] });
     expect(resolveGbrainCliInvocation({ pathBinary: '/opt/bin/gbrain', execPath: '/usr/bin/node', argv1: undefined }))
       .toEqual({ command: '/opt/bin/gbrain', argsPrefix: [] });
+    expect(() => resolveGbrainCliInvocation({ execPath: '/usr/bin/node', argv1: '/tmp/not-cli.ts' }))
+      .toThrow('Could not resolve');
   });
 });

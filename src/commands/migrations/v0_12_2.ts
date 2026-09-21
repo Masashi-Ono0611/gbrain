@@ -22,7 +22,7 @@
 
 import { runGbrainSubprocessArgs } from './in-process.ts';
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
-import { getCliOptions } from '../../core/cli-options.ts';
+import { childGlobalArgs } from '../../core/cli-options.ts';
 // Bug 3 — ledger writes moved to the runner (apply-migrations.ts).
 
 // ── Phase A — Schema ────────────────────────────────────────
@@ -48,13 +48,10 @@ function phaseBRepair(opts: OrchestratorOpts): OrchestratorPhaseResult {
   try {
     // Keep the repair in a child process, with the existing hard timeout and
     // captured stderr diagnostics, while avoiding a platform shell.
-    const cli = getCliOptions();
-    const args = ['repair-jsonb'];
-    if (cli.quiet) args.push('--quiet');
-    if (cli.progressJson) args.push('--progress-json');
-    if (cli.brain) args.push(`--brain=${cli.brain}`);
-    if (cli.progressInterval !== 1000) args.push(`--progress-interval=${cli.progressInterval}`);
-    runGbrainSubprocessArgs(args, { timeoutMs: 600_000 });
+    runGbrainSubprocessArgs(['repair-jsonb', ...childGlobalArgs()], {
+      timeoutMs: 600_000,
+      inheritStderr: true,
+    });
     return { name: 'jsonb_repair', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

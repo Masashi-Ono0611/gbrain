@@ -155,11 +155,11 @@ export function runGbrainSubprocess(cmd: string, opts?: { timeoutMs?: number }):
 }
 
 /** Run a fixed internal CLI argv without invoking a platform shell. */
-export function runGbrainSubprocessArgs(args: readonly string[], opts?: { timeoutMs?: number }): string {
+export function runGbrainSubprocessArgs(args: readonly string[], opts?: { timeoutMs?: number; inheritStderr?: boolean }): string {
   const invocation = currentGbrainCliInvocation();
   try {
     const out = execFileSync(invocation.command, [...invocation.argsPrefix, ...args], {
-      stdio: ['inherit', 'pipe', 'pipe'],
+      stdio: ['inherit', 'pipe', opts?.inheritStderr ? 'inherit' : 'pipe'],
       timeout: opts?.timeoutMs ?? MIGRATE_ONLY_TIMEOUT_MS,
       env: process.env,
       maxBuffer: SUBPROCESS_MAX_BUFFER,
