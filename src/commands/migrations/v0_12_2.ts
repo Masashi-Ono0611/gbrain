@@ -21,8 +21,7 @@
  */
 
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
-import { repairJsonb, type RepairOpts, type RepairResult } from '../repair-jsonb.ts';
-import * as db from '../../core/db.ts';
+import { repairJsonb, type RepairResult } from '../repair-jsonb.ts';
 // Bug 3 — ledger writes moved to the runner (apply-migrations.ts).
 
 // ── Phase A — Schema ────────────────────────────────────────
@@ -43,10 +42,10 @@ async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseRe
 
 // ── Phase B — JSONB repair ──────────────────────────────────
 
-async function phaseBRepair(opts: OrchestratorOpts, repair: (opts: RepairOpts) => Promise<RepairResult> = repairJsonb, onConnectionCreated?: (ownsConnection: boolean) => void): Promise<OrchestratorPhaseResult> {
+async function phaseBRepair(opts: OrchestratorOpts, repair: (opts: { dryRun: boolean }) => Promise<RepairResult> = repairJsonb): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'jsonb_repair', status: 'skipped', detail: 'dry-run' };
   try {
-    await repair({ dryRun: false, onConnectionCreated });
+    await repair({ dryRun: false });
     return { name: 'jsonb_repair', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -56,10 +55,10 @@ async function phaseBRepair(opts: OrchestratorOpts, repair: (opts: RepairOpts) =
 
 // ── Phase C — Verify ────────────────────────────────────────
 
-async function phaseCVerify(opts: OrchestratorOpts, repair: (opts: RepairOpts) => Promise<RepairResult> = repairJsonb, onConnectionCreated?: (ownsConnection: boolean) => void): Promise<OrchestratorPhaseResult> {
+async function phaseCVerify(opts: OrchestratorOpts, repair: (opts: { dryRun: boolean }) => Promise<RepairResult> = repairJsonb): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'verify', status: 'skipped', detail: 'dry-run' };
   try {
-    const result = await repair({ dryRun: true, onConnectionCreated });
+    const result = await repair({ dryRun: true });
     const remaining = result.total_repaired;
     if (remaining > 0) {
       return {
@@ -84,31 +83,23 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
   console.log('');
 
   const phases: OrchestratorPhaseResult[] = [];
-  let ownsRepairConnection = false;
-  const onConnectionCreated = (ownsConnection: boolean) => {
-    ownsRepairConnection ||= ownsConnection;
-  };
 
-  try {
-    const a = await phaseASchema(opts);
-    phases.push(a);
-    if (a.status === 'failed') return finalizeResult(phases, 'failed');
+  const a = await phaseASchema(opts);
+  phases.push(a);
+  if (a.status === 'failed') return finalizeResult(phases, 'failed');
 
-    const b = await phaseBRepair(opts, repairJsonb, onConnectionCreated);
-    phases.push(b);
-    if (b.status === 'failed') return finalizeResult(phases, 'failed');
+  const b = await phaseBRepair(opts);
+  phases.push(b);
+  if (b.status === 'failed') return finalizeResult(phases, 'failed');
 
-    const c = await phaseCVerify(opts, repairJsonb, onConnectionCreated);
-    phases.push(c);
+  const c = await phaseCVerify(opts);
+  phases.push(c);
 
-    // a.status and b.status were narrowed to 'skipped' | 'complete' by early returns above.
-    const overallStatus: 'complete' | 'partial' | 'failed' =
-      c.status === 'failed' ? 'partial' : 'complete';
+  // a.status and b.status were narrowed to 'skipped' | 'complete' by early returns above.
+  const overallStatus: 'complete' | 'partial' | 'failed' =
+    c.status === 'failed' ? 'partial' : 'complete';
 
-    return finalizeResult(phases, overallStatus);
-  } finally {
-    if (ownsRepairConnection) await db.disconnect();
-  }
+  return finalizeResult(phases, overallStatus);
 }
 
 function finalizeResult(phases: OrchestratorPhaseResult[], status: 'complete' | 'partial' | 'failed'): OrchestratorResult {

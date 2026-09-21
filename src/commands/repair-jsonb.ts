@@ -98,8 +98,6 @@ export interface RepairOpts {
   dryRun: boolean;
   /** Engine config override (for tests). Defaults to loadConfig() result. */
   engineConfig?: EngineConfig;
-  /** Called with the db singleton ownership result for in-process callers. */
-  onConnectionCreated?: (ownsConnection: boolean) => void;
 }
 
 /**
@@ -133,8 +131,7 @@ export async function repairJsonb(opts: RepairOpts = { dryRun: false }): Promise
     return result;
   }
 
-  const ownsConnection = await db.connect(engineCfg);
-  opts.onConnectionCreated?.(ownsConnection);
+  await db.connect(engineCfg);
   const sql = db.getConnection();
 
   // Progress on stderr only. Stdout is reserved for the JSON summary that
