@@ -56,21 +56,4 @@ describe('v0.12.2 — JSONB double-encode repair migration', () => {
       expect(p.detail).toContain('dry-run');
     }
   });
-
-  test('repair and verify use the injected in-process callable', async () => {
-    const { __testing } = await import('../src/commands/migrations/v0_12_2.ts');
-    const calls: boolean[] = [];
-    const repair = async ({ dryRun }: { dryRun: boolean }) => {
-      calls.push(dryRun);
-      return { engine: 'postgres', per_target: [], total_repaired: 0 };
-    };
-
-    await expect(__testing.phaseBRepair({ yes: true, dryRun: false, noAutopilotInstall: true }, repair)).resolves.toEqual({
-      name: 'jsonb_repair', status: 'complete',
-    });
-    await expect(__testing.phaseCVerify({ yes: true, dryRun: false, noAutopilotInstall: true }, repair)).resolves.toEqual({
-      name: 'verify', status: 'complete', detail: 'engine=postgres',
-    });
-    expect(calls).toEqual([false, true]);
-  });
 });
