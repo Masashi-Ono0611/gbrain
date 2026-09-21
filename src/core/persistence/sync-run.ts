@@ -10,6 +10,7 @@ import { assertPersistenceAccepting, foregroundWriteCompletions, startPersistenc
 import { discoverManagedSync, resolveManagedSyncContext, readSyncContent, syncRawHash, type SyncDiscovery } from './sync-discovery.ts';
 import { managedSyncAuthority, validateSyncAuthority, validateManagedSyncOptions, type SyncAuthority } from './sync-authority.ts';
 import type { SyncIntent } from './sync-prepare.ts';
+import { recordFailures } from '../sync-failure-ledger.ts';
 
 interface Pending { requestId: string; slug: string; pageId: number | null; intent: SyncIntent; }
 interface Cursor extends SyncDiscovery { runId: string; index: number; authority: SyncAuthority; pending?: Pending; done?: boolean;
@@ -148,8 +149,17 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
     const done = await waitForWrite(engine, row, config, 5000);
     if (!['committed','failed','conflict','cancelled'].includes(done.state)) return result(cursor, 'partial', 'writer_pending');
     if (done.state !== 'committed') {
+      const errorCode = done.error_code ?? 'storage_error';
+      const entry = cursor.entries[cursor.index];
+      // The CLI's blocked_by_failures message points operators at
+      // sync-failures.jsonl; without this the file stays empty and
+      // --skip-failed's own guard refuses to bypass a failure it never
+      // recorded, leaving no way to diagnose or acknowledge the block.
+      if (entry) {
+        recordFailures(cursor.sourceId, [{ path: entry.path, error: done.error_message ?? errorCode }], cursor.target);
+      }
       return { ...result(cursor, 'blocked_by_failures'), failedFiles: 1,
-        failureCodes: [{ code: done.error_code ?? 'storage_error', count: 1 }] };
+        failureCodes: [{ code: errorCode, count: 1 }] };
     }
     if (pending.intent.kind === 'managed_sync_checkpoint') {
       cursor = (await readCursor(engine, key))!;

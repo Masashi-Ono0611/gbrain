@@ -8,13 +8,14 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { getWorktreeBinding, claimWorktree } from '../src/core/persistence/ownership.ts';
-import { admitWrite, claimNextWrite, getWriteRequest } from '../src/core/persistence/journal.ts';
+import { admitWrite, claimNextWrite, getWriteRequest, completeWrite } from '../src/core/persistence/journal.ts';
 import { localHostId } from '../src/core/persistence/identity.ts';
 import { managedSyncAuthority } from '../src/core/persistence/sync-authority.ts';
 import { prepareManagedSyncMutation, type SyncIntent } from '../src/core/persistence/sync-prepare.ts';
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
+import { recordFailures, clearFailures, loadSyncFailures } from '../src/core/sync-failure-ledger.ts';
 import { discoverManagedSync } from '../src/core/persistence/sync-discovery.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
@@ -244,6 +245,65 @@ test('raw bytes changing after preparation conflict without publishing and the s
     expect(await engine.getPage('a',{sourceId:f.id})).toBeNull(); expect(readFileSync(join(f.root,'a.md'),'utf8')).toBe(newer);
     const replay=await admitWrite(engine,admission); expect(replay.id).toBe(accepted.id); expect(replay.state).toBe('conflict');
     expect((await getWriteRequest(engine,authority.writer.principal,requestId))?.intent).toEqual(intent);
+  }
+}),120_000);
+
+test('sync-failure ledger API: recordFailures captures a non-committed write, clearFailures removes it', async () => withEnv({GBRAIN_HOME:home},async()=>{
+  // Ledger-API unit test — calls recordFailures/clearFailures directly, so it
+  // does not exercise (and cannot regress-guard) sync-run.ts's own call site;
+  // that coverage is the next test, which drives performManagedSync end to end.
+  for(const engine of engines){
+    await disposePersistenceConsumer(engine);
+    const original='Original ledger-recording observation before admission.\n';
+    const f=await fixture(engine,{'a.md':original}); const binding=(await getWorktreeBinding(engine,f.id))!;
+    const authority=await managedSyncAuthority(engine,f.id,binding.source_incarnation,f.root);
+    const intent:SyncIntent={kind:'managed_sync_import',expected_revision:null,sourcePath:'a.md',path:'a.md',rawHash:sha256(original),content:original,
+      ownerEpoch:String(binding.owner_epoch),syncAuthority:authority,cursorKey:'test-cursor',runId:randomUUID(),index:0,total:1,from:null,target:f.head,slugMode:'git-root'};
+    const admission={requestId:randomUUID(),operation:'submit_job',sourceId:f.id,sourceIncarnation:binding.source_incarnation,slug:'a',pageId:null,
+      worktreeId:binding.worktree_id,topologyGeneration:binding.topology_generation,principal:authority.writer.principal,authority:authority.writer,callerIntent:intent,intent};
+    const accepted=await admitWrite(engine,admission); const claimed=(await claimNextWrite(engine,localHostId()))!; expect(claimed.id).toBe(accepted.id);
+    const prepared=await prepareManagedSyncMutation(engine,claimed,{engine:engine.kind});
+    writeFileSync(join(f.root,'a.md'),'External write that invalidates the frozen admission.\n');
+    // `done` here has the exact shape performManagedSync's `waitForWrite` result
+    // takes (WriteRequest) when a managed-sync write does not commit — this
+    // reproduces the sync-run.ts:151 branch without depending on internal,
+    // non-exported cursor/freeze timing.
+    const done=await publishMutation(engine,claimed,prepared);
+    expect(done.state).toBe('conflict'); expect(done.error_code).toBe('source_changed');
+    const errorCode=done.error_code??'storage_error';
+    recordFailures(f.id,[{path:'a.md',error:done.error_message??errorCode}],f.head);
+    const recorded=loadSyncFailures().filter(r=>r.source_id===f.id);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toMatchObject({source_id:f.id,path:'a.md'});
+    expect(done.error_message).not.toBeNull();
+    expect(recorded[0].error).toBe(done.error_message as string);
+    // acknowledgeFailures/clearFailures is how a caller (e.g. a future
+    // success on the same path) removes a stale ledger row.
+    clearFailures(f.id,['a.md']);
+    expect(loadSyncFailures().filter(r=>r.source_id===f.id)).toHaveLength(0);
+  }
+}),120_000);
+
+test('performManagedSync reports blocked_by_failures and records the ledger entry when its own write fails', async () => withEnv({GBRAIN_HOME:home},async()=>{
+  for(const engine of engines){
+    await disposePersistenceConsumer(engine);
+    const f=await fixture(engine,{'a.md':'Only file, injected to fail before it commits.\n'});
+    const syncPromise=performManagedSync(engine,{sourceId:f.id,noPull:true});
+    // No consumer is running, so performManagedSync's own admission sits
+    // `queued` until we claim and fail it ourselves — driving the exact
+    // waitForWrite() -> done.state!=='committed' branch this fix touches,
+    // through the public performManagedSync entry point (not the low-level
+    // journal API the sibling tests above use directly).
+    let claimed=null as Awaited<ReturnType<typeof claimNextWrite>>;
+    for(let i=0;i<300&&!claimed;i++){claimed=await claimNextWrite(engine,localHostId()); if(!claimed)await new Promise(r=>setTimeout(r,10));}
+    expect(claimed).not.toBeNull();
+    await engine.transaction(tx=>completeWrite(tx,claimed!,'failed',{},{code:'storage_error',message:'Injected test failure.'}));
+    const result=await syncPromise;
+    expect(result.status).toBe('blocked_by_failures');
+    expect(result.failedFiles).toBe(1);
+    const recorded=loadSyncFailures().filter(r=>r.source_id===f.id);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toMatchObject({source_id:f.id,path:'a.md',error:'Injected test failure.'});
   }
 }),120_000);
 
