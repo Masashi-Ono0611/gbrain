@@ -35,6 +35,21 @@ repository:
 bash skills/oss-loop/scripts/verify-target.sh --target garrytan/gbrain
 ```
 
+When creating a Draft PR, use the bundled wrapper so the publication target and
+fully qualified source branch cannot be selected implicitly by the checkout:
+
+```bash
+bash skills/oss-loop/scripts/create-upstream-draft.sh \
+  --target garrytan/gbrain \
+  --head YOUR_GITHUB_OWNER:YOUR_BRANCH \
+  --title "<current release> <kind>: <summary>" \
+  --body-file /path/to/pr-body.md
+```
+
+Do not call `gh pr create` directly for this workflow. The wrapper requires an
+explicit canonical target, a fully qualified `OWNER:BRANCH` head, and creates a
+Draft PR only after rerunning the target check.
+
 Use the repository's documented canonical target when working on another OSS
 project. If the target is not explicit or the check fails, stop before any
 push or PR creation. A personal fork may be used for local validation, but it
