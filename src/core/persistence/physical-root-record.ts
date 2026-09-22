@@ -103,7 +103,23 @@ export function assertPhysicalRootStamp(directory: string, reservation: Physical
   const value = readPrivate(join(directory, PHYSICAL_ROOT_MARKER)) as PhysicalRootStamp | null;
   const info = statSync(directory, { bigint: true });
   if (!value || value.version !== 1 || value.token !== reservation.token || value.brainId !== reservation.brainId || value.worktreeId !== reservation.worktreeId
-    || value.root !== reservation.root || value.device !== info.dev.toString() || value.inode !== info.ino.toString() || value.birth !== info.birthtimeNs.toString()) throw physicalRootError();
+    || value.root !== reservation.root || value.inode !== info.ino.toString() || value.birth !== info.birthtimeNs.toString()) throw physicalRootError();
+  // The OS device ID (POSIX st_dev) is not guaranteed stable across reboots on POSIX
+  // systems, notably macOS — see https://cmu-sei.github.io/secure-coding-standards/sei-cert-c-coding-standard/recommendations/input-output-fio/fio05-c/.
+  // Every other identity field above (token/brainId/worktreeId/root/inode/birthtime)
+  // already matched, so a device-only mismatch is most likely a benign reboot, not
+  // tampering — call that out distinctly rather than the generic message so an
+  // operator isn't left guessing. This does not weaken the check: it still throws,
+  // and only a verified writer transfer or source recovery may re-stamp. Require the
+  // stored value to actually look like a device id before trusting it as "only device
+  // drifted" — a missing/null/non-numeric field is a torn or tampered marker, not a
+  // benign drift, and must fall through to the generic message below.
+  if (value.device !== info.dev.toString()) {
+    if (typeof value.device === 'string' && /^\d+$/.test(value.device)) {
+      throw physicalRootError('The filesystem device identifier for this checkout changed while its inode and birth time still match — this can happen after a reboot on some platforms, where the OS device ID is not guaranteed stable over time. Use verified writer transfer or source recovery to re-stamp; do not remove ownership markers to claim this path.');
+    }
+    throw physicalRootError();
+  }
 }
 /** Explicit verified transfer may adopt a copied stamp of this same logical worktree. */
 export function adoptTransferredRootStamp(directory: string, reservation: PhysicalRootReservation): void {

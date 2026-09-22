@@ -8,8 +8,8 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { acquireWorktree, claimWorktree, getWorktreeBinding } from '../src/core/persistence/ownership.ts';
 import { localHostId } from '../src/core/persistence/identity.ts';
 import { assertPhysicalRoot, preparePhysicalRootReplacement, readPhysicalRootReservation, reservePhysicalRoot } from '../src/core/persistence/physical-root.ts';
-import { PHYSICAL_ROOT_MARKER, physicalRootReservationPath } from '../src/core/persistence/physical-root-record.ts';
-import { hasManagedRootMarker } from '../src/core/persistence/root-registry.ts';
+import { PHYSICAL_ROOT_MARKER, physicalRootError, physicalRootReservationPath } from '../src/core/persistence/physical-root-record.ts';
+import { canonicalFilesystemPath, hasManagedRootMarker } from '../src/core/persistence/root-registry.ts';
 import { tryAcquireNativeLock } from '../src/core/persistence/native-lock.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -123,6 +123,56 @@ test('verified staged replacement preserves reservation and validates both sides
     expect(readPhysicalRootReservation(f.root)?.token).toBe(before.token);
     expect(readPhysicalRootReservation(f.root)?.worktreeId).toBe(binding.worktree_id);
   } finally { await lock?.release(); }
+});
+
+test('a device-only mismatch (inode and birth still match) is classified distinctly from a real identity change', async () => {
+  const f = await fixture();
+  const binding = await withEnv({ GBRAIN_HOME: f.homes[0] }, () => claimWorktree(engine, f.sources[0], f.root, f.hosts[0]));
+  const markerPath = join(f.root, PHYSICAL_ROOT_MARKER);
+  const original = readFileSync(markerPath, 'utf8');
+  const identity = { hostId: f.hosts[0], worktreeId: binding.worktree_id, coordinationPath: binding.coordination_path! };
+  const genericMessage = physicalRootError().message;
+  // assertPhysicalRoot requires realpathSync(path) === path; canonicalize first
+  // (macOS tmpdir() returns a /var/folders path that is itself a symlink to
+  // /private/var/folders, same reason the existing staged-replacement test above
+  // canonicalizes via readPhysicalRootReservation before calling assertPhysicalRoot).
+  const canonicalRoot = canonicalFilesystemPath(f.root);
+
+  // Positive control: only `device` drifted (as macOS does across a reboot; st_dev is
+  // not guaranteed stable — see the comment on assertPhysicalRootStamp). inode and birth
+  // still match, so this should throw with the reboot-specific message, not the generic
+  // one, AND must leave the marker on disk untouched (assert never re-stamps — only an
+  // explicit verified transfer/adopt may).
+  const deviceDrifted = JSON.parse(original);
+  deviceDrifted.device = String(BigInt(deviceDrifted.device) + 1n);
+  const deviceDriftedJson = JSON.stringify(deviceDrifted);
+  writeFileSync(markerPath, deviceDriftedJson);
+  expect(() => assertPhysicalRoot(canonicalRoot, identity)).toThrow(/device identifier/);
+  expect(readFileSync(markerPath, 'utf8')).toBe(deviceDriftedJson);
+
+  // Negative control 1: an inode mismatch is a real identity change (e.g. a swapped
+  // directory), not a benign reboot artifact — it must keep failing closed with the
+  // exact generic message, not the device-specific one.
+  const inodeDrifted = JSON.parse(original);
+  inodeDrifted.inode = String(BigInt(inodeDrifted.inode) + 1n);
+  writeFileSync(markerPath, JSON.stringify(inodeDrifted));
+  let error: Error | undefined;
+  try { assertPhysicalRoot(canonicalRoot, identity); } catch (caught) { error = caught as Error; }
+  expect(error?.message).toBe(genericMessage);
+
+  // Negative control 2: a torn/tampered `device` field (missing) must NOT be trusted as
+  // "just a reboot" even though every other field still matches — a malformed field is
+  // not proof of a benign drift, so this keeps the generic message too.
+  const deviceMissing = JSON.parse(original);
+  delete deviceMissing.device;
+  writeFileSync(markerPath, JSON.stringify(deviceMissing));
+  error = undefined;
+  try { assertPhysicalRoot(canonicalRoot, identity); } catch (caught) { error = caught as Error; }
+  expect(error?.message).toBe(genericMessage);
+
+  // Restore the genuine stamp so this test doesn't poison the shared fixture directory.
+  writeFileSync(markerPath, original);
+  assertPhysicalRoot(canonicalRoot, identity);
 });
 
 test.skipIf(!process.env.DATABASE_URL)('two real PostgreSQL processes with distinct homes race one first claim', async () => {
