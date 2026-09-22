@@ -17,8 +17,8 @@ export const WRITER_HELP = `Usage:
   gbrain sources writer status [<source>] [--probe] [--json]
   gbrain sources writer claim <source> --path <directory> [administration options] [--dry-run] [--json]
   gbrain sources writer activate --confirm-quiesced [administration options] [--dry-run] [--json]
-  gbrain sources writer transfer prepare <source> [administration options] [--dry-run] [--json]
-  gbrain sources writer transfer accept <source> --path <worktree-root> --expected-epoch <n> --manifest <sha256> [administration options] [--dry-run] [--json]
+  gbrain sources writer transfer prepare <source> [--self-transfer] [administration options] [--dry-run] [--json]
+  gbrain sources writer transfer accept <source> --path <worktree-root> --expected-epoch <n> --manifest <sha256> [--self-transfer] [administration options] [--dry-run] [--json]
 
 Inspect status first. Routine diagnosis, doctor --fix, startup, and maintenance
 must not change ownership or activate managed persistence. Read the operator
@@ -32,7 +32,15 @@ an exact manifest; accept requires that epoch and matching bytes on the successo
 Before activation, upgrade and stop older writers on every host, claim every
 filesystem source, and inspect/release remaining legacy locks. --confirm-quiesced
 attests quiescence but does not grant administration intent. --dry-run never enables.
-No command takes over an owner based on a stale heartbeat.`;
+No command takes over an owner based on a stale heartbeat.
+
+--self-transfer recovers THIS host's own worktree when its physical-root stamp
+no longer matches (e.g. the OS device id drifted across a reboot, see #5301):
+prepare takes the coordination lock directly instead of re-verifying the
+now-possibly-broken stamp, and accept re-stamps in place ONLY when the target
+path resolves to the exact recorded canonical path for that source and the
+manifest still matches byte-for-byte — it can never move ownership to a
+different directory. Omit it for an ordinary transfer to a different host.`;
 
 export const LOCAL_WRITER_HELP = `Usage:
   gbrain auth local-writer list [--limit <1-1000>] [--before <uuid>] [--json]
@@ -69,7 +77,7 @@ export function parsePersistenceAdminArgs(group: Group, args: string[]): {
     const flag = equal < 0 ? token : token.slice(0, equal);
     if (seen.has(flag)) throw new OperationError('invalid_params', `Duplicate option ${flag}.`);
     seen.add(flag);
-    if (['--json', '--dry-run', '--replace', '--probe', '--confirm-quiesced'].includes(flag)) {
+    if (['--json', '--dry-run', '--replace', '--probe', '--confirm-quiesced', '--self-transfer'].includes(flag)) {
       if (equal >= 0) throw new OperationError('invalid_params', `${flag} does not accept a value.`);
       if (flag === '--json') json = true;
       else params[flag.slice(2).replaceAll('-', '_')] = true;

@@ -142,8 +142,9 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
       ...(params.dry_run ? { dry_run: true, action: operation } : {}) };
   }
   if (operation === 'writer_transfer_prepare') {
-    keys(params, ['source_id', 'dry_run', 'admin_intent', 'expected_state']);
+    keys(params, ['source_id', 'dry_run', 'admin_intent', 'expected_state', 'self_transfer']);
     const sourceId = source(params.source_id);
+    if (params.self_transfer !== undefined && typeof params.self_transfer !== 'boolean') throw invalid('self_transfer must be a boolean.');
     if (params.dry_run) {
       const binding = await getWorktreeBinding(engine, sourceId, existingLocalHostId());
       if (!binding || binding.owner_host_id !== existingLocalHostId() || !binding.local_path) throw new OperationError('permission_denied', 'Only the current owner can prepare a transfer.');
@@ -151,20 +152,21 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
       return { dry_run: true, action: operation, binding, manifest: { digest: manifest.digest, file_count: Object.keys(manifest.files).length } };
     }
     const expectedState = await requireWriterAdminIntent(engine, operation, params);
-    const prepared = await prepareWriterTransfer(engine, sourceId, undefined, expectedState);
+    const prepared = await prepareWriterTransfer(engine, sourceId, undefined, expectedState, { selfTransfer: params.self_transfer === true });
     return { prepared: true, source_id: sourceId, worktree_id: prepared.worktree_id, owner_epoch: prepared.owner_epoch,
       manifest: { digest: prepared.manifest.digest, file_count: Object.keys(prepared.manifest.files).length } };
   }
   if (operation === 'writer_transfer_accept') {
-    keys(params, ['source_id', 'path', 'expected_epoch', 'manifest', 'dry_run', 'admin_intent', 'expected_state']);
+    keys(params, ['source_id', 'path', 'expected_epoch', 'manifest', 'dry_run', 'admin_intent', 'expected_state', 'self_transfer']);
     const sourceId = source(params.source_id), root = path(params.path);
     if (typeof params.expected_epoch !== 'string' || !/^[1-9]\d{0,18}$/.test(params.expected_epoch)
       || BigInt(params.expected_epoch) > 9_223_372_036_854_775_807n) throw invalid('expected_epoch must be the prepared positive owner epoch.');
     if (typeof params.manifest !== 'string' || !/^[a-f0-9]{64}$/.test(params.manifest)) throw invalid('manifest must be the prepared SHA-256 manifest digest.');
+    if (params.self_transfer !== undefined && typeof params.self_transfer !== 'boolean') throw invalid('self_transfer must be a boolean.');
     if (params.dry_run) return { dry_run: true, action: operation, source_id: sourceId, current: await getWorktreeBinding(engine, sourceId, existingLocalHostId()),
       manifest_matches: worktreeManifest(root).digest === params.manifest, expected_epoch: params.expected_epoch };
     const expectedState = await requireWriterAdminIntent(engine, operation, params);
-    await acceptWriterTransfer(engine, sourceId, root, params.expected_epoch, params.manifest, undefined, expectedState);
+    await acceptWriterTransfer(engine, sourceId, root, params.expected_epoch, params.manifest, undefined, expectedState, { selfTransfer: params.self_transfer === true });
     return { transferred: true, binding: await getWorktreeBinding(engine, sourceId) };
   }
   if (operation === 'local_writer_list') {

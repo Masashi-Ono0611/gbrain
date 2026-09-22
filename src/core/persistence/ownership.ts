@@ -142,10 +142,24 @@ export function worktreeManifest(root: string): { digest: string; files: Record<
   visit(canonical);
   return { digest: digest(files), files };
 }
-export async function prepareWriterTransfer(engine: BrainEngine, sourceId: string, hostId = localHostId(), expectedAdminState?: string): Promise<{ worktree_id: string; owner_epoch: string; manifest: ReturnType<typeof worktreeManifest> }> {
+export async function prepareWriterTransfer(engine: BrainEngine, sourceId: string, hostId = localHostId(), expectedAdminState?: string,
+  opts: { selfTransfer?: boolean } = {}): Promise<{ worktree_id: string; owner_epoch: string; manifest: ReturnType<typeof worktreeManifest> }> {
   const binding = await getWorktreeBinding(engine, sourceId, hostId);
   if (!binding || binding.owner_host_id !== hostId || !binding.local_path) throw new OperationError('permission_denied', 'Only the current owner can prepare this transfer.');
-  const lock = await acquireWorktree(binding, 5000);
+  // Self-transfer (recovering this same host's own broken physical-root stamp, e.g.
+  // after a macOS reboot changes st_dev — see #5301/#5269): acquireWorktree calls
+  // assertPhysicalRoot, which is exactly what may be broken. Take the coordination
+  // lock directly instead. This does not weaken the transfer's safety — the
+  // canonical-path pin and manifest re-verification in acceptWriterTransfer's
+  // selfTransfer branch are the real guarantee, physical-root identity is a
+  // heuristic layered on top of the native lock, not the sole safety property.
+  let lock: NativeLockHandle | null;
+  if (opts.selfTransfer) {
+    if (!binding.coordination_path) throw new OperationError('storage_error', 'No coordination lock path recorded for this worktree.');
+    lock = await acquireNativeLock(binding.coordination_path, { timeoutMs: 5000 });
+  } else {
+    lock = await acquireWorktree(binding, 5000);
+  }
   if (!lock) throw new OperationError('write_pending', 'The worktree is busy; retry transfer preparation.');
   try {
     return await engine.transaction(async tx => {
@@ -163,13 +177,30 @@ export async function prepareWriterTransfer(engine: BrainEngine, sourceId: strin
     });
   } finally { await lock.release(); }
 }
-export async function acceptWriterTransfer(engine: BrainEngine, sourceId: string, path: string, expectedEpoch: string, expectedManifest: string, hostId = localHostId(), expectedAdminState?: string): Promise<void> {
+export async function acceptWriterTransfer(engine: BrainEngine, sourceId: string, path: string, expectedEpoch: string, expectedManifest: string, hostId = localHostId(), expectedAdminState?: string,
+  opts: { selfTransfer?: boolean } = {}): Promise<void> {
   const root = realpathSync(resolve(path));
   const manifest = worktreeManifest(root);
   if (manifest.digest !== expectedManifest) throw new OperationError('writer_manifest_mismatch', 'Successor checkout differs from the recorded canonical manifest.');
   const binding = await getWorktreeBinding(engine, sourceId, hostId);
   if (!binding) throw new OperationError('not_found', 'Source has no worktree owner.');
-  const coordination = readPhysicalRootReservation(root)?.coordinationPath ?? join(persistenceHome(), 'locks', `${binding.worktree_id}.lock`);
+  if (opts.selfTransfer) {
+    // owner_host_id check first: local_path/coordination_path come from a LEFT JOIN
+    // keyed on hostId (getWorktreeBinding), so a wrong-host caller sees them as null
+    // and would otherwise hit the path-pin check below with a misleading reason.
+    if (binding.owner_host_id !== hostId) throw new OperationError('permission_denied', 'Self-transfer requires the current owner host.');
+    // Manifest content-equality alone would accept a same-content clone planted
+    // somewhere else as if it were the real worktree. Pin the accepted path to the
+    // DB-recorded canonical location so a self-transfer can only re-stamp the SAME
+    // directory, never relocate ownership to a different one.
+    if (!binding.local_path || root !== realpathSync(resolve(binding.local_path))) throw new OperationError('source_changed', 'Self-transfer must target the recorded canonical path.');
+  }
+  // Self-transfer trusts the DB-recorded coordination_path, never the reservation
+  // file's own copy or a freshly-synthesized fallback path — the whole point is to
+  // recover from a broken physical-root marker, so nothing derived from the broken
+  // marker's directory should be treated as the source of truth here.
+  const coordination = opts.selfTransfer ? binding.coordination_path : readPhysicalRootReservation(root)?.coordinationPath ?? join(persistenceHome(), 'locks', `${binding.worktree_id}.lock`);
+  if (!coordination) throw new OperationError('storage_error', 'No coordination lock path recorded for this worktree.');
   const lock = await acquireNativeLock(coordination, { timeoutMs: 5000 });
   if (!lock) throw new OperationError('write_pending', 'Successor worktree is busy.');
   try {
