@@ -86,11 +86,20 @@ async function seedAtom(
 }
 
 async function seedSourcePage(slug = PAGE_SLUG): Promise<void> {
+  // #5361 (extract_atoms_page_state / identity pinning): the phase resolves
+  // item.identity via readAtomPageIdentity, which matches on the page's REAL
+  // stored content_hash + compiled_truth. Pin content_hash to CURRENT_HASH
+  // (the hash runPage's _pages fixture declares) so identity resolves the
+  // same way production discovery's real content_hash does, with the seed
+  // itself as the only mutation (unlike the shared runPhaseWithStoredPageFixtures
+  // helper, which would re-mutate the row on every runPage() call and break
+  // the dry-run zero-write assertion below).
   await engine.putPage(slug, {
     type: 'note',
     title: 'Drift Essay',
     compiled_truth: 'A long essay with extractable claims.',
     timeline: '',
+    content_hash: CURRENT_HASH,
   });
 }
 
@@ -115,6 +124,9 @@ async function snapshotPage(slug: string, sourceId = 'default'): Promise<string>
   return rows[0]?.dump ?? '';
 }
 
+// seedSourcePage() pins the stored row's content_hash to CURRENT_HASH, so
+// identity resolves via readAtomPageIdentity (#5361) without any further
+// mutation here — required for the dry-run zero-write assertion below.
 function runPage(chatTitle: string | null, opts: { dryRun?: boolean } = {}) {
   return runPhaseExtractAtoms(engine, {
     _transcripts: [],
@@ -218,20 +230,30 @@ describe('extract_atoms per-page atoms_source_changed', () => {
   test('the drift query IS issued for a page item (positive control for the next case)', async () => {
     await seedSourcePage();
     const seen: string[] = [];
-    // Preserve the receiver: transaction engines inherit this wrapper, and
-    // binding to the outer engine would query outside their held transaction.
+    // Unbound + `.call(this, …)`, NOT `.bind(engine)` — as in
+    // test/import-default-write-guard-once.test.ts. importFromContent writes
+    // the atom through engine.transaction(), whose callback runs on a
+    // `Object.create(engine)` clone (pglite-engine.ts's `transaction()`) so
+    // its own `executeRaw` calls route to the transaction's connection
+    // instead of the base engine's. `.bind(engine)` freezes `this` to the
+    // base engine, so a transaction-clone call (e.g. the chunker_version
+    // stamp in import-file.ts) would silently escape the transaction and
+    // re-enter PGLite's single connection while it is still inside that
+    // same transaction — a hang, not a wrong count. Forwarding via `.call`
+    // preserves whichever receiver (base engine or clone) invoked it.
     const realExecuteRaw = engine.executeRaw;
-    (engine as unknown as { executeRaw: typeof realExecuteRaw }).executeRaw = (function (this: PGLiteEngine,
+    (engine as unknown as { executeRaw: typeof realExecuteRaw }).executeRaw = (async function (
+      this: PGLiteEngine,
       sql: string,
-      ...rest: unknown[]
+      params?: unknown[],
     ) {
       seen.push(sql);
-      return (realExecuteRaw as (...a: unknown[]) => unknown).call(this, sql, ...rest);
+      return realExecuteRaw.call(this, sql, params);
     }) as typeof realExecuteRaw;
     try {
       await runPage('Prototypes beat renders');
     } finally {
-      (engine as unknown as { executeRaw: typeof realExecuteRaw }).executeRaw = realExecuteRaw;
+      delete (engine as unknown as { executeRaw?: typeof realExecuteRaw }).executeRaw;
     }
     expect(seen.some((sql) => sql.includes("NOT LIKE 'pending:%'"))).toBe(true);
   });
@@ -241,16 +263,18 @@ describe('extract_atoms per-page atoms_source_changed', () => {
 
     // 0 alone would also pass if the query ran and returned 0, or threw into
     // the fail-soft catch — so record the SQL and assert it was never issued.
+    // Same unbound + `.call(this, …)` wrapper as the previous test — the
+    // stubbed chat still yields an atom here, so this run also writes
+    // through importFromContent's engine.transaction() clone.
     const seen: string[] = [];
-    // Preserve the receiver: transaction engines inherit this wrapper, and
-    // binding to the outer engine would query outside their held transaction.
     const realExecuteRaw = engine.executeRaw;
-    (engine as unknown as { executeRaw: typeof realExecuteRaw }).executeRaw = (function (this: PGLiteEngine,
+    (engine as unknown as { executeRaw: typeof realExecuteRaw }).executeRaw = (async function (
+      this: PGLiteEngine,
       sql: string,
-      ...rest: unknown[]
+      params?: unknown[],
     ) {
       seen.push(sql);
-      return (realExecuteRaw as (...a: unknown[]) => unknown).call(this, sql, ...rest);
+      return realExecuteRaw.call(this, sql, params);
     }) as typeof realExecuteRaw;
 
     let result;
@@ -263,7 +287,7 @@ describe('extract_atoms per-page atoms_source_changed', () => {
         _chat: stubChat('Transcript atom'),
       });
     } finally {
-      (engine as unknown as { executeRaw: typeof realExecuteRaw }).executeRaw = realExecuteRaw;
+      delete (engine as unknown as { executeRaw?: typeof realExecuteRaw }).executeRaw;
     }
     expect(result.details?.atoms_source_changed).toBe(0);
     expect(seen.some((sql) => sql.includes("NOT LIKE 'pending:%'"))).toBe(false);
