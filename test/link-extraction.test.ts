@@ -17,6 +17,7 @@ import {
   type SlugResolver,
 } from '../src/core/link-extraction.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
+import { stripCodeBlocks } from '../src/core/markdown-code.ts';
 
 // v0.27.1 cherry-3: image-to-page path-proximity heuristic.
 describe('imageOfCandidates', () => {
@@ -919,6 +920,14 @@ describe('inferLinkType', () => {
 // ─── parseTimelineEntries ──────────────────────────────────────
 
 describe('parseTimelineEntries', () => {
+  test('timeline line checks finish quickly on a long whitespace-only line', () => {
+    parseTimelineEntries(' ');
+    const input = ' '.repeat(100_000);
+    const started = performance.now();
+    expect(parseTimelineEntries(input)).toEqual([]);
+    expect(performance.now() - started).toBeLessThan(50);
+  });
+
   test('parses standard format: - **YYYY-MM-DD** | summary', () => {
     const entries = parseTimelineEntries('- **2026-01-15** | Met with Alice');
     expect(entries.length).toBe(1);
@@ -1002,6 +1011,15 @@ More prose here.
 - **2026-02-20** | Another event`;
     const entries = parseTimelineEntries(content);
     expect(entries.length).toBe(2);
+  });
+});
+
+describe('stripCodeBlocks', () => {
+  test('preserves all line breaks after an unclosed fence', () => {
+    const input = 'before\r\n```js\r\nconst example = true;\nmore example';
+    const stripped = stripCodeBlocks(input);
+    expect(stripped.split('\n')).toHaveLength(input.split('\n').length);
+    expect(stripped.match(/\r\n|\n/g)).toEqual(input.match(/\r\n|\n/g));
   });
 });
 

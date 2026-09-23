@@ -6,11 +6,12 @@
 export function stripCodeBlocks(content: string): string {
   let out = '';
   let i = 0;
+  const maskFence = (fence: string) => fence.replace(/[^\r\n]/g, ' ');
   while (i < content.length) {
     if (content.startsWith('```', i)) {
       const end = content.indexOf('```', i + 3);
-      if (end === -1) { out += ' '.repeat(content.length - i); break; }
-      out += ' '.repeat(end + 3 - i);
+      if (end === -1) { out += maskFence(content.slice(i)); break; }
+      out += maskFence(content.slice(i, end + 3));
       i = end + 3;
       continue;
     }
