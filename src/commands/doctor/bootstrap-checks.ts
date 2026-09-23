@@ -14,6 +14,7 @@ import { probeLivePgliteHolder, resolveBrainDataDir } from '../../core/bootstrap
 import { readRunbookStamp, hooksInstalled, listVerifyRuns } from '../../core/bootstrap/status.ts';
 import { resolveGbrainHome } from '../../core/gbrain-home.ts';
 import { isManagedFilesystemPath } from '../../core/persistence/filesystem-guard.ts';
+import { withoutPhysicalRootMetadata } from '../../core/persistence/root-metadata.ts';
 import { VERSION as GBRAIN_BINARY_VERSION } from '../../version.ts';
 import type { Check } from '../doctor.ts';
 
@@ -269,9 +270,9 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
         let known = false;
         if (ws) {
           try {
-            const statusOut = execFileSync('git', ['-C', ws, 'status', '--porcelain'], {
+            const statusOut = withoutPhysicalRootMetadata(execFileSync('git', ['-C', ws, 'status', '--porcelain'], {
               stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
-            }).toString();
+            }).toString());
             if (statusOut.trim() !== '') {
               dirty = true;
               known = true;
