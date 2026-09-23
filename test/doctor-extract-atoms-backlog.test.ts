@@ -102,12 +102,38 @@ describe('computeExtractAtomsBacklogCheck (issue #1678)', () => {
 
   it('WARNs with a --drain hint when the pack does not run the phase and backlog > 10', async () => {
     for (let i = 0; i < 11; i++) await seedArticle(`article-${i}`);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
     const check = await withEnv({ GBRAIN_HOME: EMPTY_HOME }, () =>
       computeExtractAtomsBacklogCheck(engine));
     expect(check.status).toBe('warn');
-    expect(check.message).toContain('--drain');
+    expect(check.message).toBe(
+      '11 pages eligible for atom extraction but the active pack does not run extract_atoms — backlog growing. Fix: ' +
+      'gbrain dream --phase extract_atoms --drain --source default --window 120 (or declare extract_atoms in your active schema pack)',
+    );
     expect((check.details as { pack_declares_phase: boolean }).pack_declares_phase).toBe(false);
+    expect((check.details as { fix_hint: string }).fix_hint).toContain('--drain');
     expect((check.details as { known_approximation: string }).known_approximation).toContain('page backlog only');
+  });
+
+  it('managed brain with backlog is not applicable and emits no legacy drain hint', async () => {
+    for (let i = 0; i < 11; i++) await seedArticle(`managed-article-${i}`);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    try {
+      const check = await withEnv({ GBRAIN_HOME: EMPTY_HOME }, () =>
+        computeExtractAtomsBacklogCheck(engine));
+      expect(check.status).toBe('ok');
+      expect(check.message).toContain('not available on managed brains yet');
+      expect(check.message).toContain('11');
+      expect(check.message).not.toContain('gbrain dream --phase extract_atoms');
+      expect(check.details).toEqual({
+        backlog: 11,
+        managed: true,
+        known_approximation: 'page backlog only; transcript corpus not counted',
+      });
+      expect(JSON.stringify(check)).not.toContain('fix_hint');
+    } finally {
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    }
   });
 
   it('includes the source in the drain hint when backlog lives outside default', async () => {

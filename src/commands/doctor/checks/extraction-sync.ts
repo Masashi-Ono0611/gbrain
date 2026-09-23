@@ -7,6 +7,8 @@
 import { join } from 'path';
 import { existsSync, readdirSync } from 'fs';
 import type { BrainEngine } from '../../../core/engine.ts';
+import { assertUnmanagedCanonicalWriter } from '../../../core/persistence/maintenance.ts';
+import { OperationError } from '../../../core/ops/contract.ts';
 import { probeSourceGitState } from '../../../core/git-head.ts';
 // v0.41.32.0: remote staleness reads the stored newest_content_at column via
 // this pure comparator (no git subprocess on the HTTP MCP doctor path).
@@ -668,6 +670,22 @@ export async function computeExtractAtomsBacklogCheck(
     const backlog = await countExtractAtomsBacklogScoped(engine, countExtractAtomsBacklog, opts.sourceIds);
     if (backlog === null) {
       return { name, status: 'warn', message: 'backlog query failed (could not count eligible pages)' };
+    }
+
+    // Atom extraction still uses the legacy writer and is unavailable on
+    // managed brains. Use the phase's own guard as the managed-state
+    // predicate; unrelated probe errors retain the check's existing behavior.
+    try {
+      await assertUnmanagedCanonicalWriter(engine, 'Atom extraction');
+    } catch (err) {
+      if (err instanceof OperationError && err.code === 'writer_coordinator_required') {
+        return {
+          name,
+          status: 'ok',
+          message: `Atom extraction is not available on managed brains yet (${backlog} page(s) eligible; ${approx})`,
+          details: { backlog, managed: true, known_approximation: approx },
+        };
+      }
     }
 
     const { packDeclaresPhase } = await import('../../../core/cycle.ts');
