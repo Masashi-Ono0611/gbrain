@@ -78,7 +78,7 @@ const RELATIONAL_META = {
 describe('query op — relational meta wiring (#3995, local-only)', () => {
   test('relational arm fired → _meta.retrieval.relational carries the arm meta verbatim', async () => {
     simulateCacheHit = false;
-    nextResults = [{ page_id: 1, slug: 'companies/acme-example', chunk_text: 'x' }];
+    nextResults = [{ page_id: 1, source_id: 'default', slug: 'companies/acme-example', chunk_text: 'x' }];
     nextRelationalMeta = RELATIONAL_META;
     const out = await callQuery({});
     expect(out.isError ?? false).toBe(false);
@@ -88,7 +88,7 @@ describe('query op — relational meta wiring (#3995, local-only)', () => {
 
   test('relational arm never reports in → _meta.retrieval.relational absent', async () => {
     simulateCacheHit = false;
-    nextResults = [{ page_id: 1, slug: 'companies/acme-example', chunk_text: 'x' }];
+    nextResults = [{ page_id: 1, source_id: 'default', slug: 'companies/acme-example', chunk_text: 'x' }];
     nextRelationalMeta = null;
     const out = await callQuery({});
     const retrieval = (out._meta as Record<string, any>).retrieval;
@@ -106,7 +106,7 @@ describe('query op — relational meta wiring (#3995, local-only)', () => {
 
   test('semantic-cache hit → _meta.retrieval.relational absent even if the cached set had relational recall', async () => {
     simulateCacheHit = true;
-    nextResults = [{ page_id: 1, slug: 'companies/acme-example', chunk_text: 'x' }];
+    nextResults = [{ page_id: 1, source_id: 'default', slug: 'companies/acme-example', chunk_text: 'x' }];
     nextRelationalMeta = RELATIONAL_META; // ignored by the mock while simulateCacheHit is true
     const out = await callQuery({});
     const retrieval = (out._meta as Record<string, any>).retrieval;
