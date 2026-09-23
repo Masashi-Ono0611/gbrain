@@ -27,6 +27,7 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { installFixtureChunks } from '../helpers/page-projection.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { hybridSearch } from '../../src/core/search/hybrid.ts';
 import { configureGateway } from '../../src/core/ai/gateway.ts';
@@ -56,7 +57,7 @@ beforeEach(async () => {
     title: 'Widget gbrain4091test Notes',
     compiled_truth: 'A page about widgets for the gbrain4091test keyword arm fail-open test.',
   });
-  await engine.upsertChunks('notes/widget', [
+  await installFixtureChunks(engine, 'notes/widget', [
     { chunk_index: 0, chunk_text: 'A page about widgets for the gbrain4091test keyword arm fail-open test.', chunk_source: 'compiled_truth' },
   ]);
 });
