@@ -86,11 +86,20 @@ async function seedAtom(
 }
 
 async function seedSourcePage(slug = PAGE_SLUG): Promise<void> {
+  // #5361 (extract_atoms_page_state / identity pinning): the phase resolves
+  // item.identity via readAtomPageIdentity, which matches on the page's REAL
+  // stored content_hash + compiled_truth. Pin content_hash to CURRENT_HASH
+  // (the hash runPage's _pages fixture declares) so identity resolves the
+  // same way production discovery's real content_hash does, with the seed
+  // itself as the only mutation (unlike the shared runPhaseWithStoredPageFixtures
+  // helper, which would re-mutate the row on every runPage() call and break
+  // the dry-run zero-write assertion below).
   await engine.putPage(slug, {
     type: 'note',
     title: 'Drift Essay',
     compiled_truth: 'A long essay with extractable claims.',
     timeline: '',
+    content_hash: CURRENT_HASH,
   });
 }
 
@@ -115,6 +124,9 @@ async function snapshotPage(slug: string, sourceId = 'default'): Promise<string>
   return rows[0]?.dump ?? '';
 }
 
+// seedSourcePage() pins the stored row's content_hash to CURRENT_HASH, so
+// identity resolves via readAtomPageIdentity (#5361) without any further
+// mutation here — required for the dry-run zero-write assertion below.
 function runPage(chatTitle: string | null, opts: { dryRun?: boolean } = {}) {
   return runPhaseExtractAtoms(engine, {
     _transcripts: [],
