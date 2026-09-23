@@ -400,6 +400,17 @@ describe('bootstrap_push_health', () => {
     expect(c?.message).toContain('confirmed clean');
   }, T);
 
+  test('>48h stale + tree whose only change is the managed ownership stamp → ok (stamp is not unpushed work)', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace({ clean: true });
+    writeFileSync(join(ws, '.gbrain-owner.json'), '{}');
+    writeReceipt(home, ws);
+    writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('ok');
+    expect(c?.message).toContain('confirmed clean');
+  }, T);
+
   test('>48h stale + clean working tree but AHEAD of origin (committed, unpushed) → fail [B4]', async () => {
     const { parent, home } = makeHome();
     const ws = makeWorkspace({ ahead: true });
