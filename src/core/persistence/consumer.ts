@@ -16,6 +16,8 @@ export class PersistenceConsumer {
   private tickPromise: Promise<void> | undefined;
   private wakeRequested = false;
   private active = new Set<Promise<void>>();
+  /** Work abandoned after a lost claim; stop() still drains it before engine.close. */
+  private detached = new Set<Promise<unknown>>();
   private activeRoots = new Set<string>();
   private foregroundCounts = new Map<string, number>();
   private rootRetryAfter = new Map<string, number>();
@@ -28,7 +30,8 @@ export class PersistenceConsumer {
   private abort = new AbortController();
   readonly hostId: string;
   constructor(readonly engine: BrainEngine, readonly config: GBrainConfig, readonly prepare: PrepareMutation,
-    private opts: { hostId?: string; concurrency?: number; pollMs?: number; onError?: (error: unknown) => void } = {}) {
+    private opts: { hostId?: string; concurrency?: number; pollMs?: number; claimRenewIntervalMs?: number;
+      claimRenewTimeoutMs?: number; onError?: (error: unknown) => void } = {}) {
     this.hostId = opts.hostId ?? localHostId();
   }
   start(): void { this.stopping = false; this.abort = new AbortController(); this.schedule(0); }
@@ -127,18 +130,47 @@ export class PersistenceConsumer {
     else process.stderr.write('[persistence] Consumer paused after a storage error; inspect writer status.\n');
   }
   private async execute(row: WriteRequest): Promise<boolean> {
-    let renewing: Promise<unknown> | undefined;
     let claimLive = true;
     let closed = false;
+    let renewing: Promise<void> | undefined;
+    let signalClaimLost!: () => void;
+    const claimLost = new Promise<void>(resolve => { signalClaimLost = resolve; });
     const interval = setInterval(() => {
-      if (closed || renewing) return;
-      renewing = renewWriteClaim({ executeRaw: this.engine.executeRawDirect.bind(this.engine) }, row.id, row.execution_token!).then(live => { claimLive &&= live; })
-        .catch(() => { claimLive = false; }).finally(() => { renewing = undefined; });
-    }, 10_000);
+      if (closed || renewing || !claimLive) return;
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = new Promise<false>(resolve => {
+        deadline = setTimeout(() => resolve(false), this.opts.claimRenewTimeoutMs ?? 5_000);
+        deadline.unref?.();
+      });
+      const attempt = this.detach(renewWriteClaim({ executeRaw: this.engine.executeRawDirect.bind(this.engine) }, row.id, row.execution_token!)
+        .catch(() => false));
+      renewing = Promise.race([attempt, timedOut]).then(live => {
+        claimLive &&= live;
+        if (!claimLive) signalClaimLost();
+      }).finally(() => {
+        if (deadline) clearTimeout(deadline);
+        renewing = undefined;
+      });
+    }, this.opts.claimRenewIntervalMs ?? 10_000);
     interval.unref?.();
     try {
-      const prepared = await this.prepare(this.engine, row, this.config);
-      if (!claimLive || this.stopping) { await releaseUnpublishedClaim(this.engine, row, 'consumer_stopping'); return false; }
+      // Capture both outcomes immediately: if claim loss wins, the abandoned
+      // preparation can still settle later without becoming unhandled.
+      const preparation = Promise.resolve().then(() => this.prepare(this.engine, row, this.config))
+        .then(prepared => ({ kind: 'prepared' as const, prepared }), error => ({ kind: 'error' as const, error }));
+      const result = await Promise.race([preparation, claimLost.then(() => ({ kind: 'claim_lost' as const }))]);
+      if (result.kind === 'claim_lost') {
+        this.detach(preparation);
+        try { await releaseUnpublishedClaim(this.engine, row, 'claim_renewal_lost'); }
+        catch (error) { this.report(error); }
+        return false;
+      }
+      if (result.kind === 'error') throw result.error;
+      if (!claimLive || this.stopping) {
+        await releaseUnpublishedClaim(this.engine, row, claimLive ? 'consumer_stopping' : 'claim_renewal_lost');
+        return false;
+      }
+      const prepared = result.prepared;
       const done = await publishMutation(this.engine, row, prepared, this.hostId);
       if (done.state === 'committed' && row.worktree_id && !String(row.intent?.kind).startsWith('managed_sync_')) {
         this.foregroundCounts.set(row.worktree_id, this.foregroundCompletions(row.worktree_id) + 1);
@@ -152,6 +184,11 @@ export class PersistenceConsumer {
       throw error;
     } finally { closed = true; clearInterval(interval); await renewing; }
   }
+  private detach<T>(work: Promise<T>): Promise<T> {
+    this.detached.add(work);
+    void work.finally(() => this.detached.delete(work)).catch(() => {});
+    return work;
+  }
   /** Mandatory barrier: engine.close must be sequenced AFTER this promise. */
   async stop(): Promise<void> {
     this.stopping = true;
@@ -159,6 +196,7 @@ export class PersistenceConsumer {
     if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
     await this.tickPromise;
     await Promise.allSettled([...this.active]);
+    await Promise.allSettled([...this.detached]);
     await this.projectionWorker;
     await this.effectsWorker;
     await this.topologyWorker;
