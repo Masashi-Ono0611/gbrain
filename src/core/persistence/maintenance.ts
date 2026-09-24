@@ -7,6 +7,7 @@ import { opError } from '../ops/contract.ts';
 import type { Action } from '../agent-output.ts';
 import type { SqlEngine } from './model.ts';
 import { DEFAULT_TARGET_URL_ENV, planArgv } from './graduation-errors.ts';
+import { managedPersistenceEnabled } from './ownership.ts';
 
 // Every facts-family bulk writer now publishes through the coordinator on a
 // managed brain (#5280); status and activation keep reporting the (empty) list.
@@ -49,6 +50,16 @@ function engineMigrationFix(m: EngineMigrationSide, why: string): Action {
     then: { argv: planArgv(), consent: [], actor: 'agent', requires_exclusive: false, docs: GRADUATION_DOCS,
       inputs: [{ name: DEFAULT_TARGET_URL_ENV, how: `Ask the user for the target Postgres connection string and export it as ${DEFAULT_TARGET_URL_ENV} in this shell; it never goes on the command line.` }],
       why: 'The read-only graduation plan: what moves, the blockers and the plan_hash the move is approved with. Nothing changes.' } };
+}
+
+/**
+ * #5180 #5203: a legacy maintenance writer on a managed brain reports the phase
+ * as `skipped` (reason `writer_coordinator_required`) instead of failing the
+ * lane. Returns null when the phase may run; callers pass their own summary.
+ */
+export async function managedBrainPhaseSkip<P extends string>(engine: SqlEngine, phase: P, summary: string) {
+  if (!(await managedPersistenceEnabled(engine))) return null;
+  return { phase, status: 'skipped' as const, duration_ms: 0, summary, details: { reason: 'writer_coordinator_required' } };
 }
 
 /** Refuse unsupported multi-stage writers before providers, files or git change. */
