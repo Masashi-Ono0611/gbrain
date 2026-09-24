@@ -4,10 +4,21 @@ import { acquireLock, releaseLock } from '../pglite-lock.ts';
 import { assertManagedFilesystemWrite } from './filesystem-guard.ts';
 import { OperationError } from '../ops/contract.ts';
 import type { SqlEngine } from './model.ts';
+import { managedPersistenceEnabled } from './ownership.ts';
 
 // Every facts-family bulk writer now publishes through the coordinator on a
 // managed brain (#5280); status and activation keep reporting the (empty) list.
 export const UNSUPPORTED_MANAGED_BULK_WRITERS: readonly string[] = [];
+
+/**
+ * #5180 #5203: a legacy maintenance writer on a managed brain reports the phase
+ * as `skipped` (reason `writer_coordinator_required`) instead of failing the
+ * lane. Returns null when the phase may run; callers pass their own summary.
+ */
+export async function managedBrainPhaseSkip<P extends string>(engine: SqlEngine, phase: P, summary: string) {
+  if (!(await managedPersistenceEnabled(engine))) return null;
+  return { phase, status: 'skipped' as const, duration_ms: 0, summary, details: { reason: 'writer_coordinator_required' } };
+}
 
 /** Refuse unsupported multi-stage writers before providers, files or git change. */
 export async function assertUnmanagedCanonicalWriter(engine: SqlEngine, operation: string): Promise<void> {
