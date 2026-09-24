@@ -274,8 +274,10 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
       if (opts.dryRun) return result(fresh, 'dry_run');
       if (!fresh.entries.length && fresh.from === fresh.target) {
         // Bump last_sync_at as a heartbeat; it is a monitoring signal.
-        await engine.transaction(tx => withCoordinatedWrite(tx, [context.sourceId], () =>
-          tx.executeRaw('UPDATE sources SET last_sync_at=now() WHERE id=$1 AND incarnation=$2::uuid', [context.sourceId, context.incarnation])));
+        await engine.transaction(tx => withCoordinatedWrite(tx, [context.sourceId], () => {
+          assertActive();
+          return tx.executeRaw('UPDATE sources SET last_sync_at=now() WHERE id=$1 AND incarnation=$2::uuid', [context.sourceId, context.incarnation]);
+        }));
         await clearManagedSyncFailureAfterSuccess(engine, key);
         assertActive();
         return result(fresh, 'up_to_date');
