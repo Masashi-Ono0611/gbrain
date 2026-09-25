@@ -189,6 +189,23 @@ test('full sync cannot hide an older failed incremental cursor or repeat its com
   }
 }), 120_000);
 
+test('managed failure hints preserve retry options locally and redact paths remotely', async () => withEnv(env, async () => {
+  for (const engine of engines) {
+    const secretExclude = 'private-customer-data/**';
+    const f = await fixture(engine, { 'bad.md': '---\ntitle: [broken\n---\nBroken content.\n' });
+    const options = { sourceId: f.id, noPull: true, full: true, exclude: [secretExclude] };
+    const blocked = await performManagedSync(engine, options);
+    expect(blocked.status).toBe('blocked_by_failures');
+    expect(blocked.failures).toEqual([expect.objectContaining({ keyOptions: { full: true, workingTree: false,
+      srcSubpath: null, exclude: [secretExclude], includeHidden: [], strategy: null } })]);
+    const local = await checkSyncFailures(engine, { sourceIds: [f.id], remote: false });
+    expect(local?.message).toContain(`retry=gbrain sync --source ${f.id} --full --exclude 'private-customer-data/**' --retry-failed --no-pull`);
+    const remote = await checkSyncFailures(engine, { sourceIds: [f.id], remote: true });
+    expect(remote?.message).toContain('rerun with the original sync options');
+    expect(remote?.message).not.toContain(secretExclude);
+  }
+}), 120_000);
+
 test('checkpoint, discovery, and freeze failures remain diagnosable without a file receipt', async () => withEnv(env, async () => {
   for (const engine of engines) {
     const f = await fixture(engine, { 'note.md': 'A stable observation before checkpoint.\n' });
