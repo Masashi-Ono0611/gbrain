@@ -149,9 +149,9 @@ if (mode === 'initialize') {
   const principal = Number(argument); const ownerUrl = extra;
   const engine = config.kind === 'postgres' ? await openEngine(config) : undefined;
   const sources = engine ? await fixtures(engine, config) : undefined;
-  const admissionMs: number[] = []; const completionMs: number[] = []; let replays = 0;
+  const admissionMs: number[] = []; const completionMs: number[] = []; let replays = 0; let contentionRetries = 0;
   async function submit(index: number, requestId: string): Promise<WriteRequest> {
-    if (engine) return submitWithAdmissionRetry(() => admitWrite(engine!, admission(config, sources![principal % sources!.length], `soak-${index}`, `body-${index}`, principal, { requestId })));
+    if (engine) return submitWithAdmissionRetry(() => admitWrite(engine!, admission(config, sources![principal % sources!.length], `soak-${index}`, `body-${index}`, principal, { requestId })), () => { contentionRetries++; });
     const response = await fetch(new URL('submit', ownerUrl), { method: 'POST', body: JSON.stringify({ index, principal, requestId }) });
     assert(response.ok, `resident fixture admission failed: ${response.status}`); return response.json() as Promise<WriteRequest>;
   }
@@ -186,7 +186,7 @@ if (mode === 'initialize') {
         if (completed % 250 === 0) process.stderr.write(`[persistence] ${config.kind}: producer ${principal} verified ${completed} committed writes\n`);
       }
     }));
-    emit({ event: 'done', result: { principal, completed, replays, admission_ms: admissionMs, completion_ms: completionMs } });
+    emit({ event: 'done', result: { principal, completed, replays, admission_contention_retries: contentionRetries, admission_ms: admissionMs, completion_ms: completionMs } });
   } catch (error) {
     // Publish cached state before disconnect: a stuck connection must not hide
     // the original failure while the driver collects bounded owner diagnostics.
