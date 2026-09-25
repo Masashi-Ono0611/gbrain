@@ -19,6 +19,8 @@ export class PersistenceConsumer {
   private wakeRequested = false;
   private active = new Set<Promise<void>>();
   private abandoned = new Set<Promise<unknown>>();
+  /** Roots whose abandoned preparation still runs; kept busy so the next request on the root waits. */
+  private rootHolds = new Map<string, Promise<unknown>>();
   private activeRoots = new Set<string>();
   private foregroundCounts = new Map<string, number>();
   private rootRetryAfter = new Map<string, number>();
@@ -126,7 +128,12 @@ export class PersistenceConsumer {
       let progressed = false;
       const task = this.execute(row).then(result => { progressed = result; }).catch(error => this.report(error)).finally(() => {
         if (!progressed) this.rootRetryAfter.set(key, Date.now() + (this.opts.pollMs ?? 250));
-        this.active.delete(task); this.activeRoots.delete(key); this.schedule(progressed ? 0 : this.opts.pollMs ?? 250);
+        this.active.delete(task);
+        const hold = this.rootHolds.get(key);
+        this.rootHolds.delete(key);
+        if (hold) void hold.then(() => { this.activeRoots.delete(key); this.schedule(0); }, () => { this.activeRoots.delete(key); this.schedule(0); });
+        else this.activeRoots.delete(key);
+        this.schedule(progressed ? 0 : this.opts.pollMs ?? 250);
       });
       this.active.add(task);
     }
@@ -223,6 +230,7 @@ export class PersistenceConsumer {
       const result = await Promise.race([preparation, claimLost.promise.then(() => ({ kind: 'claim_lost' as const }))]);
       if (result.kind === 'claim_lost') {
         this.drainOnStop(preparation);
+        this.rootHolds.set(row.worktree_id ?? `db:${row.source_incarnation}`, preparation);
         await releaseUnpublishedClaim(this.engine, row, 'claim_lost');
         return false;
       }

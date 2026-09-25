@@ -538,6 +538,9 @@ test('a hung claim renewal abandons pending preparation and frees the consumer s
     await waitFor(() => consumer.status().active_preparations === 0, { timeoutMs: 5_000 });
     expect(consumer.status().active_preparations).toBe(0);
     expect((await getWriteRequestById(engine, first.id))?.state).toBe('queued');
+    // The abandoned preparation still runs, so its root stays busy: the next
+    // request on that worktree must not start preparing alongside it.
+    expect((consumer as unknown as { activeRoots: Set<string> }).activeRoots.has(first.worktree_id!)).toBe(true);
     // Keep the released root in its retry backoff while advancing the consumer
     // once to prove the other root can use the freed slot.
     (consumer as unknown as { rootRetryAfter: Map<string, number> }).rootRetryAfter.set(first.worktree_id!, Date.now() + 60_000);
