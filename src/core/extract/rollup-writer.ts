@@ -35,6 +35,7 @@ export type HaltReason =
   | 'provider_billing'
   | 'provider_rate_limit'
   | 'coordinator_refused'
+  | 'migration_pending'
   | 'item_error'
   | 'unknown';
 
@@ -149,6 +150,33 @@ export async function upsertExtractRollup(
     return { ok: true };
   } catch (err) {
     const msg = (err as Error).message || String(err);
+    // #5495 back-compat: a brain at v141..v165 has no halt_reasons column.
+    // Retry the v141 statement so the counters still land; the halt reason
+    // is dropped until migration v166 runs. (A pre-v141 brain fails on
+    // expected_limit_count first, which the branch below handles.)
+    if (/halt_reasons/i.test(msg)) {
+      try {
+        await engine.executeRaw(
+          `INSERT INTO extract_rollup_7d (
+             kind, source_id, day,
+             cost_usd, halt_count, eval_fail_count, eval_pass_count,
+             round_completed_count, expected_limit_count, rollup_write_failures, updated_at
+           )
+           VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, $9, $10, now())
+           ON CONFLICT (kind, source_id, day) DO UPDATE SET
+             cost_usd               = extract_rollup_7d.cost_usd               + EXCLUDED.cost_usd,
+             halt_count             = extract_rollup_7d.halt_count             + EXCLUDED.halt_count,
+             eval_fail_count        = extract_rollup_7d.eval_fail_count        + EXCLUDED.eval_fail_count,
+             eval_pass_count        = extract_rollup_7d.eval_pass_count        + EXCLUDED.eval_pass_count,
+             round_completed_count  = extract_rollup_7d.round_completed_count  + EXCLUDED.round_completed_count,
+             expected_limit_count   = extract_rollup_7d.expected_limit_count   + EXCLUDED.expected_limit_count,
+             rollup_write_failures  = extract_rollup_7d.rollup_write_failures  + EXCLUDED.rollup_write_failures,
+             updated_at             = now()`,
+          [input.kind, input.source_id, day, cost, halts, evalFails, evalPasses, completed, expectedLimits, failures],
+        );
+        return { ok: true };
+      } catch { /* fall through to the normal failure record */ }
+    }
     // #4482 back-compat: a brain that hasn't applied migration v141 yet has
     // no expected_limit_count column. Rather than losing the WHOLE rollup
     // write (best-effort would swallow it), retry the pre-v141 statement —
