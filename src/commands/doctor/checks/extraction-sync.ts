@@ -27,6 +27,7 @@ import { scannerSlugRootMode } from '../../../core/write-through.ts';
 import { unverifiedExtractionFragment } from '../../../core/extraction-review.ts';
 import { managedPersistenceEnabled } from '../../../core/persistence/ownership.ts';
 import { upstreamFreshness } from '../../../core/sync-upstream.ts';
+import { managedSyncAdviceEnabled } from '../schema-pack-checks.ts';
 import type { Check } from '../../doctor.ts';
 import { ownedContentFreshness } from '../../../core/shared-skills/content-freshness.ts';
 import { connectorAuthorities } from '../../../core/persistence/connector-authority.ts';
@@ -1178,6 +1179,7 @@ export async function checkSyncFreshness(
   opts?: { nowMs?: number; localOnly?: boolean },
 ): Promise<Check> {
   try {
+    const managedSyncHint = await managedSyncAdviceEnabled(engine);
     const sources = await loadSyncFreshnessSources(engine);
 
     if (sources.length === 0) {
@@ -1442,7 +1444,7 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'fail',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` for each stale source${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>${managedSyncHint ? ' --no-pull' : ''}\` for each stale source${inProgressNote}`,
         details,
       };
     }
@@ -1450,7 +1452,7 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'warn',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` to refresh${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>${managedSyncHint ? ' --no-pull' : ''}\` to refresh${inProgressNote}`,
         details,
       };
     }

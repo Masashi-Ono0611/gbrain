@@ -10,7 +10,7 @@
 import { applyExtractAtomsNoPricing, readExtractAtomsNoPricing } from '../../../core/cycle/extract-atoms-cost-gate.ts';
 import { join } from 'path';
 import { gbrainPath } from '../../../core/config.ts';
-import { multiSourceDriftCheck, multiSourceDriftNotVerified } from '../schema-pack-checks.ts';
+import { managedSyncAdviceEnabled, multiSourceDriftCheck, multiSourceDriftNotVerified } from '../schema-pack-checks.ts';
 import { computeConversationFormatCoverageCheck } from './conversation-coverage.ts';
 import {
   computeExtractHealthCheck,
@@ -501,7 +501,8 @@ async function runDefaultSourcePath(ctx: DoctorContext): Promise<Check[]> {
         engine!,
         nonDefaultWithPath.map(s => ({ id: s.id, local_path: s.local_path as string })),
       );
-      checks.push(multiSourceDriftCheck(result, nonDefaultWithPath.length, 'local'));
+      const managed = await managedSyncAdviceEnabled(engine!);
+      checks.push(multiSourceDriftCheck(result, nonDefaultWithPath.length, 'local', managed));
     }
   } catch (e) {
     // A broken sources table must not stop doctor, but the check still

@@ -58,6 +58,7 @@ import {
   checkSchemaPackActive,
   checkSchemaPackConsistency,
   checkSchemaPackSourceDrift,
+  managedSyncAdviceEnabled,
   multiSourceDriftCheck,
   multiSourceDriftNotVerified,
 } from './schema-pack-checks.ts';
@@ -287,7 +288,8 @@ export async function doctorReportRemote(
         engine,
         nonDefaultWithPath.map(s => ({ id: s.id, local_path: s.local_path as string })),
       );
-      checks.push(multiSourceDriftCheck(result, nonDefaultWithPath.length, 'remote'));
+      const managed = await managedSyncAdviceEnabled(engine);
+      checks.push(multiSourceDriftCheck(result, nonDefaultWithPath.length, 'remote', managed));
     }
   } catch (e) {
     // Best-effort, but the check reports that it verified nothing (#5432).
