@@ -10,6 +10,7 @@ import { admission, assertCommittedSnapshot, assertConservation, distribution, f
 import { runSchedules } from './schedules.ts';
 import type { WriteRequest } from '../../src/core/persistence/model.ts';
 import { boundedDiagnostic, diagnosticError, ownerDatabaseDiagnostic, soakFailureDiagnostic, type ActiveSoakRequest } from './failure-diagnostics.ts';
+import { submitWithAdmissionRetry } from './producer-admission.ts';
 
 const [mode, configPath, argument, extra] = process.argv.slice(2);
 const config: HarnessConfig = JSON.parse(readFileSync(configPath, 'utf8'));
@@ -150,7 +151,7 @@ if (mode === 'initialize') {
   const sources = engine ? await fixtures(engine, config) : undefined;
   const admissionMs: number[] = []; const completionMs: number[] = []; let replays = 0;
   async function submit(index: number, requestId: string): Promise<WriteRequest> {
-    if (engine) return admitWrite(engine, admission(config, sources![principal % sources!.length], `soak-${index}`, `body-${index}`, principal, { requestId }));
+    if (engine) return submitWithAdmissionRetry(() => admitWrite(engine!, admission(config, sources![principal % sources!.length], `soak-${index}`, `body-${index}`, principal, { requestId })));
     const response = await fetch(new URL('submit', ownerUrl), { method: 'POST', body: JSON.stringify({ index, principal, requestId }) });
     assert(response.ok, `resident fixture admission failed: ${response.status}`); return response.json() as Promise<WriteRequest>;
   }
