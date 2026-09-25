@@ -15,7 +15,7 @@ import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { loadSyncFailures, acknowledgeFailures, autoSkipFailures } from '../src/core/sync-failure-ledger.ts';
 import { printSyncResult, runSync } from '../src/commands/sync.ts';
 import { buildSingleSyncJsonEnvelope } from '../src/core/sync-embed-backfill.ts';
-import { readManagedSyncFailures } from '../src/core/persistence/sync-failures.ts';
+import { formatManagedSyncFailure, readManagedSyncFailures } from '../src/core/persistence/sync-failures.ts';
 import { checkSyncFailures } from '../src/commands/doctor/checks/sync-failures.ts';
 import { purgeStaleCheckpoints } from '../src/core/op-checkpoint.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
@@ -188,6 +188,14 @@ test('full sync cannot hide an older failed incremental cursor or repeat its com
     expect(loadSyncFailures().filter(row => row.source_id === f.id)).toHaveLength(0);
   }
 }), 120_000);
+
+test('managed failure hint renders a source-scoped retry even with default options', () => {
+  const base = { source_id: 'notes', source_incarnation: '00000000-0000-0000-0000-000000000000', path: 'a.md', code: 'source_changed', message: 'changed',
+    request_id: null, run_id: 'r1', target: null, observation_id: 'o1', first_seen: new Date(0).toISOString(), attempts: 1 } as any;
+  expect(formatManagedSyncFailure({ ...base, keyOptions: { full: false, workingTree: false, srcSubpath: null, exclude: [], includeHidden: [], strategy: null } }))
+    .toContain('retry=gbrain sync --source notes --retry-failed --no-pull');
+  expect(formatManagedSyncFailure(base)).not.toContain('retry=');
+});
 
 test('managed failure hints preserve retry options locally and redact paths remotely', async () => withEnv(env, async () => {
   for (const engine of engines) {
