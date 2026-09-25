@@ -166,8 +166,10 @@ export async function enrichEntity(
     const legacy = legacyAsciiEntitySlug(request.entityName, request.entityType);
     if (legacy !== candidateSlug && !/^(people|companies)\/$/.test(legacy)) {
       const legacySlug = await engine.resolveSlugWithAlias(legacy, sourceId);
-      const legacyPage = await engine.getPage(legacySlug, scope);
-      if (legacyPage) { slug = legacySlug; existingPage = legacyPage; }
+      const legacyPage = await engine.getPage(legacySlug, { sourceId });
+      // The legacy slug is lossy (José -> people/jos), so only reuse a page that names this entity.
+      const same = (t: string) => t.normalize('NFC').trim().toLowerCase();
+      if (legacyPage && same(legacyPage.title ?? '') === same(request.entityName)) { slug = legacySlug; existingPage = legacyPage; }
     }
   }
   let action: 'created' | 'updated' | 'skipped';
