@@ -18,6 +18,7 @@ export class PersistenceConsumer {
   private tickPromise: Promise<void> | undefined;
   private wakeRequested = false;
   private active = new Set<Promise<void>>();
+  private abandoned = new Set<Promise<unknown>>();
   private activeRoots = new Set<string>();
   private foregroundCounts = new Map<string, number>();
   private rootRetryAfter = new Map<string, number>();
@@ -36,7 +37,7 @@ export class PersistenceConsumer {
   private preparing = new Map<string, { request_id: string; started_at: string; deadline_exceeded: boolean; attempt: number }>();
   readonly hostId: string;
   constructor(readonly engine: BrainEngine, readonly config: GBrainConfig, readonly prepare: PrepareMutation,
-    private opts: { hostId?: string; concurrency?: number; pollMs?: number; phaseMs?: number; preparationMs?: number; onError?: (error: unknown) => void } = {}) {
+    private opts: { hostId?: string; concurrency?: number; pollMs?: number; phaseMs?: number; preparationMs?: number; renewalIntervalMs?: number; onError?: (error: unknown) => void } = {}) {
     this.hostId = opts.hostId ?? localHostId();
   }
   start(): void { this.stopping = false; this.abort = new AbortController(); this.schedule(0); }
@@ -175,12 +176,23 @@ export class PersistenceConsumer {
     this.lastLog = { key, at };
     if (!this.opts.onError) process.stderr.write(`[persistence] phase=${phase} reason=${code}; unfinished work remains tracked; inspect writer status.\n`);
   }
+  private drainOnStop(promise: Promise<unknown>): void {
+    this.abandoned.add(promise);
+    void promise.then(() => this.abandoned.delete(promise), () => this.abandoned.delete(promise));
+  }
   private async execute(row: WriteRequest): Promise<boolean> {
-    let renewing: Promise<unknown> | undefined;
+    let renewing: Promise<void> | undefined;
     let claimLive = true;
     let closed = false;
     let preparationActive = true;
     const abort = new AbortController();
+    const claimLost = Promise.withResolvers<void>();
+    const loseClaim = () => {
+      if (!claimLive) return;
+      claimLive = false;
+      abort.abort({ code: 'claim_lost' });
+      claimLost.resolve();
+    };
     const observation = { request_id: row.request_id, started_at: new Date().toISOString(), deadline_exceeded: false, attempt: ++this.preparationAttempts };
     this.preparing.set(row.id, observation);
     const stop = () => abort.abort({ code: 'consumer_stopping' });
@@ -196,14 +208,26 @@ export class PersistenceConsumer {
     const interval = setInterval(() => {
       if (closed || renewing) return;
       const renewalAbort = new AbortController();
-      const deadline = setTimeout(() => { claimLive = false; renewalAbort.abort(); }, this.opts.phaseMs ?? 5000);
-      renewing = renewWriteClaim({ executeRaw: this.engine.executeRawDirect.bind(this.engine) }, row.id, row.execution_token!, 30_000,
-        this.engine.kind === 'postgres' ? renewalAbort.signal : undefined).then(live => { claimLive &&= live; })
-        .catch(() => { claimLive = false; }).finally(() => { clearTimeout(deadline); renewing = undefined; });
-    }, 10_000);
+      const deadline = setTimeout(() => { loseClaim(); renewalAbort.abort(); }, this.opts.phaseMs ?? 5000);
+      let task!: Promise<void>;
+      task = renewWriteClaim({ executeRaw: this.engine.executeRawDirect.bind(this.engine) }, row.id, row.execution_token!, 30_000,
+        this.engine.kind === 'postgres' ? renewalAbort.signal : undefined).then(live => { if (!live) loseClaim(); })
+        .catch(() => { loseClaim(); }).finally(() => { clearTimeout(deadline); if (renewing === task) renewing = undefined; });
+      renewing = task;
+    // Tests can shorten the lease-renewal cadence; production keeps the existing 10s cadence.
+    }, this.opts.renewalIntervalMs ?? 10_000);
     interval.unref?.();
     try {
-      const prepared = await this.prepare(this.engine, row, this.config, bounded ? abort.signal : undefined);
+      const preparation = this.prepare(this.engine, row, this.config, bounded ? abort.signal : undefined)
+        .then(prepared => ({ kind: 'prepared' as const, prepared }), error => ({ kind: 'error' as const, error }));
+      const result = await Promise.race([preparation, claimLost.promise.then(() => ({ kind: 'claim_lost' as const }))]);
+      if (result.kind === 'claim_lost') {
+        this.drainOnStop(preparation);
+        await releaseUnpublishedClaim(this.engine, row, 'claim_lost');
+        return false;
+      }
+      if (result.kind === 'error') throw result.error;
+      const prepared = result.prepared;
       if (timeout) clearTimeout(timeout);
       if (bounded && performance.now() >= deadline && !abort.signal.aborted) {
         observation.deadline_exceeded = true;
@@ -211,7 +235,7 @@ export class PersistenceConsumer {
         this.log('preparation', 'deadline_exceeded');
       }
       if (!claimLive || this.stopping || abort.signal.aborted) {
-        await releaseUnpublishedClaim(this.engine, row, observation.deadline_exceeded ? 'preparation_deadline' : 'consumer_stopping'); return false;
+        await releaseUnpublishedClaim(this.engine, row, !claimLive ? 'claim_lost' : observation.deadline_exceeded ? 'preparation_deadline' : 'consumer_stopping'); return false;
       }
       this.preparing.delete(row.id);
       preparationActive = false;
@@ -223,7 +247,7 @@ export class PersistenceConsumer {
     } catch (error) {
       if (preparationActive && bounded && performance.now() >= deadline) observation.deadline_exceeded = true;
       if (preparationActive && (abort.signal.aborted || observation.deadline_exceeded)) {
-        await releaseUnpublishedClaim(this.engine, row, observation.deadline_exceeded ? 'preparation_deadline' : 'consumer_stopping');
+        await releaseUnpublishedClaim(this.engine, row, !claimLive ? 'claim_lost' : observation.deadline_exceeded ? 'preparation_deadline' : 'consumer_stopping');
         return false;
       }
       const current = await getWriteRequestById(this.engine, row.id);
@@ -233,7 +257,8 @@ export class PersistenceConsumer {
       throw error;
     } finally {
       closed = true; clearInterval(interval); if (timeout) clearTimeout(timeout);
-      this.abort.signal.removeEventListener('abort', stop); this.preparing.delete(row.id); await renewing;
+      this.abort.signal.removeEventListener('abort', stop); this.preparing.delete(row.id);
+      if (renewing) this.drainOnStop(renewing);
     }
   }
   /** Mandatory barrier: engine.close must be sequenced AFTER this promise. */
@@ -243,6 +268,7 @@ export class PersistenceConsumer {
     if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
     await this.tickPromise;
     await Promise.allSettled([...this.active]);
+    while (this.abandoned.size) await Promise.allSettled([...this.abandoned]);
     await this.projectionWorker;
     await this.effectsWorker;
     await this.topologyWorker;

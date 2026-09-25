@@ -528,8 +528,8 @@ test('a hung claim renewal abandons pending preparation and frees the consumer s
     started.push(row.id);
     if (row.id === first.id) return preparation.promise;
     return prepared(row, sources);
-  }, { hostId: config.hostId, concurrency: 1, pollMs: 60_000, claimRenewIntervalMs: 5,
-    claimRenewTimeoutMs: 30, onError: error => errors.push(error) });
+  }, { hostId: config.hostId, concurrency: 1, pollMs: 60_000, renewalIntervalMs: 5,
+    phaseMs: 30, onError: error => errors.push(error) });
   try {
     consumer.start();
     await waitFor(() => started[0] === first.id, { timeoutMs: 5_000 });
@@ -580,7 +580,7 @@ test('ordinary claims still renew and commit while preparation continues', async
   const consumer = new PersistenceConsumer(engine, { engine: 'pglite' }, async (_engine, current) => {
     await Bun.sleep(30);
     return prepared(current, sources);
-  }, { hostId: config.hostId, pollMs: 60_000, claimRenewIntervalMs: 5, claimRenewTimeoutMs: 500 });
+  }, { hostId: config.hostId, pollMs: 60_000, renewalIntervalMs: 5, phaseMs: 500 });
   try {
     consumer.start();
     await waitFor(async () => (await getWriteRequestById(engine, row.id))?.state === 'committed', { timeoutMs: 5_000 });
