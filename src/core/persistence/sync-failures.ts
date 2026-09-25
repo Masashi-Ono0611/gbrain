@@ -96,7 +96,7 @@ export function formatManagedSyncFailure(failure: ManagedSyncFailure): string {
     ...options.includeHidden.flatMap(value => ['--include-hidden', quote(value)]),
     ...(options.strategy ? ['--strategy', quote(options.strategy)] : []),
   ] : [];
-  const retry = flags.length ? ` retry=gbrain sync --source ${quote(failure.source_id)} ${flags.join(' ')} --retry-failed --no-pull` : '';
+  const retry = options ? ` retry=gbrain sync --source ${quote(failure.source_id)} ${[...flags, '--retry-failed', '--no-pull'].join(' ')}` : '';
   return `source=${clean(failure.source_id)} path=${clean(failure.path)} code=${clean(failure.code)}: ${clean(failure.message)} request=${failure.request_id ?? '<not-admitted>'} run=${failure.run_id} target=${failure.target ?? '<undiscovered>'}${retry}`;
 }
 
