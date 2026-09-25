@@ -73,6 +73,7 @@ import { searchVectorPool, readVectorPool } from './search/vector-pool.ts';
 import { withVectorSettings } from './search/vector-settings.ts';
 import { PGLITE_SCHEMA_SQL, getPGLiteSchema } from './pglite-schema.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
+import { readStoredEmbeddingIdentity } from './stored-embedding-identity.ts';
 import { DELETE_BATCH_SIZE, TRAVERSE_PATH_ROW_CAP } from './engine-constants.ts';
 import { PageMissingError } from './engine-errors.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
@@ -217,22 +218,7 @@ type PGLiteDB = PGlite;
 // optimization, never authoritative).
 let _snapshotWarnLogged = false;
 
-// Per-process memo. MIGRATIONS + PGLITE_SCHEMA_SQL are static for the life of
-// the process, so the schema hash is too; the version file and the ~42MB tar
-// are read once per (path, process) instead of once per engine construction
-// (a full suite constructs 600+ engines — the un-memoized loader re-read the
-// tar and re-hashed 131 migration handler sources every time, ~84MB of
-// transient allocation per call). A null entry means the path is terminally
-// unusable this process (missing/stale/torn) — no retry per construction.
-// The dims/model shape gate is deliberately NOT memoized: tests reconfigure
-// the gateway mid-process (zembed/1280) and a mismatched engine must fall
-// back to cold init even when an earlier engine loaded this same snapshot.
-// Accepted limitation: a snapshot file rewritten mid-process is not observed;
-// the only writer (build-pglite-snapshot.ts) runs before test fan-out.
 let _snapshotSchemaHashMemo: string | null = null;
-// blob stays null until the FIRST caller whose shape gate passes — a process
-// whose gateway shape never matches the snapshot (the zembed/1280 test
-// files) never pays the 42MB tar read at all.
 const _snapshotFileMemo = new Map<string, { versionLines: string[]; blob: Blob | null } | null>();
 let _snapshotTarReads = 0;
 
@@ -358,6 +344,9 @@ export function computeSnapshotSchemaHash(
     for (const file of [
       'migrate.ts', 'pglite-schema.ts', 'fts-language.ts', 'vector-index.ts', 'ai/defaults.ts',
       'search/projection-statistics.ts',
+      'company-brain/receipt-schema.ts',
+      'shared-skills/schema-all.ts', 'shared-skills/schema.ts', 'shared-skills/membership-schema.ts', 'shared-skills/persistence-schema.ts',
+      'shared-skills/access-schema.ts',
       'timeline-dedup-repair.ts', 'pages-upsert-arbiter.ts', 'link-extraction.ts',
       'grants/schema.ts', 'grants/migration.ts', 'grants/model.ts', 'grants/service.ts', 'grants/profiles.ts',
       'page-state/schema.ts', 'lease-schema.ts', 'page-state/projection-schema.ts', 'persistence/schema.ts', 'persistence/effect-schema.ts', 'persistence/writer-guard-schema.ts', 'persistence/topology-schema.ts', 'scope.ts', 'sql-query.ts', 'minions/tools/brain-allowlist.ts', 'facts/withdrawal-schema.ts',
@@ -751,6 +740,15 @@ export class PGLiteEngine implements BrainEngine {
 
   // Lifecycle
   async connect(config: EngineConfig): Promise<void> {
+    return this._connectWithRootRegistration(config, true);
+  }
+
+  async connectForRestore(config: EngineConfig): Promise<void> {
+    if (!config.database_path || this._db || this._connectPromise) throw new Error('Restore staging requires a fresh engine and an explicit datastore path');
+    return this._connectWithRootRegistration(config, false);
+  }
+
+  private async _connectWithRootRegistration(config: EngineConfig, registerRoots: boolean): Promise<void> {
     if (this._disconnectRequested || this._closingWork || this._closePoison) throw this._closePoison ?? new PgliteClosingError();
     if (this._db || this._connectPromise) {
       if ((this._savedConfig?.database_path || undefined) !== (config.database_path || undefined)) {
@@ -760,7 +758,7 @@ export class PGLiteEngine implements BrainEngine {
     }
     this.vectorIterativeScan = undefined;
     const opening = this._connectInternal(config).then(async () => {
-      try { await registerManagedFilesystemEngine(this, config.database_path); }
+      try { if (registerRoots) await registerManagedFilesystemEngine(this, config.database_path); }
       catch (error) {
         try { await this._closeInternal(); }
         catch (closeError) {
@@ -1036,18 +1034,6 @@ export class PGLiteEngine implements BrainEngine {
     if (this._snapshotLoaded) {
       return;
     }
-    // Pre-schema bootstrap: add forward-referenced state the embedded schema
-    // blob requires but that older brains don't have yet (issues #366/#375/
-    // #378/#396 + #266/#357). Bootstrap is idempotent and a no-op on fresh
-    // installs and modern brains.
-    await this.applyForwardReferenceBootstrap();
-
-    // Resolve embedding dim/model from gateway. v0.37 fix wave: fallbacks
-    // track the canonical defaults in `ai/defaults.ts` (zeroentropyai:zembed-1
-    // / 1280d) instead of the stale v0.13 OpenAI literals, AND we store the
-    // full `provider:model` string in the DB config table — consumers like
-    // ze-switch, doctor, and recommendation-context expect the provider
-    // prefix. (Round-1 CDX-4 + A.8.)
     let dims: number = DEFAULT_EMBEDDING_DIMENSIONS;
     let model: string = DEFAULT_EMBEDDING_MODEL;
     try {
@@ -1060,6 +1046,13 @@ export class PGLiteEngine implements BrainEngine {
       model = gw.getEmbeddingModel();
     } catch { /* gateway not configured — use defaults */ }
 
+    const storedIdentity = await readStoredEmbeddingIdentity(this);
+    if (storedIdentity) {
+      if (!storedIdentity.model) throw new Error('Stored embedding model is unknown. Run gbrain migrate embeddings --status and explicitly migrate before schema initialization.');
+      dims = storedIdentity.dimensions;
+      model = storedIdentity.model;
+    }
+    await this.applyForwardReferenceBootstrap();
     await this.db.exec(getPGLiteSchema(dims, model));
 
     const { applied } = await runMigrations(this);
@@ -3015,10 +3008,6 @@ export class PGLiteEngine implements BrainEngine {
     column: string = 'embedding',
   ): Promise<Map<number, Float32Array>> {
     if (ids.length === 0) return new Map();
-    // v0.36 (D9): column parameter so hybrid.cosineReScore can rehydrate
-    // from the active embedding space (Voyage 1024d, ZE halfvec 2560d,
-    // etc.). Identifier-quoted (D12 layer 2) plus strict regex on the
-    // column name (D12 layer 1) before interpolation.
     if (!COLUMN_NAME_REGEX.test(column)) {
       throw new EmbeddingColumnNotRegisteredError(column, []);
     }
@@ -3183,30 +3172,26 @@ export class PGLiteEngine implements BrainEngine {
     const params: unknown[] = [];
     let paramIdx = 1;
 
-    // Provenance fallback for chunks without an explicit `model`: resolve the
-    // gateway's runtime model, not the compile-time DEFAULT_EMBEDDING_MODEL.
-    // #3461: getEmbeddingModel() THROWS when unconfigured (never returns
-    // falsy) — on the throw path fall back to the brain's own
-    // `config.embedding_model` row, then the compile-time default as the
-    // last resort. See postgres-engine.ts _upsertChunksOnce for the full
-    // rationale — pglite mirrors it for parity.
     let resolvedModel: string | null = null;
     try {
       // Keep the gateway lazy so module-load failure remains inside this soft
       // fallback boundary; eager evaluation would bypass the config-row fallback.
       const gw = await import('./ai/gateway.ts'); // engine-dynamic-import-ok
-      resolvedModel = gw.getEmbeddingModel();
-    } catch {
+      resolvedModel = gw.getEmbeddingModelProvenance();
+    } catch {}
+    if (!resolvedModel) {
       try {
         const cfg = await this.db.query(
           `SELECT value FROM config WHERE key = 'embedding_model'`,
         );
         resolvedModel = ((cfg.rows[0] as { value?: string } | undefined)?.value) ?? null;
-      } catch {
-        // config table unreadable — fall through to the compile-time default.
-      }
+      } catch {}
     }
-    if (!resolvedModel) resolvedModel = DEFAULT_EMBEDDING_MODEL;
+    resolvedModel = writeCol.embeddingModel || resolvedModel;
+    if (!resolvedModel && chunks.some(chunk => chunk.embedding && !chunk.model)) {
+      throw new Error('Embedding model provenance is unknown. Supply an explicit chunk model or run gbrain migrate embeddings --status before an explicit migration.');
+    }
+    if (!resolvedModel) resolvedModel = 'unconfigured';
 
     for (const chunk of chunks) {
       const embeddingStr = chunk.embedding
