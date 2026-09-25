@@ -28,7 +28,7 @@ boundary and add its link here rather than raising the cap.
 | [Commands (3/6)](key-files/commands-3.md) | `src/commands/engine-status.ts` through `src/commands/frontmatter-install-hook.ts` |
 | [Commands (4/6)](key-files/commands-4.md) | `src/commands/graph-query.ts` through `src/commands/reindex-search-vector.ts` |
 | [Commands (5/6)](key-files/commands-5.md) | `src/commands/reindex.ts` through `src/commands/storage.ts` |
-| [Commands (6/6)](key-files/commands-6.md) | `src/commands/sync.ts` through `src/commands/ze-switch.ts` |
+| [Commands (6/6)](key-files/commands-6.md) | `src/commands/sync.ts` through `src/commands/whoknows.ts` |
 | [Core Ai](key-files/core-ai.md) | `src/core/ai/build-gateway-config.ts` through `src/core/ai/types.ts` |
 | [Core Cycle](key-files/core-cycle.md) | `src/core/cycle/anomaly.ts` through `src/core/cycle/triage-rescue.ts` |
 | [Core Minions (1/2)](key-files/core-minions-1.md) | `src/core/minions/` through `src/core/minions/rss-default.ts` |
@@ -39,7 +39,7 @@ boundary and add its link here rather than raising the cap.
 | [Core Services (2/3)](key-files/core-services-2.md) | `src/core/conversation-parser/` through `src/core/progressive-batch/` |
 | [Core Services (3/3)](key-files/core-services-3.md) | `src/core/think/index.ts` through `src/core/verbs/usage-log.ts` |
 | [Core Utilities (1/2)](key-files/core-utilities-1.md) | `src/core/archive-crawler-config.ts` through `src/core/remediation-checkpoint.ts` |
-| [Core Utilities (2/2)](key-files/core-utilities-2.md) | `src/core/rerank-audit.ts` through `src/core/ze-exposure.ts` |
+| [Core Utilities (2/2)](key-files/core-utilities-2.md) | `src/core/rerank-audit.ts` through `src/core/verbs.ts` |
 | [Engines (1/2)](key-files/engines-1.md) | `src/core/connection-manager.ts` through `src/core/pglite-repair.ts` |
 | [Engines (2/2)](key-files/engines-2.md) | `src/core/pglite-resetwal.ts` through `src/core/worker-pool.ts` |
 | [Entrypoints And Docs](key-files/entrypoints-and-docs.md) | `.agents/gbrain-launcher` through `templates/` |
@@ -51,6 +51,7 @@ boundary and add its link here rather than raising the cap.
 | [Providers](key-files/providers.md) | `src/core/anthropic-pricing.ts` through `src/core/transcription.ts` |
 | [Runtime](key-files/runtime.md) | `src/core/abort-check.ts` through `src/core/zombie-reap.ts` |
 | [Security](key-files/security.md) | `src/core/destructive-guard.ts` through `src/core/ssrf-validate.ts` |
+| [Shared brain skills](key-files/shared-skills.md) | Canonical catalog, enrollment, migration, publication and harness integration |
 | [Skills](key-files/skills.md) | `src/core/audit-skill-brain-first.ts` through `src/core/skills-integrity.ts` |
 | [Tooling And Tests](key-files/tooling-and-tests.md) | `.github/workflows/test.yml` through `test/remote-privacy-sweep.test.ts` |
 | [BrainBench — in a sibling repo](key-files/brainbench.md) | Cross-file subsystem contract |

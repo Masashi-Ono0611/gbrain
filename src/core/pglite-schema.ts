@@ -4,6 +4,7 @@ import { PERSISTENCE_TOPOLOGY_SCHEMA_SQL } from './persistence/topology-schema.t
 import { PAGE_PROJECTION_SCHEMA_SQL } from './page-state/projection-schema.ts';
 import { LEASE_TOKEN_SCHEMA_SQL } from './lease-schema.ts';
 import { PAGE_STATE_SCHEMA_SQL } from './page-state/schema.ts';
+import { SHARED_SKILLS_SCHEMA_SQL } from './shared-skills/schema-all.ts';
 /**
  * PGLite schema — derived from schema-embedded.ts (Postgres schema).
  *
@@ -1265,6 +1266,7 @@ ${PERSISTENCE_SCHEMA_STATEMENTS.join(';\n')};
 ${PAGE_PROJECTION_SCHEMA_SQL}
 ${PERSISTENCE_TOPOLOGY_SCHEMA_SQL}
 ${SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL}
+${SHARED_SKILLS_SCHEMA_SQL}
 
 CREATE TABLE IF NOT EXISTS extract_atoms_page_state (
   source_incarnation UUID NOT NULL REFERENCES sources(incarnation) ON DELETE CASCADE,
@@ -1281,14 +1283,6 @@ CREATE INDEX IF NOT EXISTS extract_atoms_page_state_page_idx ON extract_atoms_pa
 
 `;
 
-/**
- * Return the PGLite schema SQL with embedding vector dim + model name substituted.
- * Defaults come from the AI gateway (v0.36+: zeroentropyai:zembed-1 / 1280d).
- *
- * v0.37.x fix wave: defaults track gateway constants instead of stale v0.13
- * OpenAI literals so the pre-computed `PGLITE_SCHEMA_SQL` constant doesn't
- * size the column to 1536 while the runtime default model emits 1280.
- */
 export function getPGLiteSchema(
   dims: number = DEFAULT_EMBEDDING_DIMENSIONS,
   model: string = DEFAULT_EMBEDDING_MODEL,
