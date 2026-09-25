@@ -25,6 +25,7 @@ import { slugifyPath, slugifyCodePath, isCodeFilePath } from '../../../core/sync
 import { resolveSourceLocalFilePath } from '../../../core/markdown.ts';
 import { unverifiedExtractionFragment } from '../../../core/extraction-review.ts';
 import { isSyncDisabledConfig } from '../../../core/sync-policy.ts';
+import { managedSyncAdviceEnabled } from '../schema-pack-checks.ts';
 import type { Check } from '../../doctor.ts';
 import { ownedContentFreshness } from '../../../core/shared-skills/content-freshness.ts';
 
@@ -1153,6 +1154,7 @@ export async function checkSyncFreshness(
   opts?: { nowMs?: number; localOnly?: boolean },
 ): Promise<Check> {
   try {
+    const managed = await managedSyncAdviceEnabled(engine);
     // v0.41.27.0: SELECT widens to carry last_commit + chunker_version so
     // the git short-circuit gate (below) can compare against what
     // `gbrain sync`'s up-to-date predicate at sync.ts:1057+1075 checks.
@@ -1438,7 +1440,7 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'fail',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` for each stale source${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>${managed ? ' --no-pull' : ''}\` for each stale source${inProgressNote}`,
         details,
       };
     }
@@ -1446,7 +1448,7 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'warn',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` to refresh${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>${managed ? ' --no-pull' : ''}\` to refresh${inProgressNote}`,
         details,
       };
     }
