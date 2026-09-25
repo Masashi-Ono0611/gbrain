@@ -110,6 +110,22 @@ export function slugifyEntity(name: string, type: 'person' | 'company'): string 
   return `${prefix}/${slug}`;
 }
 
+/**
+ * The slug the pre-Unicode slugifier produced for the same name (ASCII only:
+ * every non-[a-z0-9] run became '-'). Kept so enrichment can find entity pages
+ * that existing brains created before slugifyEntity learned other scripts,
+ * instead of minting a second page for the same entity.
+ */
+export function legacyAsciiEntitySlug(name: string, type: 'person' | 'company'): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/['']/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const prefix = type === 'person' ? 'people' : 'companies';
+  return `${prefix}/${slug}`;
+}
+
 /** Get the brain page path for an entity. */
 export function entityPagePath(name: string, type: 'person' | 'company'): string {
   return slugifyEntity(name, type);
@@ -130,7 +146,7 @@ export async function enrichEntity(
 ): Promise<EnrichmentResult> {
   const candidateSlug = slugifyEntity(request.entityName, request.entityType);
   const sourceId = opts?.sourceId ?? 'default';
-  const slug = await engine.resolveSlugWithAlias(candidateSlug, sourceId);
+  let slug = await engine.resolveSlugWithAlias(candidateSlug, sourceId);
   // Fail-closed: only an explicit `trusted: true` writes authoritative pages.
   const trusted = opts?.trusted === true;
   const scope = opts?.sourceId ? { sourceId: opts.sourceId } : undefined;
@@ -144,7 +160,16 @@ export async function enrichEntity(
   const tierEscalated = suggestedTier < (request.tier || 3); // lower tier number = higher importance
 
   // 3. Check if entity page exists
-  const existingPage = await engine.getPage(slug, scope);
+  let existingPage = await engine.getPage(slug, scope);
+  if (!existingPage) {
+    // A page an older brain created under the ASCII-only slug is the same entity.
+    const legacy = legacyAsciiEntitySlug(request.entityName, request.entityType);
+    if (legacy !== candidateSlug && !/^(people|companies)\/$/.test(legacy)) {
+      const legacySlug = await engine.resolveSlugWithAlias(legacy, sourceId);
+      const legacyPage = await engine.getPage(legacySlug, scope);
+      if (legacyPage) { slug = legacySlug; existingPage = legacyPage; }
+    }
+  }
   let action: 'created' | 'updated' | 'skipped';
 
   if (existingPage) {
