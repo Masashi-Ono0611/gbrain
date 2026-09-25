@@ -50,4 +50,12 @@ describe('entity enrichment keeps pages created under the ASCII-only slug', () =
     const result = await enrichEntity(engine, { entityName: 'Иван Петров', entityType: 'person', context: 'c', sourceSlug: 'notes/day1' }, { trusted: true });
     expect(result.slug).toBe(slugifyEntity('Иван Петров', 'person'));
   });
+
+  test('a legacy slug held by a differently named page is not reused', async () => {
+    expect(legacyAsciiEntitySlug('José', 'person')).toBe('people/jos');
+    await engine.putPage('people/jos', { type: 'person', title: 'Jos', compiled_truth: 'A different person.', frontmatter: {} });
+    const result = await enrichEntity(engine, { entityName: 'José', entityType: 'person', context: 'c', sourceSlug: 'notes/day1' }, { trusted: true });
+    expect(result.slug).toBe('people/jose');
+    expect(await personSlugs()).toEqual(['people/jos', 'people/jose']);
+  });
 });
