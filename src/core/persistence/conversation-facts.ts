@@ -22,8 +22,10 @@ export interface ManagedConversationFactsIntent extends Record<string, unknown> 
   auditContext?: string;
 }
 
-export function conversationFactsRequestId(sourceId: string, slug: string, pageId: number, contentToken: string, variant: string): string {
-  const hex = createHash('sha256').update(JSON.stringify([sourceId, slug, pageId, contentToken, `extract-conversation-facts:v2:${variant}`])).digest('hex');
+export function conversationFactsRequestId(sourceId: string, slug: string, pageId: number, expectedRevision: string,
+  contentToken: string, variant: string): string {
+  const hex = createHash('sha256').update(JSON.stringify([sourceId, slug, pageId, expectedRevision, contentToken,
+    `extract-conversation-facts:v2:${variant}`])).digest('hex');
   return `${hex.slice(0,8)}-${hex.slice(8,12)}-8${hex.slice(13,16)}-a${hex.slice(17,20)}-${hex.slice(20,32)}`;
 }
 
@@ -51,7 +53,7 @@ export async function submitManagedConversationFacts(engine: BrainEngine, input:
     throw new OperationError('owner_unavailable', 'The canonical conversation source owner is unavailable.');
   }
   const variant = `${input.outcome}:${input.terminal === false ? 'partial' : 'terminal'}`;
-  const requestId = conversationFactsRequestId(input.sourceId, input.slug, input.pageId, input.contentToken, variant);
+  const requestId = conversationFactsRequestId(input.sourceId, input.slug, input.pageId, input.expectedRevision, input.contentToken, variant);
   let intent: ManagedConversationFactsIntent = {
     kind: 'managed_conversation_facts_page', contentToken: input.contentToken,
     expectedRevision: input.expectedRevision, facts: input.facts.map(fact => ({ ...fact,

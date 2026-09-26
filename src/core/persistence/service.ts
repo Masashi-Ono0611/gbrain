@@ -10,6 +10,7 @@ import { isWriteErrorCode, type WriteReceipt } from './types.ts';
 import { registerPgliteReopen } from '../pglite-lifecycle.ts';
 import { assertMutationProtocol } from './protocol.ts';
 import { pendingWriteHint } from './health.ts';
+import type { PublicationHooks } from './coordinator.ts';
 
 interface Service { consumer: PersistenceConsumer; stopping: boolean; unregisterStop?: () => void; unregisterReopen?: () => void; }
 const services = new WeakMap<BrainEngine, Service>();
@@ -45,13 +46,14 @@ export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest
   if (['put_page','capture','delete_page','restore_page','revert_version'].includes(row.operation)) return preparePageMutation(e, row, cfg, undefined, signal);
   throw new OperationError('unsupported_mutation_protocol', 'No compatible mutation preparer is registered for this operation.');
 }
-export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConfig): PersistenceConsumer {
+export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConfig,
+  options: { publicationHooks?: PublicationHooks } = {}): PersistenceConsumer {
   const prior = services.get(engine);
   if (prior) {
     if (prior.stopping) throw new OperationError('unavailable', 'The persistence owner is closing.');
     return prior.consumer;
   }
-  const consumer = new PersistenceConsumer(engine, config, preparePersistedMutation);
+  const consumer = new PersistenceConsumer(engine, config, preparePersistedMutation, options);
   const service: Service = { consumer, stopping: false };
   services.set(engine, service);
   const lifecycle = engine as BrainEngine & { registerBeforeDisconnect?: (run: () => Promise<void>) => unknown };
