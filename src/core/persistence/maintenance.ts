@@ -6,7 +6,7 @@ import { OperationError } from '../ops/contract.ts';
 import type { SqlEngine } from './model.ts';
 import { managedPersistenceEnabled } from './ownership.ts';
 
-export const UNSUPPORTED_MANAGED_BULK_WRITERS = ['cycle.extract_facts', 'extract-conversation-facts', 'conversation_facts_backfill', 'loops_extract'] as const;
+export const UNSUPPORTED_MANAGED_BULK_WRITERS = ['cycle.extract_facts', 'conversation_facts_backfill', 'loops_extract'] as const;
 
 /**
  * #5180 #5203: a legacy maintenance writer on a managed brain reports the phase
