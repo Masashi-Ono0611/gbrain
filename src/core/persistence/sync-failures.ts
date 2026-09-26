@@ -82,6 +82,20 @@ export async function readManagedSyncFailures(engine: BrainEngine, sourceIds?: s
   return [...failures, ...orphaned.map(row => row.failure)];
 }
 
+export function partitionManagedSyncFailures(failures: ManagedSyncFailure[], cursorKey: string): { current: ManagedSyncFailure[]; other: ManagedSyncFailure[] } {
+  return { current: failures.filter(failure => failure.cursor_key === cursorKey), other: failures.filter(failure => failure.cursor_key !== cursorKey) };
+}
+
+export function managedSyncRetryReport(failures: ManagedSyncFailure[], cursorKey: string): { retrying: number; other: number; otherLines: string[] } {
+  const { current, other } = partitionManagedSyncFailures(failures, cursorKey);
+  return { retrying: current.length, other: other.length, otherLines: other.length ? [
+    `${other.length} previously-failed file(s) will NOT be retried by this invocation because they were started with different options.`,
+    ...other.map(failure => failure.keyOptions
+      ? `  ${formatManagedSyncFailure(failure)}`
+      : `  ${failure.path}: its original options are unknown, so no retry command can be shown.`),
+  ] : [] };
+}
+
 export function formatManagedSyncFailure(failure: ManagedSyncFailure): string {
   const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 1000);
   const options = failure.keyOptions;
