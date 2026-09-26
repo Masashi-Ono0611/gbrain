@@ -87,6 +87,32 @@ function stampProgress(prior: CursorProgress | undefined, fromIndex: number, ind
   return prior && prior.startedAt === drainStartedAt ? { ...prior, lastAt: now, lastIndex: index }
     : { startedAt: drainStartedAt, startIndex: fromIndex, lastAt: now, lastIndex: index };
 }
+
+interface ManagedSyncIdentity {
+  context: Awaited<ReturnType<typeof resolveManagedSyncContext>>;
+  authority: SyncAuthority;
+  company: ReturnType<typeof currentCompanyBrainSync>;
+  syncOptions: SyncCursorOptions;
+  key: string;
+}
+async function resolveManagedSyncIdentity(engine: BrainEngine, opts: SyncOpts, assertAllowed = false): Promise<ManagedSyncIdentity> {
+  const context = await resolveManagedSyncContext(engine, opts);
+  // Only the real sync run gates on refresh state; the retry-key lookup stays read-only.
+  if (assertAllowed && !opts.dryRun) await assertManagedSyncAllowed(engine, context.binding.worktree_id, context.sourceId);
+  const authority = await managedSyncAuthority(engine, context.sourceId, context.incarnation, opts.repoPath ?? context.root);
+  const company = currentCompanyBrainSync(context.sourceId);
+  const syncOptions: SyncCursorOptions = { full: opts.full ?? false, workingTree: opts.workingTree ?? false, srcSubpath: opts.srcSubpath ?? null,
+    exclude: opts.exclude ?? [], includeHidden: opts.includeHidden ?? [], strategy: opts.strategy ?? null };
+  const key = digest({ source: context.incarnation, principal: authority.writer.principal, authority, ...(company ? { company: { receiptId: company.receiptId, planDigest: company.plan.plan_digest } } : {}),
+    options: syncOptions });
+  return { context, authority, company, syncOptions, key };
+}
+
+/** Returns the exact durable cursor key performManagedSync will use for these options. */
+export async function managedSyncCursorKey(engine: BrainEngine, opts: SyncOpts): Promise<string> {
+  return (await resolveManagedSyncIdentity(engine, opts)).key;
+}
+
 const OP = 'managed-sync';
 type CursorHeader = Omit<Cursor, 'entries' | 'companyPlan'> & { total: number };
 const header = ({ entries, companyPlan: _plan, ...value }: Cursor): CursorHeader => ({ ...value, total: entries.length });
@@ -603,17 +629,10 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
   }
   assertPersistenceAccepting(engine);
   validateManagedSyncOptions(opts);
-  const context = await resolveManagedSyncContext(engine, opts);
-  if (!opts.dryRun) await assertManagedSyncAllowed(engine, context.binding.worktree_id, context.sourceId);
-  const authority = await managedSyncAuthority(engine, context.sourceId, context.incarnation, opts.repoPath ?? context.root);
-  const company = currentCompanyBrainSync(context.sourceId);
+  const { context, authority, company, syncOptions, key } = await resolveManagedSyncIdentity(engine, opts, true);
   const processingOptions = syncProcessingOptions(opts);
-  const syncOptions: SyncCursorOptions = { full: opts.full ?? false, workingTree: opts.workingTree ?? false, srcSubpath: opts.srcSubpath ?? null,
-    exclude: opts.exclude ?? [], includeHidden: opts.includeHidden ?? [], strategy: opts.strategy ?? null };
   const frozenRun: { syncOptions: SyncCursorOptions; repoPath?: string; screen?: SyncScreenRun | null; observedAt?: string } = { syncOptions, ...(opts.repoPath ? { repoPath: resolve(opts.repoPath) } : {}) };
   const runStartedAt = new Date().toISOString();
-  const key = digest({ source: context.incarnation, principal: authority.writer.principal, authority, ...(company ? { company: { receiptId: company.receiptId, planDigest: company.plan.plan_digest } } : {}),
-    options: syncOptions });
   let cursor: Cursor | null = null;
   let missingManifestCursor: CursorHeader | null = null;
   if (!company) Object.assign(state, { sourceId: context.sourceId, incarnation: context.incarnation, remote: authority.writer.remote, cursor: () => cursor });
