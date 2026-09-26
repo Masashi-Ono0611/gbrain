@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import type { BrainEngine } from '../src/core/engine.ts';
+import type { BrainEngine, NewFact } from '../src/core/engine.ts';
 import { runExtractConversationFactsCore } from '../src/commands/extract-conversation-facts.ts';
 import { submitManagedConversationFacts } from '../src/core/persistence/conversation-facts.ts';
 import { disposePersistenceConsumer, startPersistenceConsumer } from '../src/core/persistence/service.ts';
@@ -22,6 +22,8 @@ beforeAll(async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SOURCE: undefined, GBR
     compiled_truth: '**Alice Example** (2026-01-01 9:00 AM): We shipped a durable archive.\n**Bob Demo** (2026-01-01 9:05 AM): The archive stays available.', timeline: '', frontmatter: {} });
   await engine.putPage('conversations/stale-managed-example', { type: 'conversation', title: 'Stale example',
     compiled_truth: '**Alice Example** (2026-01-01 9:00 AM): We shipped a durable archive.\n**Bob Demo** (2026-01-01 9:05 AM): The archive stays available.', timeline: '', frontmatter: {} });
+  await engine.putPage('conversations/retried-managed-example', { type: 'conversation', title: 'Retried example',
+    compiled_truth: 'A transcript snapshot for retry.', timeline: '', frontmatter: {} });
   writeFileSync(join(home, 'managed-transcript.txt'), 'Alice Example: original transcript.');
   await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [home]);
   await engine.putPage('conversations/sidecar-managed-example', { type: 'conversation', title: 'Sidecar example',
@@ -62,6 +64,27 @@ test('managed extraction journals one page batch with its terminal row and skips
   const second = await run();
   expect(second.pages_skipped_completed).toBe(1);
   expect(await engine.executeRaw("SELECT id FROM facts WHERE source_markdown_slug='conversations/managed-example'")).toHaveLength(2);
+  await disposePersistenceConsumer(engine);
+}));
+
+test('managed extraction replay ignores run metadata and publishes one snapshot batch', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  const slug = 'conversations/retried-managed-example';
+  const snapshot = await engine.readPageSnapshot(slug, { sourceId: 'default' });
+  if (!snapshot) throw new Error('retry fixture page missing');
+  const facts: NewFact[] = [{ fact: 'A durable archive shipped', kind: 'fact', entity_slug: null, source: 'cli:extract-conversation-facts', confidence: 1 }];
+  const request = { sourceId: 'default', slug, pageId: snapshot.page.id, expectedRevision: snapshot.revision,
+    contentToken: conversationSnapshotVersionToken(snapshot.page, snapshot.page.compiled_truth ?? ''), facts,
+    outcome: 'complete' as const, terminal: true };
+
+  await submitManagedConversationFacts(engine, { ...request, outcomeSession: 'run:first', auditContext: 'audit:first' });
+  await submitManagedConversationFacts(engine, { ...request, outcomeSession: 'run:retry', auditContext: 'audit:retry' });
+
+  expect(await engine.executeRaw('SELECT id FROM persistence_requests WHERE operation=$1 AND slug=$2', ['extract_facts', slug])).toHaveLength(1);
+  expect(await engine.executeRaw('SELECT source,row_num FROM facts WHERE source_markdown_slug=$1 ORDER BY row_num', [slug])).toEqual([
+    { source: 'cli:extract-conversation-facts', row_num: 0 },
+    { source: 'cli:extract-conversation-facts:terminal:v2', row_num: 1 },
+  ]);
+  expect(await engine.executeRaw("SELECT id FROM facts WHERE source_markdown_slug=$1 AND source='cli:extract-conversation-facts:terminal:v2'", [slug])).toHaveLength(1);
   await disposePersistenceConsumer(engine);
 }));
 
