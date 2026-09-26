@@ -36,6 +36,31 @@ export interface ManagedSyncWriteDiagnostic {
 
 interface Pending { requestId: string; slug: string; pageId: number | null; intent: SyncIntent; }
 type SyncKeyOptions = NonNullable<ManagedSyncFailure['keyOptions']>;
+interface ManagedSyncIdentity {
+  context: Awaited<ReturnType<typeof resolveManagedSyncContext>>;
+  authority: SyncAuthority;
+  company: ReturnType<typeof currentCompanyBrainSync>;
+  keyOptions: SyncKeyOptions;
+  key: string;
+}
+async function resolveManagedSyncIdentity(engine: BrainEngine, opts: SyncOpts): Promise<ManagedSyncIdentity> {
+  const context = await resolveManagedSyncContext(engine, opts);
+  const authority = await managedSyncAuthority(engine, context.sourceId, context.incarnation, opts.repoPath ?? context.root);
+  const company = currentCompanyBrainSync(context.sourceId);
+  // Keep the cursor identity aligned with performManagedSync's normalized
+  // SyncOpts fields; discovery-only config defaults do not change this key.
+  const keyOptions: SyncKeyOptions = { full: opts.full ?? false, workingTree: opts.workingTree ?? false, srcSubpath: opts.srcSubpath ?? null,
+    exclude: opts.exclude ?? [], includeHidden: opts.includeHidden ?? [], strategy: opts.strategy ?? null };
+  const key = digest({ source: context.incarnation, principal: authority.writer.principal, authority, ...(company ? { company: { receiptId: company.receiptId, planDigest: company.plan.plan_digest } } : {}),
+    options: keyOptions });
+  return { context, authority, company, keyOptions, key };
+}
+
+/** Returns the exact durable cursor key performManagedSync will use for these options. */
+export async function managedSyncCursorKey(engine: BrainEngine, opts: SyncOpts): Promise<string> {
+  return (await resolveManagedSyncIdentity(engine, opts)).key;
+}
+
 interface Cursor extends SyncDiscovery { runId: string; index: number; authority: SyncAuthority; keyOptions?: SyncKeyOptions; pending?: Pending; done?: boolean; companyReceiptId?: string;
   processingOptions?: SyncProcessingOptions;
   counts: { added: number; modified: number; deleted: number; chunks: number }; }
@@ -183,14 +208,8 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
   }
   assertPersistenceAccepting(engine);
   validateManagedSyncOptions(opts);
-  const context = await resolveManagedSyncContext(engine, opts);
-  const authority = await managedSyncAuthority(engine, context.sourceId, context.incarnation, opts.repoPath ?? context.root);
-  const company = currentCompanyBrainSync(context.sourceId);
+  const { context, authority, company, keyOptions, key } = await resolveManagedSyncIdentity(engine, opts);
   const processingOptions = syncProcessingOptions(opts);
-  const keyOptions: SyncKeyOptions = { full: opts.full ?? false, workingTree: opts.workingTree ?? false, srcSubpath: opts.srcSubpath ?? null,
-    exclude: opts.exclude ?? [], includeHidden: opts.includeHidden ?? [], strategy: opts.strategy ?? null };
-  const key = digest({ source: context.incarnation, principal: authority.writer.principal, authority, ...(company ? { company: { receiptId: company.receiptId, planDigest: company.plan.plan_digest } } : {}),
-    options: keyOptions });
   let cursor: Cursor | null = null;
   let missingManifestCursor: CursorHeader | null = null;
   let phase: ManagedSyncFailure['phase'] = 'resume';
