@@ -5402,7 +5402,7 @@ See also:
     // Scope the retry count and option mismatch notice to this source.
     const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
     const managedFailures = brain?.enabled ? await readManagedSyncFailures(engine, [sourceId]) : null, failures = managedFailures ?? unacknowledgedSyncFailures().filter(f => f.source_id === sourceId);
-    const report = managedFailures ? managedSyncRetryReport(managedFailures, await (await import('../core/persistence/sync-run.ts')).managedSyncCursorKey(engine, opts)) : null;
+    const report = managedFailures ? await (await import('../core/persistence/sync-run.ts')).managedSyncCursorKey(engine, opts).then(key => managedSyncRetryReport(managedFailures, key), () => null) : null; // advisory: refused sources (connectors) keep performSync's routing
     report?.otherLines.forEach(slog); const retryingCount = report?.retrying ?? failures.length;
     if (retryingCount === 0 && failures.length === 0) {
       slog('No local ledger entries; checking the durable sync cursor for unfinished or failed writes.');
