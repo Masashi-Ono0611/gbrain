@@ -30,6 +30,7 @@ export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest
     throw new OperationError('unsupported_mutation_protocol', 'No compatible skill mutation preparer is registered.');
   }
   if (row.operation === 'submit_job' && String(row.intent?.kind).startsWith('managed_atom_')) return (await import('./atom-maintenance.ts')).prepareManagedAtomMutation(e, row, cfg);
+  if (row.operation === 'extract_facts' && row.intent?.kind === 'managed_conversation_facts_page') return (await import('./conversation-facts-prepare.ts')).prepareManagedConversationFactsMutation(e, row, cfg);
   if (row.operation === 'extract_facts' && String(row.intent?.kind).startsWith('managed_facts_')) return (await import('./facts-prepare.ts')).prepareManagedFactsMutation(e, row, cfg);
   if (row.operation === 'submit_job' && String(row.intent?.kind).startsWith('managed_connector_')) return (await import('./connector-sync.ts')).prepareConnectorMutation(e, row);
   if (row.operation === 'put_page' && row.intent?.kind === 'canonical_reconcile') return (await import('./reconcile-prepare.ts')).prepareReconcileMutation(e, row, cfg);
