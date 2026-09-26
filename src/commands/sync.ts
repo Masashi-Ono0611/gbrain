@@ -1,6 +1,6 @@
 import { assertManagedFilesystemWrite } from '../core/persistence/filesystem-guard.ts';
 import { assertSyncDispatchActive, resolveSyncPersistenceMode } from '../core/persistence/sync-authority.ts';
-import { formatManagedSyncFailure, readManagedSyncFailures, syncFailureJsonFields, type ManagedSyncFailure } from '../core/persistence/sync-failures.ts';
+import { formatManagedSyncFailure, managedSyncRetryReport, readManagedSyncFailures, syncFailureJsonFields, type ManagedSyncFailure } from '../core/persistence/sync-failures.ts';
 import { readSourceFileSync, hasSourceFilesystemLock, withSourceFilesystemLock, currentSourceFilesystemSignal, assertSourceFilesystemActive } from '../core/minions/source-filesystem.ts';
 import { currentJobSignal } from '../core/minions/submission-authority.ts';
 import { existsSync, readFileSync, writeFileSync, statSync, lstatSync, realpathSync } from 'fs';
@@ -133,7 +133,6 @@ import {
   resolveSlugRootMode,
   type SlugRootMode,
 } from '../core/sync-anchor.ts';
-import { isSyncDisabledConfig } from '../core/sync-policy.ts';
 import {
   SyncLockBusyError,
   formatLockBusyMessage,
@@ -148,6 +147,7 @@ import {
   resolveStallAbortSeconds,
   composeAbortSignals,
 } from '../core/sync-reconcile.ts';
+import { isSyncDisabledConfig, isSyncDisabledForSource, SyncDisabledError } from '../core/sync-policy.ts';
 
 /**
  * v0.42.x (#1794) -- resumable incremental sync checkpoint.
@@ -621,6 +621,11 @@ See also:
 // runBreakLock, buildPartialResult) was peeled to src/core/sync-lock.ts
 // (pure move). Re-exported so existing importers keep working.
 export { SyncLockBusyError, runBreakLock } from '../core/sync-lock.ts';
+// #4399: single choke-point enforcement of config.syncEnabled=false. See
+// src/core/sync-policy.ts for the rationale. Re-exported so callers (e.g.
+// the `sync` job worker in jobs.ts) can catch it alongside SyncLockBusyError
+// without importing sync-policy.ts directly.
+export { SyncDisabledError } from '../core/sync-policy.ts';
 
 async function runConnectorSync(engine: BrainEngine, opts: SyncOpts, managed: boolean): Promise<SyncResult | null> {
   if (!opts.sourceId && !opts.githubItem) return null;
@@ -653,6 +658,27 @@ async function runConnectorSync(engine: BrainEngine, opts: SyncOpts, managed: bo
 }
 
 export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
+  // #4399: syncEnabled:false is a hard, unconditional exclusion — checked
+  // HERE, before either lock path below, because performSync is the one
+  // function every sync execution path funnels through (CLI single-source,
+  // the minion `sync` job, autopilot's freshness dispatcher, cycle.ts). A
+  // per-caller check (as sync-cost-gate.ts and the `sync --all` fan-out
+  // filter already had) can't cover every entry point; this can. No bypass
+  // flag — an explicit `gbrain sync --source X` on a disabled source is
+  // refused the same as an automated dispatch.
+  //
+  // Resolve `opts.sourceId ?? DEFAULT_SOURCE_ID` — the same fallback every
+  // other write site in this file uses (softDeletePages, rename-reconcile,
+  // the failure ledger, ...) — rather than gating on `opts.sourceId` being
+  // set. A bare `gbrain sync` / a minion `sync` job with no sourceId still
+  // writes pages under source_id='default' via the pre-v0.17 global-config
+  // path; skipping the check when sourceId is merely omitted would let a
+  // disabled 'default' source sync through that path (caught in review).
+  const effectiveSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
+  if (await isSyncDisabledForSource(engine, effectiveSourceId)) {
+    throw new SyncDisabledError(effectiveSourceId);
+  }
+
   assertSyncDispatchActive();
   const inheritedSignal = currentSourceFilesystemSignal();
   if (inheritedSignal) opts = { ...opts, signal: opts.signal ? AbortSignal.any([opts.signal, inheritedSignal]) : inheritedSignal };
@@ -5399,15 +5425,15 @@ See also:
   }
 
   if (retryFailed) {
-    // v0.42.42.0 (#2139, D13C): scope the retry count to THIS source — rows
-    // carry source_id (#1939), so a single-source retry shouldn't report
-    // another source's failures.
+    // Scope the retry count and option mismatch notice to this source.
     const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-    const failures = brain?.enabled ? await readManagedSyncFailures(engine, [sourceId]) : unacknowledgedSyncFailures().filter(f => f.source_id === sourceId);
-    if (failures.length === 0) {
+    const managedFailures = brain?.enabled ? await readManagedSyncFailures(engine, [sourceId]) : null, failures = managedFailures ?? unacknowledgedSyncFailures().filter(f => f.source_id === sourceId);
+    const report = managedFailures ? await (await import('../core/persistence/sync-run.ts')).managedSyncCursorKey(engine, opts).then(key => managedSyncRetryReport(managedFailures, key), () => null) : null; // advisory: refused sources (connectors) keep performSync's routing
+    report?.otherLines.forEach(slog); const retryingCount = report?.retrying ?? failures.length;
+    if (retryingCount === 0 && failures.length === 0) {
       slog('No local ledger entries; checking the durable sync cursor for unfinished or failed writes.');
     } else {
-      slog(`Retrying ${failures.length} previously-failed file(s)...`);
+      slog(`Retrying ${retryingCount} previously-failed file(s)...`);
     }
   }
 

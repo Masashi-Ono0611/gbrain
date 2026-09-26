@@ -22,6 +22,7 @@ import { dedupResults } from '../search/dedup.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { HybridSearchMeta, SearchResult } from '../types.ts';
+import type { RelationalArmMeta } from '../search/relational-recall.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
 import { redactRetrievalOutput } from '../search/output-redaction.ts';
@@ -42,7 +43,6 @@ import {
   stampDeepResearchIds,
   stampEvidenceSafe,
   maybeCaptureSearch,
-  thinkSourceScopeOpts,
 } from './context.ts';
 
 /**
@@ -122,7 +122,7 @@ async function buildRetrievalResponseMeta(
   queryText: string,
   results: unknown[],
   meta: HybridSearchMeta | null,
-  opts: { conceptHint?: boolean; types?: string[] } = {},
+  opts: { conceptHint?: boolean; types?: string[]; relationalMeta?: RelationalArmMeta | null } = {},
 ): Promise<Record<string, unknown>> {
   const m = meta as (HybridSearchMeta & { degraded?: unknown[]; retrieved_count?: number }) | null;
   const hint = opts.conceptHint && looksConceptShaped(queryText)
@@ -155,6 +155,17 @@ async function buildRetrievalResponseMeta(
     } : {}),
     ...((m?.degraded !== undefined || degraded.length > 0) ? { degraded } : {}),
     projection_readiness: readiness,
+    // #3995 (local-only, not submitted upstream — see patch 84 rationale)
+    // — surface whether the relational recall arm fired (and its
+    // seed/candidate counts) so a caller can distinguish "graph answer
+    // contributed" from "graph answer never reached fusion" without source
+    // access. Additive field on the existing `retrieval` _meta key; absent
+    // when the arm never ran on THIS invocation (relational retrieval off,
+    // the image-similarity branch, OR a semantic-cache hit — the cache-hit
+    // branch in hybrid.ts returns without invoking `onRelationalMeta`, so a
+    // cached result set originally produced with relational recall still
+    // reports no `relational` here).
+    ...(opts.relationalMeta ? { relational: opts.relationalMeta } : {}),
     ...(hint || readiness.hint ? { hint: [hint, readiness.hint].filter(Boolean).join(' ') } : {}),
   };
 }
@@ -569,6 +580,13 @@ const query: Operation = {
     // search). When the param is the literal '__all__', force-allow
     // cross-source mode (matches SearchOpts.sourceId contract).
     let capturedMeta: HybridSearchMeta | null = null;
+    // #3995 (local-only) — observability sink for the relational recall
+    // arm. Stays null when the callback itself never fires: relational
+    // retrieval off for the resolved mode, or a semantic-cache hit (the
+    // cache-hit branch in hybrid.ts returns before invoking
+    // onRelationalMeta). `fired` on a non-null value is what distinguishes
+    // "arm ran and found nothing to do" from "arm didn't run at all".
+    let capturedRelationalMeta: RelationalArmMeta | null = null;
     // v0.32.x search-lite: route the query op through hybridSearchCached so
     // token budget and intent weighting apply at the operation boundary.
     // Semantic cache reuse is suspended in the wrapper.
@@ -611,6 +629,11 @@ const query: Operation = {
       // v0.36 cross-modal routing param.
       crossModal: p.cross_modal as 'text' | 'image' | 'both' | 'auto' | undefined,
       onMeta: (m) => { capturedMeta = m; },
+      // #3995 (local-only) — thread the relational-arm observability sink
+      // through so `fired`/`kind`/`seeds_resolved`/`candidates`/`errored`
+      // land in the `retrieval` response meta below instead of only being
+      // visible to source-level tracing.
+      onRelationalMeta: (m) => { capturedRelationalMeta = m; },
       // v0.36 (D15): per-call embedding column override. Resolver rejects
       // unknown names at hybrid entry with EmbeddingColumnNotRegisteredError;
       // the error surfaces back to the agent as the op error envelope.
@@ -730,7 +753,15 @@ const query: Operation = {
           try {
             const { runThink } = await import('../think/index.ts');
             const { embedQuery } = await import('../embedding.ts');
-            const thinkScope = thinkSourceScopeOpts(ctx);
+            // Reuse the scope already resolved from this query's per-call
+            // source_id. Re-resolving from ctx alone loses that explicit
+            // narrowing and can widen a trusted-local CRAG think escalation
+            // to the ambient federated set.
+            const thinkScope = querySourceScope.sourceIds !== undefined
+              ? { allowedSources: querySourceScope.sourceIds }
+              : querySourceScope.sourceId !== undefined
+                ? { sourceId: querySourceScope.sourceId }
+                : {};
             const t = await runThink(ctx.engine, {
               question: queryText,
               since: typeof p.since === 'string' ? p.since : undefined,
@@ -790,7 +821,7 @@ const query: Operation = {
     // WP2/D3: query never nudges toward itself — no concept hint here.
     // #1663: the CRAG grade rides the same retrieval meta channel.
     const responseMeta = {
-      ...(await buildRetrievalResponseMeta(ctx, querySourceScope, queryText, results, capturedMeta, { types })),
+      ...(await buildRetrievalResponseMeta(ctx, querySourceScope, queryText, results, capturedMeta, { types, relationalMeta: capturedRelationalMeta })),
       crag,
     };
     // #3800: cap AFTER capture/meta/CRAG so every internal consumer graded

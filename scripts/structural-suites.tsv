@@ -37,6 +37,7 @@ test/bootstrap-opencode-door.serial.test.ts	opencode door — rendered AGENTS.md
 test/bootstrap-shared-skills.test.ts	(file-level)	18	readFileSync
 test/brain-durability-hook.serial.test.ts	#4682 — push-lock timeout is fail-loud for the helper only	1	readFileSync
 test/brain-durability-hook.serial.test.ts	brain-commit-push.sh (D13 guarantee)	4	readFileSync
+test/brain-durability-hook.serial.test.ts	durability push remote confirmation (#5138)	9	readFileSync
 test/brain-durability-hook.serial.test.ts	durability schedule (installCron:true) [D2/D12]	0	readFileSync
 test/brain-durability-hook.serial.test.ts	post-commit hook (D9 local, D7 self-contained)	4	readFileSync
 test/brain-repo-durability.serial.test.ts	hardenBrainRepo	16	readFileSync
@@ -104,7 +105,7 @@ test/docs-mcp-deploy.test.ts	DEPLOY.md documents the owner magic-link flow (#500
 test/docs-mcp-deploy.test.ts	DEPLOY.md documents the tailnet/LAN-only serve --http shape (#4500)	3	readFileSync
 test/docs-navigation.test.ts	primary documentation navigation	3	readFileSync
 test/docs-timeline-extraction-guide.test.ts	#4987 timeline extraction docs describe the real trigger	2	readFileSync
-test/doctor-atom-provenance-drift.test.ts	computeAtomProvenanceDriftCheck	18	doctor-source-helper
+test/doctor-atom-provenance-drift.test.ts	computeAtomProvenanceDriftCheck	19	doctor-source-helper
 test/doctor-embedding-env-override.test.ts	cross-surface parity (source-grep regression guard)	1	doctor-source-helper
 test/doctor-fix.test.ts	gbrain doctor --fix CLI integration	3	readFileSync
 test/doctor-frontmatter-partial.test.ts	doctor frontmatter_integrity — load-bearing render strings	5	doctor-source-helper
@@ -124,7 +125,7 @@ test/doctor.test.ts	stub_guard_24h check (v0.34.5)	5	doctor-source-helper
 test/doctor.test.ts	supervisor crash classifier wiring (v0.35.x)	4	bun-file,doctor-source-helper
 test/doctor.test.ts	sync_freshness — clone-unavailable content-lag fallback	6	doctor-source-helper
 test/doctor.test.ts	v0.31.8 — wedge migration force-retry hint (D19)	4	doctor-source-helper
-test/doctor.test.ts	v0.32.4 — sync_freshness check	12	doctor-source-helper
+test/doctor.test.ts	v0.32.4 — sync_freshness check	17	doctor-source-helper
 test/doctor.test.ts	v0.40.4 — graph_signals_coverage check	7	doctor-source-helper
 test/doctor.test.ts	v0.41.27.0 — sync_freshness git short-circuit	9	doctor-source-helper
 test/doctor.test.ts	v0.41.32.0 — commit-relative staleness	5	doctor-source-helper
@@ -259,12 +260,16 @@ test/scripts/ci-local-rendering.test.ts	ci-local command rendering	1	readFileSyn
 test/scripts/ci-local-rendering.test.ts	ci-local execution coverage	3	readFileSync
 test/scripts/ci-local-rendering.test.ts	local test configuration through run-e2e	2	readFileSync
 test/scripts/ci-local-rendering.test.ts	required PgBouncer execution through run-e2e	1	readFileSync
+test/scripts/ci-runner-routing.test.ts	CI runner routing	5	readFileSync
 test/scripts/classify-tests.test.ts	classify-tests detectors	18	bun-file,doctor-source-helper,exec-scan,readFileSync
 test/scripts/coverage-diff-gate.test.ts	exemptions	3	readFileSync
+test/scripts/e2e-runner.test.ts	second	5	readFileSync
+test/scripts/e2e-runner.test.ts	sequential E2E runner (GITHUB_ACTIONS=${githubActions})	7	readFileSync
 test/scripts/e2e-wiring.test.ts	e2e file claim ratchet	5	readFileSync
 test/scripts/e2e-wiring.test.ts	selected-e2e job wiring	6	readFileSync
 test/scripts/heavy-door-workflow.test.ts	heavy door supply chain and coverage gates	4	readFileSync
 test/scripts/native-lock-prebuilds.test.ts	native lock distribution integrity	2	readFileSync
+test/scripts/nightly-e2e.test.ts	nightly E2E scheduling	4	readFileSync
 test/scripts/run-verify-parallel.test.ts	guard registration ⇒ execution coverage	1	readFileSync
 test/scripts/test-shard.slow.test.ts	test-shard.sh — LPT balance contract	5	readFileSync
 test/scripts/test-shard.slow.test.ts	test-shard.sh — exclusion contract	6	readFileSync
@@ -318,7 +323,7 @@ test/template-repo-generator.test.ts	renderTemplateReadme	5	readFileSync
 test/thin-client-routing-audit.test.ts	thin-client routing audit — scratch-DB additions (jobs partial dispatch + config refusal)	5	readFileSync
 test/thin-client-routing-audit.test.ts	thin-client routing audit — v0.32 REFUSE additions stay in the table	4	readFileSync
 test/thin-client-routing-audit.test.ts	thin-client routing audit — v0.32 ROUTE additions wire callRemoteTool	4	readFileSync
-test/think-embed-question-wiring.serial.test.ts	#3734 — CRAG think escalation wires embedQuestion (source pin)	1	readFileSync
+test/think-embed-question-wiring.serial.test.ts	#3734 — CRAG think escalation wires embedQuestion (source pin)	2	readFileSync
 test/think-embed-question-wiring.serial.test.ts	#3734 — synthesize verb wires embedQuestion into runThink	1	readFileSync
 test/timing-safe.test.ts	extraction contract	1	readFileSync
 test/tool-catalog.test.ts	freshness guard	2	readFileSync

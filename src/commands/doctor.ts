@@ -23,6 +23,7 @@ import { parseFrontmatter } from '../core/backfill-effective-date.ts';
 import { hnswIndexExpected, hnswMaxDimsForType } from '../core/vector-index.ts';
 import { VERSION as GBRAIN_BINARY_VERSION } from '../version.ts';
 import { schemaVersionHealth } from '../core/schema-version-health.ts';
+import { MIN_ENTITY_PAGES_FOR_COVERAGE } from '../core/types.ts';
 import { zeroTotalContradictionsCheck } from '../core/eval-contradictions/run-health.ts';
 import { checkProjectionReadiness } from './doctor/checks/projection-readiness.ts';
 export { checkProjectionReadiness } from './doctor/checks/projection-readiness.ts';
@@ -31,7 +32,7 @@ export { checkProjectionReadiness } from './doctor/checks/projection-readiness.t
 // original name so existing importers (tests, scripts/live-brain-first-check.ts,
 // the run_doctor op's dynamic import of doctorReportRemote) keep working
 // unchanged.
-import { multiSourceDriftAdvice, multiSourceDriftGitRootSkipNote } from './doctor/schema-pack-checks.ts';
+import { managedSyncAdviceEnabled, multiSourceDriftAdvice, multiSourceDriftGitRootSkipNote } from './doctor/schema-pack-checks.ts';
 import { bootstrapDoctorChecks } from './doctor/bootstrap-checks.ts';
 import { buildMemorableRelayCheck } from './doctor/checks/integrations-memorable.ts';
 export { buildMemorableRelayCheck } from './doctor/checks/integrations-memorable.ts';
@@ -114,7 +115,6 @@ export {
   checkCyclePhaseScope,
 } from './doctor/checks/routing-federation.ts';
 export {
-  checkChatFallbackChainInert,
   checkSearchMode,
   checkEvalDrift,
   checkEmbeddingEnvOverride,
@@ -201,7 +201,6 @@ import {
   checkCyclePhaseScope,
 } from './doctor/checks/routing-federation.ts';
 import {
-  checkChatFallbackChainInert,
   checkSearchMode,
   checkEvalDrift,
   checkEmbeddingEnvOverride,
@@ -1659,13 +1658,14 @@ export async function buildChecks(
         });
       } else if (result.count > 0) {
         const sampleStr = result.sample.map(s => `${s.slug} (intended=${s.intended_source})`).join(', ');
+        const managed = await managedSyncAdviceEnabled(engine!);
         const skipNote = result.git_root_skipped.length > 0
           ? multiSourceDriftGitRootSkipNote(result.git_root_skipped)
           : '';
         checks.push({
           name: 'multi_source_drift',
           status: 'warn',
-          message: multiSourceDriftAdvice(result.count, sampleStr) + skipNote,
+          message: multiSourceDriftAdvice(result.count, sampleStr, managed) + skipNote,
         });
       } else {
         // #4712: if EVERY candidate source was skipped as git-root-pinned,
@@ -2542,6 +2542,8 @@ export async function buildChecks(
         status: 'ok',
         message: `Only code/test fixture entity pages found (${entityCount}); graph_coverage not applicable`,
       });
+    } else if (eligibleEntityCount < MIN_ENTITY_PAGES_FOR_COVERAGE) {
+      checks.push({ name: 'graph_coverage', status: 'ok', message: `Only ${eligibleEntityCount} eligible entity page${eligibleEntityCount === 1 ? '' : 's'} (< ${MIN_ENTITY_PAGES_FOR_COVERAGE}) — coverage ratio not meaningful at this scale` });
     } else if (linkCoverage >= 0.7 && timelineCoverage >= 0.5) {
       checks.push({ name: 'graph_coverage', status: 'ok', message: `Entity connected coverage (in/out) ${linkPct}%, entity timeline coverage ${timelinePct}%` });
     } else {
@@ -3975,9 +3977,6 @@ export async function buildChecks(
   // v0.32.3 search-lite — mode + eval_drift surfaces. Status stays 'ok' per
   // [CDX-20]; hint lives in `message`.
   if (engine !== null) {
-    progress.heartbeat('chat_fallback_chain_inert');
-    const inertFallbackChain = await checkChatFallbackChainInert(engine);
-    if (inertFallbackChain) checks.push(inertFallbackChain);
     progress.heartbeat('search_mode');
     checks.push(await checkSearchMode(engine));
     // issue #1777 — hidden_by_search_policy: chunked pages withheld from default

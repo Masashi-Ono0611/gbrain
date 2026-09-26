@@ -133,7 +133,8 @@ export const TAKES_FENCE_END   = '<!--- gbrain:takes:end -->';
  */
 import { SLUG_SEGMENT_PATTERN } from './sync.ts';
 export const HOLDER_REGEX = new RegExp(
-  `^(?:world|brain|(?:people|companies)/${SLUG_SEGMENT_PATTERN.source}|${SLUG_SEGMENT_PATTERN.source})$`,
+  // Page slugs accept uppercase; take holders retain their lowercase contract.
+  `^(?!.*\\p{Lu})(?:world|brain|(?:people|companies)/${SLUG_SEGMENT_PATTERN.source}|${SLUG_SEGMENT_PATTERN.source})$`,
   'u', // required by SLUG_SEGMENT_PATTERN's \p{...} classes (#3417)
 );
 

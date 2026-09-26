@@ -54,7 +54,8 @@ import { splitProviderModelId, normalizeModelId } from '../../model-id.ts';
 import { resolveAnthropicKey } from '../../ai/anthropic-key.ts';
 import { buildSystemPrompt, DEFAULT_SUBAGENT_SYSTEM } from '../system-prompt.ts';
 import { toolLoop as gatewayToolLoop, isThinkingModel, THINKING_MODEL_MAX_OUTPUT_TOKENS } from '../../ai/gateway.ts';
-import type { ChatToolDef, ChatMessage, ChatBlock, ChatResult, ToolHandler } from '../../ai/gateway.ts';
+import type { ChatToolDef, ChatMessage, ChatBlock, ChatOpts, ChatResult, ToolHandler } from '../../ai/gateway.ts';
+import { chatWithFallback } from '../../ai/chat-fallback.ts';
 import { classifyCapabilities } from '../../ai/capabilities.ts';
 import { runSubagentOneshot, ONESHOT_TOOL_USE_ID_PREFIX } from './subagent-oneshot.ts';
 import type { OneshotFallbackReason } from '../types.ts';
@@ -312,7 +313,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         ? { ...inner, synth_mode_used: 'agentic' }
         : inner;
     return finalizeWriteAccounting(engine, ctx.id, stamped, {
-      requireWrites: dataForAccounting.require_writes === true,
+      requireWrites: dataForAccounting.require_writes === true, allowCleanZeroWrites: dataForAccounting.allow_clean_zero_writes === true,
       // OV-4: a successful oneshot job's verdict is scoped to its own
       // invocation family; a fallback wrote through the loop (no oneshot
       // rows exist — validation precedes all writes), so job-wide is exact.
@@ -558,7 +559,10 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           maxConcurrent,
           leaseTtlMs,
           _chat: deps._chat ? opts => invokeAI(chatInvocation('subagent_oneshot', normalizeModelId(model), maxOutputTokens),
-            () => deps._chat!(opts), sdkInvocationUsage) : undefined,
+            () => deps._chat!(opts), sdkInvocationUsage)
+            // patch 96: availability-aware fallback by default (tests still
+            // override via deps._chat above, e.g. to inject a deterministic fake).
+            : (chatOpts: ChatOpts) => chatWithFallback(chatOpts, { chainKey: data.fallback_chain_key }),
         });
         if (outcome.kind === 'done') return outcome.result;
         modeState.fallbackReason = outcome.reason;
@@ -1317,6 +1321,11 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     maxTokens: maxOutputTokens,
     abortSignal: ctx.signal,
     cacheSystem,
+    // patch 96: same availability-aware fallback as the oneshot path above,
+    // keyed by the same fallback_chain_key so a job that starts oneshot and
+    // falls through to the agentic loop mid-job (#4216) uses one consistent
+    // chain either way.
+    chatFn: (chatOpts: ChatOpts) => chatWithFallback(chatOpts, { chainKey: data.fallback_chain_key }),
     // #4194/CDX-7: every provider round-trip holds a rate-lease slot (worker
     // parity with the legacy loop's per-turn acquisition). Lease-full throws
     // RateLeaseUnavailableError out of the loop → worker/inline-drain requeue

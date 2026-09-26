@@ -9,7 +9,8 @@
  *
  * Each retriever returns a ranked list with normalized scores. We fuse them
  * via RRF (k=60, same constant as src/core/search/hybrid.ts). The final
- * merged set is capped at gather_limit and dedup'd by `(slug, row_num?)`.
+ * merged set is capped at gather_limit; pages use `(source_id, slug)` identity
+ * and takes use `(page_slug, row_num)` identity.
  *
  * The page hits and take hits are returned as separate lists so the synth
  * step can render them into distinct <pages> / <takes> blocks for the prompt.
@@ -23,6 +24,7 @@ import { filterPagesToWindow, type TemporalWindow } from './temporal-window.ts';
 import { sanitizeQueryForPrompt } from '../search/expansion.ts';
 import { ensureWellFormed } from '../text-safe.ts';
 import { CJK_SLUG_CHARS } from '../cjk.ts';
+import { runWithLimit } from '../worker-pool.ts';
 
 export interface ThinkGatherOpts {
   question: string;
@@ -70,6 +72,21 @@ export interface ThinkGatherResult {
     window?: { dropped: number; undatedKept: number };
   };
 }
+
+/**
+ * Share of the gather budget reserved for the temporal-window date floor.
+ *
+ * The floor (`engine.listPages` bounded by the window) exists so a windowed
+ * gather cannot miss an in-window page that hybrid's ranking never surfaced.
+ * It was appended BEHIND up to `gatherLimit * 4` hybrid rows and then cut at
+ * `gatherLimit`, so it only ever delivered anything when hybrid happened to
+ * under-return — i.e. it was a backfill, not a floor. Reserving slots makes
+ * it one: hybrid keeps the large majority of the budget, and up to this share
+ * goes to in-window pages hybrid missed. When the floor has nothing to add
+ * the reservation is 0 and the merge is byte-identical to appending.
+ */
+const WINDOW_FLOOR_RESERVED_SHARE = 0.25;
+const WINDOW_FLOOR_HYDRATE_CONCURRENCY = 8;
 
 const RRF_K = 60;
 
@@ -125,7 +142,10 @@ export async function runGather(
       ? { sourceId: opts.sourceId }
       : {};
   const pageScope = { ...sourceScope, excludePrivate: opts.excludePrivate, requireSafeChunks: opts.remote !== false, takesHoldersAllowList: opts.takesHoldersAllowList };
+  const floorPageScope = { ...pageScope, requireLiveVisibility: true };
   const visibleBody = (body: string) => opts.remote === false ? body : sanitizeRemoteBody(body);
+  const pageIdentity = (page: Pick<SearchResult, 'slug' | 'source_id'>) =>
+    `${page.source_id ?? 'default'}\0${page.slug}`;
 
   // Sanitize the question for any path that includes it in an LLM prompt.
   // (Direct DB search is fine — those are parameterized queries.)
@@ -151,32 +171,88 @@ export async function runGather(
   // gather sized for breadth (default 40) could collapse to minKeep=1 and
   // starve synthesis. Same breadth reason as the CRAG escalation re-run in
   // ops/search.ts; precision trimming is the synth prompt's job here.
+  //
+  // tokenBudget: 0 on both legs — the same bug class as autocut, one stage
+  // later. `enforceTokenBudget` runs AFTER the limit slice and the mode
+  // bundles set it (conservative 4K, balanced 12K, and balanced is the
+  // fallback), so a gather that asked for 40 pages silently returned however
+  // many happened to fit. It is a greedy TOP-DOWN packer, so the cost falls
+  // entirely on the tail: long, lexically rich pages (meeting notes, chat
+  // transcripts) both rank first and cost the most, exhaust the budget, and
+  // the cheap terse rows behind them — calendar events, mail threads, any
+  // structured evidence — are dropped whole. Synthesis then reports those as
+  // absent. The gather already re-budgets its own prompt block in CHARACTERS
+  // (pagesBlockExcerptLen: 12K total, 2.4K/page ceiling, 600/page floor), so
+  // a second search-layer trim in tokens buys no context-window safety and
+  // costs whole pages. 0 is the documented no-op for the packer (<= 0) and
+  // per-call wins over config + bundle in resolveSearchMode.
   const pagesPromise = (window ? Promise.all([
     hybridSearch(engine, opts.question, {
       limit: Math.min(gatherLimit * 4, 200),
       expansion: false,
       autocut: false,
+      tokenBudget: 0,
       ...pageScope,
     }),
     engine.listPages({
       ...(window.startMs !== null ? { effective_after: new Date(window.startMs).toISOString() } : {}),
       ...(window.endMs !== null ? { effective_before: new Date(window.endMs).toISOString() } : {}),
-      limit: 50, ...pageScope,
-    }).then(pages => pages.map(toSearchResult)).catch((e) => {
+      limit: 50, ...floorPageScope,
+    }).then(async pages => {
+      // listPages returns stored rows, while getPage returns the canonical
+      // withdrawal-aware snapshot. Rehydrate each bounded floor row so a
+      // durable fact retraction cannot be resurrected from stale raw body
+      // text. The revision check rejects a page changed between enumeration
+      // and hydration (including withdrawal-driven projection invalidation).
+      const hydrated = await runWithLimit({
+        items: pages,
+        limit: WINDOW_FLOOR_HYDRATE_CONCURRENCY,
+        fn: async (page, rank) => {
+          const current = await engine.getPage(page.slug, {
+            sourceId: page.source_id ?? 'default',
+            excludePrivate: opts.excludePrivate,
+          });
+          if (!current || current.id !== page.id
+            || current.knowledge_revision !== page.knowledge_revision
+            || current.text_projection_revision !== page.text_projection_revision) return null;
+          return toSearchResult(current, rank);
+        },
+      });
+      const failed = hydrated.filter(result => !result.ok).length;
+      if (failed > 0) {
+        warnings.push('GATHER_WINDOW_FLOOR_PARTIAL_FAILED');
+        process.stderr.write(`[think.gather] window floor dropped ${failed} failed snapshot read(s)\n`);
+      }
+      return hydrated.flatMap(result => result.ok && result.value !== null ? [result.value] : []);
+    }).catch((e) => {
       warnings.push('GATHER_WINDOW_FLOOR_FAILED');
       process.stderr.write(`[think.gather] window floor failed: ${(e as Error).message}\n`);
       return [] as SearchResult[];
     }),
   ]).then(([hybrid, floor]) => {
     const seen = new Set<string>();
-    const combined = [...hybrid, ...floor].filter(page => !seen.has(page.slug) && !!seen.add(page.slug));
+    const combined = [...hybrid, ...floor].filter(page => {
+      const identity = pageIdentity(page);
+      return !seen.has(identity) && !!seen.add(identity);
+    });
     const filtered = filterPagesToWindow(combined, window);
     windowDiagnostic = { dropped: filtered.droppedOutOfWindow, undatedKept: filtered.undatedKept };
-    return filtered.kept.slice(0, gatherLimit);
+    // Reserved-slot merge (see WINDOW_FLOOR_RESERVED_SHARE). `filtered.kept`
+    // is still hybrid-first, so partitioning on the hybrid slug set preserves
+    // each side's own rank order; only the cut point between them moves. The
+    // floor tail takes every slot the head left, so a short hybrid leg still
+    // fills the gather exactly as it did before.
+    const hybridPages = new Set(hybrid.map(pageIdentity));
+    const fromHybrid = filtered.kept.filter(page => hybridPages.has(pageIdentity(page)));
+    const fromFloor = filtered.kept.filter(page => !hybridPages.has(pageIdentity(page)));
+    const reserved = Math.min(fromFloor.length, Math.floor(gatherLimit * WINDOW_FLOOR_RESERVED_SHARE));
+    const head = fromHybrid.slice(0, Math.max(0, gatherLimit - reserved));
+    return [...head, ...fromFloor.slice(0, gatherLimit - head.length)];
   }) : hybridSearch(engine, opts.question, {
     limit: gatherLimit,
     expansion: false,
     autocut: false,
+    tokenBudget: 0,
     ...pageScope,
   })).catch((e) => {
     warnings.push('GATHER_HYBRID_FAILED');

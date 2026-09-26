@@ -4,7 +4,8 @@
 //   1. Discover transcripts via discoverTranscripts() AND brain pages
 //      via a single raw SQL query (NOT EXISTS subquery filters out
 //      pages already extracted by content hash — see "Idempotency" below).
-//   2. Dedup by content_hash; transcripts win on collision.
+//   2. Drop physical-file twins owned by live source pages, then dedup
+//      by content_hash; remaining transcripts win on hash collision.
 //   3. Per work-item, ask the configured extract_atoms model (key-aware
 //      utility-tier default, see resolveExtractAtomsModel below) for 1-3 atoms.
 //   4. Write each atom via importFromContent(slug, markdown, {sourceId})
@@ -64,9 +65,12 @@ import type { PhaseResult } from '../cycle.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { ProgressReporter } from '../progress.ts';
 import { chat as gatewayChat, withBudgetTracker, isAvailable } from '../ai/gateway.ts';
+import { chatWithFallback } from '../ai/chat-fallback.ts';
 import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { importFromContent } from '../import-file.ts';
-import { serializeMarkdown } from '../markdown.ts';
+import { realpath } from 'node:fs/promises';
+import { isAbsolute, relative, sep } from 'node:path';
+import { resolveSourceLocalFilePath, serializeMarkdown } from '../markdown.ts';
 import { truncateUtf8 } from '../text-safe.ts';
 import { BudgetExhausted, BudgetTracker, loadPricingOverrides } from '../budget/budget-tracker.ts';
 import { resolveExtractAtomsCostGate, resolveEmbedModelForCostGate } from './extract-atoms-cost-gate.ts';
@@ -82,6 +86,7 @@ import { managedAtomSession, readAtomOrigin, resumeManagedAtoms, publishManagedA
 import { OperationError } from '../ops/contract.ts';
 import type { WriteReceipt } from '../persistence/types.ts';
 import { AtomPageStateError, completeAtomReceipts, readAtomPageIdentity, writeAtomPageState, type AtomPageInput } from './extract-atoms-page-state.ts';
+import { countSourceChangedAtoms } from './extract-atoms-source-drift.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 // #4529 + #4540: per-item extractor caps, overridable via
@@ -500,6 +505,55 @@ export async function countExtractAtomsBacklog(
   }
 }
 
+/**
+ * Synced pages own transcripts that resolve to the same file in the source
+ * checkout, but only extractable page types own notes so neither door loses them.
+ * Scan live pages independently of the extraction batch.
+ */
+async function filterTranscriptPageTwins(
+  engine: BrainEngine,
+  sourceId: string,
+  transcripts: NonNullable<ExtractAtomsOpts['_transcripts']>,
+) {
+  if (transcripts.length === 0) return transcripts;
+  try {
+    const sources = await engine.executeRaw<{ local_path: string | null }>(
+      'SELECT local_path FROM sources WHERE id = $1', [sourceId],
+    );
+    const localPath = sources[0]?.local_path;
+    if (!localPath) return transcripts;
+    const root = await realpath(localPath);
+    const transcriptFiles = new Map<typeof transcripts[number], string>();
+    for (const transcript of transcripts) {
+      try {
+        const path = await realpath(transcript.filePath);
+        const withinRoot = relative(root, path);
+        if (withinRoot !== '..' && !withinRoot.startsWith(`..${sep}`)
+          && !isAbsolute(withinRoot)) transcriptFiles.set(transcript, path);
+      } catch { /* keep transcripts whose physical path is unavailable */ }
+    }
+    if (transcriptFiles.size === 0) return transcripts;
+    const pages = await engine.executeRaw<{ source_path: string | null; slug: string }>(
+      `SELECT source_path, slug FROM pages
+       WHERE source_id = $1 AND deleted_at IS NULL AND type = ANY($2::text[])`,
+      [sourceId, await resolveExtractableTypes()],
+    );
+    const pageFiles = new Set<string>();
+    for (const page of pages) {
+      try {
+        const path = resolveSourceLocalFilePath(localPath, page.source_path, page.slug);
+        if (path) pageFiles.add(await realpath(path));
+      } catch { /* unresolved page cannot establish a twin */ }
+    }
+    return transcripts.filter(transcript => {
+      const path = transcriptFiles.get(transcript);
+      return path === undefined || !pageFiles.has(path);
+    });
+  } catch {
+    return transcripts; // fail-soft: extraction still proceeds
+  }
+}
+
 async function resolvePageDiscoveryLimit(engine: BrainEngine): Promise<number> {
   try {
     const configured = await engine.getConfig('cycle.extract_atoms.page_discovery_budget');
@@ -652,7 +706,10 @@ export async function runPhaseExtractAtoms(
   opts: ExtractAtomsOpts = {},
 ): Promise<PhaseResult> {
   const sourceId = opts.sourceId ?? 'default';
-  const chat = opts._chat ?? gatewayChat;
+  // patch 96: availability-aware fallback by default (test seam unchanged).
+  const chat = opts._chat
+    ?? ((chatOpts: Parameters<typeof gatewayChat>[0]) =>
+      chatWithFallback(chatOpts, { chainKey: 'models.dream.extract_atoms' }));
   const managed = await managedAtomSession(engine, sourceId, opts._managedRetry);
   const writeRequests: WriteReceipt[] = [];
 
@@ -694,6 +751,10 @@ export async function runPhaseExtractAtoms(
       // No transcripts available — phase no-ops cleanly.
     }
   }
+
+  const transcriptsBeforeTwins = transcripts.length;
+  transcripts = await filterTranscriptPageTwins(engine, sourceId, transcripts);
+  const transcriptPageTwinsSkipped = transcriptsBeforeTwins - transcripts.length;
 
   // 1b. Get pages (test seam OR production discovery).
   //     _pages === undefined triggers discovery; _pages: [] suppresses it
@@ -821,12 +882,14 @@ export async function runPhaseExtractAtoms(
         reason: 'no_work',
         source_id: sourceId,
         atoms_extracted: 0,
+        atoms_source_changed: 0,
         transcripts_processed: 0,
         transcripts_total: 0,
         transcripts_skipped_budget: 0,
         pages_processed: 0,
         pages_total: 0,
         duplicates_skipped: 0,
+        transcript_page_twins_skipped: transcriptPageTwinsSkipped,
         failures: [],
         estimated_spend_usd: 0,
         budget_usd: DEFAULT_BUDGET_USD,
@@ -837,6 +900,8 @@ export async function runPhaseExtractAtoms(
 
   // 4. Per work-item: extract atoms via the configured extract_atoms model
   let totalAtomsExtracted = 0;
+  // Read-only drift visibility; see ./extract-atoms-source-drift.ts.
+  let atomsSourceChanged = 0;
   let transcriptsProcessed = 0;
   let pagesProcessed = 0;
   let transcriptsSkipped = 0;
@@ -1164,6 +1229,10 @@ export async function runPhaseExtractAtoms(
           else if (item.kind === 'page') await stampAtomsScanHash(item);
           else await stampTranscriptTombstone(item.filePath, item.contentHash);
         }
+        // Zero yield ≠ zero atoms: earlier runs can have left stale rows.
+        if (item.kind === 'page') {
+          atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
+        }
         if (item.kind === 'transcript') transcriptsProcessed++;
         else pagesProcessed++;
         continue;
@@ -1312,6 +1381,12 @@ export async function runPhaseExtractAtoms(
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting
       }
+      // After the completion flip, so atoms this run refreshed carry the run's
+      // hash16 and are correctly NOT counted. Dry-run wrote nothing, so the
+      // same query reports the pre-run state; same code path either way.
+      if (item.kind === 'page') {
+        atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
+      }
       if (item.kind === 'transcript') transcriptsProcessed++;
       else pagesProcessed++;
       // v0.41.19.0 (T4): one tick per processed item, with a count note.
@@ -1418,9 +1493,11 @@ export async function runPhaseExtractAtoms(
       (failures.length > 0 ? ` (${failures.length} failed)` : '') +
       (transcriptsSkipped + pagesSkipped > 0
         ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
-        : ''),
+        : '') +
+      (atomsSourceChanged > 0 ? ` (${atomsSourceChanged} source-changed atoms)` : ''),
     details: {
       atoms_extracted: totalAtomsExtracted,
+      atoms_source_changed: atomsSourceChanged,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,
       transcripts_skipped_budget: transcriptsSkipped,
@@ -1428,6 +1505,7 @@ export async function runPhaseExtractAtoms(
       pages_total: pages.length,
       pages_skipped_budget: pagesSkipped,
       duplicates_skipped: duplicatesSkipped,
+      transcript_page_twins_skipped: transcriptPageTwinsSkipped,
       failures,
       ...(managed ? { write_requests: writeRequests } : {}),
       ...(abortedGlobalError ? { aborted_global_error: abortedGlobalError } : {}),
@@ -1658,16 +1736,42 @@ function sourceDate(ref: string): string {
  *   hash is deliberately NOT folded in: an edited/reworded source page must
  *   re-resolve to the same slug and upsert rather than mint a duplicate atom
  *   set on every body edit (the reword-still-upserts property).
- * - Transcript atoms keep the legacy title-only 6-char hash (their locator is
- *   a file path, not page identity; changing their persisted slugs would
- *   re-mint every transcript atom on upgrade for no correctness gain).
+ * - #4908: for PAGE-derived atoms the identity hash is computed over the
+ *   LOWERCASED title (plain JavaScript `.toLowerCase()` — this covers the
+ *   full Unicode range `.toLowerCase()` itself handles (including
+ *   supplementary-plane characters), but it is still simple lowercasing,
+ *   NOT full Unicode case-folding; "case-insensitive" here means exactly
+ *   that and no more). Pre-fix the hash was computed over the raw title, so
+ *   re-extracting the same underlying claim with a title that differed only
+ *   in letter case (a common model non-determinism) hashed to a DIFFERENT
+ *   slug and minted a duplicate atom instead of upserting the existing one.
+ *   Lowercasing only the hash INPUT (not the persisted `title` field on the
+ *   page) keeps the model's actual casing visible in the page's `title`
+ *   while identity comparison ignores it — the slug's own readable prefix
+ *   does NOT preserve casing either way, because `atomSlugStem` below
+ *   already lowercases it via `slugifySegment` regardless of this fix. This
+ *   is paired with the resolvePageAtomSlug adoption fallback below: an atom
+ *   already minted under the pre-fix RAW-title hash needs a way to be found
+ *   by a post-fix re-extraction of an unchanged-case title, or the hash
+ *   change alone would mint yet another duplicate on the very next run.
+ * - Transcript atoms keep the legacy title-only 6-char hash, computed over
+ *   the RAW (non-lowercased) title (their locator is a file path, not page
+ *   identity; changing their persisted slugs would re-mint every transcript
+ *   atom on upgrade for no correctness gain — this is a separate, narrower
+ *   fix than #4908, which is page-derived atoms only).
  * - The hash suffix keeps two distinct atoms whose titles share the first 60
  *   chars on separate slugs, so a deterministic slug never silently clobbers
- *   a *different* atom.
+ *   a *different* atom. `atomSlugStem` below lowercases too (via
+ *   `slugifySegment`), but that's for the human-readable prefix only — it
+ *   also strips characters and truncates to 60 chars, a lossier transform
+ *   than identity comparison needs, so it is never used as the hash INPUT.
  */
 function atomSlug(title: string, srcRef: string, sourcePageSlug?: string): string {
+  // #4908: page-derived identity hashing ignores letter case; the transcript
+  // (sourcePageSlug === undefined) branch is untouched — see the doc comment.
+  const identityTitle = sourcePageSlug !== undefined ? title.toLowerCase() : title;
   const hash = sourcePageSlug !== undefined
-    ? createHash('sha256').update(`${sourcePageSlug}\0${title}`).digest('hex').slice(0, 8)
+    ? createHash('sha256').update(`${sourcePageSlug}\0${identityTitle}`).digest('hex').slice(0, 8)
     : createHash('sha256').update(title).digest('hex').slice(0, 6);
   return `atoms/${sourceDate(srcRef)}/${atomSlugStem(title)}-${hash}`;
 }
@@ -1689,7 +1793,31 @@ function atomSlug(title: string, srcRef: string, sourcePageSlug?: string): strin
  *   3. A legacy-slug atom bound to a DIFFERENT source locator (the #4733
  *      collision class) is left untouched; the new-shape slug lands beside
  *      it — that separation is the whole point of the locator fold.
- * Both reads are scoped to the write's source (unscoped-check/scoped-write).
+ *   4. #4908 upgrade idempotency: neither exact-shape slug (1) nor the
+ *      exact legacy-shape slug (2) name an existing row — the current title
+ *      hashes to slug (1) using the FIXED (lowercased) identity, but the
+ *      atom may still be live under the OLD hash of this same page+title
+ *      (minted pre-#4908, when the identity hash was NOT lowercased; note
+ *      this is a DIFFERENT old shape than (2) — it's the locator-folded
+ *      8-char shape, just computed over the raw un-lowercased title, so an
+ *      identical-case re-extraction can also miss (1) whenever the atom's
+ *      original title was not already all-lowercase). Search THIS PAGE's
+ *      (not the whole source's) live atoms case-insensitively by title and
+ *      adopt the single match, if there is exactly one. Deliberately
+ *      narrower than (2)/(3)'s `isCompatibleAtomBinding` rule: this path
+ *      claims an atom by TITLE SEARCH rather than by a deterministic
+ *      computed address, so — unlike the legacy-slug path, where adopting
+ *      a pre-binding-era (unbound) row is unambiguous because the address
+ *      alone identifies it — a title match here must require an EXPLICIT
+ *      same-page binding (`frontmatter->>'source_slug' = sourcePageSlug`)
+ *      and must NOT also claim unbound atoms from elsewhere in the source;
+ *      that would be an open-ended claim policy this fix does not attempt
+ *      to establish. Two or more same-page matches is an AMBIGUOUS case
+ *      this safety net does not resolve: deliberately no "pick the newest"
+ *      / "pick the first" heuristic — fall through to minting the fresh
+ *      slug (1), leaving the ambiguity for a human/future decision, exactly
+ *      like the "no compatible legacy row" case already does.
+ * Every read is scoped to the write's source (unscoped-check/scoped-write).
  */
 async function resolvePageAtomSlug(
   engine: BrainEngine,
@@ -1704,6 +1832,33 @@ async function resolvePageAtomSlug(
   if (legacy && legacy.type === 'atom' && isCompatibleAtomBinding(legacy.frontmatter, sourcePageSlug)) {
     return legacySlug;
   }
+  // #4908 fallback (4): a case-variant twin may exist under some other,
+  // pre-fix identity hash (see the doc comment above). Scope is
+  // (source_id, source_slug === sourcePageSlug) EXACTLY — narrower than
+  // (2)/(3)'s `isCompatibleAtomBinding` rule on purpose (see the doc
+  // comment above this function for why an unbound-atom match must not be
+  // adopted here). Deliberately NOT filtered on
+  // `frontmatter->>'source_hash'`, so a `pending:<hash>` row from an
+  // in-progress/retried run is included in the candidate search too (a
+  // retry with a mid-run case-different title must still resolve to the
+  // SAME atom). Title comparison happens in APPLICATION CODE with
+  // JavaScript's `.toLowerCase()`, not SQL's `LOWER()` — the two disagree
+  // for some non-ASCII titles (e.g. Greek "ΟΣ" lowercases to "οσ" in
+  // PostgreSQL/PGLite but to "ος" in JS), which would silently miss a
+  // same-page adoption for those titles if the comparison were pushed into
+  // SQL instead.
+  const sourcePageAtomRows = await engine.executeRaw<{ slug: string; title: string }>(
+    `SELECT slug, title
+       FROM pages
+      WHERE type = 'atom' AND deleted_at IS NULL
+        AND source_id = $1
+        AND frontmatter->>'source_slug' = $2`,
+    [sourceId, sourcePageSlug],
+  );
+  const lowerTitle = title.toLowerCase();
+  const caseVariants = sourcePageAtomRows.filter((row) => row.title.toLowerCase() === lowerTitle);
+  // Ambiguous (0 or 2+ same-page matches) → do not guess; mint fresh.
+  if (caseVariants.length === 1) return caseVariants[0]!.slug;
   return slug;
 }
 

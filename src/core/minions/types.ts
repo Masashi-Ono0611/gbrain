@@ -560,14 +560,23 @@ export interface SubagentHandlerData {
   /**
    * When true, a job must complete at least one put_page write or FAIL
    * (UnrecoverableError → dead, idempotency key released) instead of
-   * reporting `completed` with zero pages. Set by the dream
-   * synthesize + patterns fan-outs (jobs whose entire purpose is writing
-   * pages). Left unset for open-ended `gbrain agent run` jobs, where one
+   * reporting `completed` with zero pages. Set by dream synthesize and
+   * patterns fan-outs (jobs whose entire purpose is writing pages). Left
+   * unset for open-ended `gbrain agent run` jobs, where one
    * rejected write plus a useful read-only answer is a legitimate
    * completion — those still get truthful pages_* counts on the result.
    * Same trust story as `allowed_slug_prefixes` (PROTECTED_JOB_NAMES).
    */
   require_writes?: boolean;
+  /**
+   * Only meaningful with `require_writes: true`. When true, a clean finish
+   * (`stop_reason: 'end_turn'`) with zero attempted put_page calls completes
+   * instead of dead-lettering; all-attempted-failed still dead-letters, and
+   * a non-clean zero-attempt stop still fails. Workers that predate this
+   * field ignore it and keep the strict behavior, so mixed versions fail
+   * closed.
+   */
+  allow_clean_zero_writes?: boolean;
   /**
    * #4216 — synthesis execution mode. 'oneshot' = single structured
    * completion + programmatic validated writes, falling back to the agentic
@@ -584,6 +593,20 @@ export interface SubagentHandlerData {
    * discipline. Set by the dream fan-out alongside `mode`.
    */
   oneshot_slug_suffix?: string;
+  /**
+   * patch 96 — the config key the caller used to resolve `model`
+   * (e.g. `models.dream.patterns`, `models.dream.synthesize`). Threaded
+   * through to `chatWithFallback(opts, { chainKey })` on BOTH LLM paths this
+   * handler can take — the oneshot single-completion call
+   * (subagent-oneshot.ts) and the agentic gateway.toolLoop() per-turn call
+   * (runSubagentViaGateway below) — so a billing/rate_limit failure on
+   * `model` can fall through to `chat_fallback_chain.<fallback_chain_key>`
+   * (or the global `chat_fallback_chain`) instead of dead-lettering the job.
+   * Unset → chatWithFallback still runs, just without a per-site override
+   * (identical to the global chain). Same trust story as `allowed_slug_prefixes`
+   * (PROTECTED_JOB_NAMES); MCP-submitted jobs can't set it.
+   */
+  fallback_chain_key?: string;
   /**
    * v0.41 Approach C: opt out of the auto-generated tool-usage preamble
    * that `buildSystemPrompt()` splices into `system`. Default behavior

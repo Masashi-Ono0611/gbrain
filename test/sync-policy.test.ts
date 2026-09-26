@@ -1,8 +1,8 @@
 /**
  * #4399: isSyncDisabledConfig — the shared predicate for
  * config.syncEnabled === false, read by autopilot's freshness dispatcher
- * and the `sync --all` fan-out filter (sync-cost-gate.ts's separate inline
- * check is deliberately untouched — see sync-policy.ts's module doc).
+ * and the `sync --all` fan-out filter, plus the local performSync hard
+ * exclusion and sync cost gate.
  */
 import { describe, expect, test } from 'bun:test';
 import { isSyncDisabledConfig } from '../src/core/sync-policy.ts';

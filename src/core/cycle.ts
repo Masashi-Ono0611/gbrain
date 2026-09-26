@@ -51,6 +51,7 @@ import { createProgress, type ProgressReporter } from './progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
 import { tryAcquireDbLock, reapDeadHolderLocks, LockStolenError, type DbLockHandle } from './db-lock.ts';
 import { assertValidSourceId } from './source-id.ts';
+import { managedBrainPhaseSkip } from './persistence/maintenance.ts';
 import { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
 import { assertEmbedNotStalled } from './embed-stall.ts';
 
@@ -1047,6 +1048,9 @@ function checkAborted(signal?: AbortSignal): void {
 // going through runCycle's full setup cost.
 export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: BrainEngine | null, signal?: AbortSignal): Promise<PhaseResult> {
   try {
+    // #5180: lint in fix mode writes through the legacy filesystem path a managed brain refuses; skip with the reason (dry-run still reports).
+    const managedSkip = !dryRun && engine ? await managedBrainPhaseSkip(engine, 'lint', 'lint fix skipped: a managed brain does not accept legacy filesystem writes') : null;
+    if (managedSkip) return managedSkip;
     const { runLintCore } = await import('../commands/lint.ts');
     // issue #1678: pass the cycle's live engine so lint's content-sanity
     // DB-plane lift REUSES it instead of creating + disconnecting a
@@ -1320,7 +1324,7 @@ async function runPhaseSync(
     // work; surfacing 'fail' would paint a healthy cron contention red and (with
     // the heartbeat-aware takeover) this is now the expected outcome when a long
     // sync overruns into the next cron tick. Report it as a skip.
-    const { SyncLockBusyError } = await import('../commands/sync.ts');
+    const { SyncLockBusyError, SyncDisabledError } = await import('../commands/sync.ts');
     if (e instanceof SyncLockBusyError) {
       return {
         phase: 'sync',
@@ -1328,6 +1332,20 @@ async function runPhaseSync(
         duration_ms: 0,
         summary: 'sync already in progress elsewhere — skipped',
         details: { syncStatus: 'lock_busy' },
+      };
+    }
+    // #4399 (review finding): a source with config.syncEnabled=false is a
+    // deliberate, permanent exclusion (see sync-policy.ts), not a phase
+    // failure. Without this, a cycle scoped to a disabled source reports
+    // 'fail' forever — the same "erodes the check's signal" problem #4399
+    // itself calls out for cycle_freshness, just via the sync phase instead.
+    if (e instanceof SyncDisabledError) {
+      return {
+        phase: 'sync',
+        status: 'skipped',
+        duration_ms: 0,
+        summary: 'sync disabled for this source (config.syncEnabled=false) — skipped',
+        details: { syncStatus: 'sync_disabled' },
       };
     }
     return {
@@ -1460,6 +1478,9 @@ async function runPhaseExtractFacts(
   signal?: AbortSignal,
 ): Promise<PhaseResult> {
   try {
+    // #5203: the legacy fence reconcile writes `facts` outside the coordinator (guard trigger P0001); the coordinated import path already indexes fences on a managed brain.
+    const managedSkip = dryRun ? null : await managedBrainPhaseSkip(engine, 'extract_facts', 'extract_facts skipped: fence rows are indexed by the coordinated import path on a managed brain');
+    if (managedSkip) return managedSkip;
     const { runExtractFacts } = await import('./cycle/extract-facts.ts');
     const result = await runExtractFacts(engine, {
       slugs: changedSlugs,

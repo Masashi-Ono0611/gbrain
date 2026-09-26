@@ -16,7 +16,7 @@
  * Import-cycle note: operations.ts spreads these into its `operations` array
  * at MODULE-EVAL time, so this file must be a RUNTIME LEAF — it may import
  * operations.ts types (erased) but never its values statically. Handlers load
- * verbError/parseTtlParam/sourceScopeOpts via dynamic import (the file's
+ * verbError/parseTtlParam/thinkSourceScopeOpts via dynamic import (the file's
  * existing style), which resolves after both modules finish evaluating.
  * MEMORY_VERBS_VERSION lives HERE (operations.ts imports it from us) for the
  * same reason. Violating this reintroduces the TDZ crash on whichever module
@@ -236,7 +236,7 @@ const synthesize: Operation = {
   verb: true,
   annotations: { title: 'synthesize (slow, costly — LLM-backed)', readOnlyHint: true },
   handler: async (ctx, p) => {
-    const { verbError, sourceScopeOpts } = await import('./operations.ts');
+    const { verbError, thinkSourceScopeOpts } = await import('./operations.ts');
     const question = typeof p.question === 'string' ? p.question.trim() : '';
     if (!question) {
       throw verbError(
@@ -245,7 +245,9 @@ const synthesize: Operation = {
         'Pass the question to synthesize an answer for, e.g. question: "what is our payments strategy?".',
       );
     }
-    const scope = sourceScopeOpts(ctx);
+    // Same helper as the think op, so a trusted-local synthesize spans the
+    // federated set search/query use; remote callers keep the canonical ladder.
+    const scope = thinkSourceScopeOpts(ctx);
     const { runThink } = await import('./think/index.ts');
     const { embedQuery } = await import('./embedding.ts');
     // Remote-safe delegation: save/take are NEVER offered through this verb,
@@ -255,8 +257,7 @@ const synthesize: Operation = {
       since: p.since ? String(p.since) : undefined,
       until: p.until ? String(p.until) : undefined,
       takesHoldersAllowList: ctx.takesHoldersAllowList,
-      ...(scope.sourceId !== undefined ? { sourceId: scope.sourceId } : {}),
-      ...(scope.sourceIds !== undefined ? { allowedSources: scope.sourceIds } : {}),
+      ...scope,
       // Fail-closed: only a context that explicitly says local gets local.
       remote: ctx.remote !== false,
       // #3734: activate takes' vector retrieval arm for the synthesize verb.
@@ -404,6 +405,17 @@ const SYNTHESIS_STATUS_ENUM = [
   'ok', 'empty_answer', 'not_json', 'output_truncated', 'no_llm', 'model_unusable', 'llm_error', 'extractive_fallback',
 ];
 
+const RECALL_BUDGET_ARM_SCHEMA = {
+  type: 'object',
+  required: ['candidates', 'kept', 'dropped', 'used'],
+  properties: {
+    candidates: { type: 'integer', minimum: 0, description: 'Authorized, filtered, limit-capped candidates before packing.' },
+    kept: { type: 'integer', minimum: 0 },
+    dropped: { type: 'integer', minimum: 0 },
+    used: { type: 'integer', minimum: 0, description: 'Estimated tokens in retained evidence, excluding the JSON envelope.' },
+  },
+};
+
 export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
   recall: {
     type: 'object',
@@ -445,9 +457,21 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
         },
       },
       search_degraded: { type: 'string', description: 'Present when the search arm fell back to keyword-only (no embedding provider).' },
-      budget_tokens: { type: 'integer', description: 'Present when budget_tokens was passed.' },
+      budget_tokens: { type: 'integer', description: 'Present for a positive finite numeric budget, including when its floor is zero.' },
       budget_used: { type: 'integer' },
       dropped_count: { type: 'integer' },
+      budget_packing: {
+        type: 'object',
+        description: 'Present only when a valid budget_policy is supplied. Per-arm used and dropped sums match budget_used and dropped_count when those fields exist.',
+        required: ['policy', 'applied', 'reason', 'facts', 'results'],
+        properties: {
+          policy: { type: 'string', enum: ['facts_first', 'query_first'], description: 'Effective policy; ineligible query_first requests fall back to facts_first.' },
+          applied: { type: 'boolean', description: 'Whether the requested budget policy applied, not whether all required evidence fit.' },
+          reason: { type: 'string', enum: ['no_query', 'no_positive_finite_budget', 'budget_below_one', 'no_candidates', 'first_items_exceed_budget', 'packed'] },
+          facts: RECALL_BUDGET_ARM_SCHEMA,
+          results: RECALL_BUDGET_ARM_SCHEMA,
+        },
+      },
     },
   },
   remember: {

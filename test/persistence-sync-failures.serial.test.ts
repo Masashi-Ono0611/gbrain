@@ -11,11 +11,11 @@ import { withEnv } from './helpers/with-env.ts';
 import { makeGitFixture } from './helpers/git-fixture.ts';
 import { acquireWorktree, claimWorktree, getWorktreeBinding } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
-import { performManagedSync } from '../src/core/persistence/sync-run.ts';
+import { managedSyncCursorKey, performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { loadSyncFailures, acknowledgeFailures, autoSkipFailures } from '../src/core/sync-failure-ledger.ts';
 import { printSyncResult, runSync } from '../src/commands/sync.ts';
 import { buildSingleSyncJsonEnvelope } from '../src/core/sync-embed-backfill.ts';
-import { readManagedSyncFailures } from '../src/core/persistence/sync-failures.ts';
+import { formatManagedSyncFailure, managedSyncRetryReport, readManagedSyncFailures } from '../src/core/persistence/sync-failures.ts';
 import { checkSyncFailures } from '../src/commands/doctor/checks/sync-failures.ts';
 import { purgeStaleCheckpoints } from '../src/core/op-checkpoint.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
@@ -25,7 +25,9 @@ import { localHostId } from '../src/core/persistence/identity.ts';
 import { currentExitCode, _resetCliExitVerdictForTests } from '../src/core/cli-force-exit.ts';
 import { prepareRemoteJob, withSubmissionAuthority } from '../src/core/minions/submission-authority.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
+import { testBackends } from './helpers/test-backends.ts';
 
+const backends = testBackends();
 const home = mkdtempSync(join(tmpdir(), 'gbrain-sync-failures-'));
 const engines: BrainEngine[] = [];
 let closePostgres: (() => Promise<void>) | undefined;
@@ -44,8 +46,10 @@ async function fixture(engine: BrainEngine, files: Record<string, string>) {
   return { id, root, head };
 }
 beforeAll(async () => {
-  const lite = new PGLiteEngine(); await lite.connect({}); await lite.initSchema(); engines.push(lite);
-  if (process.env.DATABASE_URL) { const pg = await isolatedPersistencePostgres(process.env.DATABASE_URL); engines.push(pg.engine); closePostgres = pg.close; }
+  if (backends.includes('pglite')) {
+    const lite = new PGLiteEngine(); await lite.connect({}); await lite.initSchema(); engines.push(lite);
+  }
+  if (backends.includes('postgres')) { const pg = await isolatedPersistencePostgres(process.env.DATABASE_URL!); engines.push(pg.engine); closePostgres = pg.close; }
 }, 120_000);
 afterAll(async () => {
   for (const engine of engines) { await disposePersistenceConsumer(engine); await engine.disconnect(); }
@@ -185,6 +189,54 @@ test('full sync cannot hide an older failed incremental cursor or repeat its com
   }
 }), 120_000);
 
+test('managed failure hint renders a source-scoped retry even with default options', () => {
+  const base = { source_id: 'notes', source_incarnation: '00000000-0000-0000-0000-000000000000', path: 'a.md', code: 'source_changed', message: 'changed',
+    request_id: null, run_id: 'r1', target: null, observation_id: 'o1', first_seen: new Date(0).toISOString(), attempts: 1 } as any;
+  expect(formatManagedSyncFailure({ ...base, keyOptions: { full: false, workingTree: false, srcSubpath: null, exclude: [], includeHidden: [], strategy: null } }))
+    .toContain('retry=gbrain sync --source notes --retry-failed --no-pull');
+  expect(formatManagedSyncFailure(base)).not.toContain('retry=');
+});
+
+test('managed retry report separates failures by the real cursor key', async () => withEnv(env, async () => {
+  for (const engine of engines) {
+    const f = await fixture(engine, { 'bad.md': '---\ntitle: [broken\n---\nBroken content.\n' });
+    const options = { sourceId: f.id, noPull: true };
+    const blocked = await performManagedSync(engine, options);
+    const [failure] = blocked.failures!;
+    const currentKey = await managedSyncCursorKey(engine, options);
+    expect(currentKey).toBe(failure.cursor_key);
+
+    const otherKey = await managedSyncCursorKey(engine, { ...options, full: true });
+    const otherReport = managedSyncRetryReport([failure], otherKey);
+    expect(otherReport.retrying).toBe(0);
+    expect(otherReport.other).toBe(1);
+    expect(otherReport.otherLines.join('\n')).toContain('1 previously-failed file(s) will NOT be retried');
+    expect(otherReport.otherLines.join('\n')).toContain(`retry=gbrain sync --source ${f.id} --retry-failed --no-pull`);
+
+    const currentReport = managedSyncRetryReport([failure], currentKey);
+    expect(currentReport.retrying).toBe(1);
+    expect(currentReport.other).toBe(0);
+    expect(currentReport.otherLines).toEqual([]);
+  }
+}), 120_000);
+
+test('managed failure hints preserve retry options locally and redact paths remotely', async () => withEnv(env, async () => {
+  for (const engine of engines) {
+    const secretExclude = 'private-customer-data/**';
+    const f = await fixture(engine, { 'bad.md': '---\ntitle: [broken\n---\nBroken content.\n' });
+    const options = { sourceId: f.id, noPull: true, full: true, exclude: [secretExclude] };
+    const blocked = await performManagedSync(engine, options);
+    expect(blocked.status).toBe('blocked_by_failures');
+    expect(blocked.failures).toEqual([expect.objectContaining({ keyOptions: { full: true, workingTree: false,
+      srcSubpath: null, exclude: [secretExclude], includeHidden: [], strategy: null } })]);
+    const local = await checkSyncFailures(engine, { sourceIds: [f.id], remote: false });
+    expect(local?.message).toContain(`retry=gbrain sync --source ${f.id} --full --exclude 'private-customer-data/**' --retry-failed --no-pull`);
+    const remote = await checkSyncFailures(engine, { sourceIds: [f.id], remote: true });
+    expect(remote?.message).toContain('rerun with the original sync options');
+    expect(remote?.message).not.toContain(secretExclude);
+  }
+}), 120_000);
+
 test('checkpoint, discovery, and freeze failures remain diagnosable without a file receipt', async () => withEnv(env, async () => {
   for (const engine of engines) {
     const f = await fixture(engine, { 'note.md': 'A stable observation before checkpoint.\n' });
@@ -273,7 +325,7 @@ test('local single and all-source CLI JSON carry durable diagnostics and fail th
   }
 }), 120_000);
 
-test('a new process reads the same failed receipt from a persisted PGLite brain', async () => withEnv(env, async () => {
+test.skipIf(!backends.includes('pglite'))('a new process reads the same failed receipt from a persisted PGLite brain', async () => withEnv(env, async () => {
   const database = join(home, 'restart-db');
   const engine = new PGLiteEngine(); await engine.connect({ database_path: database }); await engine.initSchema();
   let expected: Awaited<ReturnType<typeof performManagedSync>>, sourceId: string;

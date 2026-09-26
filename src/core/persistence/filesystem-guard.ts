@@ -21,14 +21,15 @@ function encloses(root: string, path: string): boolean {
   const rel = relative(canonicalFilesystemPath(root), canonicalFilesystemPath(path));
   return !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`);
 }
-export async function refreshManagedFilesystemRoots(engine: SqlEngine, databasePath = datastorePaths.get(engine)): Promise<void> {
-  const [brain] = await engine.executeRaw<{ brain_id: string; enabled: boolean }>('SELECT brain_id,enabled FROM persistence_brain WHERE singleton=1');
+export async function refreshManagedFilesystemRoots(engine: SqlEngine, databasePath = datastorePaths.get(engine), signal?: AbortSignal): Promise<void> {
+  const [brain] = await engine.executeRaw<{ brain_id: string; enabled: boolean }>('SELECT brain_id,enabled FROM persistence_brain WHERE singleton=1', undefined, { signal });
   if (!brain) return;
   const roots = brain.enabled ? await engine.executeRaw<ManagedRootRecord>(`SELECT DISTINCT ON (local_path) * FROM (
       SELECT h.local_path,s.source_id,s.source_incarnation,s.worktree_id,s.topology_generation
       FROM persistence_host_bindings h JOIN persistence_source_bindings s ON s.worktree_id=h.worktree_id WHERE h.host_id=$1::uuid
       UNION SELECT local_path,id,incarnation,NULL,NULL FROM sources WHERE local_path IS NOT NULL
-      ) roots ORDER BY local_path,worktree_id NULLS LAST,source_id,source_incarnation,topology_generation`, [localHostId()]) : [];
+      ) roots ORDER BY local_path,worktree_id NULLS LAST,source_id,source_incarnation,topology_generation`, [localHostId()], { signal }) : [];
+  signal?.throwIfAborted();
   if (brain.enabled && databasePath) roots.push({ local_path: databasePath });
   if (brain.enabled) recordManagedRoots(brain.brain_id, roots);
   managedRoots.set(brain.brain_id, new Set(roots.map(row => resolve(row.local_path))));
@@ -37,10 +38,13 @@ export function hasFilesystemPublication(path: string): boolean {
   const held = active.getStore();
   return held?.active === true && held.roots.some(root => encloses(root, path));
 }
-export function assertManagedFilesystemWrite(path: string): void {
-  const managed = hasManagedRootMarker(path) || registeredManagedRoots().some(root => encloses(root, path) || encloses(path, root))
+/** Same managed-root predicate used by write guards, available to read-only diagnostics. */
+export function isManagedFilesystemPath(path: string): boolean {
+  return hasManagedRootMarker(path) || registeredManagedRoots().some(root => encloses(root, path) || encloses(path, root))
     || [...managedRoots.values()].some(roots => [...roots].some(root => encloses(root, path) || encloses(path, root)));
-  if (managed && !hasFilesystemPublication(path)) throw new OperationError('writer_coordinator_required',
+}
+export function assertManagedFilesystemWrite(path: string): void {
+  if (isManagedFilesystemPath(path) && !hasFilesystemPublication(path)) throw new OperationError('writer_coordinator_required',
     'This file belongs to a managed canonical worktree.', 'Submit the change through the persistence coordinator.');
 }
 /** Invalidate inherited async contexts before the owner releases the kernel lock. */

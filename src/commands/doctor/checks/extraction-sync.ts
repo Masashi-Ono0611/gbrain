@@ -24,6 +24,8 @@ import {
 import { slugifyPath, slugifyCodePath, isCodeFilePath } from '../../../core/sync.ts';
 import { resolveSourceLocalFilePath } from '../../../core/markdown.ts';
 import { unverifiedExtractionFragment } from '../../../core/extraction-review.ts';
+import { isSyncDisabledConfig } from '../../../core/sync-policy.ts';
+import { managedSyncAdviceEnabled } from '../schema-pack-checks.ts';
 import type { Check } from '../../doctor.ts';
 import { ownedContentFreshness } from '../../../core/shared-skills/content-freshness.ts';
 
@@ -780,9 +782,12 @@ export async function computeExtractAtomsBacklogCheck(
  * unreferenced.
  *
  * Why this needs a signal: a drifted atom is still returned by search, still
- * carries a `source_quote`, and still reads as sourced — but its quote can no
- * longer be located in any current page. It is the one class of derived page
- * that silently diverges from the corpus it claims to summarize.
+ * carries a `source_quote`, and still reads as sourced — but a changed
+ * source_hash only means the source page (or its record) changed since
+ * extraction. This check does not string-match the quote against current
+ * page content, so it cannot say whether the quote itself survived that
+ * change. It is the one class of derived page whose provenance has silently
+ * gone unverified against the corpus it claims to summarize.
  *
  * Measured on a 17-source brain (30.7k pages, 4.0k atoms) before shipping this:
  * 1,001 of 3,999 atoms (25.0%) had drifted; 932 still had a live source page
@@ -915,7 +920,7 @@ export async function computeAtomProvenanceDriftCheck(
           `${drifted}/${total} atom(s) (${details.drift_pct}%) reference a source_hash no live page carries ` +
           `— ${sourceChanged} whose source page still exists (edited), ${sourceGone} whose source page is gone` +
           (oldestDays != null ? `; oldest ${oldestDays}d` : '') + su +
-          `. These still surface in search with a source_quote that no current page contains. Fix: ${fix}`,
+          `. These atoms still surface in search. This check does not verify whether their source_quote remains in any live page; a changed source hash alone does not establish that the quote is gone. Fix: ${fix}`,
         details,
       };
     }
@@ -1149,6 +1154,7 @@ export async function checkSyncFreshness(
   opts?: { nowMs?: number; localOnly?: boolean },
 ): Promise<Check> {
   try {
+    const managed = await managedSyncAdviceEnabled(engine);
     // v0.41.27.0: SELECT widens to carry last_commit + chunker_version so
     // the git short-circuit gate (below) can compare against what
     // `gbrain sync`'s up-to-date predicate at sync.ts:1057+1075 checks.
@@ -1162,6 +1168,7 @@ export async function checkSyncFreshness(
       last_commit: string | null;
       chunker_version: string | null;
       newest_content_at: Date | null;
+      config: unknown;
     };
     // v0.41.32.0: newest_content_at feeds the REMOTE (non-localOnly) lag so
     // doctorReportRemote never shells out to git on a DB-supplied local_path.
@@ -1170,13 +1177,19 @@ export async function checkSyncFreshness(
     let sources: FreshnessSourceRow[];
     try {
       sources = await engine.executeRaw<FreshnessSourceRow>(
-        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
+        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at, config FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
       );
     } catch {
       sources = await engine.executeRaw<FreshnessSourceRow>(
-        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL`,
+        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at, config FROM sources WHERE local_path IS NOT NULL`,
       );
     }
+    // #4399: a source the operator has deliberately excluded from automatic
+    // sync (config.syncEnabled=false — already honored by performSync's
+    // choke point and the autopilot freshness dispatcher, #4952) must not
+    // be reported as a stale-source [FAIL]/[WARN] here either — it is
+    // working exactly as configured, not falling behind.
+    sources = sources.filter((s) => !isSyncDisabledConfig(s.config));
 
     if (sources.length === 0) {
       return {
@@ -1427,7 +1440,7 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'fail',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` for each stale source${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>${managed ? ' --no-pull' : ''}\` for each stale source${inProgressNote}`,
         details,
       };
     }
@@ -1435,7 +1448,7 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'warn',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` to refresh${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>${managed ? ' --no-pull' : ''}\` to refresh${inProgressNote}`,
         details,
       };
     }

@@ -825,8 +825,13 @@ describe('v0.31.8 — wedge migration force-retry hint (D19)', () => {
 describe('v0.32.4 — sync_freshness check', () => {
   // Stub engine: only checkSyncFreshness's executeRaw matters. Per-case rows
   // shape is `{id, name, local_path, last_sync_at}`.
-  function makeStubEngine(rows: any[]): any {
-    return { executeRaw: async () => rows };
+  function makeStubEngine(rows: any[], managed = false): any {
+    return {
+      executeRaw: async (query: string) => {
+        if (query.includes('FROM persistence_brain')) return [{ enabled: managed }];
+        return rows;
+      },
+    };
   }
 
   function agoMs(ms: number): Date {
@@ -850,6 +855,29 @@ describe('v0.32.4 — sync_freshness check', () => {
     expect(result.message).toContain('never been synced');
     expect(result.message).toContain(`'wiki'`); // source.id embedded
     expect(result.message).toContain('gbrain sync --source <id>');
+    expect(result.message).not.toContain('--no-pull');
+  });
+
+  test('managed stale source advice includes --no-pull', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: null },
+    ], true));
+    expect(result.status).toBe('fail');
+    expect(result.message).toContain('gbrain sync --source <id> --no-pull');
+  });
+
+  test('predicate error falls back to the managed-safe sync hint', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const engine = {
+      executeRaw: async (query: string) => {
+        if (query.includes('FROM persistence_brain')) throw new Error('metadata temporarily unavailable');
+        return [{ id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: null }];
+      },
+    };
+    const result = await checkSyncFreshness(engine as any);
+    expect(result.status).toBe('fail');
+    expect(result.message).toContain('gbrain sync --source <id> --no-pull');
   });
 
   test('last_sync_at > 72h ago → fail with day-rounded "Nd ago"', async () => {
@@ -968,6 +996,39 @@ describe('v0.32.4 — sync_freshness check', () => {
     // User copy-pastes `gbrain sync --source wiki-id` (NOT "My Wiki"). Message
     // must include the id so the CLI command actually works.
     expect(result.message).toContain(`'wiki-id'`);
+  });
+
+  // #4399: config.syncEnabled=false is already honored by performSync's
+  // choke point and the autopilot freshness dispatcher (#4952) — this
+  // check must not report a deliberately-excluded source as stale either.
+  test('config.syncEnabled=false source excluded even when never synced', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'frozen', name: '', local_path: '/tmp/frozen', last_sync_at: null, config: { syncEnabled: false } },
+    ]));
+    expect(result.status).toBe('ok');
+    expect(result.message).toBe('No federated sources to sync');
+  });
+
+  test('mixed: syncEnabled=false source excluded, stale enabled source still fails', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'frozen', name: '', local_path: '/tmp/frozen', last_sync_at: null, config: { syncEnabled: false } },
+      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: agoMs(5 * 24 * 60 * 60 * 1000), config: {} },
+    ]));
+    expect(result.status).toBe('fail');
+    expect(result.message).not.toContain(`'frozen'`);
+    expect(result.message).toContain(`'wiki'`);
+    expect(result.message).toMatch(/5d ago/);
+  });
+
+  test('config.syncEnabled=true (or absent) source is unaffected', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: null, config: { syncEnabled: true } },
+    ]));
+    expect(result.status).toBe('fail');
+    expect(result.message).toContain(`'wiki'`);
   });
 });
 
