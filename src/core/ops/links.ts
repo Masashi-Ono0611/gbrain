@@ -1,4 +1,6 @@
 import { assertUnmanagedCanonicalWriter } from '../persistence/maintenance.ts';
+import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { withCoordinatedWrite } from '../persistence/context.ts';
 /**
  * Links + graph operation cluster — pure move from operations.ts (v0.46.x
  * tranche 1). MANAGED_LINK_SOURCES stays exported (test suite + operations.ts
@@ -76,7 +78,11 @@ const add_link: Operation = {
       }
     }
     if (ctx.dryRun) return { dry_run: true, action: 'add_link', from: p.from, to: p.to };
-    await assertUnmanagedCanonicalWriter(ctx.engine, 'add_link');
+    const managed = await managedPersistenceEnabled(ctx.engine);
+    // Remote callers retain the managed-brain refusal. A trusted local write
+    // enters the same source-scoped transaction capability as stale extraction.
+    if (managed && ctx.remote !== false) await assertUnmanagedCanonicalWriter(ctx.engine, 'add_link');
+    if (!managed) await assertUnmanagedCanonicalWriter(ctx.engine, 'add_link');
     // v114 (#1941): default omitted provenance to 'manual' (NOT the engine's
     // 'markdown' default) so hand/tool-created CLI edges are honestly manual,
     // and forbid forging the reconciliation-managed built-ins.
@@ -97,12 +103,14 @@ const add_link: Operation = {
     await requireWritablePage(ctx, p.from as string, 'add_link', 'from');
     await requireWritablePage(ctx, p.to as string, 'add_link', 'to');
     try {
-      await ctx.engine.addLink( // gbrain-allow-direct-insert: add_link MCP op is the explicit canonical surface for manual link creation; auto-link reconciliation runs separately via auto_link post-hook
-        p.from as string, p.to as string,
-        (p.context as string) || '', linkType,
-        linkSource, undefined, undefined,
-        linkOpts,
+      const write = (engine: typeof ctx.engine) => engine.addLink( // gbrain-allow-direct-insert: add_link is the explicit manual-link surface; managed writes enter withCoordinatedWrite below
+        p.from as string, p.to as string, (p.context as string) || '', linkType,
+        linkSource, undefined, undefined, linkOpts,
       );
+      if (managed) {
+        const sourceId = ctx.sourceId ?? 'default';
+        await ctx.engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => write(tx)));
+      } else await write(ctx.engine);
     } catch (error) {
       // An endpoint hard-deleted between preflight and mutation: reclassify
       // the typed engine miss instead of surfacing it as internal_error.
@@ -130,19 +138,24 @@ const remove_link: Operation = {
   handler: async (ctx, p) => {
     enforceClientSlugFence(ctx, p.from as string, 'remove_link');
     if (ctx.dryRun) return { dry_run: true, action: 'remove_link', from: p.from, to: p.to };
-    await assertUnmanagedCanonicalWriter(ctx.engine, 'remove_link');
+    const managed = await managedPersistenceEnabled(ctx.engine);
+    if (managed && ctx.remote !== false) await assertUnmanagedCanonicalWriter(ctx.engine, 'remove_link');
+    if (!managed) await assertUnmanagedCanonicalWriter(ctx.engine, 'remove_link');
     const linkOpts = ctx.sourceId
       ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId }
       : undefined;
     // #4527: report how many edges actually died — an unconditional
     // `{ status: 'ok' }` made a zero-match delete (typo'd slug, wrong
     // link_type, already removed) indistinguishable from a real removal.
-    const removed = await ctx.engine.removeLink(
+    const remove = (engine: typeof ctx.engine) => engine.removeLink(
       p.from as string, p.to as string,
       (p.link_type as string) || undefined,
       (p.link_source as string) || undefined,
       linkOpts,
     );
+    const removed = managed
+      ? await ctx.engine.transaction(tx => withCoordinatedWrite(tx, [ctx.sourceId ?? 'default'], () => remove(tx)))
+      : await remove(ctx.engine);
     return { status: 'ok', removed };
   },
   cliHints: { name: 'unlink', aliases: ['link-rm'], positional: ['from', 'to'] },
