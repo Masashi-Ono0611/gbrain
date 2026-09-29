@@ -439,6 +439,36 @@ export interface AddTakeInput {
   sinceDate?: string;
 }
 
+/** Compose the same append sequence used by the legacy md-first writer. */
+export function appendTakesToPageBody(body: string, rows: ReadonlyArray<AddTakeInput>): { body: string; rowNums: number[] } {
+  for (const row of rows) {
+    assertHolderAllowed(row.holder, null);
+    assertSafeCellText('claim', row.claim);
+    assertSafeCellText('kind', row.kind);
+    assertSafeCellText('holder', row.holder);
+    assertSafeCellText('source', row.source);
+    assertValidWeight(row.weight);
+    assertValidSinceDate(row.sinceDate);
+  }
+  assertFenceRoundTrips(parseTakesFence(body));
+  let nextBody = body;
+  const rowNums: number[] = [];
+  for (const row of rows) {
+    const result = upsertTakeRow(nextBody, {
+      claim: row.claim,
+      kind: row.kind,
+      holder: row.holder,
+      weight: row.weight ?? 0.5,
+      source: row.source,
+      sinceDate: row.sinceDate,
+      active: true,
+    });
+    nextBody = result.body;
+    rowNums.push(result.rowNum);
+  }
+  return { body: nextBody, rowNums };
+}
+
 export async function addTakeToPage(
   target: TakesWriteTarget,
   input: AddTakeInput,
@@ -537,23 +567,7 @@ export async function appendTakesToPageMdFirst(
     // Unlike addTakeToPage, a missing file REFUSES (readPageBody's
     // mirror_unavailable) — see the contract note above.
     const body = readPageBody(path);
-    // F1: a fence with parser-skipped rows must not be re-rendered.
-    assertFenceRoundTrips(parseTakesFence(body));
-    let nextBody = body;
-    const rowNums: number[] = [];
-    for (const row of rows) {
-      const r = upsertTakeRow(nextBody, {
-        claim: row.claim,
-        kind: row.kind,
-        holder: row.holder,
-        weight: row.weight ?? 0.5,
-        source: row.source,
-        sinceDate: row.sinceDate,
-        active: true,
-      });
-      nextBody = r.body;
-      rowNums.push(r.rowNum);
-    }
+    const { body: nextBody, rowNums } = appendTakesToPageBody(body, rows);
     writePageBody(path, nextBody, writeRoot);
     // Mirror md→DB with the reconcile primitive, exactly as the fence now
     // states the appended rows.

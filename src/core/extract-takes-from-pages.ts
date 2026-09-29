@@ -14,16 +14,21 @@
 // blocked until eval coverage catches up.
 
 import { existsSync } from 'node:fs';
+import { loadConfig } from './config.ts';
 import type { BrainEngine } from './engine.ts';
 import type { TakeKind } from './engine.ts';
+import type { OperationContext } from './ops/contract.ts';
 import { chat, getChatModel, isAvailable } from './ai/gateway.ts';
 import {
+  appendTakesToPageBody,
   appendTakesToPageMdFirst,
   isSafeFenceCellText,
   resolveTakesRepoDir,
   resolveTakesWritePath,
   TakesWriteError,
 } from './takes-write.ts';
+import { managedPersistenceEnabled } from './persistence/ownership.ts';
+import { serializePageToMarkdown } from './markdown.ts';
 
 export const ALLOWED_PAGE_TYPES = [
   'concept', 'atom', 'lore', 'briefing', 'writing', 'originals',
@@ -151,6 +156,7 @@ export async function extractTakesFromPages(
   }
 
   const dryRun = opts.dryRun ?? false;
+  const managedJournalWrites = await managedPersistenceEnabled(engine);
   const maxPages = opts.maxPages ?? 50;
   const holder = opts.holder ?? 'system';
   const sourceFilter = opts.sourceIdFilter ? `AND source_id = $1` : '';
@@ -218,8 +224,17 @@ export async function extractTakesFromPages(
       }
     }
 
+    // Pin the selected page before spending time on extraction. A managed
+    // publication with a newer revision must skip the whole page atomically.
+    const managedSnapshot = managedJournalWrites && !dryRun
+      ? await engine.readPageSnapshot(page.slug, { sourceId: page.source_id }) : null;
+    if (managedJournalWrites && !dryRun && (!managedSnapshot || managedSnapshot.page.id !== page.id)) {
+      skipPage(page.slug, 'page_identity_changed');
+      continue;
+    }
+
     // Truncate to keep per-page cost bounded (~20K chars → ~5K input tokens).
-    const text = page.compiled_truth.slice(0, 20_000);
+    const text = (managedSnapshot?.page.compiled_truth ?? page.compiled_truth).slice(0, 20_000);
 
     let response: { text: string };
     try {
@@ -260,19 +275,43 @@ export async function extractTakesFromPages(
     const safeClaims = claims.filter((c) => isSafeFenceCellText(c.claim));
     if (safeClaims.length === 0) continue;
     try {
-      const { rowNums, mirror } = await appendTakesToPageMdFirst(
-        { engine, slug: page.slug, brainDir: repoDir, sourceId: page.source_id },
-        safeClaims.map((c) => ({
+      const rows = safeClaims.map((c) => ({
           claim: c.claim,
           kind: c.kind,
           holder,
           weight: c.weight,
           source: 'cli:takes-bootstrap-from-pages',
-        })),
-      );
-      claimsExtracted += rowNums.length;
-      if (mirror.mirror_warning) mirrorWarnings++;
+        }));
+      if (managedJournalWrites) {
+        const body = serializePageToMarkdown(managedSnapshot!.page, managedSnapshot!.tags);
+        const composed = appendTakesToPageBody(body, rows);
+        const { operations } = await import('./operations.ts');
+        const putPage = operations.filter(operation => !operation.localOnly).find(operation => operation.name === 'put_page');
+        if (!putPage) throw new Error('put_page operation missing (gbrain build issue)');
+        const config = loadConfig() ?? { engine: engine.kind };
+        const ctx: OperationContext = {
+          engine, config, logger: { info: () => {}, warn: () => {}, error: () => {} },
+          dryRun: false, remote: false, sourceId: page.source_id,
+        };
+        await putPage.handler(ctx, {
+          slug: page.slug,
+          content: composed.body,
+          expected_revision: managedSnapshot!.revision,
+        });
+        claimsExtracted += composed.rowNums.length;
+      } else {
+        const { rowNums, mirror } = await appendTakesToPageMdFirst(
+          { engine, slug: page.slug, brainDir: repoDir, sourceId: page.source_id }, rows,
+        );
+        claimsExtracted += rowNums.length;
+        if (mirror.mirror_warning) mirrorWarnings++;
+      }
     } catch (err) {
+      const code = (err as { code?: string; writeError?: string })?.code ?? (err as { writeError?: string })?.writeError;
+      if (managedJournalWrites && (code === 'revision_conflict' || code === 'page_identity_changed' || code === 'source_changed')) {
+        skipPage(page.slug, code);
+        continue;
+      }
       if (err instanceof TakesWriteError) {
         // Skip + count (mirror_unavailable race, fence_unparsed, page_locked,
         // invalid_input) — never fall back to a DB-only write.
