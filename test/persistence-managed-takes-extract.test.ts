@@ -173,3 +173,18 @@ test('managed extraction composes from the DB snapshot when the canonical file i
     putPage.handler = originalHandler;
   }
 }), 120_000);
+
+test('managed duplicate filtering reads the pinned snapshot takes fence', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  const slug = 'concepts/snapshot-duplicate';
+  const compiledTruth = `${BODY}\n\n## Takes\n\n<!--- gbrain:takes:begin -->\n| # | claim | kind | who | weight | since | source |\n|---|-------|------|-----|--------|-------|--------|\n| 1 | managed bootstrap claim | take | system | 0.7 |  | manual |\n<!--- gbrain:takes:end -->`;
+  await engine.transaction(tx => withCoordinatedWrite(tx, ['default'], async () => {
+    await tx.putPage(slug, { type: 'concept', title: slug, compiled_truth: compiledTruth, timeline: '', frontmatter: {} }, { sourceId: 'default' });
+  }));
+  const snapshot = await engine.readPageSnapshot(slug, { sourceId: 'default' });
+  if (!snapshot) throw new Error(`missing fixture ${slug}`);
+  writeFileSync(join(repo, `${slug}.md`), serializePageToMarkdown(snapshot.page, snapshot.tags).replace(/managed bootstrap claim/g, 'stale disk claim'));
+  await engine.executeRaw("UPDATE pages SET updated_at=now()+interval '20 seconds' WHERE source_id=$1 AND slug=$2", ['default', slug]);
+  const result = await extractTakesFromPages(engine, { bootstrapEnabled: true, sourceIdFilter: 'default', maxPages: 1 });
+  expect(result).toMatchObject({ claims_extracted: 0, duplicates_skipped: 1 });
+  expect(parseTakesFence(serializePageToMarkdown(snapshot.page, snapshot.tags)).takes[0]?.claim).toBe('managed bootstrap claim');
+}), 120_000);
