@@ -80,7 +80,7 @@ describe('public exports — package.json exports map', () => {
     // breaking change going forward" — bump minor and update this count.
     // 23→24 (2026-08 fix wave): ./core/skillopt (audit skillopt-cats-11).
     // 24→25: ./version (gbrain-evals TODOS P3 — direct VERSION import).
-    expect(count).toBe(27);
+    expect(count).toBe(28);
   });
 
   test('EXPECTED_EXPORTS list matches the exports map exactly (no drift)', () => {
