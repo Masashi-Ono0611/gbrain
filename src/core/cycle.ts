@@ -1475,9 +1475,6 @@ async function runPhaseExtractFacts(
   signal?: AbortSignal,
 ): Promise<PhaseResult> {
   try {
-    // #5203: the legacy fence reconcile writes `facts` outside the coordinator (guard trigger P0001); the coordinated import path already indexes fences on a managed brain.
-    const managedSkip = dryRun ? null : await managedBrainPhaseSkip(engine, 'extract_facts', 'extract_facts skipped: fence rows are indexed by the coordinated import path on a managed brain');
-    if (managedSkip) return managedSkip;
     const { runExtractFacts } = await import('./cycle/extract-facts.ts');
     const result = await runExtractFacts(engine, {
       slugs: changedSlugs,
