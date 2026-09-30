@@ -850,11 +850,17 @@ describe('case-insensitive atom identity (#4908)', () => {
     expect(result.details?.failures).toEqual([]);
     expect(result.details?.atoms_extracted).toBe(1);
 
-    // Neither pre-existing duplicate was touched.
-    const a = await engine.getPage(slugA, { sourceId: 'default' });
-    const b = await engine.getPage(slugB, { sourceId: 'default' });
-    expect(a!.frontmatter.source_hash).toBe('eeee111122223333');
-    expect(b!.frontmatter.source_hash).toBe('ffff444455556666');
+    // Neither pre-existing duplicate was adopted/rewritten. (The completed
+    // extraction's stale-atom cleanup may soft-delete them, so read the rows
+    // directly rather than via getPage, which hides soft-deleted pages.)
+    const dupRows = await engine.executeRaw<{ slug: string; source_hash: string }>(
+      `SELECT slug, frontmatter->>'source_hash' AS source_hash FROM pages
+        WHERE slug = ANY($1::text[]) AND source_id = 'default'`,
+      [[slugA, slugB]],
+    );
+    const hashBySlug = new Map(dupRows.map((r) => [r.slug, r.source_hash]));
+    expect(hashBySlug.get(slugA)).toBe('eeee111122223333');
+    expect(hashBySlug.get(slugB)).toBe('ffff444455556666');
 
     // A third, FRESH slug was minted instead of guessing between them.
     const newHash = createHash('sha256')
@@ -872,7 +878,9 @@ describe('case-insensitive atom identity (#4908)', () => {
         WHERE type = 'atom' AND frontmatter->>'source_slug' = $1 AND deleted_at IS NULL`,
       [sourceSlug],
     );
-    expect(atoms[0]!.n).toBe(3); // 2 pre-existing duplicates + 1 freshly minted
+    // Only the freshly minted atom stays live: the two stale pre-existing
+    // duplicates are retired by the completed extraction's stale-atom cleanup.
+    expect(atoms[0]!.n).toBe(1);
   });
 
   test('two titles sharing the same 60-char truncated stem stay on DISTINCT slugs (the full title is hashed, never the truncated stem)', async () => {
