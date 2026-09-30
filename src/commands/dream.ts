@@ -375,6 +375,7 @@ async function resolveBrainDir(
 function printHelp() {
   console.log(`Usage: gbrain dream [options]
        gbrain dream retriage [flags]   (see: gbrain dream retriage --help)
+       gbrain dream reset-key <key> | --list   (see: gbrain dream reset-key --help)
 
 Run one brain maintenance cycle. Eight phases:
   lint -> backlinks -> sync -> synthesize -> extract -> patterns -> embed -> orphans
@@ -668,6 +669,11 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     await runDreamRetriage(engine, args.slice(1));
     return;
   }
+  if (args[0] === 'reset-key') {
+    const { runDreamResetKey } = await import('./dream-reset-key.ts');
+    await runDreamResetKey(engine, args.slice(1));
+    return;
+  }
   // Fail-loud guard (structured-review r3 P1): the CLI flag registry unions
   // retriage's flags into `dream`, so the pre-dispatch validator accepts
   // `gbrain dream --reconcile-queue` — but without the `retriage` positional,
@@ -691,7 +697,7 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
   // ─── IRON RULE: --help short-circuits BEFORE any engine-bearing work ─
   // Tests pin this ordering so `gbrain dream --help --source whatever`
   // ALWAYS prints help and exits 0, never reaching the engine-null gate
-  // below. If you reorder this, dream-cli-flags.test.ts will fail.
+  // below. If you reorder this, test/dream.test.ts ("--help --source whatever") fails.
   if (opts.help) {
     printHelp();
     return;
