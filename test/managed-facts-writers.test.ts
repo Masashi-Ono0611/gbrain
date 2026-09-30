@@ -297,6 +297,21 @@ test('managed bulk conversation extraction writes its facts and terminal audit r
   });
 }, 120_000);
 
+test('managed conversation extraction preserves the prior batch when a replacement extraction fails', async () => {
+  const slug = 'conversations/synthetic-chat';
+  await managed(async ({ engine, sourceId, put }) => {
+    await put(slug, CONVERSATION);
+    await runExtractConversationFactsCore(engine, { sourceId, overrideDisabled: true, extractor, types: ['conversation'] });
+    await put(slug, CONVERSATION.replace('Staff engineer', 'Principal engineer'));
+  }, async ({ engine, sourceId }) => {
+    const failed = async () => { throw new Error('synthetic provider failure'); };
+    const result = await runExtractConversationFactsCore(engine, { sourceId, overrideDisabled: true, extractor: failed, types: ['conversation'] });
+    expect(result.pages_failed).toBe(1);
+    expect((await facts(engine, sourceId, slug)).map(row => row.fact)).toEqual([
+      'Alice Example joined Acme Corp as a staff engineer.', 'EXTRACTION_COMPLETE']);
+  });
+}, 120_000);
+
 test('republishing a managed conversation page keeps its extracted facts active and the page complete', async () => {
   // Conversation rows are numbered on the page coordinate but carry no fence;
   // like the legacy fence reconcile (#1928), the canonical projection must not
