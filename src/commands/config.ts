@@ -117,7 +117,6 @@ async function restampVisibilityPosture(newRaw: string | null): Promise<void> {
 export const FILE_PLANE_API_KEYS: readonly string[] = [
   'openai_api_key',
   'anthropic_api_key',
-  'zeroentropy_api_key',
   'openrouter_api_key',
   'voyage_api_key',
   'dashscope_api_key',
@@ -836,14 +835,22 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     const coverageOverride =
       args.includes('--coverage-override') || args.includes('--yes');
 
+    // #5470: every admission parses the journal caps; a malformed value
+    // would refuse all managed writes, so reject it here.
+    const { JOURNAL_CONFIG_KEYS, parseJournalConfigValue } = await import('../core/persistence/limits.ts');
+    if (JOURNAL_CONFIG_KEYS.includes(key)) {
+      try { parseJournalConfigValue(key, value); }
+      catch (error) { console.error(`[config] ${(error as Error).message}`); process.exit(1); }
+    }
+
     // #4348: validate cycle.timezone at set time — resolveCycleDate falls
     // back loudly at run time, but the typo should be rejected here, at the
     // moment the operator can fix it.
-    if (key === 'cycle.timezone') {
+    if (key === 'cycle.timezone' || key === 'brain.timezone') {
       const { isValidTimeZone } = await import('../core/cycle/cycle-date.ts');
       if (!isValidTimeZone(value)) {
         console.error(
-          `[config] cycle.timezone must be a valid IANA timezone ` +
+          `[config] ${key} must be a valid IANA timezone ` +
           `(for example Asia/Kolkata or America/Los_Angeles; got '${value}').`,
         );
         process.exit(1);

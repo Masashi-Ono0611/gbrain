@@ -23,6 +23,10 @@ Two equivalent paths:
   (`scripts/select-e2e.ts`), falling back to ALL E2E files on unmapped src/
   paths or schema/skills/package.json changes. Fast iteration during a focused
   branch.
+- `bun run ci:ubicloud` (and `ci:ubicloud:diff`) runs the same lanes across ten
+  ephemeral Ubicloud VMs in about five minutes instead of one Docker host. Needs
+  `UBICLOUD_API_KEY` or `UBICLOUD_API_TOKEN`; see "Ubicloud fan-out" in
+  [docs/TESTING.md](TESTING.md).
 
 **Path B — manual lifecycle (still supported):**
 - `bun test` — unit tests (no database required)
@@ -378,6 +382,12 @@ single source of truth), mints tag `v<VERSION>` at the pushed commit, titles
 the release the same, uses that version's `CHANGELOG.md` entry as the notes
 (`scripts/changelog-entry.sh`; falls back to a CHANGELOG link if the entry is
 missing), and attaches the compiled binaries.
+
+The executable build job pins Bun 1.4.2 and verifies the Darwin artifact with
+strict native `codesign` before publishing it. A source merge does not repair
+already-published bad binaries; an affected release needs its own explicitly
+approved recovery and asset verification. The unrelated publishing jobs retain
+their own Bun pins.
 
 ### The `latest-stable` tag
 
