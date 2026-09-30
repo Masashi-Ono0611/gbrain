@@ -1,6 +1,8 @@
 import { assertUnmanagedCanonicalWriter } from '../persistence/maintenance.ts';
-import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { getWorktreeBinding, managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { withCoordinatedWrite } from '../persistence/context.ts';
+import { localHostId } from '../persistence/identity.ts';
+import { submissionAuthority } from '../persistence/authority.ts';
 /**
  * Links + graph operation cluster — pure move from operations.ts (v0.46.x
  * tranche 1). MANAGED_LINK_SOURCES stays exported (test suite + operations.ts
@@ -10,7 +12,7 @@ import { withCoordinatedWrite } from '../persistence/context.ts';
  * '../operations.ts' here (cycle).
  */
 
-import { OperationError, type Operation } from './contract.ts';
+import { OperationError, type Operation, type OperationContext } from './contract.ts';
 import {
   enforceClientSlugFence,
   linkReadScopeOpts,
@@ -30,6 +32,17 @@ import {
   undeclaredLinkTypeMessage,
   undeclaredLinkTypeSuggestion,
 } from '../schema-pack/write-vocabulary.ts';
+
+async function requireManagedLinkWriter(ctx: OperationContext, sourceId: string, operation: string, slug: string): Promise<void> {
+  const [source] = await ctx.engine.executeRaw<{ incarnation: string; archived: boolean }>(
+    'SELECT incarnation,archived FROM sources WHERE id=$1', [sourceId]);
+  if (!source || source.archived) throw new OperationError('source_changed', 'The write source is not active.');
+  await submissionAuthority({ ...ctx, sourceId }, operation, sourceId, source.incarnation, slug);
+  const binding = await getWorktreeBinding(ctx.engine, sourceId);
+  if (!binding || binding.owner_host_id !== localHostId() || binding.state !== 'active' || !binding.local_path || !binding.coordination_path) {
+    throw new OperationError('writer_registration_required', 'This installation has no active writer claim for the selected source.');
+  }
+}
 
 // --- Links ---
 
@@ -79,9 +92,11 @@ const add_link: Operation = {
     }
     if (ctx.dryRun) return { dry_run: true, action: 'add_link', from: p.from, to: p.to };
     const managed = await managedPersistenceEnabled(ctx.engine);
+    const sourceId = ctx.sourceId ?? 'default';
     // Remote callers retain the managed-brain refusal. A trusted local write
     // enters the same source-scoped transaction capability as stale extraction.
     if (managed && ctx.remote !== false) await assertUnmanagedCanonicalWriter(ctx.engine, 'add_link');
+    if (managed && ctx.remote === false) await requireManagedLinkWriter(ctx, sourceId, 'add_link', p.from as string);
     if (!managed) await assertUnmanagedCanonicalWriter(ctx.engine, 'add_link');
     // v114 (#1941): default omitted provenance to 'manual' (NOT the engine's
     // 'markdown' default) so hand/tool-created CLI edges are honestly manual,
@@ -96,19 +111,16 @@ const add_link: Operation = {
     // v0.31.8 (D7): single ctx.sourceId scopes both endpoints + origin. Cross-
     // source link creation is out of scope for this wave; use the engine API
     // directly for that edge case.
-    const linkOpts = ctx.sourceId
-      ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId, originSourceId: ctx.sourceId }
-      : undefined;
+    const linkOpts = { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId };
     // #4109: per-endpoint source-boundary diagnostics before the mutation.
-    await requireWritablePage(ctx, p.from as string, 'add_link', 'from');
-    await requireWritablePage(ctx, p.to as string, 'add_link', 'to');
+    await requireWritablePage({ ...ctx, sourceId }, p.from as string, 'add_link', 'from');
+    await requireWritablePage({ ...ctx, sourceId }, p.to as string, 'add_link', 'to');
     try {
       const write = (engine: typeof ctx.engine) => engine.addLink( // gbrain-allow-direct-insert: add_link is the explicit manual-link surface; managed writes enter withCoordinatedWrite below
         p.from as string, p.to as string, (p.context as string) || '', linkType,
         linkSource, undefined, undefined, linkOpts,
       );
       if (managed) {
-        const sourceId = ctx.sourceId ?? 'default';
         await ctx.engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => write(tx)));
       } else await write(ctx.engine);
     } catch (error) {
@@ -139,11 +151,11 @@ const remove_link: Operation = {
     enforceClientSlugFence(ctx, p.from as string, 'remove_link');
     if (ctx.dryRun) return { dry_run: true, action: 'remove_link', from: p.from, to: p.to };
     const managed = await managedPersistenceEnabled(ctx.engine);
+    const sourceId = ctx.sourceId ?? 'default';
     if (managed && ctx.remote !== false) await assertUnmanagedCanonicalWriter(ctx.engine, 'remove_link');
+    if (managed && ctx.remote === false) await requireManagedLinkWriter(ctx, sourceId, 'remove_link', p.from as string);
     if (!managed) await assertUnmanagedCanonicalWriter(ctx.engine, 'remove_link');
-    const linkOpts = ctx.sourceId
-      ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId }
-      : undefined;
+    const linkOpts = { fromSourceId: sourceId, toSourceId: sourceId };
     // #4527: report how many edges actually died — an unconditional
     // `{ status: 'ok' }` made a zero-match delete (typo'd slug, wrong
     // link_type, already removed) indistinguishable from a real removal.
@@ -154,7 +166,7 @@ const remove_link: Operation = {
       linkOpts,
     );
     const removed = managed
-      ? await ctx.engine.transaction(tx => withCoordinatedWrite(tx, [ctx.sourceId ?? 'default'], () => remove(tx)))
+      ? await ctx.engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => remove(tx)))
       : await remove(ctx.engine);
     return { status: 'ok', removed };
   },

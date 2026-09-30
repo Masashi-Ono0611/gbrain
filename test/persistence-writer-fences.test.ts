@@ -59,6 +59,10 @@ test('unregistered source lifecycle and unsupported legacy writers refuse before
         () => recloneIfMissing(engine, sourceId),
         () => addSource(engine, { id: 'new-source', remoteUrl: 'https://example.com/brain.git' }),
         () => softDeleteSource(engine, sourceId), () => restoreSource(engine, sourceId),
+        () => operationsByName.add_link!.handler({ engine, sourceId, remote: false, config: { engine: engine.kind }, dryRun: false,
+          logger: { info() {}, warn() {}, error() {} } }, { from: 'notes/example', to: 'notes/other' }),
+        () => operationsByName.remove_link!.handler({ engine, sourceId, remote: false, config: { engine: engine.kind }, dryRun: false,
+          logger: { info() {}, warn() {}, error() {} } }, { from: 'notes/example', to: 'notes/other' }),
       ]) await expect(work()).rejects.toMatchObject({ code: 'writer_registration_required' });
       const purge = await purgeExpiredSources(engine);
       expect(purge.purged).toEqual([]);
@@ -69,11 +73,8 @@ test('unregistered source lifecycle and unsupported legacy writers refuse before
         () => runGitHubSync(engine, sourceId, {} as never, {} as never),
         () => runGoogleSync(engine, sourceId, {} as never, {} as never),
         () => importFromContent(engine, 'blocked', 'canonical material', { sourceId, noEmbed: true }),
-        () => operationsByName.add_link!.handler({ engine, sourceId, remote: false, config: { engine: engine.kind }, dryRun: false,
-          logger: { info() {}, warn() {}, error() {} } }, { from: 'notes/example', to: 'notes/other' }),
-        () => operationsByName.remove_link!.handler({ engine, sourceId, remote: false, config: { engine: engine.kind }, dryRun: false,
-          logger: { info() {}, warn() {}, error() {} } }, { from: 'notes/example', to: 'notes/other' }),
       ]) await expect(work()).rejects.toMatchObject({ code: 'writer_coordinator_required' });
+      expect(await engine.getLinks('notes/example', { sourceId })).toHaveLength(0);
       expect(readFileSync(join(root, 'sentinel.md'), 'utf8')).toBe('canonical sentinel');
       expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1', [sourceId])).toHaveLength(1);
     }
