@@ -4,7 +4,6 @@
  * multiSourceDriftAdvice and doctorReportRemote consumes the three checks.
  */
 import type { BrainEngine } from '../../core/engine.ts';
-import { managedPersistenceEnabled } from '../../core/persistence/ownership.ts';
 import type { Check } from '../doctor.ts';
 
 // =================================================================
@@ -131,7 +130,8 @@ export async function checkSchemaPackSourceDrift(engine: BrainEngine): Promise<C
 
 export async function managedSyncAdviceEnabled(engine: BrainEngine): Promise<boolean> {
   try {
-    return await managedPersistenceEnabled(engine);
+    const [row] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
+    return row?.enabled === true;
   } catch {
     // Managed advice is valid for unmanaged brains too, so use it when metadata is unavailable.
     return true;
