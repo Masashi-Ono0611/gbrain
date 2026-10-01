@@ -24,6 +24,12 @@ const MIGRATION_WAVE_TESTS = [
 ];
 
 export const E2E_TEST_MAP: Record<string, string[]> = {
+  // Fix wave 4, Lane D: the apply-migrations orchestration lease (#5693), source deletes and
+  // orphan bindings (#5732), and deactivate racing admission (#5455).
+  "src/core/migration-orchestration-lock.ts": ["test/e2e/apply-migrations-orchestration-lock.test.ts"],
+  "src/core/source-delete.ts": ["test/e2e/sources-remove-bindings.test.ts"],
+  "src/core/persistence/orphan-bindings.ts": ["test/e2e/sources-remove-bindings.test.ts"],
+  "src/core/persistence/deactivation.ts": ["test/e2e/persistence-deactivate-race.test.ts", "test/e2e/fix-wave-4-integration.test.ts"],
   // SkillOpt orchestrator, outcome/resume, models plan + strict mode, spend ledger.
   "src/core/skillopt/**": [
     "test/e2e/skillopt-loop.serial.test.ts",
@@ -94,6 +100,10 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   ],
   "src/core/page-state/**": ["test/e2e/projection-recovery-parity.test.ts", "test/e2e/projection-readiness-currency.test.ts", "test/e2e/projection-embedding-input-hash.test.ts", "test/e2e/safe-chunk-reseal.test.ts", ...MIGRATION_WAVE_TESTS],
   "src/core/embedding-input-hash.ts": ["test/e2e/projection-embedding-input-hash.test.ts"],
+  // Evidence delivery (return_unit): the release-gate leak canaries and the
+  // engine / product-path parity suite.
+  "src/core/search/evidence-delivery.ts": ["test/e2e/evidence-delivery-leak.test.ts", "test/e2e/evidence-delivery-parity.test.ts"],
+  "src/core/search/chunk-windows.ts": ["test/e2e/evidence-delivery-leak.test.ts", "test/e2e/evidence-delivery-parity.test.ts"],
   "src/core/search/safe-chunks.ts": ["test/e2e/safe-chunk-reseal.test.ts", "test/e2e/legacy-chunk-privacy.test.ts"],
   "src/core/code-chunks.ts": ["test/e2e/projection-recovery-parity.test.ts"],
   "src/core/markdown-chunks.ts": ["test/e2e/projection-recovery-parity.test.ts"],
@@ -105,6 +115,7 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   "src/core/context-engine.ts": [
     "test/e2e/openclaw-context-engine-plugin.test.ts",
     "test/e2e/openclaw-plugin-load-real.test.ts",
+    "test/e2e/context-engine-rung3-extraction.test.ts",
   ],
   "src/openclaw-context-engine.ts": [
     "test/e2e/openclaw-context-engine-plugin.test.ts",
@@ -120,10 +131,13 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   // reclaim via TTL + steal grace, and exactly-once convergence on resume.
   // The peeled sync-* core modules (anchor/lock/reconcile/delta/git/…) all
   // feed that kill/resume journey.
-  "src/core/sync-*.ts": ["test/e2e/sync-sigkill-resume-postgres.test.ts", "test/e2e/sync-lock-overlap-postgres.test.ts"],
+  // Refactor wave 1 (W4 sync): parallel-worker completion under abort over
+  // the concurrency clamp and stall/abort composition (sync-concurrency,
+  // sync-reconcile). src/commands/sync/** stays unmapped (runs all E2E).
+  "src/core/sync-*.ts": ["test/e2e/sync-sigkill-resume-postgres.test.ts", "test/e2e/sync-lock-overlap-postgres.test.ts", "test/e2e/sync-run-workers-postgres.test.ts"],
   // v0.32.8 multi-source bug class regression suite — fires on any cycle
   // phase, extract, integrity, embed, or migrate-engine change.
-  "src/core/cycle/extract-takes.ts": ["test/e2e/multi-source-bug-class.test.ts"],
+  "src/core/cycle/extract-takes.ts": ["test/e2e/multi-source-bug-class.test.ts", "test/e2e/extract-takes-managed.test.ts"],
   // Takes write-op layer (fence-first write + page-lock journey on real PG).
   "src/core/ops/takes.ts": ["test/e2e/takes-write-ops-postgres.test.ts"],
   "src/core/takes-write.ts": ["test/e2e/takes-write-ops-postgres.test.ts"],
@@ -272,9 +286,14 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   "src/core/ops/links.ts": ["test/e2e/managed-writers-w3.test.ts"],
   "src/core/cycle/extract-atoms-page-state.ts": ["test/e2e/extract-atoms-page-state.test.ts", "test/e2e/reconcile-crash.test.ts", "test/e2e/reconcile-crash-unactivated.test.ts", "test/e2e/reconcile-pgbouncer.test.ts"],
   "src/commands/migrations/v0_13_1.ts": ["test/e2e/grandfather-projection-postgres.test.ts", "test/e2e/persistence-git-coalescing-5530-postgres.test.ts"],
+  "src/commands/migrations/v0_32_2.ts": ["test/e2e/migrations-v0_32_2-managed.test.ts"],
+  "src/core/facts/withdrawal.ts": ["test/e2e/facts-withdrawal-fingerprint-once.test.ts"],
+  "src/core/extract-takes-from-pages.ts": ["test/e2e/persistence-managed-takes-extract.test.ts", "test/e2e/extract-takes-from-pages-resolutions.test.ts"],
+  "src/core/persistence/prepared-maintenance.ts": ["test/e2e/migrations-v0_32_2-managed.test.ts", "test/e2e/fix-wave-4-integration.test.ts"],
   "src/core/pool-budget.ts": ["test/e2e/persistence-runtime-matrix.test.ts"],
   "src/core/connection-manager.ts": ["test/e2e/persistence-runtime-matrix.test.ts", "test/e2e/pgbouncer-teardown.test.ts"],
   "src/core/postgres-engine.ts": [
+    "test/e2e/executor-binding-matrix.test.ts",
     ...MIGRATION_WAVE_TESTS,
     "test/e2e/legacy-vector-compatibility-postgres.test.ts",
     "test/e2e/postgres-driver-install.test.ts",
@@ -290,6 +309,7 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/jsonb-roundtrip.test.ts",
     "test/e2e/engine-parity.test.ts",
     "test/e2e/schema-drift.test.ts",
+    "test/e2e/schema-catalog-golden.test.ts",
     // #3391: includeNullSignature stale predicates (engine parity).
     "test/e2e/migrate-embeddings-postgres.test.ts",
     // getHealth islanded-liveness + entity-coverage floor (#4153/#4147).
@@ -304,6 +324,7 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   ],
   // PGLite bootstrap path + parity guard.
   "src/core/pglite-engine.ts": [
+    "test/e2e/executor-binding-matrix.test.ts",
     ...MIGRATION_WAVE_TESTS,
     "test/e2e/legacy-vector-compatibility-postgres.test.ts",
     "test/e2e/unsupported-embedding-identity-postgres.test.ts",
@@ -314,11 +335,13 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/postgres-bootstrap.test.ts",
     "test/e2e/engine-parity.test.ts",
     "test/e2e/schema-drift.test.ts",
+    "test/e2e/schema-catalog-golden.test.ts",
     "test/e2e/health-parity-postgres.test.ts",
   ],
   // Engine method modules peeled from the façades carry the same blast
   // radius as the façades themselves.
   "src/core/postgres-engine/**": [
+    "test/e2e/executor-binding-matrix.test.ts",
     "test/e2e/unsupported-embedding-identity-postgres.test.ts",
     "test/e2e/chunk-canonical-text-privacy.test.ts",
     "test/e2e/engine-content-privacy.test.ts",
@@ -328,11 +351,13 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/jsonb-roundtrip.test.ts",
     "test/e2e/engine-parity.test.ts",
     "test/e2e/schema-drift.test.ts",
+    "test/e2e/schema-catalog-golden.test.ts",
     "test/e2e/migrate-embeddings-postgres.test.ts",
     "test/e2e/health-parity-postgres.test.ts",
     "test/e2e/source-boundary-mutation-postgres.test.ts",
   ],
   "src/core/pglite-engine/**": [
+    "test/e2e/executor-binding-matrix.test.ts",
     "test/e2e/unsupported-embedding-identity-postgres.test.ts",
     "test/e2e/chunk-canonical-text-privacy.test.ts",
     "test/e2e/engine-content-privacy.test.ts",
@@ -347,13 +372,14 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   ],
   // Both engines route CJK queries through the shared branch since #3986
   // (src/core/search/cjk-keyword-sql.ts). The cross-engine parity is pinned — any change here must re-run the pin. (Matches
-  // src/core/pglite-engine/** too; selector unions the entries.)
-  "src/core/pglite-engine/cjk-search.ts": ["test/e2e/engine-parity-cjk.test.ts"],
+  // src/core/engine-sql/** too; selector unions the entries.)
+  "src/core/engine-sql/cjk-search.ts": ["test/e2e/engine-parity-cjk.test.ts"],
   // D7 parity batch: the code-edge read paths (getCallersOf / getCalleesOf /
-  // getEdgesByChunk) live in the peeled engine modules; both modules key the
-  // cross-engine read-parity suite directly. (The engine-dir ** globs above
-  // match these files too; the selector unions the entries.)
-  "src/core/postgres-engine/code-edges.ts": ["test/e2e/code-edges-read-parity.test.ts"],
+  // getEdgesByChunk) live in engine-sql/code-edges.ts (PGLite's getEdgesByChunk
+  // stays in its engine module dir); both key the cross-engine read-parity
+  // suite directly. (The ** globs match these files too; the selector unions
+  // the entries.)
+  "src/core/engine-sql/code-edges.ts": ["test/e2e/code-edges-read-parity.test.ts"],
   "src/core/pglite-engine/code-edges.ts": ["test/e2e/code-edges-read-parity.test.ts"],
   // D7 parity batch: chronicle ontology merge (mergeOntologyFact helpers in
   // chronicle/ontology.ts) + event projection (only production caller:
@@ -368,13 +394,25 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/chronicle-event-projection-parity.test.ts",
   ],
   // Schema source of truth: any change must pass the cross-engine drift gate.
-  "src/schema.sql": ["test/e2e/schema-drift.test.ts"],
-  "src/core/pglite-schema.ts": ["test/e2e/schema-drift.test.ts"],
+  "src/schema.sql": ["test/e2e/schema-drift.test.ts", "test/e2e/schema-catalog-golden.test.ts"],
+  "src/core/pglite-schema.ts": ["test/e2e/schema-drift.test.ts", "test/e2e/schema-catalog-golden.test.ts"],
+  "src/core/pglite-schema.generated.ts": ["test/e2e/schema-drift.test.ts", "test/e2e/schema-catalog-golden.test.ts"],
   "src/core/migrate.ts": [
     "test/e2e/migration-vector-replay-postgres.test.ts",
     "test/e2e/schema-drift.test.ts",
+    // Refactor wave 1 E4: catalog-level goldens (both engines, both init paths).
+    "test/e2e/schema-catalog-golden.test.ts",
     "test/e2e/migrate-chain.test.ts",
     "test/e2e/link-source-check-repair-postgres.test.ts",
+    // Refactor wave 1 W3: replay the split registry from checkpoints.
+    "test/e2e/schema-migrations-replay.test.ts",
+  ],
+  "src/core/schema-migrations/**": [
+    "test/e2e/migration-vector-replay-postgres.test.ts",
+    "test/e2e/schema-drift.test.ts",
+    "test/e2e/schema-catalog-golden.test.ts",
+    "test/e2e/migrate-chain.test.ts",
+    "test/e2e/schema-migrations-replay.test.ts",
   ],
   // #4613: the links_link_source_check self-heal must use migration v114's
   // two-phase DDL (DROP + ADD NOT VALID, then VALIDATE outside the txn) on real
@@ -394,21 +432,27 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/migration-flow.test.ts",
   ],
   "src/commands/apply-migrations.ts": [
+    "test/e2e/apply-migrations-orchestration-lock.test.ts",
     "test/e2e/migration-preview-safety.test.ts",
     "test/e2e/migrate-chain.test.ts",
     "test/e2e/migration-flow.test.ts",
+    "test/e2e/managed-migration-chain-postgres.test.ts",
   ],
   "src/commands/migrations/**": [
     "test/e2e/migration-preview-safety.test.ts",
     "test/e2e/migrate-chain.test.ts",
     "test/e2e/migration-flow.test.ts",
+    "test/e2e/managed-migration-chain-postgres.test.ts",
   ],
   // Autopilot linux install/uninstall lifecycle (PATH-shimmed crontab +
   // systemctl; the ubuntu CI runner's only behavioral pin on those arms).
   "src/commands/autopilot.ts": ["test/e2e/autopilot-linux-lifecycle.serial.test.ts", "test/e2e/worker-readiness-cli.test.ts"],
-  "src/commands/doctor.ts": ["test/e2e/doctor-progress.test.ts"],
+  "src/commands/autopilot-daemon.ts": ["test/e2e/autopilot-linux-lifecycle.serial.test.ts", "test/e2e/worker-readiness-cli.test.ts"],
+  "src/commands/autopilot-dispatch.ts": ["test/e2e/autopilot-linux-lifecycle.serial.test.ts", "test/e2e/worker-readiness-cli.test.ts"],
+  "src/commands/autopilot-probes.ts": ["test/e2e/autopilot-linux-lifecycle.serial.test.ts", "test/e2e/worker-readiness-cli.test.ts"],
+  "src/commands/doctor.ts": ["test/e2e/doctor-progress.test.ts", "test/e2e/doctor-json-golden.test.ts"],
   // Doctor check modules peeled from doctor.ts feed the same e2e surface.
-  "src/commands/doctor/**": ["test/e2e/doctor-progress.test.ts", "test/e2e/recovery-layer.test.ts", "test/e2e/fix-wave-3-integration.test.ts"],
+  "src/commands/doctor/**": ["test/e2e/doctor-progress.test.ts", "test/e2e/recovery-layer.test.ts", "test/e2e/fix-wave-3-integration.test.ts", "test/e2e/doctor-json-golden.test.ts"],
   // Knowledge graph layer feeds graph-quality.
   "src/core/link-extraction.ts": ["test/e2e/graph-quality.test.ts", "test/e2e/attendance-retrieval-postgres.test.ts"],
   "src/core/attendance-repair.ts": ["test/e2e/attendance-repair-postgres.test.ts"],
@@ -429,7 +473,18 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   "src/commands/serve-http-registration.ts": ["test/e2e/serve-http-consent.test.ts"],
   "src/commands/serve-http-admin-limits.ts": ["test/e2e/serve-http-consent.test.ts"],
   "src/core/harness/client-setup.ts": ["test/e2e/serve-http-consent.test.ts"],
-  "src/commands/serve-http-oauth.ts": ["test/e2e/serve-http-consent.test.ts"],
+  "src/commands/serve-http-oauth.ts": ["test/e2e/serve-http-consent.test.ts", "test/e2e/serve-http-oauth.test.ts"],
+  // Refactor wave 1 split runServeHttp into these modules; each keeps the
+  // façade's e2e claims for the code it took.
+  "src/commands/serve-http-admin-api.ts": ["test/e2e/serve-http-consent.test.ts", "test/e2e/serve-http-oauth.test.ts"],
+  "src/commands/serve-http-metrics.ts": ["test/e2e/serve-http-oauth.test.ts"],
+  "src/commands/serve-http-spa.ts": ["test/e2e/serve-http-consent.test.ts"],
+  "src/commands/serve-http-webhooks.ts": ["test/e2e/serve-http-ingest-webhook.test.ts"],
+  "src/commands/serve-http-mcp.ts": [
+    "test/e2e/serve-http-oauth.test.ts",
+    "test/e2e/harness-access.test.ts",
+    "test/e2e/serve-http-source-grant.test.ts",
+  ],
   "src/commands/serve-http.ts": [
     "test/e2e/serve-http-consent.test.ts",
     "test/e2e/serve-http-ingest-webhook.test.ts",
@@ -454,24 +509,37 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   "src/core/ops/facts.ts": ["test/e2e/managed-facts-backstop.test.ts"],
   "src/core/facts/backstop.ts": ["test/e2e/managed-facts-backstop.test.ts", "test/e2e/facts-worker-config.test.ts", "test/e2e/managed-facts-embedding.test.ts", "test/e2e/managed-facts-compaction.test.ts", "test/e2e/legacy-fact-extraction-dedup-postgres.test.ts"],
   "src/core/facts/extract.ts": ["test/e2e/managed-facts-embedding.test.ts"],
-  "src/core/github-source.ts": ["test/e2e/managed-connector-routing.test.ts", "test/e2e/managed-connector-retry.test.ts", "test/e2e/managed-connector-fencing.test.ts", "test/e2e/managed-connector-recovery.test.ts"],
-  "src/core/google/google-source.ts": ["test/e2e/managed-connector-routing.test.ts", "test/e2e/managed-connector-retry.test.ts", "test/e2e/managed-connector-fencing.test.ts", "test/e2e/managed-connector-recovery.test.ts", "test/e2e/google-attachments-postgres.test.ts"],
+  "src/core/github-source.ts": ["test/e2e/managed-connector-routing.test.ts", "test/e2e/managed-connector-retry.test.ts", "test/e2e/managed-connector-fencing.test.ts", "test/e2e/managed-connector-recovery.test.ts", "test/e2e/connector-holds.test.ts"],
+  "src/core/google/google-source.ts": ["test/e2e/managed-connector-routing.test.ts", "test/e2e/managed-connector-retry.test.ts", "test/e2e/managed-connector-fencing.test.ts", "test/e2e/managed-connector-recovery.test.ts", "test/e2e/google-attachments-postgres.test.ts", "test/e2e/connector-holds.test.ts"],
   "src/core/google/attachment-receipts.ts": ["test/e2e/google-attachments-postgres.test.ts"],
   "src/core/google/attachment-backfill.ts": ["test/e2e/google-attachments-postgres.test.ts"],
   "src/core/persistence/connector-google-receipts.ts": ["test/e2e/google-attachments-postgres.test.ts"],
+  // Fix wave 4 lane B: connector item holds, #5581 Gmail cursors, the dispatch gate and the fence refusal.
+  "src/core/connectors/item-holds.ts": ["test/e2e/connector-holds.test.ts"],
+  "src/core/connectors/item-holds-store.ts": ["test/e2e/connector-holds.test.ts"],
+  "src/core/connectors/connector-hold-session.ts": ["test/e2e/connector-holds.test.ts"],
+  "src/core/connectors/connector-text.ts": ["test/e2e/connector-holds.test.ts"],
+  "src/commands/sources-retry-held.ts": ["test/e2e/connector-holds.test.ts"],
+  "src/core/repair/connector-fences.ts": ["test/e2e/connector-holds.test.ts"],
   // Fix wave 3 lane A: connector identity, account pin, no-op kernel, pending set and migration 176.
-  "src/core/persistence/connector-sync.ts": ["test/e2e/connector-wave3.test.ts"],
+  "src/core/take-proposals.ts": ["test/e2e/takes-propose-accept-managed.test.ts"],
+  "src/core/persistence/connector-sync.ts": ["test/e2e/connector-wave3.test.ts", "test/e2e/connector-holds.test.ts"],
   "src/core/persistence/connector-identity.ts": ["test/e2e/connector-wave3.test.ts"],
-  "src/core/persistence/connector-state.ts": ["test/e2e/connector-wave3.test.ts"],
+  "src/core/persistence/connector-state.ts": ["test/e2e/connector-wave3.test.ts", "test/e2e/connector-holds.test.ts", "test/e2e/fix-wave-4-integration.test.ts"],
   "src/core/persistence/connector-account.ts": ["test/e2e/connector-wave3.test.ts"],
   "src/core/persistence/connector-errors.ts": ["test/e2e/connector-wave3.test.ts"],
   "src/core/persistence/connector-status.ts": ["test/e2e/connector-wave3.test.ts"],
   "src/core/persistence/connector-reset.ts": ["test/e2e/connector-wave3.test.ts"],
   "src/core/persistence/connector-checkpoint-migration.ts": ["test/e2e/connector-wave3.test.ts"],
-  "src/core/persistence/noop-kernel.ts": ["test/e2e/connector-wave3.test.ts"],
+  "src/core/persistence/noop-kernel.ts": ["test/e2e/connector-wave3.test.ts", "test/e2e/fix-wave-4-lane-a.test.ts"],
   "src/core/persistence/import-mutations.ts": ["test/e2e/connector-wave3.test.ts"],
-  "src/core/persistence/sync-run.ts": ["test/e2e/connector-wave3.test.ts"],
-  "src/core/persistence/sync-prepare.ts": ["test/e2e/connector-wave3.test.ts"],
+  "src/core/persistence/sync-run.ts": ["test/e2e/connector-wave3.test.ts", "test/e2e/fix-wave-4-lane-a.test.ts"],
+  "src/core/persistence/sync-prepare.ts": ["test/e2e/connector-wave3.test.ts", "test/e2e/fix-wave-4-lane-a.test.ts"],
+  // Fix wave 4 lane A (#5762): request indexes, checkpoint validation, the repair kind and the doctor checks.
+  "src/core/persistence/checkpoint-validation.ts": ["test/e2e/fix-wave-4-lane-a.test.ts", "test/e2e/persistence-request-indexes-postgres.test.ts"],
+  "src/core/repair/request-indexes.ts": ["test/e2e/persistence-request-indexes-postgres.test.ts"],
+  "src/commands/doctor/checks/persistence-requests.ts": ["test/e2e/persistence-request-indexes-postgres.test.ts"],
+  "src/core/schema-migrations/v179-persistence-request-sync-run-indexes.ts": ["test/e2e/persistence-request-indexes-postgres.test.ts"],
   "src/core/persistence/accepted-pending.ts": ["test/e2e/connector-wave3.test.ts"],
   "src/commands/google-attachments.ts": ["test/e2e/google-attachments-postgres.test.ts"],
   "src/core/backup/**": ["test/e2e/backup-coverage-parity.test.ts"],
@@ -479,4 +547,34 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   "src/commands/doctor/checks/backup-coverage.ts": ["test/e2e/backup-coverage-parity.test.ts"],
   "src/commands/doctor/checks/sync-failures.ts": ["test/e2e/managed-sync-failures.test.ts"],
   "src/commands/doctor/checks/writer-version.ts": ["test/e2e/persistence-writer-stamps.test.ts"],
+  // E5 executor binding matrix: master's executor path is engine.executeRaw
+  // over sql-query.ts's scalar contract (refactor wave 1, EO20).
+  "src/core/sql-query.ts": ["test/e2e/executor-binding-matrix.test.ts"],
 };
+
+// Refactor wave 1: src/core/engine-sql/ holds SQL shared by BOTH engines, so a
+// change there re-runs every E2E file either engine's façade or module dir
+// selects (plus the E5 binding matrix, already in those rows).
+E2E_TEST_MAP["src/core/engine-sql/**"] = [
+  ...new Set(
+    [
+      "src/core/postgres-engine.ts",
+      "src/core/pglite-engine.ts",
+      "src/core/postgres-engine/**",
+      "src/core/pglite-engine/**",
+    ].flatMap((key) => E2E_TEST_MAP[key] ?? []),
+  ),
+];
+
+// Executor-contract E2E files (both backends) claimed by the module they pin.
+const ENGINE_SQL_EXECUTOR_E2E = [
+  "test/e2e/engine-sql-prepare-parity.test.ts",
+  "test/e2e/engine-sql-capabilities-parity.test.ts",
+  "test/e2e/engine-sql-transaction-parity.test.ts",
+];
+E2E_TEST_MAP["src/core/engine-sql/executor.ts"] = ENGINE_SQL_EXECUTOR_E2E;
+E2E_TEST_MAP["src/core/engine-sql/dialect-*.ts"] = ENGINE_SQL_EXECUTOR_E2E;
+E2E_TEST_MAP["src/core/engine-sql/normalize.ts"] = ["test/e2e/engine-sql-normalize-parity.test.ts"];
+E2E_TEST_MAP["src/core/engine-sql/brands.ts"] = ["test/e2e/engine-sql-rls-scope.test.ts"];
+E2E_TEST_MAP["src/core/engine-sql/chunks.ts"] = ["test/e2e/evidence-delivery-leak.test.ts", "test/e2e/evidence-delivery-parity.test.ts"];
+E2E_TEST_MAP["src/core/engine-sql/links.ts"] = ["test/e2e/links-read-order.test.ts", "test/e2e/attendance-retrieval-postgres.test.ts"];
