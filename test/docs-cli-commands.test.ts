@@ -60,16 +60,6 @@ const ALLOWLIST: Record<string, { tokens: string[]; reason: string }> = {
     tokens: ['rls-exempt'],
     reason: 'explains that gbrain deliberately does NOT ship this command',
   },
-  'docs/guides/concurrent-writes.md': {
-    tokens: ['--dry-run'],
-    reason: 'CLI bug: `auth rescope-client` / `auth local-writer` parse --dry-run '
-      + '(src/core/grants/cli.ts, src/commands/persistence-admin.ts) but '
-      + "CLI_FLAG_REGISTRY['auth'] omits it, so the validator rejects it. Remove once the registry accepts it.",
-  },
-  'docs/guides/shared-brain-skills.md': {
-    tokens: ['--dry-run'],
-    reason: 'same auth --dry-run registry bug as docs/guides/concurrent-writes.md',
-  },
 };
 
 interface Violation { file: string; line: number; token: string; message: string }

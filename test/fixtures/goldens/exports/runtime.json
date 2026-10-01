@@ -504,6 +504,7 @@
         "loadConfig",
         "loadConfigFileOnly",
         "loadConfigWithEngine",
+        "parseChatFallbackChainsEnv",
         "saveConfig",
         "toEngineConfig"
       ],
@@ -832,6 +833,9 @@
         "affectsRecall",
         "assertNever",
         "isCRMode"
+      ],
+      "./version": [
+        "VERSION"
       ]
     }
   },
