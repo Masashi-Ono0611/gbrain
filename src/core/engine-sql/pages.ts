@@ -20,9 +20,9 @@ import { PAGE_SORT_SQL } from '../types.ts';
 import type { PageWriteOptions } from '../page-state/types.ts';
 import { moveSlugBindings, recordRenameAlias } from '../page-state/rename-alias.ts';
 import { sanitizeText } from '../batch-rows.ts';
-import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion } from '../search/safe-chunks.ts';
+import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion, currentTextProjectionFilter, safeChunksFilter } from '../search/safe-chunks.ts';
 import { privatePagesFilterFragment, privateSnapshotFilterFragment } from '../search/private-visibility.ts';
-import { quarantineFilterFragment } from '../quarantine.ts';
+import { QUARANTINE_FILTER_FRAGMENT, quarantineFilterFragment } from '../quarantine.ts';
 import { buildVisibilityClause } from '../search/sql-ranking.ts';
 import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
 import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
@@ -418,12 +418,13 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       ? trustedSql(`AND ${privatePagesFilterFragment('p')}`)
       : sqlFragment``;
     // Opt-in search visibility for canonical bodies; administrative listPages calls retain their existing behavior.
+    const visibilityPrivate = filters?.excludePrivate
+      ? sqlFragment` AND ${trustedSql(privatePagesFilterFragment('p'))}` : sqlFragment``;
+    const visibilitySafeChunks = (filters?.requireSafeChunks ?? filters?.excludePrivate)
+      ? sqlFragment` AND ${trustedSql(safeChunksFilter('p'))}` : sqlFragment``;
+    const visibilityCondition = sqlFragment`AND p.deleted_at IS NULL AND ${trustedSql(currentTextProjectionFilter('p'))} AND NOT s.archived AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)}${visibilityPrivate}${visibilitySafeChunks}`;
     const privateAndVisibilityCondition = requireVisibility
-      ? sqlFragment`${privateCondition} ${trustedSql(buildVisibilityClause('p', 's', {
-          excludePrivate: filters?.excludePrivate,
-          requireSafeChunks: filters?.requireSafeChunks === true,
-        }))}`
-      : privateCondition;
+      ? sqlFragment`${privateCondition} ${visibilityCondition}` : privateCondition;
     const effectiveAfterCondition = filters?.effective_after
       ? sqlFragment`AND p.effective_date >= ${filters.effective_after}::timestamptz`
       : sqlFragment``;
