@@ -798,7 +798,7 @@ export interface SearchResult {
   title: string;
   type: PageType;
   chunk_text: string;
-  chunk_source: 'compiled_truth' | 'timeline';
+  chunk_source: 'compiled_truth' | 'timeline' | 'fenced_code';
   chunk_id: number;
   chunk_index: number;
   score: number;
@@ -1036,6 +1036,8 @@ export interface SearchResult {
    * incident's duplicate-stub class.
    */
   create_safety?: import('./search/evidence.ts').CreateSafety;
+  /** Evidence delivery (`return_unit`): present only when a non-chunk unit applied. */
+  delivered?: import('./search/evidence-delivery.ts').DeliveredEvidence;
 }
 
 /**

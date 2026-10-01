@@ -53,7 +53,7 @@ export async function readManagedSyncFailures(engine: BrainEngine, sourceIds?: s
     receipt: Pick<WriteRequest, 'state' | 'request_id' | 'error_code' | 'error_message'> | null; failure: ManagedSyncFailure | null; path: string | null; updated_at: string }>(`
     SELECT c.fingerprint AS cursor_key,jsonb_build_object('sourceId',s.id,'incarnation',s.incarnation,'runId',c.completed_keys->0->>'runId',
       'index',c.completed_keys->0->'index','target',c.completed_keys->0->>'target',
-      'keyOptions',c.completed_keys->0->'keyOptions',
+      'keyOptions',COALESCE(c.completed_keys->0->'syncOptions',c.completed_keys->0->'keyOptions'),
       'pending',jsonb_build_object('requestId',c.completed_keys->0->'pending'->>'requestId')) AS value,
       CASE WHEN r.id IS NULL THEN NULL ELSE jsonb_build_object('state',r.state,'request_id',r.request_id,'error_code',r.error_code,'error_message',r.error_message) END AS receipt,
       f.completed_keys->0 AS failure,m.completed_keys->((c.completed_keys->0->>'index')::int)->>'path' AS path,c.updated_at
