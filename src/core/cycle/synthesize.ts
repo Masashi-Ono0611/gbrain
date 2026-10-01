@@ -342,6 +342,8 @@ export interface SynthesizePhaseOpts {
   to?: string;
   /** #4348: clock seam for deterministic cycle-date bucketing (tests). */
   now?: () => Date;
+  /** Test seam for the triage time budget; defaults to the real clock. */
+  triageNow?: () => number;
   /** C-15: the cycle's calendar date (runCycle resolves one per cycle); --date still wins. */
   cycleDate?: string;
   /** #4168 sibling: absolute wall-clock deadline (epoch ms) of the enclosing
@@ -531,7 +533,7 @@ async function runPhaseSynthesizeInner(
       maxTokens: config.triage.maxTokens,
       threshold: config.triage.threshold,
       concurrency: config.triage.concurrency,
-      maxMs: config.triage.maxMs,
+      maxMs: config.triage.maxMs, now: opts.triageNow,
       signal: opts.signal,
       rescue: rescueConfigOf(config.triage),
     }, opts.yieldDuringPhase);
