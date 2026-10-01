@@ -38,6 +38,7 @@ import { registerBuiltinHandlers } from '../src/commands/jobs.ts';
 import { performSync, SyncDisabledError } from '../src/commands/sync.ts';
 import { isSyncDisabledConfig, isSyncDisabledForSource } from '../src/core/sync-policy.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
+import { claimWorktree } from '../src/core/persistence/ownership.ts';
 
 let engine: PGLiteEngine;
 let schemaVersion: string | null = null;
@@ -137,6 +138,17 @@ describe('isSyncDisabledForSource', () => {
 // ─── performSync choke point ────────────────────────────────────────────────
 
 describe('performSync — SyncDisabledError choke point', () => {
+  test('an available managed owner with syncEnabled=false still gets SyncDisabledError', async () => {
+    await withEnv({ GBRAIN_HOME: emptyHome() }, async () => {
+      const repo = makeGitRepo();
+      await insertSource('owned-disabled', repo, { syncEnabled: false });
+      await claimWorktree(engine, 'owned-disabled', repo);
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+      await expect(performSync(engine, { repoPath: repo, sourceId: 'owned-disabled', noPull: true }))
+        .rejects.toBeInstanceOf(SyncDisabledError);
+    });
+  }, 30_000);
+
   test('a disabled source refuses with SyncDisabledError naming the sourceId', async () => {
     await withEnv({ GBRAIN_HOME: emptyHome() }, async () => {
       const repo = makeGitRepo();
