@@ -864,6 +864,8 @@
           "limit?: number | undefined",
           "listColumnsOnly?: boolean | undefined",
           "offset?: number | undefined",
+          "requireLiveVisibility?: boolean | undefined",
+          "requireSafeChunks?: boolean | undefined",
           "slugPrefix?: string | undefined",
           "sort?: \"updated_desc\" | \"updated_asc\" | \"created_desc\" | \"slug\" | undefined",
           "sourceId?: string | undefined",
@@ -1713,6 +1715,7 @@
           "abortSignal?: AbortSignal | undefined",
           "acquireTurnPermit?: (() => Promise<TurnPermit>) | undefined",
           "cacheSystem?: boolean | undefined",
+          "chatFn?: ((opts: ChatOpts) => Promise<ChatResult>) | undefined",
           "initialMessages: ChatMessage[]",
           "maxTokens?: number | undefined",
           "maxTurns?: number | undefined",
@@ -2020,7 +2023,7 @@
         "kind": "function",
         "name": "getChatFallbackChain",
         "signature": [
-          "() => string[]"
+          "(chainKey?: string) => string[]"
         ]
       },
       {
@@ -2445,6 +2448,7 @@
           "backup?: { check_enabled?: boolean | string; check_interval_days?: number | string; } | undefined",
           "brain?: { audience?: string; } | undefined",
           "chat_fallback_chain?: string[] | undefined",
+          "chat_fallback_chains?: Record<string, string[]> | undefined",
           "chat_model?: string | undefined",
           "content_sanity?: { bytes_warn?: number; bytes_block?: number; junk_patterns_enabled?: boolean; disabled_patterns?: string[]; disabled?: boolean; junk_disposition?: \"quarantine\" | \"reject\"; max_markup_ratio?: number; prose_check_enabled?: boolean; } | undefined",
           "cycle?: Record<string, string> | undefined",
@@ -2604,6 +2608,13 @@
         "name": "loadConfigWithEngine",
         "signature": [
           "(engine: DbPlaneEngineReader, base?: GBrainConfig | null) => Promise<GBrainConfig | null>"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "parseChatFallbackChainsEnv",
+        "signature": [
+          "(raw: string | undefined) => Record<string, string[]> | undefined"
         ]
       },
       {
@@ -7760,6 +7771,8 @@
           "limit?: number | undefined",
           "listColumnsOnly?: boolean | undefined",
           "offset?: number | undefined",
+          "requireLiveVisibility?: boolean | undefined",
+          "requireSafeChunks?: boolean | undefined",
           "slugPrefix?: string | undefined",
           "sort?: \"updated_desc\" | \"updated_asc\" | \"created_desc\" | \"slug\" | undefined",
           "sourceId?: string | undefined",
@@ -8154,6 +8167,15 @@
         "name": "isCRMode",
         "signature": [
           "(value: unknown) => value is CRMode"
+        ]
+      }
+    ],
+    "./version": [
+      {
+        "kind": "variable",
+        "name": "VERSION",
+        "signature": [
+          "string"
         ]
       }
     ]

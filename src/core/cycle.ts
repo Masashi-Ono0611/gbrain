@@ -54,7 +54,6 @@ import { timeContainedPhase } from './cycle/phase-containment.ts';
 import { isManagedBrain } from './cycle/phase-table.ts';
 import { managedPullWarning, type UpstreamRefresh } from './sync-upstream.ts';
 import { assertValidSourceId } from './source-id.ts';
-import { managedBrainPhaseSkip } from './persistence/maintenance.ts';
 import { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
 import { assertEmbedNotStalled } from './embed-stall.ts';
 import { anyAbortSignal } from './abort-signals.ts';
@@ -1007,9 +1006,8 @@ function checkAborted(signal?: AbortSignal): void {
 // going through runCycle's full setup cost.
 export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: BrainEngine | null, signal?: AbortSignal): Promise<PhaseResult> {
   try {
-    // #5180: lint in fix mode writes through the legacy filesystem path a managed brain refuses; skip with the reason (dry-run still reports).
-    const managedSkip = !dryRun && engine ? await managedBrainPhaseSkip(engine, 'lint', 'lint fix skipped: a managed brain does not accept legacy filesystem writes') : null;
-    if (managedSkip) return managedSkip;
+    // Managed lint reports issues without fixing files; runLintCore's fix=false
+    // path avoids the legacy filesystem writer while retaining the audit.
     const { runLintCore } = await import('../commands/lint.ts');
     // issue #1678: pass the cycle's live engine so lint's content-sanity
     // DB-plane lift REUSES it instead of creating + disconnecting a
@@ -1444,9 +1442,8 @@ async function runPhaseExtractFacts(
   signal?: AbortSignal,
 ): Promise<PhaseResult> {
   try {
-    // #5203: the legacy fence reconcile writes `facts` outside the coordinator (guard trigger P0001); the coordinated import path already indexes fences on a managed brain.
-    const managedSkip = dryRun ? null : await managedBrainPhaseSkip(engine, 'extract_facts', 'extract_facts skipped: fence rows are indexed by the coordinated import path on a managed brain');
-    if (managedSkip) return managedSkip;
+    // Fence reconciliation uses withDerivedFactsWrite on managed brains, so
+    // run it to repair drift left by older imports as well as new pages.
     const { runExtractFacts } = await import('./cycle/extract-facts.ts');
     const result = await runExtractFacts(engine, {
       slugs: changedSlugs,

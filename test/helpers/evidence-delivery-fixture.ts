@@ -35,13 +35,23 @@ function ctxOf(engine: BrainEngine, meta: Record<string, unknown>[], overrides: 
   } as OperationContext;
 }
 
+// Patch 84 intentionally exposes relational-arm metadata on query. Its elapsed
+// time varies between runs; pin the presence and all semantic fields, not the clock.
+function stableOffPathBytes(value: unknown): string {
+  return JSON.stringify(value, function (key, field) {
+    if (key === 'duration_ms' && typeof this === 'object' && this !== null
+      && 'fired' in this && 'seeds_resolved' in this && 'candidates' in this) return 0;
+    return field;
+  });
+}
+
 export async function captureOffPath(engine: BrainEngine): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   const op = (name: string) => operations.find(o => o.name === name)!;
   const run = async (label: string, name: string, params: Record<string, unknown>, overrides: Partial<OperationContext> = {}) => {
     const meta: Record<string, unknown>[] = [];
     const result = await op(name).handler(ctxOf(engine, meta, overrides), params);
-    out[label] = JSON.stringify({ result, meta });
+    out[label] = stableOffPathBytes({ result, meta });
   };
   for (const variant of [{}, { return_unit: 'chunk' }]) {
     const tag = Object.keys(variant).length ? ':chunk' : '';
@@ -61,7 +71,7 @@ export async function captureOffPath(engine: BrainEngine): Promise<Record<string
     for (const name of ['search', 'query', 'recall']) {
       const res = await dispatchToolCall(engine, name, { query: 'ocelot', ...(name === 'query' ? { expand: false } : {}) },
         { remote: true, transport: 'stdio', sourceId: 'default' });
-      out[`mcp-${name}`] = JSON.stringify(res);
+      out[`mcp-${name}`] = stableOffPathBytes(res);
     }
   });
   const prompts: string[] = [];
