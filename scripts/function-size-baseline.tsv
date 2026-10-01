@@ -9,9 +9,9 @@ path	name	lines	justification
 src/commands/bootstrap.ts	runHooks	597	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/commands/bootstrap.ts	runHooks>withLock(#1)	449	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/commands/config.ts	runConfig	852	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/commands/doctor/bootstrap-checks.ts	bootstrapDoctorChecks	476	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
+src/commands/doctor/bootstrap-checks.ts	bootstrapDoctorChecks	500	local patch stack (not for upstream); TODO:decompose
 src/commands/doctor/checks/extraction-sync.ts	checkSyncFreshness	333	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/commands/doctor/report-remote.ts	doctorReportRemote	416	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
+src/commands/doctor/report-remote.ts	doctorReportRemote	418	local patch stack (not for upstream); TODO:decompose
 src/commands/dream-retriage.ts	runDreamRetriage	524	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/commands/embed.ts	embedAllStale	551	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/commands/embed.ts	runEmbedCore	376	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
@@ -34,27 +34,27 @@ src/core/config.ts	loadConfigWithEngine	360	seed: W5 baseline, refactor wave 1 (
 src/core/context-engine.ts	createGBrainContextEngine	519	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/context/retrieval-reflex.ts	resolveEntitiesToPointers	355	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/cycle.ts	runCycle	1229	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/core/cycle/extract-atoms.ts	runPhaseExtractAtoms	810	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/core/cycle/extract-atoms.ts	runPhaseExtractAtoms>withBudgetTracker(#1)	305	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
+src/core/cycle/extract-atoms.ts	runPhaseExtractAtoms	838	local patch stack (not for upstream); TODO:decompose
+src/core/cycle/extract-atoms.ts	runPhaseExtractAtoms>withBudgetTracker(#1)	319	local patch stack (not for upstream); TODO:decompose
 src/core/cycle/extract-facts.ts	runExtractFacts	505	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/cycle/grade-takes.ts	GradeTakesPhase.process	402	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/core/cycle/patterns.ts	runPhasePatterns	303	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
+src/core/cycle/patterns.ts	runPhasePatterns	307	local patch stack (not for upstream); TODO:decompose
 src/core/cycle/propose-takes.ts	ProposeTakesPhase.process	427	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/core/cycle/synthesize-concepts.ts	runPhaseSynthesizeConcepts	447	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/core/cycle/synthesize.ts	runPhaseSynthesizeInner	1043	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
+src/core/cycle/synthesize-concepts.ts	runPhaseSynthesizeConcepts	450	local patch stack (not for upstream); TODO:decompose
+src/core/cycle/synthesize.ts	runPhaseSynthesizeInner	1050	local patch stack (not for upstream); TODO:decompose
 src/core/facts/backstop.ts	runPipelineBodyInner	358	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/import-file.ts	importFromContent	857	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/minions/handlers/subagent-oneshot.ts	runSubagentOneshot	377	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/core/minions/handlers/subagent.ts	makeSubagentHandler	884	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/core/minions/handlers/subagent.ts	makeSubagentHandler>subagentHandlerInner	814	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/core/minions/handlers/subagent.ts	runSubagentViaGateway	328	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
+src/core/minions/handlers/subagent.ts	makeSubagentHandler	887	local patch stack (not for upstream); TODO:decompose
+src/core/minions/handlers/subagent.ts	makeSubagentHandler>subagentHandlerInner	817	local patch stack (not for upstream); TODO:decompose
+src/core/minions/handlers/subagent.ts	runSubagentViaGateway	333	local patch stack (not for upstream); TODO:decompose
 src/core/minions/queue.ts	MinionQueue.add	498	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/minions/queue.ts	MinionQueue.add>result=this.engine.transaction(#0)	359	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/minions/worker.ts	MinionWorker.executeJob	303	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/minions/worker.ts	MinionWorker.start	470	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/oauth-provider.ts	GBrainOAuthProvider.verifyAccessToken	327	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/ops/facts.ts	recall.handler	348	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/core/ops/search.ts	query.handler	330	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
+src/core/ops/search.ts	query.handler	351	local patch stack (not for upstream); TODO:decompose
 src/core/progressive-batch/orchestrator.ts	runProgressiveBatch	348	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/remediation/run.ts	runRemediation	428	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/schema-pack/unify-types-handler.ts	runUnifyTypes	310	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
