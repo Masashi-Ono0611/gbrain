@@ -320,9 +320,6 @@ test/sync.test.ts	sync auto-embed arguments	2	source-surface-helper
 test/sync.test.ts	sync regression — #132 nested transaction deadlock	3	source-surface-helper
 test/template-repo-generator.test.ts	generateTemplateTree	0	readFileSync
 test/template-repo-generator.test.ts	renderTemplateReadme	5	readFileSync
-test/thin-client-routing-audit.test.ts	thin-client routing audit — scratch-DB additions (jobs partial dispatch + config refusal)	5	readFileSync
-test/thin-client-routing-audit.test.ts	thin-client routing audit — v0.32 REFUSE additions stay in the table	4	readFileSync
-test/thin-client-routing-audit.test.ts	thin-client routing audit — v0.32 ROUTE additions wire callRemoteTool	4	readFileSync
 test/think-embed-question-wiring.serial.test.ts	#3734 — CRAG think escalation wires embedQuestion (source pin)	2	readFileSync
 test/think-embed-question-wiring.serial.test.ts	#3734 — synthesize verb wires embedQuestion into runThink	1	readFileSync
 test/think-save-source.test.ts	#5426 think --save persists into the think source	5	readFileSync
