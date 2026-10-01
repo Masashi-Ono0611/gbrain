@@ -1915,6 +1915,19 @@
           "*"
         ]
       },
+      "listPages#requireSafeChunks": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx"
+        ],
+        "flagOnScopes": [
+          "*"
+        ]
+      },
       "listPages#slugPrefix": {
         "flagOffLanes": [
           "pool"
