@@ -733,10 +733,9 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
   // Managed brain: timeline_entries is guard-triggered outside the coordinator and
   // the coordinated import path already derives those rows; keep the (unguarded)
   // links pass, skip the timeline pass with a reason instead of losing rows.
-  if (!dryRun && opts.mode !== 'links' && await managedPersistenceEnabled(engine)) {
+  if (!dryRun && opts.mode === 'timeline' && await managedPersistenceEnabled(engine)) {
     result.timeline_skipped_reason = 'writer_coordinator_required';
-    if (opts.mode === 'timeline') return result;
-    opts = { ...opts, mode: 'links' };
+    return result;
   }
 
   // v0.41.15.0 (D9): resolve workers via the PGLite-clamp wrapper.

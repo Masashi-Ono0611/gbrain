@@ -1,7 +1,7 @@
 /**
  * Evidence delivery off-path golden: with `return_unit: chunk` (explicit or
  * from config) search, query, recall, think's prompt and the MCP
- * serialization are byte-identical to the pre-feature release, and the
+ * serialization match the pinned baseline, and the
  * implied `auto` default is byte-identical wherever no hit is a conversation.
  *
  * Authoring gate: protects the frozen off-path contract (plan amendment 6)
@@ -12,7 +12,9 @@
  * release before evidence delivery (refactor wave 1, 9a0e01b4) and must not
  * be regenerated on a branch that changes the off path. The cost wave's two
  * declared remote-output changes (lean rows, compact MCP JSON) are applied to
- * the frozen bytes by `withCostWave`, not regenerated into them.
+ * the frozen bytes by `withCostWave`, not regenerated into them. Patch 84
+ * intentionally added query relational metadata; its elapsed time is
+ * normalized, while all other response fields remain pinned.
  *
  * The Postgres arm lives in test/e2e/evidence-delivery-parity.test.ts.
  */
@@ -53,7 +55,7 @@ afterAll(async () => {
 }, 240_000);
 
 describe('evidence delivery off path', () => {
-  test('a config-level chunk unit is byte-identical to the pre-feature release', async () => {
+  test('a config-level chunk unit matches the pinned off-path baseline', async () => {
     const got = await withChunkConfig(engine, () => captureOffPath(engine));
     if (process.env.GBRAIN_TEST_UPDATE_GOLDENS === '1') {
       mkdirSync(dirname(FIXTURE), { recursive: true });
@@ -64,7 +66,7 @@ describe('evidence delivery off path', () => {
     for (const key of Object.keys(want)) expect(`${key}: ${got[key]}`).toBe(`${key}: ${withCostWave(key, want[key])}`);
   });
 
-  test('an explicit return_unit chunk is byte-identical to the pre-feature release', async () => {
+  test('an explicit return_unit chunk matches the pinned off-path baseline', async () => {
     const want = JSON.parse(readFileSync(FIXTURE, 'utf8')) as Record<string, string>;
     const got = await captureOffPath(engine);
     const keys = Object.keys(want).filter(k => k.endsWith(':chunk'));
