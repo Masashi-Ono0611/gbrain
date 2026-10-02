@@ -11,6 +11,8 @@ import type { PageSnapshot } from '../page-state/types.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode } from '../write-through.ts';
 import { localHostId } from './identity.ts';
+import { isDatabaseOnlyPage, slugDerivedOrigin } from './unbound-pages.ts';
+import { isUnboundSourcePage } from './unbound-source.ts';
 import { getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
 import { digest, requireUuid, sha256, stableJson } from './digest.ts';
 import { reconcileCanonical, strictReconcileKeys, validateReconcileJson, type ReconcileConflict, type ReconcileDecision } from './reconcile-merge.ts';
@@ -30,10 +32,30 @@ export interface ReconcileArtifact {
 export interface ReconcileState {
   binding: WorktreeBinding; root: string; path: string; raw: Buffer; snapshot: PageSnapshot;
   storedPage: Record<string, unknown>; file: ParsedPage; pins: ReconcilePins;
+  /** `slug_derived`: a database-only page matched to the canonical file at its slug path. */
+  origin: 'recorded' | 'slug_derived';
+  /** The `source_path` apply records for a `slug_derived` origin. */
+  originSourcePath: string | null;
 }
+/**
+ * Cycle bookkeeping that `cycle.ts` stamps into `sources.config` after every
+ * successful source cycle. It is not reconcile policy, so it stays out of the
+ * policy digest: otherwise an autopilot cycle between preview and apply made
+ * every reconcile preview stale.
+ */
+const CYCLE_STAMP_KEYS = ['last_source_cycle_at', 'last_full_cycle_at'];
+
 export async function reconcilePolicyDigest(engine: BrainEngine, sourceId: string): Promise<string> {
   const config = await loadConfigWithEngine(engine, loadConfig());
-  const [source] = await engine.executeRaw('SELECT config,contextual_retrieval_mode,trust_frontmatter_overrides FROM sources WHERE id=$1', [sourceId]);
+  const [row] = await engine.executeRaw<Record<string, unknown>>('SELECT config,contextual_retrieval_mode,trust_frontmatter_overrides FROM sources WHERE id=$1', [sourceId]);
+  let sourceConfig = row?.config;
+  if (typeof sourceConfig === 'string') {
+    try { sourceConfig = JSON.parse(sourceConfig); } catch { /* digest the raw text */ }
+  }
+  if (sourceConfig && typeof sourceConfig === 'object' && !Array.isArray(sourceConfig)) {
+    sourceConfig = Object.fromEntries(Object.entries(sourceConfig).filter(([key]) => !CYCLE_STAMP_KEYS.includes(key)));
+  }
+  const source = row ? { ...row, config: sourceConfig } : row;
   return digest({ version: 1, config, source, literals: loadOperatorLiterals(), disabled: process.env.GBRAIN_NO_SANITY ?? null });
 }
 export function staleReconcile(what: string): never {
@@ -60,7 +82,11 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
   const root = realpathSync(join(binding.local_path, binding.relative_path));
   const recorded = recordedPathFromFileUri(snapshot.page.source_uri, root);
   const mode = await scannerSlugRootMode(engine, sourceId, root);
-  const path = recordedReconcilePath(root, snapshot.page, mode);
+  const recordedPath = recordedReconcilePath(root, snapshot.page, mode);
+  const derived = !recordedPath && isDatabaseOnlyPage({ ...snapshot.page,
+    database_only_reason: await isUnboundSourcePage(engine, sourceId, slug) ? 'unbound_source' : null }) ? slugDerivedOrigin(root, slug, mode) : null;
+  const origin = derived ? 'slug_derived' : 'recorded';
+  const path = recordedPath ?? derived?.path ?? null;
   if (!path || !isWriteTargetContained(path, root)) throw new OperationError('source_changed', 'The page has no unambiguous confined recorded Markdown origin.');
   let size: number;
   try {
@@ -107,7 +133,7 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
     page_id: snapshot.page.id, worktree_id: binding.worktree_id, binding_digest: digest({ binding, root, path: canonicalPath }), owner_epoch: String(binding.owner_epoch),
     revision: snapshot.revision, raw_file_hash: sha256(raw), relative_path: relative(root, path),
     policy_digest: await reconcilePolicyDigest(engine, sourceId), withdrawals_digest: digest(snapshot.withdrawals), assessment_at: assessmentAt };
-  return { binding, root, path, raw, snapshot, storedPage, file: reconcileCanonical(parsed, parsed.tags), pins };
+  return { binding, root, path, raw, snapshot, storedPage, file: reconcileCanonical(parsed, parsed.tags), pins, origin, originSourcePath: derived?.sourcePath ?? null };
 }
 export function assertReconcilePins(expected: ReconcilePins, actual: ReconcilePins): void {
   for (const key of Object.keys(expected) as Array<keyof ReconcilePins>) if (expected[key] !== actual[key]) staleReconcile(key);

@@ -1,7 +1,7 @@
 import { isEmbedSkipped } from '../embed-skip.ts';
 import { isQuarantined } from '../quarantine.ts';
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { Page, PageVersion } from '../types.ts';
@@ -18,7 +18,8 @@ import { digest, sha256 } from './digest.ts';
 import { getWorktreeBinding } from './ownership.ts';
 import type { PreparedContentImport } from './prepared-import.ts';
 import type { PreparedMutation } from './coordinator.ts';
-import type { WriteRequest } from './model.ts';
+import type { SqlEngine, WriteRequest } from './model.ts';
+import { isUnboundSourcePage } from './unbound-source.ts';
 import { sealPageTextProjection } from '../page-state/projections.ts';
 import { overlayCanonicalBodies } from '../page-state/snapshot.ts';
 import { materializeTimeline, prepareCanonicalProjections } from './canonical-projections.ts';
@@ -27,8 +28,10 @@ import { isAutoLinkEnabled } from '../link-extraction.ts';
 import { prepareAutomaticLinks } from './links-preparation.ts';
 import { preparePageAdvisories, remoteLinkHint, pageNoopAdvisories } from './page-advisories.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
-import { nativeFileTarget } from './native-file-target.ts';
+import { colonSlugWindowsRefusal, isWindowsColonTarget, nativeFileTarget } from './native-file-target.ts';
 import { isSourceDbOnlySlug } from './source-storage.ts';
+import { isMirrorOnlyPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
+import { DERIVE_PHASE_DB_ONLY_DEFAULTS } from '../storage-config.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from '../source-config-sql.ts';
 import { readSlugRootMode } from '../sync-anchor.ts';
 
@@ -65,24 +68,52 @@ function putProvenance(row: WriteRequest, snapshot: PageSnapshot | null, parsed:
   Object.assign(parsed.frontmatter, stamp);
   return stamp;
 }
+/** A derive-phase page (DERIVE_PHASE_DB_ONLY_DEFAULTS) that never recorded a canonical file. */
+function isNeverFiledDerivedPage(slug: string, page: { source_path?: string | null; source_uri?: string | null }): boolean {
+  return !page.source_path && !page.source_uri && DERIVE_PHASE_DB_ONLY_DEFAULTS.some(prefix => slug.startsWith(prefix));
+}
+/**
+ * A live page whose canonical file is absent publishes to the database only
+ * when its slug is a declared db_only path or a never-filed derive-phase page.
+ */
+export function publishesDatabaseOnly(root: string, slug: string, snapshot: PageSnapshot | null): boolean {
+  if (!snapshot || snapshot.page.deleted_at) return false;
+  return isSourceDbOnlySlug(root, slug, 'refuse') || isNeverFiledDerivedPage(slug, snapshot.page);
+}
 export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'worktree_id' | 'slug'>, snapshot: PageSnapshot | null,
   content: string | null, hostId?: string, options: { allowMissing?: boolean; capture?: { path: string; hash: string } } = {}): Promise<PreparedMutation['file']> {
   if (!row.worktree_id) return undefined;
+  // #5409: a read-only mirror's checkout belongs to its Git remote; nothing is written or removed there.
+  if (await sourceMirrorReadOnly(engine, row.source_id)) return undefined;
+  if (snapshot && !snapshot.page.source_path && await isMirrorOnlyPage(engine, row.source_id, row.slug)) return undefined;
+  // #5254: a page written while its source was unbound stays database-only in
+  // every state (live, tombstone, restore, revert, delete, purge); any file at
+  // its derived path is not its canonical file and is neither written nor removed.
+  if (snapshot && !snapshot.page.source_path && await isUnboundSourcePage(engine, row.source_id, row.slug)) return undefined;
   const binding = await getWorktreeBinding(engine, row.source_id, hostId);
   if (!binding?.local_path) throw new OperationError('owner_unavailable', 'The canonical worktree is unavailable on this host.');
   const root = join(binding.local_path, binding.relative_path);
   // #5622: a new page captured from a file inside the source is published to that file.
   const capturedPath = !snapshot && options.capture ? options.capture.path : recordedPathFromFileUri(snapshot?.page.source_uri, root);
   const mode = snapshot?.page.source_path ? await scannerSlugRootMode(engine, row.source_id, root) : undefined;
-  const path = nativeFileTarget(root, resolveSourceLocalFilePath(root, snapshot?.page.source_path, row.slug, mode)
-    ?? (capturedPath ? join(root, capturedPath) : join(root, `${row.slug}.md`)));
+  const candidate = resolveSourceLocalFilePath(root, snapshot?.page.source_path, row.slug, mode)
+    ?? (capturedPath ? join(root, capturedPath) : join(root, `${row.slug}.md`));
+  if (isWindowsColonTarget(relative(root, candidate))) {
+    if (!options.allowMissing && publishesDatabaseOnly(root, row.slug, snapshot)) return undefined;
+    throw colonSlugWindowsRefusal(row.slug, row.source_id);
+  }
+  const path = nativeFileTarget(root, candidate);
   if (!isWriteTargetContained(path, root)) throw new OperationError('source_changed', 'The canonical file target is outside its registered source.');
   const before = existsSync(path) ? readFileSync(path) : null;
   if (!before && snapshot && !snapshot.page.deleted_at && !options.allowMissing) {
     // A declared db_only page has no canonical file by design and publishes to
     // the database only. gbrain.yml is consulted only here, where the write
     // would otherwise refuse, so an invalid config can only change the refusal.
-    if (isSourceDbOnlySlug(root, row.slug, 'refuse')) return undefined;
+    // Derive-phase output (atoms/, concepts/, ...) is database-only by design and
+    // deliberately never declared in gbrain.yml. A page there that never recorded a
+    // canonical file publishes to the database only; a recorded file that went
+    // missing still refuses below.
+    if (publishesDatabaseOnly(root, row.slug, snapshot)) return undefined;
     throw new OperationError('source_changed', 'The canonical file was removed outside coordinated publication.',
       'Import the local deletion or recover the canonical file before editing this page.');
   }
@@ -113,15 +144,24 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
 /**
  * Receipt reason for a page write that publishes no file. Invariant: for a
  * bound row, prepareFileTarget returns no target only for a live declared
- * db_only page whose file is absent; every other case returns a target or throws.
+ * db_only page whose file is absent, a page of a read-only mirror source
+ * (#5409), or a page written while its source was unbound (#5254) in any state; every other case returns a target or throws.
  */
 export function databaseOnlyPublication(row: Pick<WriteRequest, 'worktree_id'>, file: PreparedMutation['file']): Pick<PreparedMutation, 'databaseOnlyReason'> {
   return row.worktree_id && !file ? { databaseOnlyReason: 'db_only' } : {};
 }
+async function pageDatabaseOnlyPublication(engine: SqlEngine, row: WriteRequest, file: PreparedMutation['file']): Promise<Pick<PreparedMutation, 'databaseOnlyReason'>> {
+  const reason = databaseOnlyPublication(row, file);
+  if (reason.databaseOnlyReason && (await sourceMirrorReadOnly(engine, row.source_id) || await isMirrorOnlyPage(engine, row.source_id, row.slug))) {
+    return { databaseOnlyReason: 'mirror_read_only' };
+  }
+  return reason.databaseOnlyReason && await isUnboundSourcePage(engine, row.source_id, row.slug) ? { databaseOnlyReason: 'unbound_source' } : reason;
+}
 
 /** Providers and parsing run before the OS lock and before any publication transaction. */
 export async function preparePageMutation(engine: BrainEngine, row: WriteRequest, _config: GBrainConfig,
-  preparedIntent?: { content: string; expectedRevision: string; tags?: string[] }, signal?: AbortSignal): Promise<PreparedMutation> {
+  preparedIntent?: { content: string; expectedRevision: string; tags?: string[] }, signal?: AbortSignal,
+  options: { allowMissingFile?: boolean } = {}): Promise<PreparedMutation> {
   signal?.throwIfAborted();
   if (!row.intent) throw new OperationError('storage_error', 'A pending write lost its normalized intent.');
   await assertKnowledgePublicationAllowed(engine, row);
@@ -148,8 +188,8 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
     // Tombstones still own their recorded artifact. Purge always attempts its
     // removal before the guarded hard-delete and receipt commit; failure rolls
     // back to the prior row, and replay survives the eventual absence of that row.
-    const file = await prepareFileTarget(engine, row, snapshot, null, undefined, { allowMissing: purge });
-    return { observedRevision, noop, file, ...databaseOnlyPublication(row, file), apply: async tx => {
+    const file = await prepareFileTarget(engine, row, snapshot, null, undefined, { allowMissing: purge || options.allowMissingFile });
+    return { observedRevision, noop, file, ...await pageDatabaseOnlyPublication(engine, row, file), apply: async tx => {
       if (purge) {
         await tx.deletePage(row.slug, source);
         return { status: 'purged', slug: row.slug, source_id: row.source_id, residuals: PURGE_RESIDUALS };
@@ -206,7 +246,7 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
     const tags = versionTags ?? [...new Set([...snapshot.tags,...incoming.tags])].sort();
     if (digest(canonical(snapshot.page,snapshot.tags)) === digest(canonical(incoming,tags))) {
       const file=await prepareFileTarget(engine,row,snapshot,targetDeleted ? null : serializePageToMarkdown(snapshot.page,snapshot.tags));
-      return {observedRevision,noop:true,file,...databaseOnlyPublication(row,file),
+      return {observedRevision,noop:true,file,...await pageDatabaseOnlyPublication(engine,row,file),
         apply:async()=>({...pageNoopAdvisories(row),status:'skipped',slug:row.slug,source_id:row.source_id,noop:true,chunks:0,chunk_skip_reason:'write_skipped',
           ...(row.operation==='capture'?{channel:'capture',content_hash:p.capture_hash}:{})})};
     }
@@ -258,12 +298,12 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
     ? await prepareAutomaticLinks(engine,row.slug,ready.parsedPage,row.source_id) : undefined;
   const capture = row.operation === 'capture' && typeof p.capture_path === 'string' && typeof p.capture_file_hash === 'string'
     ? { path: p.capture_path, hash: p.capture_file_hash } : undefined;
-  const file = await prepareFileTarget(engine, row, snapshot, targetDeleted ? null : rendered, undefined, { capture });
+  const file = await prepareFileTarget(engine, row, snapshot, targetDeleted ? null : rendered, undefined, { capture, allowMissing: options.allowMissingFile });
   const mintMode = file && !snapshot?.page.source_path ? await scannerSlugRootMode(engine, row.source_id, file.root) : undefined;
   const sourcePath = file && mintMode ? scannerSourcePath(file.root, file.path, mintMode) : undefined;
   // An inferred mode is pinned with the first origin it mints, so later pages cannot flip the inference (#5610).
   const pinMode = sourcePath && mintMode && scannerSourcePath(file!.root, file!.root) && !await readSlugRootMode(engine, row.source_id) ? mintMode : undefined;
-  return { observedRevision, noop, additionalPageKeys:links?.pageKeys, file, ...databaseOnlyPublication(row, file), validate: ready.validate, apply: async tx => {
+  return { observedRevision, noop, additionalPageKeys:links?.pageKeys, file, ...await pageDatabaseOnlyPublication(engine, row, file), validate: ready.validate, apply: async tx => {
     let autoLinks: Awaited<ReturnType<NonNullable<typeof links>['apply']>> | undefined;
     if (!noop) {
       await ready.apply(tx);

@@ -16,7 +16,7 @@
  * Import-cycle note: operations.ts spreads these into its `operations` array
  * at MODULE-EVAL time, so this file must be a RUNTIME LEAF — it may import
  * operations.ts types (erased) but never its values statically. Handlers load
- * verbError/parseTtlParam/sourceScopeOpts via dynamic import (the file's
+ * verbError/parseTtlParam/thinkSourceScopeOpts via dynamic import (the file's
  * existing style), which resolves after both modules finish evaluating.
  * MEMORY_VERBS_VERSION lives HERE (operations.ts imports it from us) for the
  * same reason. Violating this reintroduces the TDZ crash on whichever module
@@ -60,6 +60,7 @@ const PROVENANCE_MAX = 500;
 
 const remember: Operation = {
   name: 'remember',
+  outputRedaction: 'no_stored_text',
   description:
     'MEMORY VERB (v1): save one fact to durable agent memory — the protocol write verb. ' +
     'provenance is REQUIRED (free text, e.g. "conversation 2026-06-12", "user said in chat", "import: notes.md"). ' +
@@ -86,6 +87,11 @@ const remember: Operation = {
       type: 'string',
       description:
         'Person/company/project this fact is about (name or slug; canonicalized server-side). Set it whenever the fact has a subject — entity-scoped recall misses unattributed facts.',
+    },
+    infer_entity: {
+      type: 'boolean',
+      description:
+        'Default true. When `entity` is omitted, link the fact to the one entity page the text names exactly (response `entity_inferred: "mention"`); pass false to save it unattributed.',
     },
     kind: {
       type: 'string',
@@ -165,6 +171,7 @@ const remember: Operation = {
 
 const entity: Operation = {
   name: 'entity',
+  outputRedaction: 'retrieval',
   description:
     'MEMORY VERB (v1): inspect ONE known person/company/project card — zero LLM calls, sub-100ms. ' +
     'Resolution: alias > exact title > slug-suffix; ties break on most-recently-touched. ' +
@@ -219,6 +226,7 @@ const SYNTHESIS_FAILURE_CODES: Record<string, string> = {
 
 const synthesize: Operation = {
   name: 'synthesize',
+  outputRedaction: 'retrieval',
   description:
     '[EXPENSIVE / SLOW — makes LLM calls, seconds-to-minutes latency, costs money] ' +
     'MEMORY VERB (v1): answer a broad question using cross-page LLM reasoning with citations and gap analysis. ' +
@@ -236,7 +244,7 @@ const synthesize: Operation = {
   verb: true,
   annotations: { title: 'synthesize (slow, costly — LLM-backed)', readOnlyHint: true },
   handler: async (ctx, p) => {
-    const { verbError, sourceScopeOpts } = await import('./operations.ts');
+    const { verbError, thinkSourceScopeOpts } = await import('./operations.ts');
     const question = typeof p.question === 'string' ? p.question.trim() : '';
     if (!question) {
       throw verbError(
@@ -245,7 +253,9 @@ const synthesize: Operation = {
         'Pass the question to synthesize an answer for, e.g. question: "what is our payments strategy?".',
       );
     }
-    const scope = sourceScopeOpts(ctx);
+    // Same helper as the think op, so a trusted-local synthesize spans the
+    // federated set search/query use; remote callers keep the canonical ladder.
+    const scope = thinkSourceScopeOpts(ctx);
     const { runThink } = await import('./think/index.ts');
     const { embedQuery } = await import('./embedding.ts');
     // Remote-safe delegation: save/take are NEVER offered through this verb,
@@ -255,8 +265,7 @@ const synthesize: Operation = {
       since: p.since ? String(p.since) : undefined,
       until: p.until ? String(p.until) : undefined,
       takesHoldersAllowList: ctx.takesHoldersAllowList,
-      ...(scope.sourceId !== undefined ? { sourceId: scope.sourceId } : {}),
-      ...(scope.sourceIds !== undefined ? { allowedSources: scope.sourceIds } : {}),
+      ...scope,
       // Fail-closed: only a context that explicitly says local gets local.
       remote: ctx.remote !== false,
       // #3734: activate takes' vector retrieval arm for the synthesize verb.
@@ -341,6 +350,7 @@ const synthesize: Operation = {
 
 const forget: Operation = {
   name: 'forget',
+  outputRedaction: 'no_stored_text',
   description:
     'MEMORY VERB (v1): expire a remembered fact by id — the protocol delete verb. ' +
     '`id` is the opaque string id returned by remember and recall (facts[].fact_id) — never a page slug. ' +
@@ -484,6 +494,10 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
       entity_slug: { type: ['string', 'null'] },
       valid_until: { type: ['string', 'null'], description: 'ISO 8601 or null (never expires).' },
       degraded_dedup: { type: 'boolean', description: 'Present (true) when no embedding provider — near-duplicates may insert.' },
+      entity_inferred: { type: 'string', enum: ['mention'], description: 'Present when `entity` was omitted and the subject was inferred from an exact mention.' },
+      warnings: { type: 'array', items: { type: 'string', enum: ['NO_ENTITY', 'ENTITY_LINK_FAILED'] },
+        description: 'NO_ENTITY: saved unattributed. ENTITY_LINK_FAILED: an inferred entity could not be linked; saved unattributed.' },
+      hint: { type: 'string', description: 'Present with warnings: how to attribute the fact (pass `entity`).' },
       write_request: WRITE_RECEIPT_SCHEMA,
     },
   },

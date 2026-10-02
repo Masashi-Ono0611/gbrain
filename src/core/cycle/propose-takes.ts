@@ -40,10 +40,12 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { BaseCyclePhase, CYCLE_DEADLINE_RESERVE_MS, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { defaultTimeoutMsFor } from '../minions/handler-timeouts.ts';
-import { chat as gatewayChat, getChatModel, probeChatModel } from '../ai/gateway.ts';
+import { getChatModel, probeChatModel } from '../ai/gateway.ts';
+import { chatWithFallback as gatewayChat } from '../ai/chat-fallback.ts';
 import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
+import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { upsertExtractRollup, classifyRunStop } from '../extract/rollup-writer.ts';
 import { GBrainError } from '../types.ts';
 import { isConfigTruthy } from '../config.ts';
@@ -276,6 +278,7 @@ async function listCandidatePages(
   const where = [
     'deleted_at IS NULL',
     "type IS DISTINCT FROM 'extract_receipt'",
+    "COALESCE(frontmatter->>'dream_generated', '') <> 'true'",
   ];
   const params: unknown[] = [];
   if (scope.sourceIds && scope.sourceIds.length > 0) {
@@ -998,7 +1001,9 @@ class ProposeTakesPhase extends BaseCyclePhase {
     // v0.42 Wave B3: receipt + rollup for propose_takes. Source-scoped
     // via the read scope. Receipt only when proposals actually written.
     const sourceIdForReceipt = scope.sourceId ?? 'default';
-    if (result.proposals_inserted > 0) {
+    // Managed brains skip the receipt page (a legacy putPage the coordinator
+    // refuses), like extract_atoms and synthesize_concepts; the rollup stays.
+    if (result.proposals_inserted > 0 && !await managedPersistenceEnabled(engine)) {
       try {
         await writeReceipt(engine, {
           kind: 'takes.proposed',

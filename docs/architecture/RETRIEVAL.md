@@ -97,6 +97,9 @@ written up in [`RETRIEVAL_MAXPOOL_INCIDENT.md`](../incidents/RETRIEVAL_MAXPOOL_I
   a JavaScript timeout can cancel its WASM work. Unresolved shortfalls appear
   as `vector_candidates_incomplete` in `degraded`, with scoped
   `vector_pool_underfilled` details in the public retrieval metadata.
+  The content-freshness check runs after the HNSW candidate scan on indexed
+  columns (the planner cannot estimate it and would drop the index); doctor
+  `vector_plan` warns when the emitted statement still misses the index.
 - **Title-phrase boost** — when the normalized query is a contiguous token-run
   inside `page.title` (or an exact full-title match), a floor-ratio-gated,
   bounded multiplier fires (`applyTitleBoost`, `search.title_boost` knob). A
@@ -365,6 +368,34 @@ from that single capture, validating byte-for-byte against the live decisions
 before any other cell is read.
 
 Each stage is testable in isolation. Each stage is replaceable. The whole pipeline is < 1ms of orchestration cost; the latency budget goes to the upstream HTTP calls (embedding, rerank) and the index scans.
+
+## Evidence delivery: whole evidence after ranking
+
+Ranking decides which pages matter; the reader still needs enough of each page
+to answer. `return_unit` (`chunk`, `window`, `section`, `page`, `auto`; default `auto`)
+adds a stage after ranking, cache and capture, and before output
+redaction and snippet capping, shared by `search`, `query`, `recall` and
+`think` (via `think.return_unit`). It groups the ranked hits by page, reads
+every needed neighbor chunk in ONE batched, page_id-keyed query that
+re-authorizes each page under the caller's current scope, sanitizes each
+page's complete body before slicing, locates the hit chunks in it (so chunk
+overlap never duplicates text), cuts the requested unit around the hits,
+and packs blocks by rank into the token budget with a per-page floor so lower
+ranked sessions keep their matching span. The strict protected-body sanitizer
+runs on the whole body first, so delivered evidence never contains more than
+`get_page` returns to the same caller. The default `auto` expands only
+conversation pages (by page type or `chat/` / `conversations/` slug) to the
+whole page and leaves every other hit its ranked chunk; with no conversation
+hit, or with `chunk`, the stage does not run and responses are byte-identical. The measured motivation: on 400 held-out
+LongMemEval questions whole sessions answered 361 against 253 for top-5
+chunks, while neighbor windows reached only 285–292, so `auto` gives
+conversations exactly the `page` unit. `auto` itself answered 445 of 500
+LongMemEval-S questions against 312 for chunks (development data), and the
+preregistered sealed check was inconclusive at a ceiling (149 against 147 of
+150); see `docs/evidence-delivery.md` for the numbers and the token cost. The
+earlier failed lexical excerpt selector is in
+`docs/eval/ANSWER_PACKET_RESULTS.md`. Contract, algorithms and latency:
+[`docs/evidence-delivery.md`](../evidence-delivery.md).
 
 ## How to verify on your own brain
 

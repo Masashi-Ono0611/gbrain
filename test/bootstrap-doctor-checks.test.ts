@@ -148,6 +148,13 @@ function run(parent: string, engine: BrainEngine | null = null): Promise<Check[]
   return withEnv({ GBRAIN_HOME: parent }, () => bootstrapDoctorChecks(engine));
 }
 
+/** Minimal persistence_brain probe fixture used by the shared writer guard. */
+function writerStateEngine(enabled: boolean): BrainEngine {
+  return {
+    executeRaw: async () => [{ enabled }],
+  } as unknown as BrainEngine;
+}
+
 function byName(checks: Check[], name: string): Check | undefined {
   return checks.find((c) => c.name === name);
 }
@@ -362,6 +369,24 @@ describe('bootstrap_push_health', () => {
     expect(c?.message).toContain('push_failed');
   }, T);
 
+  test('a recorded managed-writer refusal stays informational and points to writer status', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace();
+    writeFileSync(join(ws, '.gbrain-owner.json'), '{}');
+    writePushStatus(home, JSON.stringify({
+      ts: new Date().toISOString(),
+      ok: false,
+      reason: 'writer_coordinator_required: This file belongs to a managed canonical worktree.',
+      repoRoot: ws,
+    }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('warn');
+    expect(c?.message).toContain('managed canonical worktree');
+    expect(c?.message).toContain('legacy bulk push is not available');
+    expect(c?.message).toContain('gbrain sources writer status --probe --json');
+    expect(c?.message).not.toContain('gbrain sources push');
+  }, T);
+
   test('>48h stale + no receipt/workspace (state unverified) → warn, not ok', async () => {
     const { parent, home } = makeHome();
     // No receipt → ws is null → tree state can't be probed at all.
@@ -375,6 +400,17 @@ describe('bootstrap_push_health', () => {
   test('>48h stale + git-VERIFIED clean tree (in sync with origin) → ok', async () => {
     const { parent, home } = makeHome();
     const ws = makeWorkspace({ clean: true });
+    writeReceipt(home, ws);
+    writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('ok');
+    expect(c?.message).toContain('confirmed clean');
+  }, T);
+
+  test('>48h stale + tree whose only change is the managed ownership stamp → ok (stamp is not unpushed work)', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace({ clean: true });
+    writeFileSync(join(ws, '.gbrain-owner.json'), '{}');
     writeReceipt(home, ws);
     writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
     const c = byName(await run(parent), 'bootstrap_push_health');
@@ -431,6 +467,22 @@ describe('bootstrap_push_health', () => {
     expect(c?.status).toBe('fail');
     expect(c?.message).toContain('DIRTY');
     expect(c?.message).toContain(ws);
+    expect(c?.message).toContain(`Run \`gbrain sources push --path ${ws}\`.`);
+  }, T);
+
+  test('>48h stale + DIRTY managed canonical worktree → still fail, with managed-writer guidance', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace({ dirty: true });
+    writeFileSync(join(ws, '.gbrain-owner.json'), '{}');
+    writeReceipt(home, ws);
+    writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('fail');
+    expect(c?.message).toContain('managed canonical worktree');
+    expect(c?.message).toContain('legacy bulk push is not available');
+    expect(c?.message).toContain('gbrain sources writer status --probe --json');
+    expect(c?.message).toContain('direct file edits here are not published');
+    expect(c?.message).not.toContain('gbrain sources push');
   }, T);
 
   test('unparseable ts → not stale (NaN guard) → ok', async () => {
@@ -601,7 +653,7 @@ describe('bootstrap_runbook_skew', () => {
 // ── 6. last verify freshness [B2 read side] ─────────────────────────────────
 
 describe('bootstrap_last_verify', () => {
-  test('last verify FAILED → warn naming the failed check ids', async () => {
+  test('non-managed last verify FAILED → unchanged warn naming the failed check ids', async () => {
     const { parent, home } = makeHome();
     writeHeartbeat(home, [{ outcome: 'ok' }]); // verify snapshots alone don't open the gate
     writeVerifyRun(
@@ -609,10 +661,44 @@ describe('bootstrap_last_verify', () => {
       'verify-2026-01-01T00-00-00-000Z.json',
       JSON.stringify({ ts: '2026-01-01T00:00:00.000Z', ok: false, checks: [{ id: 'roundtrip', ok: false }] }),
     );
-    const c = byName(await run(parent), 'bootstrap_last_verify');
+    const c = byName(await run(parent, writerStateEngine(false)), 'bootstrap_last_verify');
     expect(c?.status).toBe('warn');
+    expect(c?.message).toBe('last bootstrap verify FAILED (2026-01-01T00:00:00.000Z): roundtrip — re-run `gbrain bootstrap verify`');
+  }, T);
+
+  test('managed brain + failed old receipt → not applicable with writer health guidance', async () => {
+    const { parent, home } = makeHome();
+    writeHeartbeat(home, [{ outcome: 'ok' }]);
+    writeVerifyRun(
+      home,
+      'verify-2026-09-20T00-00-00-000Z.json',
+      JSON.stringify({ ts: '2026-09-20T00:00:00.000Z', ok: false, checks: [{ id: 'roundtrip', ok: false }] }),
+    );
+    const c = byName(await run(parent, writerStateEngine(true)), 'bootstrap_last_verify');
+    expect(c?.status).toBe('ok'); // doctor marks not-applicable checks as ok
+    expect(c?.message).toContain('not yet available for managed brains');
+    expect(c?.message).toContain('2026-09-20T00:00:00.000Z');
     expect(c?.message).toContain('FAILED');
-    expect(c?.message).toContain('roundtrip');
+    expect(c?.message).toContain('gbrain sources writer status --probe --json');
+    expect(c?.message).not.toContain('re-run `gbrain bootstrap verify`');
+  }, T);
+
+  test('managed brain + stale receipt → not applicable with writer health guidance', async () => {
+    const { parent, home } = makeHome();
+    writeHeartbeat(home, [{ outcome: 'ok' }]);
+    const oldTs = new Date(Date.now() - 20 * 86_400_000).toISOString();
+    writeVerifyRun(
+      home,
+      'verify-2026-09-01T00-00-00-000Z.json',
+      JSON.stringify({ ts: oldTs, ok: true, checks: [] }),
+    );
+    const c = byName(await run(parent, writerStateEngine(true)), 'bootstrap_last_verify');
+    expect(c?.status).toBe('ok'); // doctor marks not-applicable checks as ok
+    expect(c?.message).toContain('not yet available for managed brains');
+    expect(c?.message).toContain(oldTs);
+    expect(c?.message).toContain('passed');
+    expect(c?.message).toContain('gbrain sources writer status --probe --json');
+    expect(c?.message).not.toContain('re-run `gbrain bootstrap verify`');
   }, T);
 
   test('passed >14 days ago → warn (workspace rot self-check nag)', async () => {

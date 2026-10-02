@@ -61,7 +61,7 @@ import {
 // #3190: pack-aware link typing on every extract surface (db/stale/fs).
 import { loadActivePackForLocalEngine } from '../core/schema-pack/best-effort.ts';
 import { resolveIncludeFrontmatter } from '../core/extract-frontmatter.ts';
-import { inferLinkTypeFromPack } from '../core/schema-pack/link-inference.ts';
+import { inferLinkTypeFromPack, ownsAttendanceInference } from '../core/schema-pack/link-inference.ts';
 import { PageRegexBudget } from '../core/schema-pack/redos-guard.ts';
 export { extractTimelineFromContent, type ExtractedTimelineEntry } from '../core/timeline-extract.ts';
 import { extractTimelineFromContent, pruneTimelineOrphans, retractRemovedTimelineEntries, type ExtractedTimelineEntry } from '../core/timeline-extract.ts';
@@ -247,6 +247,8 @@ interface ExtractResult {
   skipped_missing_target?: number;
   skipped_attendance_incomplete?: number;
   skipped_cross_source?: number;
+  /** Set when a managed brain skipped the timeline pass (rows come from the coordinated import path). */
+  timeline_skipped_reason?: 'writer_coordinator_required';
 }
 
 // --- Shared walker ---
@@ -505,6 +507,7 @@ export async function extractLinksFromFile(
   const globalBasename = opts?.globalBasename ?? false;
   const pack = opts?.pack ?? null;
   const packBudget = pack ? new PageRegexBudget() : undefined;
+  const packOwnsAttendance = ownsAttendanceInference(pack);
   const activePack = pack?.page_types ? { page_types: pack.page_types } : undefined;
   const parsed = parseMarkdown(content, relPath, { activePack });
   const fm = parsed.frontmatter;
@@ -539,6 +542,7 @@ export async function extractLinksFromFile(
       const position = index ?? scanContent.indexOf(name);
       const evidence = scanContent.slice(Math.max(0, position - 120), position + 240);
       let inferred = pack ? inferLinkTypeFromPack(pack, guessedPageType, evidence, packBudget, targetType) : null;
+      if (inferred === 'attended' && guessedPageType === 'meeting' && !packOwnsAttendance) inferred = null;
       const bareTarget = relTarget.endsWith('.md') ? relTarget.slice(0, -3) : relTarget;
       const ambiguousAttendance = !inferred && guessedPageType === 'meeting' && targetType === 'person'
         && !bareTarget.includes('/') && new Set([slugifyPath(bareTarget), normalizeBasename(bareTarget)]
@@ -546,13 +550,13 @@ export async function extractLinksFromFile(
           && (opts?.pageTypes?.get(candidate) ?? parseMarkdown('', `${candidate}.md`, { activePack }).type) === 'person')).size > 1;
       const canonicalAttendance = !inferred && guessedPageType === 'meeting' && targetType === 'person'
         && resolvedSlugs.length === 1 && !ambiguousAttendance
-        && !pack?.link_types.some(lt => lt.name === 'attended' && (lt.inference?.page_type || lt.inference?.target_type))
+        && !(packOwnsAttendance && pack?.link_types.some(lt => lt.name === 'attended' && (lt.inference?.page_type || lt.inference?.target_type)))
         && hasAttendanceEvidence(attendanceRanges, position);
       if (!inferred) {
         inferred = guessedPageType === 'meeting' ? (canonicalAttendance ? 'attended' : 'mentions')
           : inferLinkType(guessedPageType, evidence, scanContent, target, targetType);
         if (inferred === 'mentions' && !pack && !parsed.typeExplicit) inferred = inferTypeByDir(fileDir, dirname(target), fm);
-        if (pack?.link_types.some(lt => lt.name === inferred && (lt.inference?.page_type || lt.inference?.target_type))) inferred = 'mentions';
+        if (!canonicalAttendance && pack?.link_types.some(lt => lt.name === inferred && (lt.inference?.page_type || lt.inference?.target_type))) inferred = 'mentions';
       }
       if (inferred === 'attended' && guessedPageType === 'meeting' && targetType !== 'person') inferred = 'mentions';
       const link: ExtractedLink = {
@@ -722,6 +726,13 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
   const jsonMode = !!opts.jsonMode;
   const quiet = !!opts.quiet;
   const result: ExtractResult = { links_created: 0, timeline_entries_created: 0, pages_processed: 0 };
+  // Managed brain: timeline_entries is guard-triggered outside the coordinator and
+  // the coordinated import path already derives those rows; keep the (unguarded)
+  // links pass, skip the timeline pass with a reason instead of losing rows.
+  if (!dryRun && opts.mode === 'timeline' && await managedPersistenceEnabled(engine)) {
+    result.timeline_skipped_reason = 'writer_coordinator_required';
+    return result;
+  }
 
   // v0.41.15.0 (D9): resolve workers via the PGLite-clamp wrapper.
   // Page count unknown at this point — pass 0 so the auto-path falls
@@ -733,6 +744,16 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
     0,
   );
   const workers = workersResolved.workers;
+
+  // Managed brains: the file walk's raw timeline batch is refused by the
+  // writer guard, so links, missing canonical timeline rows and the watermark
+  // publish on the one managed path (the same one sync and `extract --stale` run).
+  if (!dryRun && opts.mode === 'all' && opts.slugs?.length !== 0 && await managedPersistenceEnabled(engine)) {
+    const { extractManagedStaleLinks } = await import('../core/persistence/links-maintenance.ts');
+    const progress = createProgress(cliOptsToProgressOptions(getCliOptions())); progress.start('extract.links_fs', opts.slugs?.length);
+    const r = await extractManagedStaleLinks(engine, { sourceId: opts.sourceId, slugs: opts.slugs, signal: opts.signal, maxPages: opts.slugs?.length });
+    progress.finish(); return { links_created: r.created, timeline_entries_created: r.timeline, pages_processed: r.pages };
+  }
 
   // Incremental path: if specific slugs provided, only extract from those files.
   // This is the cycle path — sync tells us what changed, we only re-extract those.
@@ -2202,6 +2223,7 @@ export async function extractStaleFromDB(
 
     const timelineRows: TimelineBatchInput[] = [];
     const processedRefs: Array<{ slug: string; source_id: string; extractedAt: string }> = [];
+    const attendanceBlocked: Array<{ slug: string; source_id: string; revision: string }> = [];
 
     for (const page of rows) {
       const pack = packs.get(page.source_id);
@@ -2224,7 +2246,11 @@ export async function extractStaleFromDB(
           return resolved.ok ? targetMetadata.get(`${resolved.toSourceId}\0${targetSlug}`)?.type : undefined;
         } },
       );
-      if (!extracted.attendanceComplete) { skippedAttendanceIncomplete++; continue; }
+      if (!extracted.attendanceComplete) {
+        skippedAttendanceIncomplete++;
+        attendanceBlocked.push({ slug: page.slug, source_id: page.source_id, revision: snapshot.revision });
+        continue;
+      }
       for (const c of extracted.candidates) {
         const r = resolveCandidateSources(
           c, page.slug, page.source_id, allSlugs, slugToSources,
@@ -2272,12 +2298,16 @@ export async function extractStaleFromDB(
       processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: stampIso });
     }
 
-    for (let i = 0; i < timelineRows.length; i += BATCH_SIZE) {
-      timelineCreated += await engine.addTimelineEntriesBatch(timelineRows.slice(i, i + BATCH_SIZE), { auditSite: 'extract.stale' });
+    // Managed brain: guarded timeline rows come from the coordinated import; links only.
+    if (!(await managedPersistenceEnabled(engine))) {
+      for (let i = 0; i < timelineRows.length; i += BATCH_SIZE) {
+        timelineCreated += await engine.addTimelineEntriesBatch(timelineRows.slice(i, i + BATCH_SIZE), { auditSite: 'extract.stale' });
+      }
     }
     // Stamp LAST, directly (not the swallowing stampExtracted) so a stamp
     // failure surfaces instead of looping forever.
     await engine.markPagesExtractedBatch(processedRefs, new Date().toISOString());
+    await engine.markPagesAttendanceBlocked(attendanceBlocked);
 
     pagesProcessed += processedRefs.length;
     progress.tick(processedRefs.length);

@@ -17,6 +17,7 @@ import { compareVersions } from '../migrations/index.ts';
 import { resolveHoursEnv } from '../../core/env-number.ts';
 import { schemaVersionHealth } from '../../core/schema-version-health.ts';
 import { checkProjectionReadiness } from './checks/projection-readiness.ts';
+import { remoteUnlinkedFactsCheck } from './checks/unlinked-facts.ts';
 import { resolveExcludePrivatePages } from '../../core/search/private-visibility.ts';
 import {
   type Check,
@@ -37,7 +38,6 @@ import {
   checkSyncConsolidation,
   checkPoolBudget,
   checkLinksExtractionLag,
-  checkChatFallbackChainInert,
   checkSearchMode,
   checkEvalDrift,
   checkRerankerHealth,
@@ -59,6 +59,7 @@ import {
   checkSchemaPackActive,
   checkSchemaPackConsistency,
   checkSchemaPackSourceDrift,
+  managedSyncAdviceEnabled,
 } from './schema-pack-checks.ts';
 
 // Same alias the local doctor keeps for its own freshness checks; the alias
@@ -294,6 +295,10 @@ export async function doctorReportRemote(
         });
       } else if (result.count > 0) {
         const sampleStr = result.sample.map(s => `${s.slug} (intended=${s.intended_source})`).join(', ');
+        const managed = await managedSyncAdviceEnabled(engine);
+        const syncCommand = managed
+          ? 'gbrain sync --source <id> --no-pull --full'
+          : 'gbrain sync --source <id> --full';
         const skipNote = result.git_root_skipped.length > 0
           ? multiSourceDriftGitRootSkipNote(result.git_root_skipped)
           : '';
@@ -303,7 +308,7 @@ export async function doctorReportRemote(
           message:
             `${result.count} page slug(s) appear at 'default' but NOT at the intended source ` +
             `(e.g., ${sampleStr}). Likely pre-v0.30.3 misroutes OR an incomplete initial sync. ` +
-            `Verify on the brain host: \`gbrain sources status\` then \`gbrain sync --source <id> --full\`.` +
+            `Verify on the brain host: \`gbrain sources status\` then \`${syncCommand}\`.` +
             skipNote,
         });
       } else {
@@ -406,8 +411,6 @@ export async function doctorReportRemote(
   checks.push(await checkSchemaPackSourceDrift(engine));
 
   // 7. v0.32.3 search-lite mode + per-key drift surface.
-  const inertFallbackChain = await checkChatFallbackChainInert(engine);
-  if (inertFallbackChain) checks.push(inertFallbackChain);
   checks.push(await checkSearchMode(engine));
 
   // 8. v0.32.3 eval_drift: retrieval-affecting files changed since last
@@ -452,7 +455,7 @@ export async function doctorReportRemote(
   checks.push(await checkProjectionReadiness(engine, {
     sourceIds: opts.sourceIds,
     excludePrivate: await resolveExcludePrivatePages(engine, opts.remote),
-  }));
+  }, { resident: engine.kind === 'pglite' && opts.remote === true }));
 
   // issue #1777 — hidden_by_search_policy: chunked pages withheld from default
   // search by the hard-exclude prefix policy. Pure SQL COUNT, safe on the
@@ -471,8 +474,14 @@ export async function doctorReportRemote(
   checks.push(await checkFederationHealth(engine));
 
   // 13. v0.42 self_upgrade_health: mode, whether behind, recent failures.
-  // File-plane only (no engine) — works on thin clients too.
-  checks.push(checkSelfUpgradeHealth());
+  // File-plane only (no engine) — works on thin clients too. Then #5836 unlinked_facts inside the caller's grant.
+  checks.push(checkSelfUpgradeHealth(), await remoteUnlinkedFactsCheck(engine, opts));
+
+  // 14. Wave checks as sanitized host-action lines (doctor/wave-checks.ts):
+  // stable check id, a count-free impact summary and the on-host preview
+  // command; a check that could not run reports unknown, never ok.
+  const { remoteWaveHandoff } = await import('./wave-checks.ts');
+  checks.push(...await remoteWaveHandoff(engine, opts.sourceIds));
 
   return computeDoctorReport(checks);
 }

@@ -22,9 +22,11 @@ import { dedupResults } from '../search/dedup.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { HybridSearchMeta, SearchResult } from '../types.ts';
+import type { RelationalArmMeta } from '../search/relational-recall.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
 import { redactRetrievalOutput } from '../search/output-redaction.ts';
+import { assembleEvidenceForHits, capDeliveredSnippets, deliverEvidence, effectivePlan, resolveEvidencePlan, unsupportedDelivery, type DeliveryMeta, type DeliveryScope, type EvidencePlan, type FrozenHit, type ReturnUnit } from '../search/evidence-delivery.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { SAFE_FENCE_CHUNKER_VERSION } from '../search/safe-chunks.ts';
 import { expandEngineTypeFilters } from '../schema-pack/query-types.ts';
@@ -42,7 +44,6 @@ import {
   stampDeepResearchIds,
   stampEvidenceSafe,
   maybeCaptureSearch,
-  thinkSourceScopeOpts,
 } from './context.ts';
 
 /**
@@ -65,10 +66,77 @@ async function resolveEffectiveLimit(ctx: OperationContext, p: Record<string, un
 
 type SourceScope = { sourceId?: string; sourceIds?: string[] };
 
-function searchOutput(ctx: OperationContext, results: SearchResult[], meta: Record<string, unknown>, snippetCap: number): SearchResult[] {
-  const output = redactRetrievalOutput(results, meta);
+function searchOutput(ctx: OperationContext, results: SearchResult[], meta: Record<string, unknown>, snippetCap: number,
+  evidence?: { delivery: DeliveryMeta; explicitSnippet: boolean }): SearchResult[] {
+  if (!evidence) {
+    const output = redactRetrievalOutput(results, meta);
+    ctx.emitResponseMeta?.('retrieval', output.meta);
+    return applySnippetCap(output.results, snippetCap);
+  }
+  // Evidence delivery: explicit snippet_chars wins over the delivered blocks;
+  // otherwise the blocks are returned whole (their budget already bounds
+  // them). The cap runs before the meta is emitted so it can report itself.
+  const output = redactRetrievalOutput(results, { ...meta, delivery: evidence.delivery });
+  const capped = evidence.explicitSnippet ? capDeliveredSnippets(output.results, snippetCap, output.meta.delivery) : output.results;
   ctx.emitResponseMeta?.('retrieval', output.meta);
-  return applySnippetCap(output.results, snippetCap);
+  return capped;
+}
+
+/** Evidence delivery params shared by `search` and `query`. */
+const RETURN_UNIT_PARAM = {
+  type: 'string' as const,
+  enum: ['chunk', 'window', 'section', 'page', 'auto'],
+  description:
+    "Evidence unit returned in each result's chunk_text (default: config search.return_unit, which defaults to 'auto').\n" +
+    "  'chunk'   — the ranked chunk only (~300-450 tokens per result).\n" +
+    "  'window'  — the hit chunk plus return_window neighbor chunks each side (local context, ~3x chunk).\n" +
+    "  'section' — the enclosing markdown section, or the conversation rounds around the hit.\n" +
+    "  'page'    — the whole page/session, capped. Use for multi-session or temporal questions where the answer needs the whole conversation.\n" +
+    "  'auto'    — the whole page for conversation pages (conversation/transcript/chat/meeting/slack/imessage types, chat/ or conversations/ slugs), the ranked chunk unchanged for everything else. When no hit is a conversation the response is exactly the chunk response.\n" +
+    'Non-chunk units return one result per page, packed into token_budget (default 6000, auto 24000; remote max 32000), with a `delivered` object (unit, chunk_ids, match_spans, tokens, truncated; reason under auto) per result and `delivery` in the response meta.',
+};
+const RETURN_WINDOW_PARAM = {
+  type: 'number' as const,
+  description: "Neighbor chunks on each side for return_unit 'window' (integer 1-3, default 1).",
+};
+
+/**
+ * With a plan, `token_budget` budgets the delivered evidence, so query's
+ * chunk-level budget stays off; query's token_budget without a return_unit
+ * keeps its chunk-mode meaning.
+ */
+async function evidencePlanFor(ctx: OperationContext, p: Record<string, unknown>, snippetCap: number, op: 'search' | 'query'): Promise<EvidencePlan | null> {
+  return resolveEvidencePlan(ctx.engine, {
+    legacyBudget: op === 'query' && typeof p.token_budget === 'number',
+    remote: ctx.remote,
+    viaSubagent: ctx.viaSubagent,
+    returnUnit: p.return_unit,
+    returnWindow: p.return_window,
+    budget: p.token_budget,
+    snippetChars: p.snippet_chars,
+    snippetCap,
+    op,
+  });
+}
+
+/**
+ * Run the evidence stage when a plan applies: the rows to serialize plus the
+ * delivery handed to searchOutput. Hits from a cache hit are not live, so a
+ * failed fetch drops them instead of falling back to cached text.
+ */
+async function withEvidence(ctx: OperationContext, p: Record<string, unknown>, results: SearchResult[], plan: EvidencePlan | null,
+  scope: DeliveryScope, meta: HybridSearchMeta | null): Promise<{ rows: SearchResult[]; evidence?: { delivery: DeliveryMeta; explicitSnippet: boolean } }> {
+  const applied = effectivePlan(plan, results);
+  if (!applied) return { rows: results };
+  const d = await deliverEvidence(ctx.engine, results, applied, { ...scope, requireSafeChunks: ctx.remote !== false }, { liveHits: meta?.cache?.status !== 'hit' });
+  return { rows: d.results, evidence: { delivery: d.delivery, explicitSnippet: typeof p.snippet_chars === 'number' && Number.isFinite(p.snippet_chars) } };
+}
+
+/** withEvidence + the response meta for the rows actually returned + searchOutput. */
+async function evidenceOutput(ctx: OperationContext, p: Record<string, unknown>, results: SearchResult[], plan: EvidencePlan | null, scope: DeliveryScope,
+  meta: HybridSearchMeta | null, snippetCap: number, buildMeta: (rows: SearchResult[]) => Promise<Record<string, unknown>>): Promise<SearchResult[]> {
+  const ev = await withEvidence(ctx, p, results, plan, scope, meta);
+  return searchOutput(ctx, ev.rows, await buildMeta(ev.rows), snippetCap, ev.evidence);
 }
 
 /**
@@ -133,7 +201,7 @@ async function buildRetrievalResponseMeta(
   queryText: string,
   results: unknown[],
   meta: HybridSearchMeta | null,
-  opts: { conceptHint?: boolean; types?: string[] } = {},
+  opts: { conceptHint?: boolean; types?: string[]; relationalMeta?: RelationalArmMeta | null } = {},
 ): Promise<Record<string, unknown>> {
   const m = meta as (HybridSearchMeta & { degraded?: unknown[]; retrieved_count?: number }) | null;
   const hint = opts.conceptHint && looksConceptShaped(queryText)
@@ -164,9 +232,23 @@ async function buildRetrievalResponseMeta(
       ...(m.cache ? { cache: m.cache.status } : {}),
       ...(m.token_budget ? { token_budget: m.token_budget } : {}),
       ...(m.vector_pool_underfilled ? { vector_pool_underfilled: m.vector_pool_underfilled } : {}),
+      ...(m.decide ? { decide: m.decide } : {}),
+      ...(m.rerank ? { rerank: m.rerank } : {}),
+      ...(m.answerability ? { answerability: m.answerability } : {}),
     } : {}),
     ...((m?.degraded !== undefined || degraded.length > 0) ? { degraded } : {}),
     projection_readiness: readiness,
+    // #3995 (local-only, not submitted upstream — see patch 84 rationale)
+    // — surface whether the relational recall arm fired (and its
+    // seed/candidate counts) so a caller can distinguish "graph answer
+    // contributed" from "graph answer never reached fusion" without source
+    // access. Additive field on the existing `retrieval` _meta key; absent
+    // when the arm never ran on THIS invocation (relational retrieval off,
+    // the image-similarity branch, OR a semantic-cache hit — the cache-hit
+    // branch in hybrid.ts returns without invoking `onRelationalMeta`, so a
+    // cached result set originally produced with relational recall still
+    // reports no `relational` here).
+    ...(opts.relationalMeta ? { relational: opts.relationalMeta } : {}),
     ...(hint || readiness.hint ? { hint: [hint, readiness.hint].filter(Boolean).join(' ') } : {}),
   };
 }
@@ -174,13 +256,26 @@ async function buildRetrievalResponseMeta(
 /**
  * #3985: normalize the `types` param. MCP passes a real array; the CLI
  * passes `--types person,company` as one string. Rejects non-string entries
- * and an all-empty list loudly (invalid_params) instead of silently
- * dropping the filter. The SQL-level plumbing (SearchOpts.types → both
- * engines' keyword/title/vector legs) has existed since v0.33 (whoknows);
- * this just exposes it on the public search/query ops.
+ * and a non-empty list whose entries trim/filter to nothing loudly
+ * (invalid_params) instead of silently dropping the filter.
+ *
+ * #5390: a structurally empty array (`[]`), `""` or a whitespace-only string
+ * carries no user intent — it is
+ * what OpenAI-family MCP clients send when an LLM over-fills every optional
+ * parameter with a type-zero value. Treat it as absent (no filter applied)
+ * rather than throwing, so the search still runs unfiltered. A non-empty
+ * list that filters to nothing (`['']`, `',,'`) still throws, so a CLI
+ * `--types ,` typo is still loud. The SQL-level plumbing (SearchOpts.types
+ * → both engines' keyword/title/vector legs) has existed since v0.33
+ * (whoknows); this just exposes it on the public search/query ops.
  */
 function normalizeTypesParam(raw: unknown): string[] | undefined {
   if (raw === undefined || raw === null) return undefined;
+  // #5390: a structurally empty array, an empty string or a whitespace-only
+  // string is treated as absent, not as a request for an impossible filter.
+  // The CLI typo guard below still catches `',,'`, `' , '` and `['']`.
+  if (Array.isArray(raw) && raw.length === 0) return undefined;
+  if (typeof raw === 'string' && raw.trim() === '') return undefined;
   const arr = Array.isArray(raw)
     ? raw
     : typeof raw === 'string'
@@ -236,6 +331,7 @@ async function resolveSnippetCap(ctx: OperationContext, p: Record<string, unknow
 
 const search: Operation = {
   name: 'search',
+  outputRedaction: 'retrieval',
   description: SEARCH_DESCRIPTION,
   params: {
     query: { type: 'string', required: true, description: "Search text. Exact tokens, names, and structured-field values work best here (e.g. 'acme-example series A'), since this op does no LLM expansion. This is the search text param — there is no `text` or `q` param." },
@@ -253,6 +349,9 @@ const search: Operation = {
     types: { type: 'array', items: { type: 'string' }, description: TYPES_PARAM_DESCRIPTION },
     // #3800: subagent token economy — per-call snippet cap.
     snippet_chars: { type: 'number', description: SNIPPET_CHARS_PARAM_DESCRIPTION },
+    return_unit: RETURN_UNIT_PARAM,
+    return_window: RETURN_WINDOW_PARAM,
+    token_budget: { type: 'number', description: "Token budget for delivered evidence when return_unit is not 'chunk' (default search.return_budget_default = 6000; auto: search.return_budget_conversation = 24000). Ignored in chunk mode." },
     // #4415: explicit ranking-axis overrides (the same knobs `query` has had
     // since v0.29.1). The auto-detect banks are English regex, so on a
     // non-English brain the recency/salience stages never fire — these flags
@@ -282,6 +381,7 @@ const search: Operation = {
     let types = normalizeTypesParam(p.types);
     // #3800: snippet cap (param > subagent config default > full text).
     const snippetCap = await resolveSnippetCap(ctx, p);
+    const plan = await evidencePlanFor(ctx, p, snippetCap, 'search');
     // #4398: explicit per-call source_id wins over ctx.sourceId, validated
     // (invalid ids throw invalid_params) then resolved through the single
     // trust+grant resolver (resolveRequestedScope inside federatedSearchScope)
@@ -329,7 +429,8 @@ const search: Operation = {
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false);
       // #3800: cap AFTER capture/meta so eval + cache see the real payload.
-      return searchOutput(ctx, results, await buildRetrievalResponseMeta(ctx, scope, queryText, results, null, { conceptHint: true, types }), snippetCap);
+      return evidenceOutput(ctx, p, results, plan, { ...scope, excludePrivate }, null, snippetCap,
+        rows => buildRetrievalResponseMeta(ctx, scope, queryText, rows, null, { conceptHint: true, types }));
     }
 
     // Cheap-hybrid (D4/D15): full vector+keyword+RRF+pool+title+alias, but
@@ -348,6 +449,7 @@ const search: Operation = {
       // #4415: agent-explicit recency + salience (same posture as `query`).
       salience: p.salience as 'off' | 'on' | 'strong' | undefined,
       recency: p.recency as 'off' | 'on' | 'strong' | undefined,
+      decide: { remote: ctx.remote !== false },
       onMeta: (m) => { capturedMeta = m; },
     })).map(r => ({ ...r }));
     stampDeepResearchIds(results);
@@ -355,7 +457,8 @@ const search: Operation = {
     bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
     // #3800: cap AFTER capture/meta so eval + cache see the real payload.
-    return searchOutput(ctx, results, await buildRetrievalResponseMeta(ctx, scope, queryText, results, capturedMeta, { conceptHint: true, types }), snippetCap);
+    return evidenceOutput(ctx, p, results, plan, { ...scope, excludePrivate }, capturedMeta, snippetCap,
+      rows => buildRetrievalResponseMeta(ctx, scope, queryText, rows, capturedMeta, { conceptHint: true, types }));
   },
   scope: 'read',
   cliHints: { name: 'search', positional: ['query'] },
@@ -363,6 +466,7 @@ const search: Operation = {
 
 const query: Operation = {
   name: 'query',
+  outputRedaction: 'retrieval',
   description: QUERY_DESCRIPTION,
   params: {
     // v0.27.1: `query` is no longer strictly required — `--image <path>`
@@ -398,6 +502,9 @@ const query: Operation = {
     types: { type: 'array', items: { type: 'string' }, description: TYPES_PARAM_DESCRIPTION },
     // #3800: subagent token economy — per-call snippet cap.
     snippet_chars: { type: 'number', description: SNIPPET_CHARS_PARAM_DESCRIPTION },
+    return_unit: RETURN_UNIT_PARAM,
+    return_window: RETURN_WINDOW_PARAM,
+    token_budget: { type: 'number', description: "Token budget. Chunk mode, and whenever return_unit is omitted: caps the cumulative chunk payload (results that would overflow are skipped). Explicit non-chunk return_unit: the budget for delivered evidence (default search.return_budget_default = 6000, auto 24000; remote max search.return_budget_max_remote = 32000)." },
     expand: { type: 'boolean', description: 'Request multi-query expansion (default: true in every search mode, regardless of search.expansion). Set false to opt out. Requires configured embedding and expansion providers; a cloud expander receives the query and may charge for the call. Response metadata expansion_applied reports whether variants were actually used.' },
     detail: { type: 'string', description: 'Result detail level: low (compiled truth only), medium (default, all with dedup), high (all chunks)' },
     mode: { type: 'string', description: 'Search mode (conservative|balanced|tokenmax). Local callers only; remote uses configured mode.' },
@@ -490,6 +597,7 @@ const query: Operation = {
     let types = normalizeTypesParam(p.types);
     // #3800: snippet cap (param > subagent config default > full text).
     const snippetCap = await resolveSnippetCap(ctx, p);
+    const plan = await evidencePlanFor(ctx, p, snippetCap, 'query');
     const imageData = p.image as string | undefined;
     const imageMime = (p.image_mime as string) || 'image/jpeg';
     const embeddingColumnParam =
@@ -559,7 +667,7 @@ const query: Operation = {
       })).map(r => ({ ...r }));
       stampDeepResearchIds(results);
       imageMeta.retrieved_count = results.length;
-      return searchOutput(ctx, results, await buildRetrievalResponseMeta(ctx, querySourceScope, queryText ?? '', results, imageMeta, { types }), snippetCap);
+      return searchOutput(ctx, results, { ...await buildRetrievalResponseMeta(ctx, querySourceScope, queryText ?? '', results, imageMeta, { types }), ...(plan && (plan.unit !== 'auto' || plan.explicitUnit) ? { delivery: unsupportedDelivery(plan, 'image_query_unsupported') } : {}) }, snippetCap);
     }
 
     if (!queryText) {
@@ -582,6 +690,13 @@ const query: Operation = {
     // search). When the param is the literal '__all__', force-allow
     // cross-source mode (matches SearchOpts.sourceId contract).
     let capturedMeta: HybridSearchMeta | null = null;
+    // #3995 (local-only) — observability sink for the relational recall
+    // arm. Stays null when the callback itself never fires: relational
+    // retrieval off for the resolved mode, or a semantic-cache hit (the
+    // cache-hit branch in hybrid.ts returns before invoking
+    // onRelationalMeta). `fired` on a non-null value is what distinguishes
+    // "arm ran and found nothing to do" from "arm didn't run at all".
+    let capturedRelationalMeta: RelationalArmMeta | null = null;
     // v0.32.x search-lite: route the query op through hybridSearchCached so
     // token budget and intent weighting apply at the operation boundary.
     // Semantic cache reuse is suspended in the wrapper.
@@ -598,7 +713,7 @@ const query: Operation = {
       limit: (p.limit as number) || undefined,
       offset: (p.offset as number) || 0,
       excludePrivate,
-      requireSafeChunks: ctx.remote !== false,
+      requireSafeChunks: ctx.remote !== false, decide: { remote: ctx.remote !== false, answerability: true },
       takesHoldersAllowList: readHolders(ctx),
       expansion: expand,
       expandFn: expand ? expandQuery : undefined,
@@ -618,12 +733,17 @@ const query: Operation = {
       since: typeof p.since === 'string' ? p.since : undefined,
       until: typeof p.until === 'string' ? p.until : undefined,
       // v0.32.x search-lite: token budget + cache opt-outs.
-      tokenBudget: typeof p.token_budget === 'number' ? (p.token_budget as number) : undefined,
+      tokenBudget: !plan && typeof p.token_budget === 'number' ? (p.token_budget as number) : undefined,
       useCache: typeof p.use_cache === 'boolean' ? (p.use_cache as boolean) : undefined,
       intentWeighting: typeof p.intent_weighting === 'boolean' ? (p.intent_weighting as boolean) : undefined,
       // v0.36 cross-modal routing param.
       crossModal: p.cross_modal as 'text' | 'image' | 'both' | 'auto' | undefined,
       onMeta: (m) => { capturedMeta = m; },
+      // #3995 (local-only) — thread the relational-arm observability sink
+      // through so `fired`/`kind`/`seeds_resolved`/`candidates`/`errored`
+      // land in the `retrieval` response meta below instead of only being
+      // visible to source-level tracing.
+      onRelationalMeta: (m) => { capturedRelationalMeta = m; },
       // v0.36 (D15): per-call embedding column override. Resolver rejects
       // unknown names at hybrid entry with EmbeddingColumnNotRegisteredError;
       // the error surfaces back to the agent as the op error envelope.
@@ -680,6 +800,7 @@ const query: Operation = {
           // the config reads only run on the rare escalation path.
           const effectiveLimit = await resolveEffectiveLimit(ctx, p);
           let escalatedMeta: HybridSearchMeta | null = null;
+          let escalatedRelationalMeta: RelationalArmMeta | null = null;
           const escalated = await hybridSearchCached(ctx.engine, queryText, {
             excludePrivate,
             requireSafeChunks: ctx.remote !== false,
@@ -689,17 +810,11 @@ const query: Operation = {
             expansion: true,
             expandFn: expandQuery,
             relationalRetrieval: true,
-            autocut: false,
+            autocut: false, decide: { remote: ctx.remote !== false, rerankOnly: true }, // System One: S2-S5 off on the re-run
             detail,
-            // Preserve the caller's #3985 type filter on the re-run (raw
-            // pass-through; the base call already rejected malformed input).
-            ...(Array.isArray(p.types) || typeof p.types === 'string'
-              ? {
-                  types: (Array.isArray(p.types) ? (p.types as string[]) : (p.types as string).split(','))
-                    .map((t) => t.trim())
-                    .filter(Boolean),
-                }
-              : {}),
+            // Preserve the caller's #3985 type filter on the re-run, as
+            // normalized for the base call (#5390: [] and "" stay absent).
+            ...(types ? { types } : {}),
             language: (p.lang as string) || undefined,
             symbolKind: (p.symbol_kind as string) || undefined,
             // Preserve the caller's symbol-proximity constraints too — an
@@ -713,6 +828,7 @@ const query: Operation = {
             crossModal: p.cross_modal as 'text' | 'image' | 'both' | 'auto' | undefined,
             embeddingColumn: embeddingColumnParam,
             onMeta: (m) => { escalatedMeta = m; },
+            onRelationalMeta: (m) => { escalatedRelationalMeta = m; },
           });
           // Grade the FULL escalated sweep (rank-1 is what the grader reads),
           // then adopt only the caller-visible window. #4610: the re-run is
@@ -726,6 +842,7 @@ const query: Operation = {
           if (confidenceRank(regraded.level) > confidenceRank(grade.level)) {
             results = escalated.slice(0, effectiveLimit);
             capturedMeta = escalatedMeta;
+            capturedRelationalMeta = escalatedRelationalMeta;
             grade = regraded;
             crag.confidence = regraded.level;
             crag.reason = regraded.reason;
@@ -743,7 +860,15 @@ const query: Operation = {
           try {
             const { runThink } = await import('../think/index.ts');
             const { embedQuery } = await import('../embedding.ts');
-            const thinkScope = thinkSourceScopeOpts(ctx);
+            // Reuse the scope already resolved from this query's per-call
+            // source_id. Re-resolving from ctx alone loses that explicit
+            // narrowing and can widen a trusted-local CRAG think escalation
+            // to the ambient federated set.
+            const thinkScope = querySourceScope.sourceIds !== undefined
+              ? { allowedSources: querySourceScope.sourceIds }
+              : querySourceScope.sourceId !== undefined
+                ? { sourceId: querySourceScope.sourceId }
+                : {};
             const t = await runThink(ctx.engine, {
               question: queryText,
               since: typeof p.since === 'string' ? p.since : undefined,
@@ -802,18 +927,61 @@ const query: Operation = {
 
     // WP2/D3: query never nudges toward itself — no concept hint here.
     // #1663: the CRAG grade rides the same retrieval meta channel.
-    const responseMeta = {
-      ...(await buildRetrievalResponseMeta(ctx, querySourceScope, queryText, results, capturedMeta, { types })),
-      crag,
-    };
     // #3800: cap AFTER capture/meta/CRAG so every internal consumer graded
     // and recorded the real payload; only the returned envelope is snipped.
-    return searchOutput(ctx, results, responseMeta, snippetCap);
+    return evidenceOutput(ctx, p, results, plan, { ...querySourceScope, excludePrivate, detail }, capturedMeta, snippetCap,
+      async rows => ({ ...(await buildRetrievalResponseMeta(ctx, querySourceScope, queryText, rows, capturedMeta, { types, relationalMeta: capturedRelationalMeta })), crag }));
   },
   scope: 'read',
   cliHints: { name: 'query', positional: ['query'] },
 };
 
+
+/**
+ * Evidence delivery for a frozen, ordered hit list: exactly the evidence the
+ * `query` op returns for those hits (same plan resolution, assembler and
+ * redaction). gbrain-evals uses it for product-path parity (E3); agents can
+ * use it to widen hits from an earlier search. Hits are resolved under the
+ * caller's read scope — out-of-scope, deleted or private-to-caller hits are
+ * reported by index in `unresolved`, never read.
+ */
+const assemble_evidence: Operation = {
+  name: 'assemble_evidence',
+  outputRedaction: 'retrieval',
+  description:
+    'Deliver whole evidence for an ordered list of search hits (each {source_id, slug, chunk_id} from a prior search/query result): ' +
+    "the same windows, sections or pages `query` returns with return_unit, packed into token_budget. Use it to widen hits you already have " +
+    "instead of calling get_page per hit. Returns { results, delivery, unresolved }; results carry chunk_text (the evidence) and `delivered`.",
+  params: {
+    hits: { type: 'array', required: true, items: { type: 'object' }, description: 'Ordered hits, best first (max 50): [{ "source_id": "default", "slug": "chat/session-0412", "chunk_id": 8812 }]. chunk_id 0 addresses the page\'s first chunk.' },
+    return_unit: { ...RETURN_UNIT_PARAM, description: "Evidence unit: 'chunk' | 'window' | 'section' | 'page' | 'auto' (default 'page')." },
+    return_window: RETURN_WINDOW_PARAM,
+    token_budget: { type: 'number', description: 'Token budget for the delivered evidence (default search.return_budget_default = 6000, auto search.return_budget_conversation = 24000; remote max 32000).' },
+    detail: { type: 'string', enum: ['low', 'medium', 'high'], description: "As query: 'low' delivers compiled truth only (no timeline text)." },
+  },
+  scope: 'read',
+  annotations: { title: 'assemble evidence', readOnlyHint: true },
+  handler: async (ctx, p) => {
+    const hits = p.hits;
+    if (!Array.isArray(hits) || hits.some(h => typeof h !== 'object' || h === null
+      || typeof (h as Record<string, unknown>).source_id !== 'string' || typeof (h as Record<string, unknown>).slug !== 'string'
+      || !Number.isInteger((h as Record<string, unknown>).chunk_id))) {
+      throw new OperationError('invalid_params', 'hits must be an array of { source_id: string, slug: string, chunk_id: integer }.',
+        'Example: {"hits": [{"source_id": "default", "slug": "chat/session-0412", "chunk_id": 8812}], "return_unit": "page"}');
+    }
+    const scope = federatedSearchScope(ctx);
+    const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
+    const out = await assembleEvidenceForHits(ctx.engine, {
+      hits: hits as FrozenHit[],
+      return_unit: (p.return_unit as ReturnUnit | undefined) ?? 'page',
+      return_window: p.return_window as number | undefined,
+      budget_tokens: p.token_budget as number | undefined,
+      detail: p.detail as 'low' | 'medium' | 'high' | undefined,
+      caller: { remote: ctx.remote !== false, ...scope, excludePrivate },
+    });
+    return out;
+  },
+};
 
 // ---------------------------------------------------------------------------
 // CLI→MCP gap-closure wave — search/cache introspection ops. Read-only views
@@ -828,6 +996,7 @@ const query: Operation = {
 
 const search_stats: Operation = {
   name: 'search_stats',
+  outputRedaction: 'no_stored_text',
   description:
     'Search observability over a window: cache hit rate, intent/mode mix, budget drops, ' +
     'rank-1 score drift, graph-signals failure counts. Same payload as the search-stats ' +
@@ -868,6 +1037,7 @@ const search_stats: Operation = {
 
 const search_modes: Operation = {
   name: 'search_modes',
+  outputRedaction: 'no_stored_text',
   description:
     'Read-only search-mode dashboard: active mode, EVERY mode-bundle knob resolved with ' +
     'attribution (mode default vs config override), the three frozen bundles, and a ' +
@@ -890,6 +1060,7 @@ const search_modes: Operation = {
 
 const search_tune: Operation = {
   name: 'search_tune',
+  outputRedaction: 'no_stored_text',
   description:
     'Read-only tuning recommendations derived from the last 7 days of search telemetry: ' +
     'what should change, why, and the paste-ready config command per recommendation — relay ' +
@@ -908,6 +1079,7 @@ const search_tune: Operation = {
 
 const cache_stats: Operation = {
   name: 'cache_stats',
+  outputRedaction: 'no_stored_text',
   description:
     'Semantic query-cache introspection: resolved knobs (enabled, similarity threshold, TTL) ' +
     'plus row counts and total hits. Read-only; clearing/pruning the cache stays on the CLI.',
@@ -934,5 +1106,5 @@ const cache_stats: Operation = {
 
 // Ops in EXACTLY the canonical `operations` array order.
 export const searchOperations: Operation[] = [
-  search, query, search_stats, search_modes, search_tune, cache_stats,
+  search, query, assemble_evidence, search_stats, search_modes, search_tune, cache_stats,
 ];

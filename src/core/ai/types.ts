@@ -243,6 +243,10 @@ export interface ExpansionTouchpoint {
 export interface RerankerTouchpoint {
   models: string[];
   default_model: string;
+  /** Native request/response dialect. Omitted means the standard rerank shape. */
+  wire_format?: 'typesafe-systemone';
+  /** Score semantics: `rubric` scores are level indices, not calibrated relevance (autocut/CRAG ignore them). */
+  score_semantics?: 'rubric';
   cost_per_1m_tokens_usd?: number;
   price_last_verified?: string;
   max_payload_bytes: number;
@@ -258,6 +262,21 @@ export interface RerankerTouchpoint {
    * without forcing every user to discover the config key.
    */
   default_timeout_ms?: number;
+}
+
+/** Typed decision questions (System One, src/core/ai/decide/). */
+export interface DecideTouchpoint {
+  models: string[];
+  default_model: string;
+  /** Moving aliases accepted with a doctor warning; the response names the version that answered. */
+  aliases: string[];
+  path: string;
+  max_payload_bytes: number;
+  /** Per-request limits: state + all questions, and state + the longest question. */
+  max_request_tokens: number;
+  max_state_question_tokens: number;
+  cost_per_1m_tokens_usd: number;
+  price_last_verified: string;
 }
 
 export interface ChatTouchpoint {
@@ -338,6 +357,7 @@ export interface Recipe {
     expansion?: ExpansionTouchpoint;
     chat?: ChatTouchpoint;
     reranker?: RerankerTouchpoint;
+    decide?: DecideTouchpoint;
   };
   /**
    * Optional alias map for friendlier `provider:model` strings.
@@ -371,6 +391,8 @@ export interface Recipe {
     headerName: string;
     token: string;
   };
+  /** With a custom resolveAuth: whether its env credential is present (readiness and no_key preflights). */
+  authPresent?(env: Record<string, string | undefined>): boolean;
   /**
    * v0.37.6.0: static request headers applied to every openai-compatible
    * touchpoint (embedding, expansion, chat, reranker). Use for static-per-recipe
@@ -471,11 +493,20 @@ export interface AIGatewayConfig {
 
   reranker_model?: string;
   /**
-   * Optional silent-refusal fallback chain ("provider:modelId" entries).
-   * Plumbed for `chatWithFallback()` (commit 3). Blocked from critic/judge/
-   * synthesize flows in their respective handlers.
+   * Optional availability-failure chain ("provider:modelId" entries) consumed
+   * by `chatWithFallback()` after rate-limit or billing failures. Silent-
+   * refusal fallback is not implemented.
    */
   chat_fallback_chain?: string[];
+  /**
+   * Per-call-site overrides of `chat_fallback_chain`, keyed by the caller's
+   * own model-resolution config key (e.g. `models.dream.patterns`). A
+   * `chatWithFallback(opts, { chainKey })` lookup checks this map first and
+   * falls back to `chat_fallback_chain` when the key is absent — so callers
+   * that never pass a chainKey (or whose key has no override configured)
+   * see identical behavior to the single global chain.
+   */
+  chat_fallback_chains?: Record<string, string[]>;
   /** Optional per-provider base URL override (openai-compatible variants). */
   base_urls?: Record<string, string>;
   /** Optional chat providerOptions overrides keyed by recipe id or "recipe:modelId". */

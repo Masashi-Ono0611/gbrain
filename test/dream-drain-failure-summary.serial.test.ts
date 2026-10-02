@@ -7,40 +7,34 @@
  *
  * The drain loop itself (capping, sanitizing, reconciling failure_count) is
  * pinned in test/extract-atoms-drain*.test.ts. This file pins dream.ts's
- * rendering of the drain RESULT and its argv/exit-code wiring (#1678), so the shared drain helper is replaced by a
- * stub that returns a hand-built result. Serial: a top-level mock.module.
+ * rendering of the drain RESULT and its argv/exit-code wiring (#1678), so the shared drain helper is replaced
+ * by a stub through a narrow test seam.
  */
 
-import { afterAll, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import type { ExtractAtomsDrainResult } from '../src/core/cycle/extract-atoms-drain.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { LockUnavailableError } from '../src/core/db-lock.ts';
+import { __setDreamDrainRunnerForTests, runDream } from '../src/commands/dream.ts';
 
 let nextResult: ExtractAtomsDrainResult | Error;
 let drainCalls: Array<{ sourceId: string | undefined; windowSeconds: number }> = [];
 
-mock.module('../src/core/cycle/extract-atoms-drain.ts', () => ({
-  MAX_DRAIN_FAILURE_RECORDS: 25,
-  MAX_DRAIN_FAILURE_SOURCE_CHARS: 256,
-  MAX_DRAIN_FAILURE_REASON_CHARS: 200,
-  runExtractAtomsDrainForSource: async (_engine: unknown, opts: { sourceId: string | undefined; windowSeconds: number }) => {
-    drainCalls.push({ sourceId: opts.sourceId, windowSeconds: opts.windowSeconds });
-    if (nextResult instanceof Error) throw nextResult;
-    return nextResult;
-  },
-}));
-
-let runDream: typeof import('../src/commands/dream.ts').runDream;
+__setDreamDrainRunnerForTests(async (_engine, opts) => {
+  drainCalls.push({ sourceId: opts.sourceId, windowSeconds: opts.windowSeconds });
+  if (nextResult instanceof Error) throw nextResult;
+  return nextResult;
+});
 let engine: PGLiteEngine;
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-  ({ runDream } = await import('../src/commands/dream.ts'));
 }, 120_000);
 
 afterAll(async () => {
+  __setDreamDrainRunnerForTests(null);
   await engine.disconnect();
 });
 
@@ -54,6 +48,7 @@ function baseResult(overrides: Partial<ExtractAtomsDrainResult>): ExtractAtomsDr
     status: 'ok',
     extracted: 1,
     skipped: 0,
+    atoms_source_changed: 0,
     remaining: 0, // fully drained → dream exits 0 (no process.exit call)
     batches: 1,
     stopped: 'drained',
@@ -195,3 +190,45 @@ describe('dream --drain wiring and exit codes (#1678)', () => {
     expect(drainCalls).toEqual([]);
   });
 });
+
+// #5809 / #5832 stop contract: every stop that is not `drained` keeps exit 3,
+// prints the drain JSON, and names the exact rerun command on stderr.
+describe('dream --drain stop contract (#5809)', () => {
+  test.each([
+    { stopped: 'window' as const, remaining: 12 },
+    { stopped: 'deadline' as const, remaining: 30 },
+    { stopped: 'lock_lost' as const, remaining: 8 },
+  ])('a $stopped stop prints the JSON, exits 3 and names the rerun command', async ({ stopped, remaining }) => {
+    nextResult = baseResult({ stopped, remaining, extracted: 4, batches: 2 });
+    const r = await runDrainCaptured(['--json', '--window', '90']);
+    expect(JSON.parse(r.stdout.join('\n'))).toMatchObject({ stopped, remaining, extracted: 4, batches: 2 });
+    expect(r.exitCode).toBe(3);
+    expect(r.stderr).toContain(`[drain] stopped: ${stopped}; ${remaining} page(s) remaining. Rerun: gbrain dream --drain --window 90`);
+  });
+
+  test('a provider_failure stop with an empty final recount still exits 3 (only drained exits 0)', async () => {
+    nextResult = baseResult({ status: 'provider_failure', stopped: 'provider_failure', remaining: 0 });
+    const r = await runDrainCaptured([]);
+    expect(r.exitCode).toBe(3);
+    expect(r.stderr).toContain('Rerun: gbrain dream --drain --window 300');
+  });
+
+  test('a drained run prints no rerun hint and exits 0', async () => {
+    nextResult = baseResult({});
+    const r = await runDrainCaptured([]);
+    expect(r.exitCode).toBeUndefined();
+    expect(r.stderr).not.toContain('Rerun:');
+  });
+
+  test('--help says the window is a hard deadline', async () => {
+    const out: string[] = [];
+    const logSpy = spyOn(console, 'log').mockImplementation((...a: unknown[]) => { out.push(a.map(String).join(' ')); });
+    try {
+      await runDream(engine, ['--help']);
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(out.join('\n')).toContain('Drain window, a hard deadline');
+  });
+});
+

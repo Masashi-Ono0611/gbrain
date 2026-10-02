@@ -12,11 +12,12 @@ import type { GmailThreadAttachmentReceipts } from '../google/types.ts';
 
 export type GoogleReceipts = GmailThreadAttachmentReceipts;
 
-export function ownedGoogleReceipts(snapshot: PageSnapshot | null, config: Record<string, unknown>, receipts: GoogleReceipts): GoogleReceipts {
+/** `account` is the parsed connector account (connector-identity.ts), never read from raw source config. */
+export function ownedGoogleReceipts(snapshot: PageSnapshot | null, account: string, receipts: GoogleReceipts): GoogleReceipts {
   const page = snapshot?.page;
   const fm = page?.frontmatter;
   if (!page || page.deleted_at || page.type !== 'email' || !page.source_path?.startsWith('emails/') ||
-    config.kind !== 'google' || typeof config.g_account !== 'string' || config.g_account.trim().toLowerCase() !== receipts.account || fm?.account !== receipts.account ||
+    !account || account !== receipts.account || fm?.account !== receipts.account ||
     fm.thread_id !== receipts.threadId || !Array.isArray(fm.message_ids) || !fm.message_ids.length ||
     !fm.message_ids.every(id => typeof id === 'string' && /^[A-Za-z0-9]{1,128}$/.test(id)) || fm.message_ids.length > 512 ||
     new Set(fm.message_ids).size !== fm.message_ids.length || receipts.version !== 1 || !Array.isArray(receipts.messages) ||
@@ -62,13 +63,14 @@ export function ownedGoogleReceipts(snapshot: PageSnapshot | null, config: Recor
 }
 
 export async function prepareGoogleReceiptPatch(engine: BrainEngine, row: WriteRequest, snapshot: PageSnapshot | null,
-  config: Record<string, unknown>, supplied: GoogleReceipts): Promise<PreparedMutation> {
-  const receipts = ownedGoogleReceipts(snapshot, config, supplied);
+  account: string, supplied: GoogleReceipts): Promise<PreparedMutation> {
+  const receipts = ownedGoogleReceipts(snapshot, account, supplied);
   const current = snapshot!;
   const frontmatter = { ...current.page.frontmatter, gmail_attachment_receipts: receipts };
   const page = { ...current.page, frontmatter };
   const noop = digest(current.page.frontmatter.gmail_attachment_receipts ?? null) === digest(receipts);
-  const file = await prepareFileTarget(engine, row, current, serializePageToMarkdown(page, current.tags));
+  const target = await prepareFileTarget(engine, row, current, serializePageToMarkdown(page, current.tags));
+  const file = target && { ...target, publishMode: 0o600 };
   const projection = noop ? null : await readProjectionSnapshot(engine, row.slug, row.source_id, { allowUnsealed: true });
   if (!noop && (!projection || projection.snapshot.revision !== current.revision)) throw new OperationError('revision_conflict', 'The Gmail page changed during receipt preparation.');
   const chunks = projection ? await preparePageProjection(projection) : null;

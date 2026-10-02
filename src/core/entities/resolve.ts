@@ -25,13 +25,16 @@ import type { BrainEngine } from '../engine.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import { foldNonDecomposingLatin } from '../latin-fold.ts';
 import { isUndefinedTableError } from '../utils.ts';
+import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
  *
  * Resolution order:
  *   1. If `raw` is already a page slug shape (contains a "/" or matches an
- *      exact pages.slug row in this source), return it untouched.
+ *      exact pages.slug row in this source), return it untouched. A mention
+ *      that is exactly one live page's own name (slug basename) resolves to
+ *      it next, before any other page's alias.
  *   2. Resolve a bare name only when prefix expansion finds one candidate.
  *   3. For multi-token input, take a fuzzy candidate within the source only
  *      when it carries the same name tokens (sameEntityName).
@@ -58,6 +61,13 @@ export async function resolveEntitySlug(
     if (exact) return exact;
   }
 
+  // 1.25. Exact own name: a live page whose slug basename IS the mention wins
+  //       over another page's alias — "Jordan Lee-Example" is
+  //       people/jordan-lee-example even when a different person lists it as
+  //       a former name.
+  const basenames = await findExactBasenameCandidates(engine, source_id, trimmed);
+  if (basenames.length === 1) return basenames[0].slug;
+
   // 1.5. Alias-exact (v0.46.15 identity wave, #3730): an unambiguous
   //      page_aliases hit resolves BEFORE prefix expansion / fuzzy — the
   //      alias table is curated ground truth ("saoirse" → people/saoirse-x)
@@ -65,8 +75,6 @@ export async function resolveEntitySlug(
   const aliased = await tryAliasExact(engine, source_id, trimmed);
   if (aliased) return aliased;
 
-  const basenames = await findExactBasenameCandidates(engine, source_id, trimmed);
-  if (basenames.length === 1) return basenames[0].slug;
   if (basenames.length > 1) return fallbackSlugify(trimmed);
 
   // 2. Prefix-expansion match: when the input looks like a bare first name
@@ -119,7 +127,7 @@ const FACT_ENTITY_TYPES = new Set(['concept', 'project', 'deal']);
 const FACT_ENTITY_DIRS = ['hosts/', 'projects/', 'concepts/', 'deals/'];
 
 /** Pages a fuzzy fact attribution may land on: entities, never meetings, notes or other documents. */
-function isFactEntityPage(slug: string, type: string | null): boolean {
+export function isFactEntityPage(slug: string, type: string | null): boolean {
   return isIdentityEntity(slug, type) || (type != null && FACT_ENTITY_TYPES.has(type))
     || FACT_ENTITY_DIRS.some(dir => slug.startsWith(dir));
 }
@@ -262,11 +270,12 @@ export async function resolveEntitySlugWithSource(
     if (exact) return { slug: exact, source: 'exact_page' };
   }
 
+  const basenames = await findExactBasenameCandidates(engine, source_id, trimmed);
+  if (basenames.length === 1) return { slug: basenames[0].slug, source: 'fuzzy_match' };
+
   const aliased = await tryAliasExact(engine, source_id, trimmed);
   if (aliased) return { slug: aliased, source: 'alias_exact' };
 
-  const basenames = await findExactBasenameCandidates(engine, source_id, trimmed);
-  if (basenames.length === 1) return { slug: basenames[0].slug, source: 'fuzzy_match' };
   if (basenames.length > 1) return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
 
   if (isBareName(trimmed)) {
@@ -278,6 +287,95 @@ export async function resolveEntitySlugWithSource(
   }
 
   return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
+}
+
+/**
+ * How a strict reference resolution found its page. `basename` is the
+ * unique-slug-basename arm and `same_name` the trigram arm restricted to
+ * pages carrying the same name tokens (both are `fuzzy_match` in
+ * resolveEntitySlugWithSource).
+ */
+export type StrictResolutionArm = 'exact_page' | 'alias_exact' | 'basename' | 'same_name';
+
+/**
+ * A strict resolution miss: `ambiguous` (two live pages qualify),
+ * `unverified` (only a bare-name prefix guess exists), `not_entity` (the
+ * reference names a live page that is not a fact entity, e.g. a meeting) or
+ * `no_page`.
+ */
+export type StrictResolution =
+  | { slug: string; arm: StrictResolutionArm }
+  | { slug: null; miss: 'ambiguous' | 'unverified' | 'not_entity' | 'no_page' };
+
+/**
+ * Resolve a name to a live fact-entity page using only identity evidence:
+ * exact slug, unique slug basename, unique alias and, with `sameName`, the
+ * same-name trigram arm. Never guesses from a bare-name prefix and never
+ * falls back to a slugified name. With `excludePrivate`, private pages are
+ * removed before uniqueness is counted, so an unreadable namesake can neither
+ * be returned nor change the outcome for a remote caller.
+ */
+export async function resolveStrictEntityReference(
+  engine: BrainEngine,
+  source_id: string,
+  raw: string,
+  opts: { sameName?: boolean; excludePrivate?: boolean } = {},
+): Promise<StrictResolution> {
+  const trimmed = raw.trim();
+  if (!trimmed) return { slug: null, miss: 'no_page' };
+  const privacy = opts.excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : '';
+  const live = async (slugs: string[]) => slugs.length === 0 ? [] : engine.executeRaw<{ slug: string; type: string | null }>(
+    `SELECT p.slug, p.type FROM pages p
+      WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.slug = ANY($2::text[]) ${privacy}`,
+    [source_id, [...new Set(slugs)]],
+  );
+  const pick = (rows: Array<{ slug: string; type: string | null }>, arm: StrictResolutionArm): StrictResolution | null => {
+    if (rows.length > 1) return { slug: null, miss: 'ambiguous' };
+    if (rows.length === 0) return null;
+    return isFactEntityPage(rows[0].slug, rows[0].type) ? { slug: rows[0].slug, arm } : { slug: null, miss: 'not_entity' };
+  };
+
+  if (looksLikeSlug(trimmed)) {
+    const exact = pick(await live([trimmed]), 'exact_page');
+    if (exact) return exact;
+  }
+  const token = slugify(trimmed);
+  if (!trimmed.includes('/') && token.includes('-')) {
+    const basename = pick(await live([...PREFIX_EXPANSION_DIRS, 'concepts'].map(dir => `${dir}/${token}`)), 'basename');
+    if (basename) return basename;
+  }
+  const norm = normalizeAlias(trimmed);
+  if (norm) {
+    try {
+      const hits = (await engine.resolveAliases([norm], { sourceId: source_id })).get(norm) ?? [];
+      const aliased = pick(await live(hits.map(h => h.slug)), 'alias_exact');
+      if (aliased) return aliased;
+    } catch (err) {
+      if (!isUndefinedTableError(err)) throw err;
+    }
+  }
+  if (opts.sameName && !isBareName(trimmed)) {
+    try {
+      const rows = await engine.executeRaw<{ slug: string; title: string; type: string | null }>(
+        `SELECT p.slug, p.title, p.type FROM pages p
+          WHERE p.source_id = $1 AND p.deleted_at IS NULL ${privacy}
+            AND (lower(p.title) % $2 OR p.slug ILIKE '%' || $3 || '%')
+          ORDER BY GREATEST(similarity(lower(p.title), $2), similarity(p.slug, $3)) DESC, p.slug ASC
+          LIMIT 5`,
+        [source_id, trimmed.toLowerCase(), token],
+      );
+      const named = pick(rows.filter(row => isFactEntityPage(row.slug, row.type) && sameEntityName(trimmed, row.title, row.slug)), 'same_name');
+      if (named) return named;
+    } catch (err) {
+      if (!isMissingTrigramError(err)) throw err;
+    }
+  }
+  if (isBareName(trimmed) && token) {
+    const prefixed = (await findPrefixCandidates(engine, source_id, token)).map(c => c.slug);
+    // Readable scope applies here too, so a private namesake never changes a remote outcome.
+    if ((opts.excludePrivate ? await live(prefixed) : prefixed).length > 0) return { slug: null, miss: 'unverified' };
+  }
+  return { slug: null, miss: 'no_page' };
 }
 
 /**
@@ -455,7 +553,7 @@ async function tryPrefixExpansion(
   return null;
 }
 
-function looksLikeSlug(s: string): boolean {
+export function looksLikeSlug(s: string): boolean {
   // Slug shape: lowercase letters/digits with at least one slash OR matches
   // [a-z0-9-]+ exactly. Anything with whitespace or capital letters fails.
   if (/\s/.test(s)) return false;

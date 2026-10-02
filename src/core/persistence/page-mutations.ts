@@ -19,7 +19,11 @@ import { assertPurgeParams } from './purge-params.ts';
 import type { Principal } from './model.ts';
 import { normalizeSubagentPageInput } from './page-input.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
-import { WRITER_INSPECTION_HINT } from './admin-intent.ts';
+import { isUnboundSourcePage, readUnboundWritePolicy, unboundSourceError } from './unbound-source.ts';
+import { colonSlugWindowsRefusal, isWindowsColonTarget } from './native-file-target.ts';
+import { publishesDatabaseOnly } from './page-prepare.ts';
+import { isMirrorOnlyPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
+import { isConnectorSourceKind } from './connector-identity.ts';
 
 export async function requestPrincipalForContext(ctx: OperationContext): Promise<Principal> {
   if (ctx.auth?.principal) return { ...ctx.auth.principal };
@@ -98,8 +102,8 @@ export async function submitPageMutation(ctx: OperationContext,
     return writeResponse(await waitForWrite(ctx.engine, prior, ctx.config, input.waitMs));
   }
   if (input.operation === 'delete_page') assertPurgeParams(p, ctx.remote);
-  const [source] = await ctx.engine.executeRaw<{ incarnation: string; archived: boolean; local_path: string | null }>(
-    'SELECT incarnation,archived,local_path FROM sources WHERE id=$1', [sourceId]);
+  const [source] = await ctx.engine.executeRaw<{ incarnation: string; archived: boolean; local_path: string | null; kind: string | null }>(
+    "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
   if (!source || source.archived) throw new OperationError('source_changed', 'The write source is not active.');
   let slug = typeof p.slug === 'string' ? p.slug.toLowerCase() : '';
   const intent = ['takes_add','takes_update','takes_supersede','takes_resolve'].includes(input.operation)
@@ -162,9 +166,32 @@ export async function submitPageMutation(ctx: OperationContext,
     if (!matches) throw new OperationError('invalid_params', 'The CLI directory must match the selected source canonical root.',
       'Register the source canonical path, then omit --dir or use that same path.');
   }
-  if (writeThrough && root && !binding) {
-    if (ctx.engine.kind !== 'pglite') throw new OperationError('owner_unavailable', 'This source has no designated canonical owner.', WRITER_INSPECTION_HINT);
-    binding = await claimWorktree(ctx.engine, sourceId, root);
+  // A connector source without a canonical owner is database-only by design
+  // (connector_database): a page write never claims it or refuses as unbound.
+  if (writeThrough && root && !binding && isConnectorSourceKind(source.kind)) authority.databaseOnlyReason = 'connector_database';
+  else if (writeThrough && root && !binding) {
+    if (ctx.engine.kind === 'pglite') binding = await claimWorktree(ctx.engine, sourceId, root, undefined, undefined, { automatic: true });
+    else {
+      // #5393: the opt-in covers every page mutation whose target has no
+      // recorded canonical file; a revert is also judged on the version it writes.
+      const fileBacked = Boolean(snapshot?.page.source_path) || (input.operation === 'revert_version' && snapshot
+        && (await ctx.engine.executeRaw<{ source_path: string | null }>('SELECT source_path FROM page_versions WHERE id=$1 AND page_id=$2',
+          [p.version_id, snapshot.page.id]))[0]?.source_path);
+      if (fileBacked || await readUnboundWritePolicy(ctx.engine) !== 'database_only') {
+        throw unboundSourceError(sourceId, ctx.remote === false ? root : null, fileBacked ? 'file_backed' : 'database_only_eligible');
+      }
+      authority.databaseOnlyReason = 'unbound_source';
+    }
+  }
+  // #5032: this host publishes the canonical file, and on Windows a ':' in its
+  // name cannot be stored; refuse before admission. Database-only writes pass,
+  // including read-only mirror sources and pages created while one (#5409).
+  if (writeThrough && binding?.owner_host_id === localHostId() && binding.local_path && isWindowsColonTarget(snapshot?.page.source_path ?? `${slug}.md`)
+    && !(snapshot && !snapshot.page.source_path && await isUnboundSourcePage(ctx.engine, sourceId, slug))
+    && !await sourceMirrorReadOnly(ctx.engine, sourceId)
+    && !(snapshot && !snapshot.page.source_path && await isMirrorOnlyPage(ctx.engine, sourceId, slug))
+    && !publishesDatabaseOnly(join(binding.local_path, binding.relative_path), slug, snapshot)) {
+    throw colonSlugWindowsRefusal(slug, sourceId);
   }
   const row = await admitWrite(ctx.engine, { principal, operation: input.operation, sourceId, sourceIncarnation: source.incarnation,
     slug, pageId: snapshot?.page.id ?? null, requestId, callerIntent, intent, authority,

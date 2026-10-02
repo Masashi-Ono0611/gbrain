@@ -146,11 +146,20 @@ export interface GBrainConfig {
    */
   chat_model?: string;
   /**
-   * Optional silent-refusal fallback chain for `chatWithFallback()` (v0.27+).
-   * Each entry is a "provider:modelId" string. Blocked from critic/judge/
-   * synthesize flows in their respective handlers (per D13 review decision).
+   * Optional availability-failure chain for `chatWithFallback()` (v0.27+).
+   * Entries are "provider:modelId" targets tried after rate-limit or billing
+   * failures. Silent-refusal fallback is not implemented.
    */
   chat_fallback_chain?: string[];
+  /**
+   * Per-call-site overrides of `chat_fallback_chain` (patch 96), keyed by the
+   * caller's own model-resolution config key (e.g. `models.dream.patterns`).
+   * DB-plane keys look like `chat_fallback_chain.<chainKey>` (see
+   * config-db-merge.ts); `gbrain config set chat_fallback_chain.models.dream.patterns
+   * model-a,model-b` sets one entry. Absent/unset keys fall through to
+   * `chat_fallback_chain`.
+   */
+  chat_fallback_chains?: Record<string, string[]>;
   /** Optional base URL overrides for openai-compatible providers (keyed by recipe id). */
   provider_base_urls?: Record<string, string>;
   /** Optional chat request providerOptions overrides keyed by recipe id or "recipe:modelId". */
@@ -252,6 +261,8 @@ export interface GBrainConfig {
     adaptive_return_entity_max?: number;
     adaptive_return_other_max?: number;
     adaptive_return_min_keep?: number;
+    /** #5824 rollback switch (search/vector-legacy-guard.ts); file > DB, env wins over both. */
+    vector_legacy_guard?: boolean;
   };
 
   /**
@@ -679,6 +690,39 @@ export function envShadowDetected(dir: string = process.cwd()): boolean {
   );
 }
 
+/**
+ * Parse `GBRAIN_CHAT_FALLBACK_CHAINS` — a JSON object of
+ * `{ "<chainKey>": "model-a,model-b" }` — into `GBrainConfig.chat_fallback_chains`.
+ * Fail-safe: undefined/empty input, invalid JSON, a non-object shape, or a
+ * chainKey whose value isn't a non-empty CSV string all warn (except the
+ * unset case, which is silent) and are dropped rather than throwing, so a
+ * malformed env var never crashes startup. Exported for tests.
+ */
+export function parseChatFallbackChainsEnv(raw: string | undefined): Record<string, string[]> | undefined {
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.warn(`[gbrain] config: GBRAIN_CHAT_FALLBACK_CHAINS is not valid JSON; ignoring (${(err as Error).message})`);
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    console.warn('[gbrain] config: GBRAIN_CHAT_FALLBACK_CHAINS must be a JSON object of chainKey -> CSV string; ignoring');
+    return undefined;
+  }
+  const result: Record<string, string[]> = {};
+  for (const [chainKey, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof value !== 'string') {
+      console.warn(`[gbrain] config: GBRAIN_CHAT_FALLBACK_CHAINS["${chainKey}"] is not a string; ignoring that entry`);
+      continue;
+    }
+    const chain = value.split(',').map(s => s.trim()).filter(Boolean);
+    if (chain.length > 0) result[chainKey] = chain;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
 export function loadConfig(): GBrainConfig | null {
   // #3893 (reimplemented from @y2688): fill process.env from the
   // operator-owned ~/.gbrain/.env BEFORE the env-over-file merge below, so
@@ -709,6 +753,13 @@ export function loadConfig(): GBrainConfig | null {
     ? 'postgres'
     : fileConfig?.engine || (fileConfig?.database_path ? 'pglite' : 'postgres');
 
+  // patch 96: GBRAIN_CHAT_FALLBACK_CHAINS is a JSON object mapping a chainKey
+  // (the caller's own model-resolution config key, e.g. "models.dream.patterns")
+  // to a CSV chain string — same per-value shape as GBRAIN_CHAT_FALLBACK_CHAIN.
+  // Malformed input warns and is dropped so a typo'd env var never crashes
+  // startup (mirrors the DB-plane chain parsing in config-db-merge.ts).
+  const envChatFallbackChains = parseChatFallbackChainsEnv(process.env.GBRAIN_CHAT_FALLBACK_CHAINS);
+
   // Merge: env vars override config file. READ only — never mutate process.env.
   const merged = {
     ...fileConfig,
@@ -725,6 +776,7 @@ export function loadConfig(): GBrainConfig | null {
     ...(process.env.GBRAIN_CHAT_FALLBACK_CHAIN
       ? { chat_fallback_chain: process.env.GBRAIN_CHAT_FALLBACK_CHAIN.split(',').map(s => s.trim()).filter(Boolean) }
       : {}),
+    ...(envChatFallbackChains ? { chat_fallback_chains: envChatFallbackChains } : {}),
     ...(process.env.GBRAIN_EMBEDDING_MULTIMODAL
       ? { embedding_multimodal: process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true' }
       : {}),
@@ -1153,6 +1205,8 @@ export async function loadConfigWithEngine(
     const n = Number(await dbStr(`search.${cap}`));
     if (Number.isFinite(n)) mergedSearch[cap] = n;
   }
+  const dbVectorLegacyGuard = await dbBoolStrict('search.vector_legacy_guard');
+  if (mergedSearch.vector_legacy_guard === undefined && dbVectorLegacyGuard !== undefined) mergedSearch.vector_legacy_guard = dbVectorLegacyGuard;
   if (Object.keys(mergedSearch).length > 0) {
     merged.search = mergedSearch;
   }
@@ -1230,6 +1284,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'eval.scrub_pii',
   'embedding_multimodal',
   'embedding_multimodal_model',
+  // #5691: per-brain query instruction (DB plane; read by search/query-prefix.ts).
+  'embedding_query_prefix',
   'embedding_image_ocr',
   'embedding_image_ocr_model',
   'embedding_columns',
@@ -1323,6 +1379,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // weak-graded query), and unlike crag_think it is reachable by remote
   // callers — attacker-shaped weak queries drive that spend (ship security
   // review). See docs/operations/spend-controls.md.
+  // #5824 one-release rollback, latched per process (search/vector-legacy-guard.ts).
+  'search.vector_legacy_guard',
   'search.adaptive_return',
   'search.adaptive_return_entity_max',
   'search.adaptive_return_other_max',
@@ -1341,6 +1399,14 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.metadata_boost_gate',
   'search.crag_escalation',
   'search.crag_think',
+  // Evidence delivery (search/evidence-delivery.ts): default unit (auto),
+  // window radius, default/auto/remote-max token budgets; think reads its own unit.
+  'search.return_unit',
+  'search.return_window',
+  'search.return_budget_default',
+  'search.return_budget_conversation',
+  'search.return_budget_max_remote',
+  'think.return_unit',
   // Models tier system (v0.31.12)
   'models.default',
   'models.tier.utility',
@@ -1401,6 +1467,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // didn't specify one: 'private' (default) | 'world'. Resolved by
   // src/core/facts/visibility.ts; explicit caller values always win.
   'facts.default_visibility',
+  'facts.entity_inference', // #5836: write-time subject inference kill switch (subject-infer.ts)
   // Ambient memory writeback (opt-in, default OFF): 'off' | 'salient' | 'all'.
   // DUAL-PLANE: `gbrain config set` writes the DB plane (authoritative — the
   // serve-side harvest gate re-checks it) AND mirrors into the file plane's
@@ -1606,7 +1673,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'persistence.limits.principal_lifetime_ids', 'persistence.limits.brain_lifetime_ids',
   'persistence.limits.principal_terminal_bytes', 'persistence.limits.brain_terminal_bytes',
   'persistence.limits.brain_recovery_bytes', 'persistence.limits.worktree_recovery_bytes',
-  'persistence.receipt_retention_days',
+  'persistence.receipt_retention_days', 'persistence.unbound_write', // #5254: persistence/unbound-source.ts
 ];
 
 /**
@@ -1619,6 +1686,10 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'models.',           // models.* (tier, aliases, per-task)
   'dream.',            // dream.synthesize.*, dream.patterns.*
   'cycle.',            // cycle.<phase>.*
+  // patch 96: per-call-site chatWithFallback chain override, keyed by the
+  // caller's model-resolution config key, e.g.
+  // chat_fallback_chain.models.dream.patterns
+  'chat_fallback_chain.',
   'embedding_columns.', // per-column overrides
   'provider_base_urls.', // per-provider base URL overrides
   'provider_chat_options.', // per-provider / per-model chat providerOptions
@@ -1634,6 +1705,7 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   //   parser; numeric 0 disables.
   'minions.',
   'pace.',              // pace.mode + PACE_MODE_CONFIG_KEYS (src/core/pace-mode.ts)
+  'decide.',            // System One decide.* (validated by src/core/ai/decide/config.ts DECIDE_CONFIG_KEYS)
   'connectors.',        // chat-connectors: source_id, sync_floor_min, embed_kickoff_min_pages, doctor_stale_hours, <provider>.{auto_sync,last_sync_at,auth_error_at,watermark_iso} (no secrets — creds are file-plane)
 ];
 
