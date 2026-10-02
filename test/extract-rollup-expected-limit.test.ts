@@ -87,7 +87,7 @@ describe('extract_rollup_7d.expected_limit_count (#4482)', () => {
     expect(Object.values(reasons).reduce((sum, count) => sum + Number(count), 0)).toBe(Number(row!.halt_count));
   });
 
-  test('a pre-v184 brain without halt_reasons still records the counters', async () => {
+  test('a pre-v190 brain without halt_reasons still records the counters', async () => {
     await engine.executeRaw('DELETE FROM extract_rollup_7d');
     await engine.executeRaw('ALTER TABLE extract_rollup_7d DROP COLUMN halt_reasons');
     try {

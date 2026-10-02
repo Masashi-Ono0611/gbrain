@@ -150,9 +150,9 @@ export async function upsertExtractRollup(
     return { ok: true };
   } catch (err) {
     const msg = (err as Error).message || String(err);
-    // #5495 back-compat: a brain at v141..v183 has no halt_reasons column.
+    // #5495 back-compat: a brain at v141..v186 has no halt_reasons column.
     // Retry the v141 statement so the counters still land; the halt reason
-    // is dropped until migration v184 runs. (A pre-v141 brain fails on
+    // is dropped until migration v190 runs. (A pre-v141 brain fails on
     // expected_limit_count first, which the branch below handles.)
     if (/halt_reasons/i.test(msg)) {
       try {
