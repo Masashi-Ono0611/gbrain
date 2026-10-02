@@ -357,7 +357,7 @@ describe('extract_atoms per-page atoms_source_changed', () => {
 });
 
 describe('drain lane carries atoms_source_changed', () => {
-  const passThroughLock: ExtractAtomsDrainDeps['withLock'] = (work) => work();
+  const passThroughLock: ExtractAtomsDrainDeps['withLock'] = (work) => work(new AbortController().signal);
 
   test('sums the per-batch count across batches', async () => {
     const counts = [2, 3];
