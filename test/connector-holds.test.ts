@@ -69,6 +69,33 @@ async function sourceHolds(engine: BrainEngine, id: string) {
   return (await readAllSourceHolds(engine, { sourceIds: [id] }))[0]?.held ?? [];
 }
 
+test('sources status reports unreadable connector holds without hiding healthy status', async () => withEnv(env, async () => {
+  const { readConnectorSourceStatuses, connectorStatusLines } = await import('../src/core/persistence/connector-status.ts');
+  for (const engine of engines) {
+    const f = await githubSource(engine, true);
+    const healthy = (await readConnectorSourceStatuses(engine)).get(f.id);
+    expect(healthy).toBeDefined();
+    expect(healthy?.held).toEqual([]);
+    expect(healthy?.held_error).toBeUndefined();
+    const healthyLines = connectorStatusLines(f.id, healthy!);
+
+    const failingEngine = {
+      executeRaw: ((sql: string, params?: unknown[]) => {
+        if (sql.includes('ORDER BY id')) throw new Error('synthetic hold read failure');
+        return engine.executeRaw(sql, params);
+      }) as BrainEngine['executeRaw'],
+    };
+    const status = (await readConnectorSourceStatuses(failingEngine)).get(f.id);
+    expect(status?.held).toEqual([]);
+    expect(status?.held_error).toBe('synthetic hold read failure');
+    expect(connectorStatusLines(f.id, status!)).toContain('    hold state unreadable: synthetic hold read failure');
+
+    const recovered = (await readConnectorSourceStatuses(engine)).get(f.id);
+    expect(recovered).toEqual(healthy);
+    expect(connectorStatusLines(f.id, recovered!)).toEqual(healthyLines);
+  }
+}));
+
 test('#5740: a GitHub item failing 3 runs is held, the watermark advances past it, and retry-held clears it on recovery', async () => withEnv(env, async () => {
   for (const engine of engines) for (const managed of [false, true]) {
     const f = await githubSource(engine, managed);
