@@ -9,7 +9,7 @@ path	name	lines	justification
 src/commands/bootstrap.ts	runHooks	597	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/commands/bootstrap.ts	runHooks>withLock(#1)	449	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/commands/config.ts	runConfig	852	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/commands/doctor/bootstrap-checks.ts	bootstrapDoctorChecks	476	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
+src/commands/doctor/bootstrap-checks.ts	bootstrapDoctorChecks	491	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1); +15 PR #5380 after rebase
 src/commands/doctor/checks/extraction-sync.ts	checkSyncFreshness	333	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/commands/doctor/report-remote.ts	doctorReportRemote	416	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/commands/dream-retriage.ts	runDreamRetriage	524	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
