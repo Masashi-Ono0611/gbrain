@@ -42,7 +42,7 @@ function parseFlags(args: string[]): BackfillOpts {
     } else if (a === '--max-chunks') {
       const raw = args[++i];
       const n = Number(raw);
-      if (!raw || !/^[1-9]\d*$/.test(raw.trim()) || !Number.isSafeInteger(n)) {
+      if (!raw || !/^\d+$/.test(raw.trim()) || !Number.isSafeInteger(n) || n < 1) {
         throw new Error('--max-chunks must be a positive safe integer');
       }
       opts.maxChunks = n;

@@ -29,3 +29,9 @@ test('edges-backfill accepts --max-chunks 5 and runs the resolver', async () => 
   await runEdgesBackfill(engine, ['--source', 'default', '--max-chunks', '5']);
   expect(dbCalls()).toBeGreaterThan(0);
 });
+
+test('edges-backfill accepts a leading-zero --max-chunks 05 as 5', async () => {
+  const { engine, dbCalls } = emptyEngine();
+  await runEdgesBackfill(engine, ['--source', 'default', '--max-chunks', '05']);
+  expect(dbCalls()).toBeGreaterThan(0);
+});
