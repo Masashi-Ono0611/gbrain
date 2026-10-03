@@ -138,6 +138,12 @@ export async function managedSyncAdviceEnabled(engine: BrainEngine): Promise<boo
   }
 }
 
+export async function multiSourceDriftSyncCommand(engine: BrainEngine): Promise<string> {
+  return await managedSyncAdviceEnabled(engine)
+    ? 'gbrain sync --source <id> --no-pull --full'
+    : 'gbrain sync --source <id> --full';
+}
+
 /**
  * #1123 — multi_source_drift remediation advice. Exported so the regression
  * test can pin that it only references CLI surfaces that actually exist

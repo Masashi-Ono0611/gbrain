@@ -60,7 +60,7 @@ import {
   checkSchemaPackActive,
   checkSchemaPackConsistency,
   checkSchemaPackSourceDrift,
-  managedSyncAdviceEnabled,
+  multiSourceDriftSyncCommand,
 } from './schema-pack-checks.ts';
 
 // Same alias the local doctor keeps for its own freshness checks; the alias
@@ -296,13 +296,8 @@ export async function doctorReportRemote(
         });
       } else if (result.count > 0) {
         const sampleStr = result.sample.map(s => `${s.slug} (intended=${s.intended_source})`).join(', ');
-        const managed = await managedSyncAdviceEnabled(engine);
-        const syncCommand = managed
-          ? 'gbrain sync --source <id> --no-pull --full'
-          : 'gbrain sync --source <id> --full';
-        const skipNote = result.git_root_skipped.length > 0
-          ? multiSourceDriftGitRootSkipNote(result.git_root_skipped)
-          : '';
+        const syncCommand = await multiSourceDriftSyncCommand(engine);
+        const skipNote = result.git_root_skipped.length > 0 ? multiSourceDriftGitRootSkipNote(result.git_root_skipped) : '';
         checks.push({
           name: 'multi_source_drift',
           status: 'warn',
