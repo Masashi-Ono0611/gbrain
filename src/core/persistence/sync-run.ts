@@ -38,6 +38,7 @@ import { SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
 import { dryRunScreen, isSyncReadBound, loadSyncScreenRun, pinnedBlob, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
 import { faultPoint } from './fault-points.ts';
 import { addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, readSyncHoldPolicy, recordSyncConversion, recoveredReport, writeGitHold } from './sync-holds.ts';
+import { principalAttribution } from './attribution.ts';
 
 export interface ManagedSyncWriteDiagnostic {
   source_id: string;
@@ -725,7 +726,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         await engine.transaction(tx => withCoordinatedWrite(tx, [context.sourceId], () => {
           assertActive();
           return tx.executeRaw('UPDATE sources SET last_sync_at=now() WHERE id=$1 AND incarnation=$2::uuid', [context.sourceId, context.incarnation]);
-        }));
+        }, principalAttribution(authority.writer.principal)));
         await clearManagedSyncFailureAfterSuccess(engine, key);
         assertActive();
         return result(fresh, 'up_to_date');
