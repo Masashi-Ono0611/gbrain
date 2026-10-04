@@ -28,6 +28,7 @@ import { CHECKPOINT_VALIDATION_TIMEOUT, checkpointTimeoutHint } from './checkpoi
 import { isTerminalWriteState, publicWriteReceipt, type WriteReceipt } from './types.ts';
 import type { WriteRequest } from './model.ts';
 import { assertManagedSyncAllowed } from './worktree-refresh.ts';
+import { principalAttribution } from './attribution.ts';
 
 export interface ManagedSyncWriteDiagnostic {
   source_id: string;
@@ -385,7 +386,7 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
         await engine.transaction(tx => withCoordinatedWrite(tx, [context.sourceId], () => {
           assertActive();
           return tx.executeRaw('UPDATE sources SET last_sync_at=now() WHERE id=$1 AND incarnation=$2::uuid', [context.sourceId, context.incarnation]);
-        }));
+        }, principalAttribution(authority.writer.principal)));
         await clearManagedSyncFailureAfterSuccess(engine, key);
         assertActive();
         return result(fresh, 'up_to_date');

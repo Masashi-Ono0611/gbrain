@@ -23,6 +23,7 @@ import { withEnv } from './helpers/with-env.ts';
 import { prepareRemoteJob, withSubmissionAuthority } from '../src/core/minions/submission-authority.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { loadSyncFailures, syncFailuresPath } from '../src/core/sync-failure-ledger.ts';
+import { maintenanceAttribution } from '../src/core/persistence/attribution.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-sync-'));
 const engines: BrainEngine[] = [];
@@ -135,7 +136,7 @@ test('managed sync refreshes quiet-source freshness only after a complete up-to-
     const f = await fixture(engine, { 'notes/example.md': 'A stable observation for heartbeat coverage.\n' });
     await performManagedSync(engine, { sourceId: f.id, noPull: true });
     const old = '2000-01-01T00:00:00Z';
-    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_sync_at=$2::timestamptz WHERE id=$1', [f.id, old])));
+    await engine.transaction(async tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_sync_at=$2::timestamptz WHERE id=$1', [f.id, old]), await maintenanceAttribution(tx)));
     const [before] = await engine.executeRaw<{ last_commit: string; newest_content_at: Date | string | null }>(
       'SELECT last_commit,newest_content_at FROM sources WHERE id=$1', [f.id]);
 
@@ -148,7 +149,7 @@ test('managed sync refreshes quiet-source freshness only after a complete up-to-
 
     writeFileSync(join(f.root, 'notes/example.md'), 'A changed observation requiring a partial sync.\n');
     commit(f.root, 'changed content');
-    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_sync_at=$2::timestamptz WHERE id=$1', [f.id, old])));
+    await engine.transaction(async tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_sync_at=$2::timestamptz WHERE id=$1', [f.id, old]), await maintenanceAttribution(tx)));
     const abort = new AbortController();
     const partial = await performManagedSync(engine, { sourceId: f.id, noPull: true, signal: abort.signal,
       onProgress: progress => { if (progress.bankedFiles === 1) abort.abort(); } });
@@ -163,7 +164,7 @@ test('managed up-to-date heartbeat is scoped to its source incarnation', async (
     const f = await fixture(engine, { 'notes/example.md': 'A stable observation for incarnation coverage.\n' });
     await performManagedSync(engine, { sourceId: f.id, noPull: true });
     const old = '2000-01-01T00:00:00Z';
-    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_sync_at=$2::timestamptz WHERE id=$1', [f.id, old])));
+    await engine.transaction(async tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_sync_at=$2::timestamptz WHERE id=$1', [f.id, old]), await maintenanceAttribution(tx)));
     const transaction = engine.transaction;
     let replaced = false;
     engine.transaction = async function <T>(this: BrainEngine, run: (tx: BrainEngine) => Promise<T>): Promise<T> {
