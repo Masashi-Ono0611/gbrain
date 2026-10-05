@@ -104,7 +104,12 @@ export async function resolveManagedFactsEmbedding(engine: BrainEngine, config: 
   if (!model) return null;
   const dimensions = /^[1-9]\d*$/.test(values.embedding_dimensions ?? '') ? Number(values.embedding_dimensions) : null;
   if (!/^[^\s:]+:[^\s]+$/.test(model) || !dimensions || !Number.isSafeInteger(dimensions)) {
-    throw opError('embedding_configuration', 'The selected brain has no verifiable facts embedding model and dimensions.',
+    const invalidKeys = [
+      !/^[^\s:]+:[^\s]+$/.test(model) ? 'embedding_model' : null,
+      !dimensions || !Number.isSafeInteger(dimensions) ? 'embedding_dimensions' : null,
+    ].filter(Boolean).join(', ');
+    throw opError('embedding_configuration', 'The selected brain has no verifiable facts embedding model and dimensions.' +
+      ` Invalid DB-plane config key(s): ${invalidKeys}. Read from the selected brain's config table: embedding_model=${JSON.stringify(model)}, embedding_dimensions=${values.embedding_dimensions === undefined ? 'unset' : JSON.stringify(values.embedding_dimensions)}.`,
       `The brain's embedding_model (${JSON.stringify(model)}) is not provider:model or embedding_dimensions is not a positive integer, so fact extraction stopped before admission. Check embedding readiness; correcting the configuration is the user's decision.`,
       { fix: embeddingsFix() });
   }
