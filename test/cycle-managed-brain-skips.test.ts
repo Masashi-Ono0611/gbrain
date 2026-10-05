@@ -42,7 +42,9 @@ describe('managed brain: legacy lint/extraction phases skip with a reason', () =
     const before = readFileSync(join(brainDir, 'note.md'), 'utf8');
     const r = await runPhaseLint(brainDir, false, engine);
     expect(r.status).not.toBe('skipped');
-    expect(r.status).not.toBe('fail');
+    // v0.60.65.0: a managed maintenance source without an active canonical owner now refuses
+    // (owner_unavailable) before any file write; that refusal is the only accepted failure.
+    if (r.status === 'fail') expect((r as { error?: { code?: string } }).error?.code).toBe('owner_unavailable');
     expect(readFileSync(join(brainDir, 'note.md'), 'utf8')).toBe(before);
   });
 
