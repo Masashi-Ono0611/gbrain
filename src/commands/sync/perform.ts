@@ -44,7 +44,8 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
         const binding = await getWorktreeBinding(engine, effectiveSourceId);
         if (source.archived || !binding || binding.source_incarnation !== source.incarnation ||
             binding.owner_host_id !== localHostId() || binding.state !== 'active' || !binding.local_path) {
-          throw new OperationError('owner_unavailable', 'Sync must run on the active registered worktree owner.');
+          throw new OperationError('owner_unavailable', 'Sync must run on the active registered worktree owner.',
+            'Run this sync on the host that owns the source worktree. Check ownership with: gbrain sources writer status --json');
         }
       }
     }
