@@ -136,6 +136,7 @@ test/e2e/openclaw-reference-compat.test.ts	OpenClaw reference workspace compat (
 test/e2e/workspace-generic-compat.test.ts	generic agent-workspace compat (INSTALL_FOR_AGENTS.md flow)	6	readFileSync
 test/embedding-dim-check-facts.test.ts	doctor checkFactsEmbeddingWidthConsistency wiring (T6)	4	doctor-source-helper
 test/embedding-dim-check-facts.test.ts	postgres-engine fact insert cast (T6, codex #20)	1	source-surface-helper
+test/enrich-person-template.test.ts	enrich person page template	1	readFileSync
 test/env-trust-protected-keys.test.ts	CWD_DOTENV_PROTECTED_KEYS covers every suspicious GBRAIN_* env read in src/	3	readFileSync
 test/error-catalogue.test.ts	error code registry (agent contract v1)	5	readFileSync
 test/eval-brainbench-e2e.slow.test.ts	--llm availability gate	1	exec-scan

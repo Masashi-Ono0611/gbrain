@@ -213,6 +213,9 @@ Current projects, recent launches, what they're focused on.
 ## What Motivates Them
 Ambition, career arc, what drives them.
 
+## Communication Style
+Communication preferences, disagreement patterns, and what energizes them in conversation. Use direct observations only, avoid generalizing from one data point, and mark confidence.
+
 ## Hobby Horses
 Topics they return to obsessively. Recurring themes in their work/posts.
 
