@@ -1,4 +1,5 @@
 import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts';
+import { load as yamlLoad } from 'js-yaml';
 /**
  * brain-writer — frontmatter validation/audit/auto-fix orchestrator.
  *
@@ -311,8 +312,17 @@ export function autoFixFrontmatter(
       for (let i = firstNonEmpty + 1; i < lines.length; i++) {
         if (lines[i].trim() === '---') { closeIdx = i; break; }
       }
+      let isValidFrontmatterYaml = false;
+      if (closeIdx < lines.length) {
+        try {
+          yamlLoad(lines.slice(firstNonEmpty + 1, closeIdx).join('\n'));
+          isValidFrontmatterYaml = true;
+        } catch {
+          // Keep the legacy line repair for frontmatter that does not parse.
+        }
+      }
       let fixedAny = false;
-      for (let i = firstNonEmpty + 1; i < closeIdx; i++) {
+      for (let i = firstNonEmpty + 1; !isValidFrontmatterYaml && i < closeIdx; i++) {
         const m = lines[i].match(/^(\s*[A-Za-z_][\w-]*\s*:\s*)"(.*)"\s*(.*)$/);
         if (!m) continue;
         const [, prefix, inner, trailing] = m;

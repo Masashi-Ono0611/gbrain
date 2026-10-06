@@ -78,6 +78,13 @@ describe('autoFixFrontmatter', () => {
     expect(content).toMatch(/^title: '.*'\s*$/m);
   });
 
+  test('does not rewrite nested-looking continuation lines in valid folded YAML', () => {
+    const input = `${fence}\ntype: note\ntitle: 'Example pattern'\nevidence:\n  - claim: >-\n      The user pushed back twice.\n      Alex: "Why not you?", then "Let us keep it\n      simple", and moved on.\n${fence}\n\nBody.`;
+    const { content, fixes } = autoFixFrontmatter(input);
+    expect(content).toBe(input);
+    expect(fixes.some(f => f.code === 'NESTED_QUOTES')).toBe(false);
+  });
+
   test('removes mismatched slug field', () => {
     const input = `${fence}\ntype: concept\ntitle: hi\nslug: wrong-slug\n${fence}\n\nbody`;
     const { content, fixes } = autoFixFrontmatter(input, { filePath: 'people/jane-doe.md' });

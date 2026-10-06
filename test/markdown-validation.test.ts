@@ -173,6 +173,24 @@ body`;
   // fallback runs js-yaml.safeLoad on suspicious values; only flags
   // genuinely unparseable lines.
   describe('NESTED_QUOTES — YAML-aware fallback', () => {
+    test('folded block-scalar continuation lines with nested-looking quotes do NOT trigger', () => {
+      const md = `${fence}\ntype: note\ntitle: 'Example pattern'\nevidence:\n  - claim: >-\n      The user pushed back twice.\n      Alex: "Why not you?", then "Let us keep it\n      simple", and moved on.\n${fence}\n\nBody.`;
+      const parsed = parseMarkdown(md, undefined, { validate: true });
+      expect(parsed.errors!.filter(e => e.code === 'NESTED_QUOTES')).toHaveLength(0);
+    });
+
+    test('genuinely broken nested-quoted title still triggers', () => {
+      const md = `${fence}\ntype: note\ntitle: "Name "Nick" Last"\n${fence}\n\nBody.`;
+      const parsed = parseMarkdown(md, undefined, { validate: true });
+      expect(parsed.errors!.map(e => e.code)).toContain('NESTED_QUOTES');
+    });
+
+    test('valid flow sequence remains free of nested-quote findings', () => {
+      const md = `${fence}\ntype: note\ntags: ["yc", "w2025"]\n${fence}\n\nBody.`;
+      const parsed = parseMarkdown(md, undefined, { validate: true });
+      expect(parsed.errors!.filter(e => e.code === 'NESTED_QUOTES')).toHaveLength(0);
+    });
+
     test('flow sequence with quoted tags does NOT trigger (6,981-error regression guard)', () => {
       const md = `${fence}\ntype: concept\ntitle: x\ntags: ["yc", "w2025", "ai"]\n${fence}\n\nbody`;
       const parsed = parseMarkdown(md, undefined, { validate: true });
