@@ -8,7 +8,7 @@ describe('enrich person page template', () => {
     const template = skill.match(/#### Person page template\s+```markdown\n([\s\S]*?)\n```/)?.[1];
     expect(template).toBeDefined();
 
-    const headings = template!.match(/^## .+$/gm) ?? [];
+    const headings: string[] = template!.match(/^## .+$/gm) ?? [];
     const motivate = headings.indexOf('## What Motivates Them');
     const communication = headings.indexOf('## Communication Style');
     const hobby = headings.indexOf('## Hobby Horses');
