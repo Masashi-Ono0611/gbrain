@@ -16,8 +16,8 @@
  *
  * Serial: spawns `gbrain serve` subprocesses against one PGLite brain.
  */
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -47,8 +47,60 @@ beforeAll(async () => {
 }, 120_000);
 
 afterAll(() => h?.cleanup());
+afterEach(() => {
+  rmSync(join(h.home, 'codex'), { recursive: true, force: true });
+  rmSync(join(h.home, '.claude'), { recursive: true, force: true });
+});
 
 describe('doctor --only harness_wiring', () => {
+  test('enabled Codex gbrain plugin suppresses the missing-registration warning', async () => {
+    const codexHome = join(h.home, 'codex');
+    mkdirSync(codexHome, { recursive: true });
+    writeFileSync(join(codexHome, 'config.toml'), '[plugins."gbrain@marketplace"]\nenabled = true\n');
+
+    const run = await runGbrain(h, ['doctor', '--only', 'harness_wiring', '--json'], { CODEX_HOME: codexHome });
+    const check = harnessCheck(run);
+    expect(check.status).toBe('ok');
+    expect(String(check.message)).toContain('gbrain@marketplace');
+    expect(String(check.message)).toContain('enabled, not verified healthy');
+  }, 60_000);
+
+  test('no plugin or registration keeps the existing warning wording', async () => {
+    const codexHome = join(h.home, 'codex');
+    mkdirSync(codexHome, { recursive: true });
+    writeFileSync(join(codexHome, 'config.toml'), '');
+
+    const run = await runGbrain(h, ['doctor', '--only', 'harness_wiring', '--json'], { CODEX_HOME: codexHome });
+    const check = harnessCheck(run);
+    expect(check.status).toBe('warn');
+    expect(check.message).toBe('Codex is installed but has no gbrain MCP registration, so its sessions get no memory tools. The gbrain binary is not on PATH as an absolute path, and harness registrations never use a bare `gbrain` (GUI hosts inherit no PATH).');
+  }, 60_000);
+
+  test('enabled plugin leaves the warning for another detected harness only', async () => {
+    const codexHome = join(h.home, 'codex');
+    mkdirSync(codexHome, { recursive: true });
+    mkdirSync(join(h.home, '.claude'), { recursive: true });
+    writeFileSync(join(codexHome, 'config.toml'), '[plugins."gbrain@marketplace"]\nenabled = true\n');
+
+    // CLAUDE_CONFIG_DIR is pinned so a developer's own Claude settings never reach this case.
+    const run = await runGbrain(h, ['doctor', '--only', 'harness_wiring', '--json'], { CODEX_HOME: codexHome, CLAUDE_CONFIG_DIR: join(h.home, '.claude') });
+    const check = harnessCheck(run);
+    expect(check.status).toBe('warn');
+    expect(String(check.message)).toContain('Claude Code is installed but has no gbrain MCP registration');
+    expect(String(check.message)).not.toContain('Codex');
+  }, 60_000);
+
+  test('an enabled Claude Code gbrain plugin is not reported as unwired', async () => {
+    const claudeDir = join(h.home, '.claude');
+    mkdirSync(claudeDir, { recursive: true });
+    writeFileSync(join(claudeDir, 'settings.json'), JSON.stringify({ enabledPlugins: { 'gbrain@marketplace': true } }));
+
+    const run = await runGbrain(h, ['doctor', '--only', 'harness_wiring', '--json'], { CODEX_HOME: join(h.home, 'no-codex'), CLAUDE_CONFIG_DIR: claudeDir });
+    const check = harnessCheck(run);
+    expect(check.status).toBe('ok');
+    expect(String(check.message)).toContain('gbrain@marketplace');
+  }, 60_000);
+
   test('no harness and no registration: information with the install fix', async () => {
     rmSync(join(h.home, '.claude.json'), { force: true });
     const run = await runGbrain(h, ['doctor', '--only', 'harness_wiring', '--json']);

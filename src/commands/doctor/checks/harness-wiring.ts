@@ -246,11 +246,32 @@ export async function harnessWiringCheck(opts: { smoke: boolean }): Promise<Chec
   const regs = readHarnessRegistrations();
   if (regs.length === 0) {
     const harnesses = detectedHarnesses();
+    const { codexPluginProvidesName, claudePluginProvidesName } = await import('../../../core/bootstrap/harness.ts');
+    const { codexConfigPath, claudeUserSettingsPath } = await import('../../../core/bootstrap/host-specs.ts');
+    const pluginLanes = harnesses.flatMap((harness) => {
+      const plugin = harness === 'codex'
+        ? codexPluginProvidesName(codexConfigPath(), 'gbrain')
+        : harness === 'claude-code'
+          ? claudePluginProvidesName(claudeUserSettingsPath(), 'gbrain')
+          : null;
+      return plugin ? [{ harness, plugin }] : [];
+    });
+    if (pluginLanes.length === harnesses.length && pluginLanes.length > 0) {
+      return {
+        name: NAME,
+        status: 'ok',
+        message: `The gbrain plugin lane is enabled via ${pluginLanes.map(({ plugin }) => plugin).join(', ')}; enabled, not verified healthy (doctor does not smoke-test plugin lanes).`,
+        details: { reason: 'plugin_enabled_unverified', harnesses: pluginLanes.map(({ harness }) => harness) },
+      };
+    }
+    const unregisteredHarnesses = pluginLanes.length > 0
+      ? harnesses.filter((harness) => !pluginLanes.some((lane) => lane.harness === harness))
+      : harnesses;
     const lock = brainLock();
     const lockOwner = lock?.held && lock.isServe && lock.pid !== undefined ? { pid: lock.pid, transport: lock.http ? 'http' as const : 'stdio' as const, is_self: false } : null;
-    const entry = harnessWiringEntry({ transport: 'cli', harnesses, lockOwner, gbrainBin: resolveGbrainBin() });
+    const entry = harnessWiringEntry({ transport: 'cli', harnesses: unregisteredHarnesses, lockOwner, gbrainBin: resolveGbrainBin() });
     if (harnesses.length === 0) return infoCheck(NAME, `${entry.why} Wire one when the user picks an agent app.`, entry.state, entry.fix, { reason: entry.reason });
-    return { name: NAME, status: 'warn', message: `${harnesses.map((h) => HARNESS_LABEL[h]).join(', ')} ${harnesses.length > 1 ? 'are' : 'is'} installed but ${harnesses.length > 1 ? 'have' : 'has'} no gbrain MCP registration, so its sessions get no memory tools. ${entry.why}`,
+    return { name: NAME, status: 'warn', message: `${unregisteredHarnesses.map((h) => HARNESS_LABEL[h]).join(', ')} ${unregisteredHarnesses.length > 1 ? 'are' : 'is'} installed but ${unregisteredHarnesses.length > 1 ? 'have' : 'has'} no gbrain MCP registration, so its sessions get no memory tools. ${entry.why}`,
       details: { reason: entry.reason }, ...(entry.fix ? { fix: entry.fix } : { fix_unavailable_reason: 'no_safe_automatic_fix' as const }) };
   }
   const bare = regs.find((r) => r.kind === 'stdio' && r.command && !isAbsolute(r.command) && r.command !== 'bun' && r.command !== 'node');
