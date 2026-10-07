@@ -18,6 +18,7 @@ tools:
   - exec
 mutating: true
 brain_first: exempt
+when_to_use: "Use when the user asks: \"OSS loop\", \"OSS contribution\", \"open source PR\", \"prepare an upstream PR\", \"check OSS candidates\"."
 ---
 
 # OSS Contribution Loop
