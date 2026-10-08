@@ -21,6 +21,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { OperationContext } from './operations.ts';
 import { OperationError } from './ops/contract.ts';
+import { parseWriteRequestId } from './persistence/preconditions.ts';
 
 export const REMEMBER_BATCH_MAX = 20;
 const ITEM_KEYS = new Set(['fact', 'provenance', 'entity', 'infer_entity', 'kind', 'ttl', 'visibility', 'replaces']);
@@ -76,7 +77,8 @@ export async function runRememberBatch(ctx: OperationContext, p: Record<string, 
     }
   }
   if (ctx.dryRun) return { dry_run: true, action: 'remember', items: normalized.length, protocol_version: 1 };
-  const requestId = typeof p.request_id === 'string' && p.request_id ? p.request_id : randomUUID();
+  // Validate only: child ids derive from the caller's own spelling, so retries of an already-submitted batch keep their ids.
+  const requestId = parseWriteRequestId(p.request_id) === undefined ? randomUUID() : p.request_id as string;
   const results: BatchItemResult[] = [];
   const hints = new Set<string>();
   for (const [index, item] of normalized.entries()) {

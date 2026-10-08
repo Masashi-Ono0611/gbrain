@@ -29,12 +29,13 @@ describe('remember items[] batch', () => {
 
   test('saves each item with shared provenance and child request ids', async () => {
     const { handler, writes } = fakeSingle();
-    const out = await runRememberBatch(ctx, { request_id: 'r1', provenance: 'session', items: [{ fact: 'a' }, { fact: 'b', provenance: 'own' }] }, handler, ve);
+    const requestId = '11111111-1111-4111-8111-111111111111';
+    const out = await runRememberBatch(ctx, { request_id: requestId, provenance: 'session', items: [{ fact: 'a' }, { fact: 'b', provenance: 'own' }] }, handler, ve);
     expect(out.saved).toBe(2);
     expect(out.partial).toBe(false);
     expect(writes.map(w => w.provenance)).toEqual(['session', 'own']);
-    expect(writes[0].request_id).toBe(childRequestId('r1', 0));
-    expect(writes[1].request_id).toBe(childRequestId('r1', 1));
+    expect(writes[0].request_id).toBe(childRequestId(requestId, 0));
+    expect(writes[1].request_id).toBe(childRequestId(requestId, 1));
   });
 
   test('one invalid item refuses the whole batch before any write', async () => {

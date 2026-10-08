@@ -5,6 +5,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { randomUUID } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 
@@ -27,6 +28,35 @@ afterAll(async () => {
 });
 
 describe('remember records the MCP session', () => {
+  test('batch remember refuses a non-UUID top-level request_id before saving', async () => {
+    const fact = 'the sample ledger closes on Tuesdays';
+    const res = await dispatchToolCall(engine, 'remember', {
+      request_id: 'not-a-uuid', provenance: 'test', items: [{ fact }],
+    }, { ...STDIO });
+    expect(res.isError).toBe(true);
+    expect(parsed(res)).toMatchObject({ error: 'invalid_params', message: 'request_id must be a UUID.' });
+    const single = await dispatchToolCall(engine, 'remember', {
+      request_id: 'not-a-uuid', provenance: 'test', fact,
+    }, { ...STDIO });
+    expect(single.isError).toBe(true);
+    expect(parsed(res).message).toBe(parsed(single).message);
+    const rows = await engine.executeRaw<{ fact: string }>('SELECT fact FROM facts WHERE fact=$1', [fact]);
+    expect(rows).toEqual([]);
+  });
+
+  test('batch remember accepts a UUID and an omitted request_id', async () => {
+    for (const requestId of [randomUUID(), randomUUID().toUpperCase(), undefined]) {
+      const fact = `the sample queue closes at ${requestId ?? 'dawn'}`;
+      const res = await dispatchToolCall(engine, 'remember', {
+        provenance: 'test', items: [{ fact }], ...(requestId ? { request_id: requestId } : {}),
+      }, { ...STDIO });
+      expect(res.isError ?? false).toBe(false);
+      expect(parsed(res).saved).toBe(1);
+      const rows = await engine.executeRaw<{ fact: string }>('SELECT fact FROM facts WHERE fact=$1', [fact]);
+      expect(rows).toEqual([{ fact }]);
+    }
+  });
+
   test('a fact remembered in a session is recalled by that session, and not by another', async () => {
     const res = await dispatchToolCall(
       engine,
