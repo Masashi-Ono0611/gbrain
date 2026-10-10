@@ -131,7 +131,6 @@ test/doctor-remediation-plan-observational.serial.test.ts	global-state	global-st
 test/doctor-remote.serial.test.ts	global-state	global-state: binds local servers/ports
 test/doctor-report-remote.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME)
 test/doctor-revision-backfill-journey.serial.test.ts	global-state	global-state: withEnv holds GBRAIN_HOME across awaited doctor and CLI journey runs
-test/dream-drain-failure-summary.serial.test.ts	R2	R2: mock.module(../src/core/cycle/extract-atoms-drain.ts) replaces modules for every file in the process
 test/dream-owner-id-threading.serial.test.ts	R2	R2: mock.module(../src/core/cycle.ts) replaces modules for every file in the process
 test/dream-postgres.serial.test.ts	global-state	global-state: spyOn process.exit, console.error
 test/dream-publication-hold.serial.test.ts	R2	R2: mock.module(../src/core/ai/gateway.ts, ../src/core/cycle/synthesize-concepts.ts, ../src/core/cycle/synthesize.ts, ../src/core/persistence/prepared-maintenance.ts, ../src/core/minions/wait-for-completion.ts) replaces modules for every file in the process
@@ -291,6 +290,7 @@ test/query-image-date-readiness.serial.test.ts	R2	R2: mock.module(../src/core/ai
 test/query-image-flag.serial.test.ts	R2	R2: mock.module(../src/core/ai/gateway.ts) replaces modules for every file in the process
 test/query-image-mode-limit.serial.test.ts	R2	R2: mock.module(../src/core/ai/gateway.ts) replaces modules for every file in the process
 test/query-op-limit-mode-4356.serial.test.ts	R2	R2: mock.module(../src/core/search/hybrid.ts) replaces modules for every file in the process
+test/query-op-relational-meta.serial.test.ts	R2	R2: mock.module(../src/core/search/hybrid.ts) replaces the module for every file in the process
 test/readiness-embedding-enablement.serial.test.ts	global-state	global-state: R3: constructs PGLiteEngine outside beforeAll
 test/recall-budget-policy-thin.serial.test.ts	R2	R2: mock.module(../src/core/config.ts, ../src/core/mcp-client.ts) replaces modules for every file in the process
 test/recall-thin-client-fallback.serial.test.ts	R2	R2: mock.module(../src/core/config.ts, ../src/core/mcp-client.ts) replaces modules for every file in the process
@@ -312,6 +312,7 @@ test/search-multimodal-no-embed.serial.test.ts	global-state	global-state: config
 test/search-telemetry-cache-wiring.serial.test.ts	R2	R2: mock.module(../src/core/embedding.ts) replaces modules for every file in the process
 test/search/autocut-integration.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests; configureGateway changes the process-wide AI gateway
 test/search/crag-escalation-limit.serial.test.ts	R2	R2: mock.module(dynamic specifier) replaces modules for every file in the process
+test/search/hybrid-keyword-arm-failopen-4091.serial.test.ts	global-state	global-state: R5: configureGateway() sets the process-global gateway config
 test/search/hybrid-reranker-integration.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME, GBRAIN_AUDIT_DIR)
 test/search/operation-expansion-contract.serial.test.ts	global-state	global-state: spyOn hybrid.hybridSearchCached, console.log
 test/search/output-redaction.serial.test.ts	R2	R2: mock.module(../../src/core/eval-capture.ts, ../../src/core/search/hybrid.ts, ../../src/core/ai/gateway.ts, ../../src/core/think/index.ts) replaces modules for every file in the process

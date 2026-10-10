@@ -127,7 +127,6 @@
   "test/doctor-remote.serial.test.ts": 0,
   "test/doctor-report-remote.serial.test.ts": 17,
   "test/doctor-revision-backfill-journey.serial.test.ts": 9,
-  "test/dream-drain-failure-summary.serial.test.ts": 1,
   "test/dream-owner-id-threading.serial.test.ts": 2,
   "test/dream-postgres.serial.test.ts": 3,
   "test/dream-publication-hold.serial.test.ts": 5,

@@ -569,7 +569,6 @@
   "serial:test/doctor-remote.serial.test.ts": 700,
   "serial:test/doctor-report-remote.serial.test.ts": 2875,
   "serial:test/doctor-revision-backfill-journey.serial.test.ts": 15535,
-  "serial:test/dream-drain-failure-summary.serial.test.ts": 1535,
   "serial:test/dream-owner-id-threading.serial.test.ts": 1310,
   "serial:test/dream-postgres.serial.test.ts": 2556,
   "serial:test/dream-synthesize-chunking.serial.test.ts": 9859,
