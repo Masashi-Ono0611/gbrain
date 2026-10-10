@@ -383,6 +383,20 @@ export interface PageFilters {
    * read none of those fields (list_pages).
    */
   listColumnsOnly?: boolean;
+  /**
+   * Apply the search-visible live-page predicates (current projection,
+   * unarchived source, and non-quarantined page) without a safe chunk gate.
+   * Used by trusted canonical-body reads matching search visibility without chunk readiness.
+   */
+  requireLiveVisibility?: boolean;
+  /**
+   * Restrict enumeration to the same live, current, safely indexed page set
+   * exposed by untrusted search. Intended for internal read paths that need
+   * canonical page bodies (for example think's temporal floor) rather than
+   * chunk hits. When true, deleted/quarantined pages, archived sources,
+   * stale text projections, and pre-safe-fence chunk versions are excluded.
+   */
+  requireSafeChunks?: boolean;
 }
 
 /** v0.26.5 — opts for getPage / softDeletePage / restorePage. */
@@ -393,6 +407,10 @@ export interface PageReadScope {
   excludePrivate?: boolean;
   /** Untrusted chunk reads require a verified protected-body index, even with visibility opt-outs. */
   requireSafeChunks?: boolean;
+  /** #5575 read floor (eligibility/policy.ts): only pages at or above this tier; a chunk's tier is its page's. */
+  minTrust?: import('./trust/tier.ts').TrustTier;
+  /** #5575 CEO-20, proactive reads only: hide unconfirmed agent-written pages with an instruction-family gate flag. */
+  suppressFlagged?: boolean;
 }
 
 export interface PageReadPolicy extends PageReadScope {
@@ -828,6 +846,11 @@ export interface SearchResult {
    * Absent when the page is clean.
    */
   content_flag?: { reason: string; detail: string };
+  /** #5575 A6: the page's trust tier and short write origin (eligibility/stamp.ts), stamped after ranking. */
+  trust_tier?: import('./trust/tier.ts').TrustTier;
+  origin?: string;
+  /** #5575 CEO-20: unconfirmed agent-written content with an instruction-family gate flag (explicit reads only). */
+  unconfirmed?: true;
   /**
    * 2026-09 fix wave (#3617 follow-up): true when this row came from the
    * keyword/title arm's AND→OR zero-strict-recall fallback rather than a
@@ -1176,6 +1199,10 @@ export interface SearchOpts extends PageReadPolicy {
   onVectorPoolMeta?: (m: VectorPoolMeta) => void;
   /** #5824 rollback: keep the freshness guard inside the HNSW candidate CTE. Latched by the caller (search/vector-legacy-guard.ts). */
   vectorLegacyGuard?: boolean;
+  /** #6132: pgvector `hnsw.iterative_scan` mode (default relaxed_order), latched by the caller (search/hnsw-iterative-scan.ts). */
+  hnswIterativeScan?: import('./search/hnsw-iterative-scan.ts').HnswIterativeScanMode;
+  /** #5989: bounded CJK keyword arm (deadline + meta sink); set by hybrid only (engine-sql/cjk-search.ts). */
+  cjkKeyword?: import('./engine-sql/cjk-search.ts').CjkKeywordRun;
   /**
    * v0.42 — intent-aware adaptive return-sizing. `true` enables with config/
    * default caps; an object overrides caps per-call; omitted/`false` = off
@@ -1661,6 +1688,8 @@ export interface TimelineInput {
 
 export interface TimelineOpts extends PageReadScope {
   limit?: number;
+  /** #5575 read eligibility (eligibility/sql.ts) for read ops. */
+  eligibility?: import('./eligibility/policy.ts').ReadEligibility;
   after?: string;
   before?: string;
   /**
@@ -1995,6 +2024,7 @@ export const DEGRADED_STAGES = [
   'keyword_relaxed_carried',
   'safe_index_pending',
   'vector_candidates_incomplete',
+  'keyword_candidates_incomplete',
   'projection_pending',
   'projection_status_unknown',
 ] as const;
@@ -2091,6 +2121,8 @@ export interface HybridSearchMeta {
    * yield). Omitted on clean runs. Exhaustion is VISIBLE, not silent.
    */
   vector_pool_underfilled?: Omit<VectorPoolMeta, 'underfilled'>;
+  /** #5989: the bounded CJK keyword arm's outcome and wall time (separate from total hybrid latency). */
+  keyword_candidates?: import('./engine-sql/cjk-search.ts').CjkKeywordMeta;
   /**
    * v0.42.3.0 — autocut decision (signal, cut point, kept/total, gapRatio).
    * Omitted when autocut didn't run (no reranker). Surfaced for

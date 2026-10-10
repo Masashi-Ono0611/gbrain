@@ -35,6 +35,7 @@ import { loadActivePack } from '../core/schema-pack/load-active.ts';
 import { loadActivePackForLocalEngine } from '../core/schema-pack/best-effort.ts';
 import { safeCliToken, sanitizeTypeForDisplay, storedTypeMissesPack, type TypeUsagePack } from '../core/schema-pack/type-usage.ts';
 import { parseLineGrammar } from '../core/line-grammar.ts';
+import { stripCodeBlocks } from '../core/markdown-code.ts';
 import { pathToSlug } from '../core/sync.ts';
 import { isManagedBrain } from '../core/cycle/phase-table.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../core/persistence/prepared-maintenance.ts';
@@ -175,9 +176,13 @@ export function lintContent(content: string, filePath: string, opts: LintContent
   }
 
   // Rule: line-grammar near-misses (a relation or fact line that will not be
-  // read as written). Read-only; the fix is in each message.
+  // read as written). Read-only; the fix is in each message. Syntax-only: a
+  // file check reads no brain settings or schema pack, so it never implies an
+  // edge will be stored; `gbrain get <slug> --grammar-diagnostics` is the
+  // effective check against the brain.
   for (const d of parseLineGrammar(content).diagnostics) {
-    issues.push({ file: filePath, line: d.line, rule: 'line-grammar', message: `${d.message} (${d.reason})`, fixable: false });
+    issues.push({ file: filePath, line: d.line, rule: 'line-grammar',
+      message: `${d.message} (${d.reason}; syntax-only check: run \`gbrain get <slug> --grammar-diagnostics\` for what the brain reads)`, fixable: false });
   }
 
   // Rule: LLM preamble artifacts (only a leading run; see findLeadingPreamble)
@@ -204,17 +209,13 @@ export function lintContent(content: string, filePath: string, opts: LintContent
     });
   }
 
-  // Rule: Placeholder dates. #3958: skip lines inside fenced code blocks —
-  // a page DOCUMENTING date formats (```\ncreated: YYYY-MM-DD\n```) is not a
-  // page with an unfilled placeholder. Both ``` and ~~~ fences toggle.
-  let inFence = false;
+  // Rule: Placeholder dates. #3958/#6133: code is not a placeholder — a page
+  // DOCUMENTING date formats (```\ncreated: YYYY-MM-DD\n``` or `YYYY-MM-DD`)
+  // is not a page with an unfilled one. stripCodeBlocks masks fenced blocks
+  // and inline spans in place, so line numbers stay exact.
+  const prose = stripCodeBlocks(content).split('\n');
   for (let i = 0; i < lines.length; i++) {
-    if (/^\s{0,3}(```|~~~)/.test(lines[i])) {
-      inFence = !inFence;
-      continue;
-    }
-    if (inFence) continue;
-    if (lines[i].match(/\bYYYY-MM-DD\b/) || lines[i].match(/\bXX-XX\b/) || lines[i].match(/\b\d{4}-XX-XX\b/)) {
+    if (prose[i].match(/\bYYYY-MM-DD\b/) || prose[i].match(/\bXX-XX\b/) || prose[i].match(/\b\d{4}-XX-XX\b/)) {
       issues.push({
         file: filePath, line: i + 1, rule: 'placeholder-date',
         message: `Placeholder date found: ${lines[i].trim().slice(0, 60)}`,
@@ -289,19 +290,24 @@ export function lintContent(content: string, filePath: string, opts: LintContent
     }
   }
 
-  // Rule: Empty/stub sections
+  // Rule: Empty/stub sections. #6257: headings and section boundaries are
+  // found in the code-masked text (a `## ` line inside a fence is not a
+  // section); the body and title are read from the original at the same
+  // offsets, so a section whose body is only a code block is not empty.
+  const masked = prose.join('\n');
   const sectionPattern = /^##\s+(.+)$/gm;
   let sectionMatch;
-  while ((sectionMatch = sectionPattern.exec(content)) !== null) {
+  while ((sectionMatch = sectionPattern.exec(masked)) !== null) {
     const sectionStart = sectionMatch.index + sectionMatch[0].length;
-    const nextSection = content.indexOf('\n## ', sectionStart);
+    const nextSection = masked.indexOf('\n## ', sectionStart);
     const sectionBody = content.slice(sectionStart, nextSection > 0 ? nextSection : undefined).trim();
 
     if (sectionBody === '' || sectionBody === '[No data yet]' || sectionBody === '*[To be filled by agent]*') {
       const lineNum = content.slice(0, sectionMatch.index).split('\n').length;
+      const title = content.slice(sectionStart - sectionMatch[1].length, sectionStart);
       issues.push({
         file: filePath, line: lineNum, rule: 'empty-section',
-        message: `Empty section: ## ${sectionMatch[1]}`,
+        message: `Empty section: ## ${title}`,
         fixable: false,
       });
     }
@@ -662,7 +668,7 @@ function writeLintFixOrRefusal(page: string, relPath: string, fixed: string): Li
     const errno = (e as NodeJS.ErrnoException | null)?.code;
     if (typeof errno !== 'string' || !UNWRITABLE_CODES.has(errno)) throw e;
     const envelope = toAgentError(opError('fix_not_writable', `fix not applied: ${relPath} is not writable (${errno}); the file was left unchanged.`,
-      'Make the file writable by the user running gbrain, or pass its directory or file name to `gbrain lint --exclude`, then lint again.', {
+      'Make the file writable by the user running gbrain, or pass its directory or file name to `gbrain lint --exclude` (for the cycle, add it to `cycle.lint_exclude` with `gbrain config set`), then lint again.', {
         why: 'Lint repairs files in place, and this file refused the write (its permissions or a read-only mount).',
         fix: { consent: [], actor: 'user', requires_exclusive: false, why: 'Only the file owner can change its permissions or mount.',
           user_message: `Make ${relPath} writable for gbrain, or exclude it from lint.` },

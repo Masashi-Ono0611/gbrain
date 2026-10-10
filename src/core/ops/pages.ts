@@ -1,6 +1,6 @@
-import { pageMutationSource, submitPageMutation } from '../persistence/page-mutations.ts';
+import { pageMutationSource, submitPageMutation, validateMutationSlug } from '../persistence/page-mutations.ts';
 import { suffixedSlugDryRun } from '../persistence/suffixed-slug.ts';
-import { PAGE_MUTATION_PARAMS, CAPTURE_EVENT_PARAMS, WRITE_WAIT_PARAM } from '../persistence/params.ts';
+import { AGENT_CONTENT_PARAMS, PAGE_MUTATION_PARAMS, CAPTURE_EVENT_PARAMS, WRITE_WAIT_PARAM } from '../persistence/params.ts';
 import { assertPurgeParams } from '../persistence/purge-params.ts';
 /**
  * Page CRUD operation cluster — pure move from operations.ts (v0.46.x
@@ -16,7 +16,9 @@ import type { Page } from '../types.ts';
 import { decodeDeepResearchId, deepResearchPageUrl } from '../deep-research-id.ts';
 import { PageSnapshotAmbiguousError, type PageSnapshot } from '../page-state/types.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
-import { projectGetPage } from './get-page-projection.ts';
+import { pageTrustForRead, projectFetchText, projectGetPage, readQuarantined } from './get-page-projection.ts';
+import { MIN_TRUST_PARAM } from '../eligibility/policy.ts';
+import { stampRowTrust } from '../eligibility/stamp.ts';
 import { isAutoLinkEnabled } from '../link-extraction.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import { getContentFlag } from '../quarantine.ts';
@@ -82,7 +84,7 @@ const get_page: Operation = {
   name: 'get_page',
   idempotent: true,
   outputRedaction: { exempt: 'explicit page read by slug/id; governed by page visibility, not output redaction (CEO-17 raw-read exception)' },
-  description: 'Read a page by slug (fuzzy optional; renamed slugs redirect). To edit, pass include_content:true and send `content` to put_page, or use edit_page. Timeline rows need include_timeline_entries.',
+  description: 'Read a page by slug. To edit, pass include_content:true and send `content` to put_page, or use edit_page.',
   params: {
     slug: { type: 'string', description: 'Page slug.', required: true },
     fuzzy: { type: 'boolean', description: 'Fuzzy slug match.' },
@@ -90,7 +92,10 @@ const get_page: Operation = {
     content_only: { type: 'boolean', description: 'Round-trip fields only.' },
     include_deleted: { type: 'boolean', description: 'Include soft-deleted pages.' },
     include_timeline_entries: { type: 'boolean', description: 'Also return timeline rows.' },
+    grammar_diagnostics: { type: 'boolean', description: 'Also return every line-grammar finding for the page.', fullSurfaceOnly: true },
     source_id: { type: 'string', description: "One source, or '__all__'." },
+    include_quarantined: { type: 'boolean', description: 'Admin: quarantined body.' },
+    min_trust: MIN_TRUST_PARAM,
   },
   handler: async (ctx, p) => {
     const slug = p.slug as string;
@@ -166,6 +171,8 @@ const get_page: Operation = {
       }
       throw pageNotFoundError(ctx, slug, { includeDeleted, sourceIdParam, elsewhereSource });
     }
+    const readable = await pageTrustForRead(ctx, page, p.min_trust); // #5575: below the read floor reads as missing
+    if (!readable) throw pageNotFoundError(ctx, slug, { includeDeleted, sourceIdParam });
 
     // v0.37.0 (D11): op-layer write-back for the `last_retrieved_at` stale
     // signal. Fire-and-forget — caller does NOT await. Internal callers
@@ -174,11 +181,8 @@ const get_page: Operation = {
     // inside bumpLastRetrievedAt (D2).
     bumpLastRetrievedAt(ctx.engine, [page.id]);
 
-    // #2200: resolve tags against the concrete page's source. `sourceOpts` may
-    // be { sourceIds:[...] } (federated) with no scalar sourceId, which getTags
-    // would otherwise fall back to 'default' for — the wrong source for a
-    // non-default page. We already hold the resolved page, so its source is
-    // unambiguous.
+    // #2200: tags come from the concrete page's source: federated `sourceOpts` has no
+    // scalar sourceId, and getTags would fall back to 'default' (the wrong source).
     const tags = snapshot!.tags;
     // Only explicitly trusted local reads retain protected body sections.
     // Holder grants and page-visibility opt-outs do not bypass this boundary.
@@ -204,12 +208,16 @@ const get_page: Operation = {
     // `content` roughly duplicates compiled_truth + timeline — always emitting
     // it would double every reader's payload for the round-trip minority.
     const timelineEntries = includeTimelineEntries
-      ? await ctx.engine.getTimeline(page.slug, await readPolicyOpts(ctx, { sourceId: page.source_id })) : undefined;
-    return projectGetPage(visibleBody, {
-      revision: snapshot!.revision, tags, includeContent, contentOnly: (p.content_only as boolean) === true, resolved_slug, content_flag,
+      ? await stampRowTrust(ctx.engine, 'timeline_entries', await ctx.engine.getTimeline(page.slug, { ...await readPolicyOpts(ctx, { sourceId: page.source_id }), eligibility: readable.eligibility }), e => e.id) : undefined;
+    // Read-only, over the same visibility-filtered body the reader gets.
+    const lineGrammar = p.grammar_diagnostics === true ? await (await import('../line-grammar-report.ts')).lineGrammarReport(ctx.engine, { slug: page.slug, sourceId: page.source_id, body: visibleBody.compiled_truth }) : undefined;
+    const quarantined = readQuarantined(ctx, page, p.include_quarantined === true); // #6259
+    const projected = projectGetPage(visibleBody, {
+      revision: snapshot!.revision, tags, includeContent, contentOnly: (p.content_only as boolean) === true, resolved_slug, content_flag, quarantined, trust: readable.trust,
       ...(timelineEntries ? { timeline_entries: timelineEntries } : {}),
       ...(held ? { file_held: fileHeldField(held, isUntrustedReader) } : {}),
     });
+    return lineGrammar ? { ...projected, line_grammar: lineGrammar } : projected;
   },
   scope: 'read', mutating: false,
   cliHints: { name: 'get', positional: ['slug'] },
@@ -222,6 +230,8 @@ const fetch_page: Operation = {
   description: "Fetch the full text of one search result by its opaque, source-qualified `id` (OpenAI deep-research contract: the search/fetch pair). Pass the id unchanged; it does not grant access. Legacy slug ids work only when unambiguous within your current read scope. Returns { id, title, text, url, metadata } — `text` is the page's canonical markdown. For fuzzy slugs, soft-delete recovery, or lossless edit round-trips, use get_page.",
   params: {
     id: { type: 'string', required: true, description: 'Opaque result id from a prior `search` call. Pass unchanged. Unambiguous legacy slugs are also accepted.' },
+    include_quarantined: { type: 'boolean', description: 'Admin: quarantined body.' },
+    min_trust: MIN_TRUST_PARAM,
   },
   handler: async (ctx, p) => {
     const id = p.id as string;
@@ -260,17 +270,17 @@ const fetch_page: Operation = {
     }
     const page = snapshot?.page;
     if (!page || (excludePrivate && isPrivatePage(page))) throw missing();
+    const readable = await pageTrustForRead(ctx, page, p.min_trust); // #5575: below the read floor reads as missing
+    if (!readable) throw missing();
     bumpLastRetrievedAt(ctx.engine, [page.id]);
     const tags = snapshot!.tags;
-    // Same privacy boundary as get_page: untrusted readers (ctx.remote ===
-    // true — every MCP transport) never see takes or private facts fences.
-    const visibleBody = ctx.remote === false
-      ? page
-      : stripPrivacyFencesForRemoteReader(page);
+    // Same boundaries as get_page: untrusted readers never see takes or private facts fences, nor a quarantined body (#6259).
+    const visibleBody = ctx.remote === false ? page : stripPrivacyFencesForRemoteReader(page);
+    const quarantined = readQuarantined(ctx, page, p.include_quarantined === true);
     return {
       id: identity ? id : page.slug,
       title: page.title,
-      text: serializePageToMarkdown(visibleBody as Page, tags),
+      text: projectFetchText(visibleBody as Page, tags, quarantined, readable.trust),
       // Pages have no public http home; a stable brain-local URI satisfies
       // the contract's citation slot without inventing a fake web URL.
       url: deepResearchPageUrl(page.source_id, page.slug),
@@ -279,7 +289,7 @@ const fetch_page: Operation = {
         type: page.type,
         source_id: page.source_id,
         updated_at: page.updated_at,
-        tags,
+        tags, ...(quarantined ? { quarantined } : {}), ...readable.trust,
       },
     };
   },
@@ -291,12 +301,13 @@ const put_page: Operation = {
   name: 'put_page',
   idempotent: true,
   outputRedaction: 'no_stored_text',
-  description: 'Replace a complete Markdown page: content REPLACES the whole page. Read get_page include_content:true; pass its revision as expected_revision (omit to create). Keep a request_id UUID; retry with identical arguments. Remote callers: [[links]] to existing pages become mentions; typed links are skipped (a stdio `gbrain serve` sweeps them later, `gbrain serve --http` does not self-sweep). Small changes: edit_page. Over 3 pages: put_pages.',
+  description: 'Complete content REPLACES the whole page: read get_page include_content:true; send its revision as expected_revision. Keep a request_id UUID; retry with identical arguments. Remote callers: existing-page [[links]] become mentions; typed links are skipped (stdio `gbrain serve` sweeps them later, `gbrain serve --http` does not self-sweep). Edits: edit_page; >3 pages: put_pages.',
   params: {
-    ...PAGE_MUTATION_PARAMS,
+    ...AGENT_CONTENT_PARAMS,
     slug: { type: 'string', description: 'Page slug.', required: true },
-    content: { type: 'string', required: true, description: 'Complete markdown with frontmatter; read get_page include_content:true first.' },
-    allow_empty: { type: 'boolean', required: false, description: 'Allow emptying a non-empty page.' },
+    content: { type: 'string', required: true, description: 'Complete markdown (get_page include_content:true).' },
+    allow_empty: { type: 'boolean', required: false, description: 'Allow emptying the page.' },
+    drop_timeline: { type: 'boolean', required: false, description: 'No Timeline in content: delete its entries.' },
     wait_ms: WRITE_WAIT_PARAM,
     // v0.39.3.0 provenance write-through (WARN-8 + A1 + CV6). Optional fields
     // for trusted local callers (capture CLI, autopilot, dream cycle). Remote
@@ -382,17 +393,17 @@ const delete_page: Operation = {
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
-    pageMutationSource(ctx, p, 'delete_page');
+    const sourceId = pageMutationSource(ctx, p, 'delete_page');
     assertPurgeParams(p, ctx.remote);
     if (ctx.dryRun) {
       if (typeof p.slug === 'string') {
-        validatePageSlug(p.slug);
+        await validateMutationSlug(ctx, 'delete_page', p.slug, sourceId);
         enforceClientSlugFence(ctx, p.slug, 'delete_page');
         enforceSubagentSlugFence(ctx, p.slug, 'delete_page');
       }
       return { dry_run: true, action: p.purge === true ? 'purge_page' : 'delete_page', slug: p.slug };
     }
-    return submitPageMutation(ctx, { operation: 'delete_page', params: p });
+    return (await import('../persistence/page-purge.ts')).finishPagePurge(ctx, await submitPageMutation(ctx, { operation: 'delete_page', params: p }));
   },
   cliHints: { name: 'delete', positional: ['slug'] },
 };
@@ -410,10 +421,10 @@ const restore_page: Operation = {
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
-    pageMutationSource(ctx, p, 'restore_page');
+    const sourceId = pageMutationSource(ctx, p, 'restore_page');
     if (ctx.dryRun) {
       if (typeof p.slug === 'string') {
-        validatePageSlug(p.slug);
+        await validateMutationSlug(ctx, 'restore_page', p.slug, sourceId);
         enforceClientSlugFence(ctx, p.slug, 'restore_page');
         enforceSubagentSlugFence(ctx, p.slug, 'restore_page');
       }
@@ -428,20 +439,21 @@ const purge_deleted_pages: Operation = {
   name: 'purge_deleted_pages',
   idempotent: false,
   outputRedaction: 'no_stored_text',
-  description: 'Admin-only. Hard-deletes pages whose deleted_at is older than older_than_hours (default 72). Cascades through content_chunks, page_links, chunk_relations. Local CLI only (not exposed over HTTP MCP). Manual escape hatch alongside the autopilot purge phase.',
+  description: 'Admin-only. Hard-deletes pages whose deleted_at is older than older_than_hours (default 72), in every source. Cascades through content_chunks, page_links, chunk_relations. Trusted local CLI only; the command is `gbrain pages purge-deleted`, which asks first (yes: true is the consent). Manual escape hatch alongside the autopilot purge phase.',
   params: {
     older_than_hours: { type: 'number', description: 'Age cutoff in hours. Default 72.' },
+    yes: { type: 'boolean', description: 'Consent to the irreversible brain-wide purge. Ask the user first.' },
   },
   mutating: true,
   scope: 'admin',
-  localOnly: true,
+  localOnly: true, cliOnly: { argv: ['gbrain', 'pages', 'purge-deleted', '--dry-run', '--json'] },
   handler: async (ctx, p) => {
     const olderThanHours = (p.older_than_hours as number | undefined) ?? 72;
     if (ctx.dryRun) return { dry_run: true, action: 'purge_deleted_pages', older_than_hours: olderThanHours };
-    const result = await (await import('../persistence/purge-deleted.ts')).purgeDeletedPagesCoordinated(ctx.engine, olderThanHours);
-    return { status: result.failed ? 'partial' : 'purged', count: result.count, slugs: result.slugs, ...(result.blocked.length ? { blocked: result.blocked } : {}) };
+    if (ctx.remote !== false) throw (await import('./callable.ts')).cliOnlyRefusal(purge_deleted_pages);
+    return (await import('../persistence/purge-deleted.ts')).consentedPurgeDeletedPages(ctx.engine, olderThanHours, p.yes === true);
   },
-  cliHints: { name: 'purge-deleted' },
+  cliHints: { name: 'purge-deleted', hidden: true },
 };
 
 const LIST_PAGES_SORT_VALUES = ['updated_desc', 'updated_asc', 'created_desc', 'slug'] as const;
@@ -635,7 +647,7 @@ const capture: Operation = {
   outputRedaction: 'no_stored_text',
   description: CAPTURE_DESCRIPTION,
   params: {
-    ...PAGE_MUTATION_PARAMS,
+    ...AGENT_CONTENT_PARAMS,
     ...CAPTURE_EVENT_PARAMS,
     content: { type: 'string', required: true, description: 'Markdown or text (not a file path).' },
     local_file: { type: 'string', description: 'Local CLI only.', required: false },

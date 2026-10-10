@@ -284,6 +284,20 @@ makes it report-only on any brain (`details.lint_fix: false`, phase `warn`
 while issues remain); `gbrain config set cycle.lint_fix true` turns repairs
 back on. An explicit `gbrain lint <dir> --fix` is not affected.
 
+**Skip files the cycle should not lint:** `cycle.lint_exclude` (string, default
+unset = exclude nothing) is a comma-separated list of directory or file
+basenames that the cycle's lint phase and the `lint`/`lint-fix` minion jobs
+skip, matched like `gbrain lint --exclude`: whitespace is trimmed, blank entries
+are dropped, and each entry is the last part of a path (no slash).
+
+```bash
+gbrain config set cycle.lint_exclude attachments,drafts.md
+gbrain config unset cycle.lint_exclude   # lint everything again
+```
+
+The phase reports the list in `details.excluded`. `config set` refuses an entry
+with a slash (`invalid_params`), because a basename match would never apply it.
+
 ### Roll back safely
 
 Stop submitting new reconciliation requests first. Keep a compatible upgraded
@@ -523,13 +537,16 @@ require connecting a second process to an already-owned PGLite store.
 this source. Preserve my edits and the withdrawal, and ask before explicit
 recovery if the original processing options are unknown."*
 
+<a id="facts-backstop"></a>
 Before and after managed activation, eligible `put_page` and `capture` writes
 record durable facts-extraction intent. `facts_backstop.queued` means that
 intent committed with the page; the `facts-backstop` effect becomes
 `dispatched` when its durable worker job is accepted. Extraction availability
 is checked by that worker. The handoff is idempotent and rechecks the source,
 page revision and current writer grant. Confined writers, unchanged pages,
-disabled extraction and dream-generated content do not enqueue work.
+disabled extraction, dream-generated content and pages whose frontmatter sets
+`facts_backstop: false` (`skipped: "opted_out"`, #6232) do not enqueue work.
+Removing that line queues extraction again, even with an unchanged body.
 Extraction reads only `compiled_truth`, so a write that leaves it unchanged on
 a live page that was already eligible records
 `facts_backstop: { skipped: "body_unchanged" }` and queues nothing. Title,

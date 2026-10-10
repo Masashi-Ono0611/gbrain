@@ -978,6 +978,39 @@ describe('v0.32.4 — sync_freshness check', () => {
     // must include the id so the CLI command actually works.
     expect(result.message).toContain(`'wiki-id'`);
   });
+
+  // #4399: config.syncEnabled=false is already honored by performSync's
+  // choke point and the autopilot freshness dispatcher (#4952) — this
+  // check must not report a deliberately-excluded source as stale either.
+  test('config.syncEnabled=false source excluded even when never synced', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'frozen', name: '', local_path: '/tmp/frozen', last_sync_at: null, config: { syncEnabled: false } },
+    ]));
+    expect(result.status).toBe('ok');
+    expect(result.message).toBe('No federated sources to sync');
+  });
+
+  test('mixed: syncEnabled=false source excluded, stale enabled source still fails', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'frozen', name: '', local_path: '/tmp/frozen', last_sync_at: null, config: { syncEnabled: false } },
+      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: agoMs(5 * 24 * 60 * 60 * 1000), config: {} },
+    ]));
+    expect(result.status).toBe('fail');
+    expect(result.message).not.toContain(`'frozen'`);
+    expect(result.message).toContain(`'wiki'`);
+    expect(result.message).toMatch(/5d ago/);
+  });
+
+  test('config.syncEnabled=true (or absent) source is unaffected', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: null, config: { syncEnabled: true } },
+    ]));
+    expect(result.status).toBe('fail');
+    expect(result.message).toContain(`'wiki'`);
+  });
 });
 
 // ============================================================================
@@ -1008,8 +1041,8 @@ describe('v0.41.27.0 — sync_freshness git short-circuit', () => {
   beforeEach(async () => {
     const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
       await import('../src/core/git-head.ts');
-    const { CHUNKER_VERSION } = await import('../src/core/chunkers/code.ts');
-    currentChunkerVersion = String(CHUNKER_VERSION);
+    const { chunkerStamp } = await import('../src/core/chunkers/code.ts');
+    currentChunkerVersion = chunkerStamp();
     _setGitHeadProbeForTests(null);
     _setGitCleanProbeForTests(null);
   });
@@ -1260,8 +1293,8 @@ describe('v0.41.32.0 — commit-relative staleness', () => {
   beforeEach(async () => {
     const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
       await import('../src/core/git-head.ts');
-    const { CHUNKER_VERSION } = await import('../src/core/chunkers/code.ts');
-    currentChunkerVersion = String(CHUNKER_VERSION);
+    const { chunkerStamp } = await import('../src/core/chunkers/code.ts');
+    currentChunkerVersion = chunkerStamp();
     _setGitHeadProbeForTests(null);
     _setGitCleanProbeForTests(null);
   });
@@ -1931,8 +1964,8 @@ describe('sync_freshness — clone-unavailable content-lag fallback', () => {
   beforeEach(async () => {
     const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
       await import('../src/core/git-head.ts');
-    const { CHUNKER_VERSION } = await import('../src/core/chunkers/code.ts');
-    currentChunkerVersion = String(CHUNKER_VERSION);
+    const { chunkerStamp } = await import('../src/core/chunkers/code.ts');
+    currentChunkerVersion = chunkerStamp();
     _setGitHeadProbeForTests(null);
     _setGitCleanProbeForTests(null);
   });

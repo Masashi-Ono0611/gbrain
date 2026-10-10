@@ -35,6 +35,23 @@ async function writer(engine: BrainEngine) {
   };
 }
 
+// topologyTransaction takes publication capacity without waiting and throws the retryable
+// writer_pool_capacity when the concurrent writes hold every slot. Under the same contention its
+// 1 s lock_timeout can expire behind the core writes' brain-row share locks, which it reports as
+// the retryable write_pending ("Retry the same lifecycle request_id"). A caller retries both with
+// the same request_id; a deadlock or any other error still fails the test.
+async function retryTopology<T>(run: (requestId: string) => Promise<T>): Promise<T> {
+  const requestId = randomUUID();
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await run(requestId);
+    } catch (error) {
+      if (!['writer_pool_capacity', 'write_pending'].includes((error as { code?: string }).code ?? '') || attempt >= 40) throw error;
+      await new Promise(r => setTimeout(r, 50 * Math.min(attempt, 10)));
+    }
+  }
+}
+
 describeE2E('core memory ordered source lock (Postgres)', () => {
   test('core writes in two sources, non-core writes in default and a topology change interleave without deadlock', () => managedBrain(async ({ engine, root }) => {
     const alphaPath = join(root, '..', 'alpha'); mkdirSync(alphaPath);
@@ -48,8 +65,8 @@ describeE2E('core memory ordered source lock (Postgres)', () => {
     }
     const probe = join(root, '..', 'probe'); mkdirSync(probe);
     const topology = (async () => {
-      await runManagedSourceLifecycle(engine, { operation: 'add', sourceId: 'probe', path: probe });
-      return runManagedSourceLifecycle(engine, { operation: 'remove', sourceId: 'probe', confirmDestructive: true });
+      await retryTopology(requestId => runManagedSourceLifecycle(engine, { operation: 'add', sourceId: 'probe', path: probe, requestId }));
+      return retryTopology(requestId => runManagedSourceLifecycle(engine, { operation: 'remove', sourceId: 'probe', confirmDestructive: true, requestId }));
     })();
     const results = await Promise.all(writes);
     await topology;

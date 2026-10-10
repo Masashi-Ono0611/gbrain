@@ -131,6 +131,7 @@
         "./commands/pricing.ts"
       ],
       "quarantine": [
+        "./commands/trust.ts",
         "./commands/quarantine.ts"
       ],
       "recall": [
@@ -145,7 +146,9 @@
         "./core/sync-concurrency.ts",
         "./commands/reindex-vectors.ts",
         "./commands/reindex-aliases.ts",
-        "./commands/reindex.ts"
+        "./commands/reindex.ts",
+        "./core/consent.ts",
+        "./core/ops/contract.ts"
       ],
       "reindex-code": [
         "./commands/reindex-code.ts"
@@ -197,6 +200,12 @@
       ],
       "transcripts": [
         "./commands/transcripts.ts"
+      ],
+      "trust": [
+        "./commands/trust-claim.ts",
+        "./core/eligibility/explain.ts",
+        "./core/eligibility/scan.ts",
+        "./core/trust/backfill.ts"
       ],
       "waiting": [
         "./commands/loops.ts"

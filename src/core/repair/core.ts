@@ -25,7 +25,7 @@ import { lookupEmbeddingPrice, estimateCostFromChars } from '../embedding-pricin
 import { shellQuote, type Action } from '../agent-output.ts';
 import type { RepairKindSpec } from './registry.ts';
 
-export const REPAIR_KINDS = ['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'google-file-modes', 'stale-atoms', 'extractor-facts', 'captured-facts', 'loop-facts', 'orphan-children', 'failed-writes', 'frontmatter', 'fences'] as const;
+export const REPAIR_KINDS = ['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'google-file-modes', 'stale-atoms', 'extractor-facts', 'conversation-labels', 'captured-facts', 'loop-facts', 'ontology-facts', 'orphan-children', 'failed-writes', 'frontmatter', 'fences', 'slug-conflicts', 'timeline-comments'] as const;
 export type RepairKind = typeof REPAIR_KINDS[number];
 
 export interface RepairScope { brain_id: string; source_ids: string[] }
@@ -74,7 +74,9 @@ export interface RepairListing { item: string; class: string; detail?: string }
  * the run's paid-model allowance (it only lowers the kind's own cap). `deadline` (epoch ms) bounds a discovery scan.
  */
 export interface RepairPlanOptions { apply: boolean; expect?: string; includeAmbiguous?: boolean; only?: string[]; skip?: string[]; slugs?: string[];
-  noLlm?: boolean; maxLlmUsd?: number; deadline?: number }
+  noLlm?: boolean; maxLlmUsd?: number; deadline?: number;
+  /** `ctx.remote !== false` of the run: a remote caller's plan never names a local path (unset reads as remote). */
+  remote?: boolean }
 
 export interface RepairHandler {
   kind: RepairKind;
@@ -142,9 +144,11 @@ export interface RepairResult {
   scan?: { fresh_at: string | null; partial: boolean };
   /** Preview-bound kinds' dry run: every item the preview hash covers. */
   listing?: RepairListing[];
+  /** Preview-bound kinds' dry run: the hash `--apply --expect` binds to (the one `apply_command` carries). */
+  preview_hash?: string;
   /** Per-outcome counts and the first items, for kinds that name outcomes. */
   outcomes?: Record<string, number>;
-  outcome_items?: Array<{ item: string; outcome: string; reason?: string; detail?: Record<string, unknown> }>;
+  outcome_items?: Array<{ item: string; outcome: string; reason?: string; detail?: Record<string, unknown>; llm_usd?: number }>;
   /** Kind-specific preview detail (see RepairPlan.details). */
   details?: Record<string, unknown>;
 }
@@ -251,7 +255,7 @@ export async function runRepair(ctx: OperationContext, handler: RepairHandler, s
   const now = opts.now ?? Date.now;
   const planOpts: RepairPlanOptions = { apply: opts.apply, expect: opts.expect, includeAmbiguous: opts.includeAmbiguous, only: opts.only, skip: opts.skip,
     ...(opts.slugs?.length ? { slugs: opts.slugs } : {}), ...(opts.noLlm ? { noLlm: true } : {}), ...(opts.maxLlmUsd !== undefined ? { maxLlmUsd: opts.maxLlmUsd } : {}),
-    ...(opts.deadline !== undefined ? { deadline: opts.deadline } : {}) };
+    ...(opts.deadline !== undefined ? { deadline: opts.deadline } : {}), remote: ctx.remote !== false };
   const plan = await handler.plan(ctx.engine, scope, resumed, planOpts);
   const pending = opts.limit !== undefined ? plan.items.slice(0, opts.limit) : plan.items;
   const counters = await capacity(ctx);
@@ -284,6 +288,7 @@ export async function runRepair(ctx: OperationContext, handler: RepairHandler, s
   };
   if (!opts.apply) {
     if (plan.listing) result.listing = plan.listing;
+    if (plan.preview_hash) result.preview_hash = plan.preview_hash;
     if (plan.details) result.details = plan.details;
     result.complete = pending.length === plan.items.length;
     return finish();
@@ -326,7 +331,7 @@ export async function runRepair(ctx: OperationContext, handler: RepairHandler, s
         result.outcomes = { ...result.outcomes, [applied.outcome]: (result.outcomes?.[applied.outcome] ?? 0) + 1 };
         if ((result.outcome_items ??= []).length < (handler.outcomeItemsLimit ?? SAMPLE * 2)) {
           result.outcome_items.push({ item: `${item.source_id}:${item.slug}`, outcome: applied.outcome, ...(applied.reason ? { reason: applied.reason } : {}),
-            ...(applied.detail ? { detail: applied.detail } : {}) });
+            ...(applied.detail ? { detail: applied.detail } : {}), ...(applied.llm_usd ? { llm_usd: applied.llm_usd } : {}) });
         }
       }
       if (typeof applied === 'object' ? applied.applied : applied) result.applied++;

@@ -32,8 +32,10 @@
 import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { loadConfig } from '../config.ts';
+import { currentCliWriteWait } from '../persistence/write-wait.ts';
 import { REPAIR_KINDS, runRepair, type RepairHandler, type RepairKind, type RepairResult, type RepairScope } from './core.ts';
 import { timelineRepair } from './timeline.ts';
+import { timelineCommentsRepair } from './timeline-comments.ts';
 import { visibilityRepair } from './visibility.ts';
 import { safeChunksRepair } from './safe-chunks.ts';
 import { contextualModeRepair } from './contextual-mode.ts';
@@ -46,14 +48,17 @@ import { embeddingEffectsRepair } from './embedding-effects.ts';
 import { googleFileModesRepair } from './google-file-modes.ts';
 import { staleAtomsRepair } from './stale-atoms.ts';
 import { extractorFactsRepair } from './extractor-facts.ts';
+import { conversationLabelsRepair } from './conversation-labels.ts';
 import { capturedFactsRepair } from './captured-facts.ts';
 import { loopFactsRepair } from './loop-facts.ts';
+import { ontologyFactsRepair } from './ontology-facts.ts';
 import { orphanChildrenRepair } from './orphan-children.ts';
 import { failedWritesRepair } from './failed-writes.ts';
 import { frontmatterRepair } from './frontmatter.ts';
 import { attributionBackfillRepair } from './attribution-backfill.ts';
 import { plannerStatsRepair } from './planner-stats.ts';
 import { fencesRepair } from './fences.ts';
+import { slugConflictsRepair } from './slug-conflicts.ts';
 import { ERROR_CATALOGUE, catalogueError } from '../error-catalogue.ts';
 import type { OperationError } from '../ops/contract.ts';
 
@@ -70,8 +75,10 @@ export interface RepairKindSpec {
   explicit_only?: true;
   /** The preview prints a hash and `--apply --expect <hash>` applies exactly that set (accepted with or without `explicit_only`). */
   preview_bound?: true;
-  /** `destructive`: the apply rewrites user files, so it also needs the user's consent (`--yes` with the preview hash, or a terminal prompt). */
+  /** `destructive`: the apply rewrites user files or retires stored rows, so it also needs the user's consent (`--yes` with the preview hash, or a terminal prompt). */
   consent?: 'destructive';
+  /** The consent payload's wording for a destructive kind: what the apply does and how to undo it (default: the frontmatter file rewrite). */
+  consentText?: { what: string; why: string; risk: string; user_message: string };
   /** `llm`: the kind may call a paid chat model; its spend is metered by the daily USD ledger and reported in `cost.llm_usd`. */
   spends?: 'llm';
 }
@@ -156,6 +163,21 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'without that evidence. Preview-bound: --apply --expect <hash> restores exactly the previewed set; a fact that changed since reports '
       + 'changed_since_preview and stays expired. Superseded, withdrawn and duplicated facts are never restored. Database-only; no page is rewritten.',
   },
+  'conversation-labels': {
+    handler: conversationLabelsRepair, embeds: 'none', checks: ['conversation_label_facts'], explicit_only: true, consent: 'destructive',
+    consentText: {
+      what: 'Retire the previewed label-misattributed conversation facts in the database',
+      why: 'The preview listed each fact; applying it expires exactly those rows (and the page completion markers they invalidate), with no model calls.',
+      risk: 'Database rows only: no page or file changes. Retired facts are expired, not deleted, and keep "retired: conversation-labels" in their context; '
+        + 'recall stops returning them. Re-extracting a page writes fresh facts (gbrain extract-conversation-facts --slugs <page> --dry-run, then with --max-cost-usd).',
+      user_message: 'Retire the previewed label-misattributed conversation facts? They stop appearing in recall; the rows are expired, not deleted, and nothing calls a model.',
+    },
+    summary: 'Retire conversation facts the pre-v0.60.69 parser attributed to meeting-note labels (**Date:**, **Attendees:**, …) instead of speakers. '
+      + 'Default set: facts whose context names a 1970-01-01 segment, which only that parser wrote; --include-ambiguous adds the other extractor facts of '
+      + 'label pages, listed fact by fact. Preview-bound and destructive: --apply --expect <hash> --yes expires exactly the previewed rows, expires the '
+      + 'page completion marker and writes the not-extractable outcome for prose or undated pages. No model calls; the other pages re-enter the '
+      + 'extraction backlog and the preview prints the capped re-extract commands. Withdrawn, superseded and referenced facts are kept.',
+  },
   'captured-facts': {
     handler: capturedFactsRepair, embeds: 'effect', checks: ['captured_facts_active'], explicit_only: true,
     summary: 'Expire facts the capture lanes (writeback, compact, corpus sweep) extracted before v0.60.30.0 from gbrain\'s own claude-cli sessions '
@@ -169,6 +191,13 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
     summary: 'Retire the commitment facts of loops closed before this release (#5869): expires each fact and strikes its fence row in one coordinated write, '
       + 'only when no open loop shares the fact. Preview-bound: --apply --expect <hash> retires exactly the previewed set; a loop or fact that changed since '
       + 'reports changed_since_preview and is kept. Never writes a withdrawal, so the same promise made again is stored normally.',
+  },
+  'ontology-facts': {
+    handler: ontologyFactsRepair, embeds: 'none', checks: ['ontology_facts_fenced'], explicit_only: true,
+    summary: 'Restore ontology observations that the extract_facts fence step (v0.60.53.0 until this release, #6264) moved onto an entity page\'s Facts '
+      + 'table: each gets its own provenance back, leaves the fence and, if a later page write retired it, becomes active again. Withdrawn, consolidated '
+      + 'and duplicated observations are never restored. Preview-bound: --apply --expect <hash> restores exactly the previewed set; a row that changed '
+      + 'since reports changed_since_preview. Database-only; no page is rewritten.',
   },
   'orphan-children': {
     handler: orphanChildrenRepair, embeds: 'none', checks: ['child_table_orphans'], explicit_only: true,
@@ -192,6 +221,11 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'select files. Preview-bound: --apply --expect <hash> --yes writes exactly the previewed bytes, imports them and clears the hold (managed '
       + 'sources commit through the Git effect; legacy sources back up first and print the commit step). Files no rule fixes are listed with the exact manual fix.',
   },
+  'timeline-comments': {
+    handler: timelineCommentsRepair, embeds: 'effect', checks: [], explicit_only: true,
+    summary: 'Clean timeline rows filed from adjacent HTML comments (#6184): drop the materialized bullets that copied a section END marker into the page, '
+      + 'delete rows that are only comment markup, and strip the markup from the rest. Each page whose bullets change is re-embedded by its publication.',
+  },
   fences: {
     handler: fencesRepair, embeds: 'effect', checks: ['fence_integrity'], preview_bound: true, spends: 'llm',
     summary: 'Repair malformed facts and takes fences (#6188) that sync held or that pages store: per file or page the free tiers first (the lossless '
@@ -200,6 +234,16 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + '(a)-(g) and is a Tier 1 fixed point, or it is not written. Managed sources commit through the Git effect, legacy sources back up and print '
       + 'the commit step, database-only pages take a revision-bound write. --only/--skip <path> and --slug <slug> select; --no-llm keeps to the free '
       + 'tiers; --max-usd <n> lowers the model cap for this run. Preview-bound: --apply --expect <hash> applies exactly the previewed set.',
+  },
+  'slug-conflicts': {
+    handler: slugConflictsRepair, embeds: 'effect', checks: [], preview_bound: true, spends: 'llm',
+    summary: 'Clear frontmatter_slug_conflict sync holds (#6377): a file whose frontmatter slug: names another page. A stray slug (no such page and no such '
+      + 'file, or a page of another type with no title word in common) loses the slug: line deterministically; anything else is judged by the content-repair '
+      + 'model (models.content_repair, else models.fence_repair, else the measured list) under the fences.repair caps and the same daily ledger as fences: '
+      + 'remove_slug applies the one-line edit, merge_into and needs_human write nothing and record the recommendation on the hold for a person '
+      + '(gbrain sync status shows the paragraph). Managed sources commit through the Git effect with a gbrain-repair: trailer, legacy sources back up and '
+      + 'print the commit step. --only/--skip <path> select; --no-llm keeps to the deterministic tier; --max-usd <n> lowers the model cap for this run. '
+      + 'Preview-bound: --apply --expect <hash> applies exactly the previewed set. gbrain repair content runs fences, then this kind.',
   },
   'planner-stats': {
     handler: plannerStatsRepair, embeds: 'none', checks: ['planner_stats_stale'],
@@ -274,6 +318,10 @@ export function repairApplyCommand(kind: RepairKind, opts: { source?: string; no
  * `registry` replaces the registered kinds (tests register stub specs here).
  */
 export async function repairRunner(engine: BrainEngine, opts: { apply: boolean; noEmbed?: boolean; logger?: OperationContext['logger']; registry?: readonly RepairKindSpec[] }) {
+  // #6185: an apply waits for each publication like every other CLI write (`--wait`, GBRAIN_WRITE_WAIT_MS,
+  // persistence.write_wait_ms, else 30 s). Resolved before any kind runs, so a malformed value refuses before
+  // a checkpoint is written; a preview never publishes and never reads it.
+  const writeWaitMs = opts.apply ? currentCliWriteWait().waitMs : undefined;
   const config = loadConfig() ?? { engine: engine.kind };
   let embeddingModel: string | undefined;
   try { embeddingModel = config.embedding_disabled ? undefined : (await import('../ai/gateway.ts')).getEmbeddingModel(); } catch { embeddingModel = undefined; }
@@ -286,7 +334,7 @@ export async function repairRunner(engine: BrainEngine, opts: { apply: boolean; 
      */
     async run(kind: RepairKind, scope: RepairScope, run: { limit?: number; sourceFlag?: string; explicit?: boolean; expect?: string; includeAmbiguous?: boolean; only?: string[]; skip?: string[];
       slugs?: string[]; noLlm?: boolean; maxLlmUsd?: number; deadline?: number } = {}): Promise<RepairResult> {
-      const ctx = { engine, config, logger, dryRun: !opts.apply, remote: false, sourceId: scope.source_ids[0] } as OperationContext;
+      const ctx = { engine, config, logger, dryRun: !opts.apply, remote: false, sourceId: scope.source_ids[0], writeWaitMs } as OperationContext;
       const spec = repairSpec(kind, opts.registry);
       return runRepair(ctx, spec.handler, scope, { apply: opts.apply, limit: run.limit, embeddingModel, sourceFlag: run.sourceFlag, spec,
         embed: !opts.noEmbed && embeddingModel !== undefined, applyArgs: opts.noEmbed && spec.embeds === 'inline' ? ['--no-embed'] : [],

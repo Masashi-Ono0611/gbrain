@@ -39,6 +39,7 @@ import {
 import { backupCheckDisabled, backupNagGate, backupNoticeText, loadBackupStatus } from '../core/backup/status-file.ts';
 import { maybeRefreshBackupStatusInProcess } from '../core/backup/coverage.ts';
 import { operationScopesAllowed } from '../core/scope.ts';
+import { enforceReadTrustFloor } from '../core/eligibility/registry.ts';
 import { invalidateHotMemoryForEngine } from '../core/facts/meta-hook.ts';
 import { admittedPendingReceipt, type WriteReceipt } from '../core/persistence/types.ts';
 import { currentVerifiedLocalWriter, readLocalWriter, verifyLocalWriter, withVerifiedLocalRegistration } from '../core/persistence/identity.ts';
@@ -380,6 +381,8 @@ export function retrievalNoticeBlocks(result: unknown, retrieval: unknown): stri
     type_filter_notice?: unknown;
     other_names?: Array<{ name: string; alias: string; slug: string }>;
     saved_facts?: Array<{ fact: string; entity_slug: string | null; valid_from: string; source: string }>;
+    answer_id?: unknown;
+    feedback?: { rateable?: boolean; how_to_rate?: string };
   };
   const blocks: string[] = empty ? [empty] : [];
   if (typeof r.type_filter_notice === 'string') blocks.push(r.type_filter_notice);
@@ -394,12 +397,24 @@ export function retrievalNoticeBlocks(result: unknown, retrieval: unknown): stri
       '\n', SAVED_FACTS_NOTICE_MAX_CHARS);
     blocks.push(more ? `${text}\n(+${more} more; recall returns them)` : text);
   }
+  if (typeof r.answer_id === 'string' && r.feedback?.rateable === true) blocks.push(rateLine(r.answer_id, typeof r.feedback.how_to_rate === 'string'));
   return blocks;
+}
+
+/**
+ * #6192: the rateable answer's id on the model-visible channel (hosts that
+ * show only `content[]` never see `_meta`). Short on every rateable answer;
+ * the fuller wording on the answers where the `how_to_rate` cadence fires.
+ */
+function rateLine(answerId: string, coach: boolean): string {
+  const call = `rate_answer { answer_id: "${answerId}", rating: 1-5 }`;
+  return (coach ? `Rate this answer after you use it: ${call}. Ratings tune this brain's ranking.` : `Rate after use: ${call}`).slice(0, RATE_LINE_MAX_CHARS);
 }
 
 /** C4: character ceilings for the model-visible notice blocks (header included). */
 export const SAVED_FACTS_NOTICE_MAX_CHARS = 1_500;
 export const OTHER_NAMES_NOTICE_MAX_CHARS = 400;
+export const RATE_LINE_MAX_CHARS = 160;
 
 /**
  * Whole items after `head` while the block stays within `max` characters;
@@ -881,6 +896,8 @@ export async function dispatchToolCall(
     // run inside the handlers; this stops an unfenced write op from being
     // a silent hole. See CLIENT_FENCED_WRITE_OPS in operations.ts.
     enforceBoundClientOpAllowList(ctx.auth, op);
+    // #5575 CEO-18: a floored connection only reaches read ops that enforce its floor.
+    enforceReadTrustFloor(ctx.auth, op);
     const sharedStdio = ctx.transport === 'stdio' && !ctx.auth &&
       (op.requiredScopes?.length || ['list_skills', 'get_skill', 'get_skill_asset', 'list_brain_skillpack'].includes(name));
     let registration: Awaited<ReturnType<typeof readLocalWriter>> | undefined;

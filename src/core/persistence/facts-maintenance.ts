@@ -2,8 +2,10 @@ import { isConnectorSourceKind } from './connector-identity.ts';
 import type { BrainEngine, NewFact } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { FactsBackstopCtx } from '../facts/backstop.ts';
+import { factEventTime } from '../facts/event-time.ts';
 import { ENTITY_HINTS_CAP, type ExtractedFact, type FactEmbeddingSignature } from '../facts/extract.ts';
 import { readFactsEmbeddingDim } from '../embedding-dim-check.ts';
+import { currentEmbeddingSignature } from '../embedding.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { hostFix, opTransport, readFix } from '../ops/op-fix.ts';
@@ -27,6 +29,9 @@ import { maintenancePublishWaitMs } from './maintenance-wait.ts';
 import { digest, requireUuid, sha256 } from './digest.ts';
 import { isTerminal, type WriteAuthority, type WriteRequest } from './model.ts';
 import type { WriteReceipt } from './types.ts';
+import { assertAmbientCaptureAdmissible, captureGateLaneForSource } from '../facts/capture-sources.ts';
+import { declareDerivation, type DerivationDeclaration } from '../trust/taint.ts';
+import type { TaintInput, WriteTrust } from '../trust/tier.ts';
 
 export interface ManagedFactsResult {
   inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; write_requests: WriteReceipt[];
@@ -49,6 +54,10 @@ export interface ManagedFactIntent extends Record<string, unknown> {
    */
   attribute_fallback?: true;
   embedding?: FactEmbeddingSignature | null;
+  /** #6091: the ambient capture lane (`hook:*`, `sweep:*`) the facts came from; admission re-checks its gate. */
+  capture_source?: string;
+  /** #5575 I2: the extraction's taint, declared at prompt-build time (trust/taint.ts). */
+  derivation?: DerivationDeclaration;
 }
 export interface ManagedFactsSession {
   authority: WriteAuthority; binding: WorktreeBinding | null; config: GBrainConfig;
@@ -57,6 +66,9 @@ export interface ManagedFactsSession {
   embedding?: FactEmbeddingSignature | null;
   /** #6048: the batch is keyed by its input alone and the caller asked to re-admit facts the canonical file check refused. */
   fileRefusalRetry?: boolean;
+  /** #6091: set when the facts come from an ambient capture lane. */
+  captureSource?: string;
+  derivation?: DerivationDeclaration;
 }
 
 /** #6048: follow-up batches one input-keyed extraction may admit for file-check refusals. */
@@ -111,6 +123,16 @@ export async function resolveManagedFactsEmbedding(engine: BrainEngine, config: 
   const model = values.embedding_model;
   if (!model) return null;
   const dimensions = /^[1-9]\d*$/.test(values.embedding_dimensions ?? '') ? Number(values.embedding_dimensions) : null;
+  if (!/[:/]/.test(model) && /^[^\s]+$/.test(model) && dimensions) {
+    // #6113: a legacy row stores the model without its provider. Name the one supported rewrite (a preview first).
+    const signature = currentEmbeddingSignature();
+    const gateway = signature ? signature.slice(0, signature.lastIndexOf(':')) : null;
+    const target = gateway?.endsWith(`:${model}`) ? gateway : null;
+    throw opError('embedding_configuration', 'The selected brain records its embedding model without a provider, so facts cannot be embedded.',
+      `The brain's embedding_model row is ${JSON.stringify(model)} with no provider prefix (a row from an older install), so fact extraction stopped before admission; gbrain config set cannot change it. `
+      + `Preview the supported rewrite with gbrain migrate embeddings --to ${target ?? `<provider>:${model}`} --dry-run and show the user its cost: it re-embeds active facts, so applying it needs the user's paid authorization.`,
+      { fix: target ? readFix(`Previews rewriting the brain's embedding identity to ${target}, read-only.`, { argv: ['gbrain', 'migrate', 'embeddings', '--to', target, '--dry-run'] }) : embeddingsFix() });
+  }
   if (!/^[^\s:]+:[^\s]+$/.test(model) || !dimensions || !Number.isSafeInteger(dimensions)) {
     throw opError('embedding_configuration', 'The selected brain has no verifiable facts embedding model and dimensions.',
       `The brain's embedding_model (${JSON.stringify(model)}) is not provider:model or embedding_dimensions is not a positive integer, so fact extraction stopped before admission. Check embedding readiness; correcting the configuration is the user's decision.`,
@@ -136,7 +158,7 @@ export async function assertManagedFactsEmbedding(engine: BrainEngine, config: G
 }
 
 export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
-  input: { turnText: string; pageSlug?: string }): Promise<ManagedFactsSession | null> {
+  input: { turnText: string; pageSlug?: string }, derivation?: { trust: WriteTrust; inputs: readonly TaintInput[] }): Promise<ManagedFactsSession | null> {
   const engine = ctx.engine;
   if (!(await managedPersistenceEnabled(engine))) return null;
   assertPersistenceAccepting(engine);
@@ -236,7 +258,9 @@ export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
   const session: ManagedFactsSession = { authority, binding: writeThrough ? binding : null, config,
     batchKey, inputDigest, origin, originalRequestId: ctx.persistenceRequestId ?? null,
     completionRequestId: ctx.requestId ? requireUuid(ctx.requestId) : managedFactRequestId(batchKey, '__managed_facts_complete__'),
-    fileRefusalRetry: ctx.reAdmitFileRefusals === true && seed === inputDigest };
+    fileRefusalRetry: ctx.reAdmitFileRefusals === true && seed === inputDigest,
+    ...(captureGateLaneForSource(ctx.source) ? { captureSource: ctx.source } : {}),
+    ...(derivation ? { derivation: declareDerivation(derivation.trust, derivation.inputs) } : {}) };
   const prior = await getWriteRequest(engine, authority.principal, session.completionRequestId);
   if (prior) await validateManagedFactsCompletion(engine, session, prior);
   return session;
@@ -371,7 +395,7 @@ export async function publishManagedFacts(engine: BrainEngine, session: ManagedF
     // #5836: an inferred subject carries its provenance note into the fence cell and the row.
     group.push({ ...fact, entity_slug: attributed, visibility, context: fact.entity_inferred ? appendContextNote(context, inferenceNote(fact.entity_inferred)) : context,
       embedding: fact.embedding ? Array.from(fact.embedding) : null,
-      valid_from: (fact.valid_from ?? ctx.validFrom ?? new Date()).toISOString(), valid_until: fact.valid_until?.toISOString() ?? null });
+      valid_from: (factEventTime(fact, ctx) ?? new Date()).toISOString(), valid_until: fact.valid_until?.toISOString() ?? null });
     groups.set(slug, group);
   }
   const inputs: ManagedFactsEntityInput[] = [];
@@ -384,6 +408,8 @@ export async function publishManagedFacts(engine: BrainEngine, session: ManagedF
       inputDigest: session.inputDigest, origin: session.origin, originalRequestId: session.originalRequestId,
       embedding: session.embedding ?? null, ...(options.supersede ? { supersede: true as const } : {}),
       ...(options.attributeFallback ? { attribute_fallback: true as const } : {}),
+      ...(session.captureSource ? { capture_source: session.captureSource } : {}),
+      ...(session.derivation ? { derivation: session.derivation } : {}),
       ...(snapshot ? { expected_revision: snapshot.revision } : {}), facts: group } });
   }
   return collectManagedFacts(engine, session, await admitManagedFactsBatch(engine, session, inputs, embedded, ctx.abortSignal));
@@ -396,12 +422,14 @@ async function admitManagedFactsBatch(engine: BrainEngine, session: ManagedFacts
   embedded: boolean, signal?: AbortSignal): Promise<WriteRequest[]> {
   const sourceId = session.authority.sourceId;
   return engine.transaction(async tx => {
+    await assertAmbientCaptureAdmissible(tx, session.captureSource);
     if (embedded) await assertManagedFactsEmbedding(tx, session.config, session.embedding, true);
     const children: string[] = [];
     const accepted: WriteRequest[] = [];
     for (const input of [...inputs, { slug: '__managed_facts_complete__', pageId: null, intent: {
       kind: 'managed_facts_complete', batchKey: session.batchKey, inputDigest: session.inputDigest,
-      origin: session.origin, originalRequestId: session.originalRequestId, children } as ManagedFactIntent }]) {
+      origin: session.origin, originalRequestId: session.originalRequestId, children,
+      ...(session.captureSource ? { capture_source: session.captureSource } : {}) } as ManagedFactIntent }]) {
       if (signal?.aborted) throw new DOMException('Fact extraction was aborted before admission.', 'AbortError');
       await authorizePageVisibility(tx, session.authority, input.slug);
       const requestId = input.intent.kind === 'managed_facts_complete' ? session.completionRequestId : managedFactRequestId(session.batchKey, input.slug);

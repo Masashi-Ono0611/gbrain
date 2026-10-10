@@ -18,11 +18,39 @@ import { readSyncAnchor } from '../../core/sync-anchor.ts';
 import { recordUpstreamObservation } from '../../core/sync-upstream.ts';
 import { assertSyncApplicable } from '../../core/sync-applicability.ts';
 import { SyncLockBusyError, formatLockBusyMessage, buildPartialResult } from '../../core/sync-lock.ts';
+import { isSyncDisabledForSource, SyncDisabledError } from '../../core/sync-policy.ts';
+import { parseSourceConfig } from '../../core/sources-load.ts';
+import { OperationError } from '../../core/ops/contract.ts';
+import { getWorktreeBinding } from '../../core/persistence/ownership.ts';
+import { localHostId } from '../../core/persistence/identity.ts';
+import { DEFAULT_SOURCE_ID } from '../../core/sync.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
 import { runConnectorSync } from './connector.ts';
 import { performSyncInner } from './incremental.ts';
 
 export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
+  // Local patch 117: enforce even for explicit single-source calls and the
+  // implicit default source, before either lock path or managed dispatch.
+  const effectiveSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
+  if (await isSyncDisabledForSource(engine, effectiveSourceId)) {
+    // A detached managed file source has no owner even when restore disabled
+    // its sync. Preserve that stronger refusal before reporting the opt-out.
+    const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
+    if (brain?.enabled) {
+      const [source] = await engine.executeRaw<{ incarnation: string; archived: boolean; config: unknown }>(
+        'SELECT incarnation,archived,config FROM sources WHERE id=$1', [effectiveSourceId]);
+      const kind = source && parseSourceConfig(source.config).kind;
+      if (source && kind !== 'google' && kind !== 'github') {
+        const binding = await getWorktreeBinding(engine, effectiveSourceId);
+        if (source.archived || !binding || binding.source_incarnation !== source.incarnation ||
+            binding.owner_host_id !== localHostId() || binding.state !== 'active' || !binding.local_path) {
+          throw new OperationError('owner_unavailable', 'Sync must run on the active registered worktree owner.',
+            'Run this sync on the host that owns the source worktree. Check ownership with: gbrain sources writer status --json');
+        }
+      }
+    }
+    throw new SyncDisabledError(effectiveSourceId);
+  }
   assertSyncDispatchActive();
   const inheritedSignal = currentSourceFilesystemSignal();
   if (inheritedSignal) opts = { ...opts, signal: opts.signal ? AbortSignal.any([opts.signal, inheritedSignal]) : inheritedSignal };
@@ -31,7 +59,7 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
   const finish = async (result: SyncResult, refresh = false): Promise<SyncResult> => {
     assertSyncDispatchActive();
     if (refresh && (result.pagesAffected.length > 0 || result.deleted > 0)) {
-      await refreshProjectionStatistics(engine);
+      await refreshProjectionStatistics(engine, result.pagesAffected.length + result.deleted);
     }
     if (refresh && !opts.dryRun) await recordUpstreamObservation(engine, opts.sourceId ?? 'default', opts.repoPath);
     return result;

@@ -1,6 +1,6 @@
 {
   "_comment": "Curation record for the Codex + Claude Code plugin lanes (the committed plugin/ tree). Lane set = (openclaw.plugin.json#skills minus base_exclusions) plus additions. Every entry is a recorded publication decision with a reason — scripts/generate-plugin-tree.ts validates this file and test/codex-plugin-manifest.test.ts pins membership. The openclaw lane's own curation (openclaw.plugin.json + skills/plugin-exclusions.json) is untouched: a skill can be openclaw-excluded and plugin-lane-included because plugin users ARE the brain host (the downstream-vs-host inversion). starter_gaps is a generated snapshot (refresh: bun run scripts/generate-plugin-tree.ts --out plugin --write-gaps): per-skill gbrain MCP ops declared in frontmatter tools: that sit beyond the starter serve surface — every one has a first-class gbrain CLI path (see plugin/README.md), and a change here is a review-visible curation event, not silent drift.",
-  "starter_policy": "cli-primary: bundled skills drive gbrain through the CLI when an op is beyond the starter MCP surface; users can widen a machine with GBRAIN_SURFACE=full (launcher-honored).",
+  "starter_policy": "cli-primary: bundled skills drive gbrain through the CLI when an op is beyond the plugin MCP surface (REGISTRATION_SURFACE, full since S0); a machine narrowed with GBRAIN_SURFACE=starter|verbs (launcher-honored) keeps those CLI paths.",
   "additions": {
     "setup": "the plugin lane's own onboarding path (install + gbrain init + first import); swept 2026-08-15 — install command, privacy names, daemon-only prose, and repo-relative doc refs fixed for plugin consumers",
     "gbrain-upgrade": "binary upgrade path — plugin users own the gbrain install; swept clean (one daemon-convention mention generalized)",
@@ -12,7 +12,8 @@
     "skill-optimizer": "skillopt ships in the gbrain CLI; sweep added the read-only-snapshot note (optimize copies in your own skills dir)",
     "db-repair": "plugin users ARE the brain host — the GBRAIN_DB_ACCESS marker loop needs its repair skill installed by default or the availability feature defeats itself",
     "postgres-adopt": "plugin users ARE the brain host — engine detection + Postgres-first install/migration is a host-owner activity the harness lane ships by default",
-    "remote-mcp": "plugin users ARE the brain host — publishing the local serve over Tailscale and granting remote clients is a host-owner activity the harness lane ships by default"
+    "remote-mcp": "plugin users ARE the brain host — publishing the local serve over Tailscale and granting remote clients is a host-owner activity the harness lane ships by default",
+    "oss-loop": "Claude Code and Codex need the same upstream-target and Draft-until-Green contribution guard; ship the shared loop in both coding-agent plugin lanes"
   },
   "base_exclusions": {
     "testing": "gbrain-repo development skill — instructs running this repository's own test suite; meaningless-to-harmful in a plugin snapshot",
@@ -44,6 +45,7 @@
         "measure-before-you-fix": "measurement discipline before performance/bug fixes — engineering hygiene",
         "brain-ingest-gate": "gates what session content deserves brain ingestion — noise control",
         "data-loss-gate": "guards destructive operations touching brain data during coding work",
+        "oss-loop": "shared OSS contribution loop with canonical upstream-target and Draft-until-Green safeguards",
         "db-repair": "availability is the point: a coding session hitting GBRAIN_DB_ACCESS without the repair skill loses its brain mid-task",
         "mcp-access": "coding harnesses need native OAuth setup and explicit owner handoffs when hosted memory access or client administration fails",
         "postgres-adopt": "engine detection by default is requirement one; the concurrency-heavy coding persona is exactly who outgrows PGLite"
@@ -76,105 +78,5 @@
       }
     }
   },
-  "starter_gaps": {
-    "brain-ops": [
-      "add_link",
-      "sync_brain"
-    ],
-    "briefing": [
-      "get_timeline"
-    ],
-    "cold-start": [
-      "add_link",
-      "sync_brain"
-    ],
-    "daily-task-prep": [
-      "get_timeline"
-    ],
-    "data-research": [
-      "add_link",
-      "file_upload",
-      "put_raw_data"
-    ],
-    "eiirp": [
-      "add_link"
-    ],
-    "enrich": [
-      "add_link"
-    ],
-    "gbrain-advisor": [
-      "advisor"
-    ],
-    "google-loops": [
-      "loops_close",
-      "loops_mute",
-      "open_loops"
-    ],
-    "idea-ingest": [
-      "add_link",
-      "file_upload"
-    ],
-    "idea-lineage": [
-      "find_contradictions",
-      "find_trajectory",
-      "takes_search"
-    ],
-    "ingest": [
-      "add_link",
-      "sync_brain"
-    ],
-    "maintain": [
-      "add_link",
-      "get_health"
-    ],
-    "media-ingest": [
-      "add_link",
-      "file_upload"
-    ],
-    "meeting-ingestion": [
-      "add_link",
-      "chronicle_day",
-      "get_timeline"
-    ],
-    "migrate": [
-      "add_link",
-      "add_tag",
-      "sync_brain"
-    ],
-    "minion-orchestrator": [
-      "get_job",
-      "get_job_progress",
-      "list_jobs",
-      "pause_job",
-      "replay_job",
-      "resume_job",
-      "send_job_message",
-      "submit_job"
-    ],
-    "query": [
-      "get_timeline"
-    ],
-    "schema-author": [
-      "get_active_schema_pack",
-      "list_schema_packs",
-      "reload_schema_pack",
-      "schema_apply_mutations",
-      "schema_explain_type",
-      "schema_graph",
-      "schema_lint",
-      "schema_review_orphans",
-      "schema_stats"
-    ],
-    "schema-unify": [
-      "run_onboard"
-    ],
-    "setup": [
-      "get_health",
-      "get_stats",
-      "sync_brain"
-    ],
-    "signal-detector": [
-      "add_link"
-    ]
-  }
+  "starter_gaps": {}
 }

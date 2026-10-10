@@ -13,6 +13,7 @@ import { isFactsExtractionEnabled } from '../facts/extract.ts';
 import { loadConfig } from '../config.ts';
 import { resolveDefaultVisibility } from '../facts/visibility.ts';
 import { declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
+import { EXPIRED_PREPARING_CHARGE_SQL } from './claim-phase.ts';
 import { refreshFenceClear } from './worktree-refresh-schema.ts';
 import { pageBatchChildRequestIds } from './page-batch-id.ts';
 import { EFFECT_FAULT_POINTS, faultPoint } from './fault-points.ts';
@@ -42,7 +43,7 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
     const commit = prepared.file.commit;
     queue('git', { relative_path: relative(binding.local_path, prepared.file.path).split(sep).join('/'),
       expected_hash: prepared.file.content === null ? null : sha256(prepared.file.content),
-      ...(commit ? { commit_subject: commit.subject, commit_line: commit.line } : {}) });
+      ...(commit ? { commit_subject: commit.subject, commit_line: commit.line, ...(commit.trailer ? { commit_trailer: commit.trailer } : {}) } : {}) });
     if (outcome.persistence && typeof outcome.persistence === 'object') Object.assign(outcome.persistence, { git_state: 'queued' });
   }
   if (snapshot && !snapshot.page.deleted_at) {
@@ -185,14 +186,21 @@ export async function claimCoalescedGitEffects(engine: BrainEngine, hostId: stri
  * mirror left running would otherwise also hold back writes to its pages.
  * Claims with a recovery record stay with the recovery path.
  */
-export async function releaseAbandonedClaims(engine: BrainEngine, processStartedAt: Date): Promise<number> {
+/**
+ * `chargePreparing` (#6278, the `preparation_deadlines` switch): a request whose
+ * dead owner stamped the reclaimed claim `preparing` is charged one preparation
+ * attempt, the same rule as the Postgres expired-claim sweep (consumer.ts), so a
+ * kill loop reaches `persistence.max_preparation_attempts`.
+ */
+export async function releaseAbandonedClaims(engine: BrainEngine, processStartedAt: Date, chargePreparing = false): Promise<number> {
   if (engine.kind !== 'pglite') return 0;
   const effects = await engine.executeRaw(`UPDATE persistence_effects SET state='queued',execution_token=NULL,claim_expires_at=NULL,
     next_attempt_at=LEAST(next_attempt_at,now()) WHERE state='running' AND recovery IS NULL AND updated_at<$1::timestamptz
     AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [processStartedAt.toISOString()]);
-  const requests = await engine.executeRaw(`UPDATE persistence_requests SET state='queued',execution_token=NULL,claim_expires_at=NULL
+  const requests = await engine.executeRaw(`UPDATE persistence_requests r SET state='queued',execution_token=NULL,claim_expires_at=NULL,
+    preparation_attempts=preparation_attempts+CASE WHEN $2::boolean THEN ${EXPIRED_PREPARING_CHARGE_SQL('r')} ELSE 0 END
     WHERE state='running' AND recovery IS NULL AND publication_started=false AND updated_at<$1::timestamptz
-    AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [processStartedAt.toISOString()]);
+    AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [processStartedAt.toISOString(), chargePreparing]);
   return effects.length + requests.length;
 }
 

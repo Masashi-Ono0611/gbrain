@@ -2,7 +2,7 @@ import type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions } fro
 import type { GetVersionsOpts, PageVersionRows } from './page-state/version-types.ts';
 import type { LinkReadScope } from './link-validity.ts';
 import type { ChunkWindowRequest, ChunkWindowOpts, ChunkWindowPage } from './search/chunk-windows.ts';
-import type { DerivedLinkOrigin, DerivedLinkReplacementOptions } from './derived-links.ts';
+import type { DerivedLinkBatchItem, DerivedLinkOrigin, DerivedLinkReplacementOptions } from './derived-links.ts';
 export type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions, PageMutationPrecondition, PageWithdrawal } from './page-state/types.ts';
 import type {
   Page, PageInput, PageFilters, GetPageOpts, PageReadScope, PageReadPolicy,
@@ -317,6 +317,8 @@ export interface TakesListOpts extends PageReadPolicy {
    *  scalar, matching sourceScopeOpts. Omitted (local CLI) = no source filter. */
   sourceId?: string;
   sourceIds?: string[];
+  /** #5575 read eligibility (eligibility/sql.ts) for read ops; unset for internal writers and fence re-renders. */
+  eligibility?: import('./eligibility/policy.ts').ReadEligibility;
 }
 
 /** Search result row from searchTakes / searchTakesVector. */
@@ -481,7 +483,7 @@ export const DREAM_VERDICT_TTL_SECONDS = 30 * 86400;
 export interface DreamVerdictInput {
   worth_processing: boolean;
   reasons: string[];
-  score: number;
+  score: number | null; // NULL only on a triage backoff marker (cycle/triage-backoff.ts): a miss to every reader
   content_type: string | null;
   segments: TriageSegment[];
   entities: string[];
@@ -542,6 +544,9 @@ export interface FactRow {
   created_at_iso?: string;
   /** Who asserted the claim (migration v215); null when attribution is unavailable. */
   attributed_to?: FactAttribution | null;
+  /** #5575: the stored trust tier and write origin (absent on brains before the trust migration). */
+  trust_tier?: import('./trust/tier.ts').TrustTier;
+  write_origin?: Record<string, unknown> | null;
 }
 
 /**
@@ -652,6 +657,8 @@ export interface FactListOpts {
   excludeAuditRows?: boolean;
   /** #5888: listFactsSince/listFactsBySession also select `gbrain_fact_fingerprint(fact)` as `fact_fingerprint`. */
   fingerprint?: boolean;
+  /** #5575 read eligibility (eligibility/sql.ts): read floor, quarantined-page and needs_rederive hiding, proactive suppression. Unset for internal writers. */
+  eligibility?: import('./eligibility/policy.ts').ReadEligibility;
 }
 
 /** Per-source operational health snapshot consumed by `gbrain doctor`. */
@@ -1168,9 +1175,11 @@ export interface BrainEngine {
    * pre-registry brains. `embedding_image` routing is unaffected.
    * `sealChunkerVersion` (#5984): the caller deleted every chunk of the page
    * earlier in this transaction; the stale-row work is skipped and the page is
-   * sealed at that chunker version after the insert.
+   * sealed at that chunker version after the insert. With `pageId` (the
+   * caller's own write of that page in this transaction) the seal and the
+   * insert are sent together and the seal's page is checked against it.
    */
-  upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number } & BatchOpts): Promise<void>;
+  upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; pageId?: number } & BatchOpts): Promise<void>;
   /**
    * Read every chunk for a page. Scope precedence mirrors getPage (#2555):
    * a federated grant (`sourceIds[]`) wins over scalar `sourceId`; with
@@ -1411,6 +1420,8 @@ export interface BrainEngine {
    */
   addLinksBatch(links: LinkBatchInput[], opts?: BatchOpts): Promise<number>;
   replaceDerivedLinks(origin: DerivedLinkOrigin, links: LinkBatchInput[], opts?: DerivedLinkReplacementOptions): Promise<{ created: number; removed: number }>;
+  /** replaceDerivedLinks for many origins in one transaction; any failure rolls back every origin (derived-links.ts). */
+  replaceDerivedLinksBatch(items: readonly DerivedLinkBatchItem[]): Promise<Array<{ created: number; removed: number }>>;
   /**
    * Remove links from `from` to `to`. If linkType is provided, only that specific
    * (from, to, type) row is removed. If omitted, ALL link types between the pair
@@ -1874,7 +1885,7 @@ export interface BrainEngine {
    * Honors `takesHoldersAllowList` via WHERE filter so MCP-bound calls cannot
    * retrieve holders outside the token's allow-list.
    */
-  searchTakes(query: string, opts?: SearchOpts & { takesHoldersAllowList?: string[]; sourceId?: string; sourceIds?: string[] }): Promise<TakeHit[]>;
+  searchTakes(query: string, opts?: SearchOpts & { takesHoldersAllowList?: string[]; sourceId?: string; sourceIds?: string[]; eligibility?: import('./eligibility/policy.ts').ReadEligibility }): Promise<TakeHit[]>;
 
   /**
    * Vector search across active takes. Cosine distance against `embedding`.
@@ -1882,7 +1893,7 @@ export interface BrainEngine {
    */
   searchTakesVector(
     embedding: Float32Array,
-    opts?: SearchOpts & { takesHoldersAllowList?: string[]; sourceId?: string; sourceIds?: string[] },
+    opts?: SearchOpts & { takesHoldersAllowList?: string[]; sourceId?: string; sourceIds?: string[]; eligibility?: import('./eligibility/policy.ts').ReadEligibility },
   ): Promise<TakeHit[]>;
 
   /** Look up embeddings by take id (mirrors getEmbeddingsByChunkIds). */
@@ -2254,7 +2265,7 @@ export interface BrainEngine {
    */
   listSupersessions(
     source_id: string,
-    opts?: { since?: Date; limit?: number; visibility?: FactVisibility[] },
+    opts?: { since?: Date; limit?: number; visibility?: FactVisibility[]; eligibility?: FactListOpts['eligibility'] },
   ): Promise<FactRow[]>;
 
   /**
@@ -2434,6 +2445,8 @@ export interface BrainEngine {
     slug: string,
     sourceId: string,
     aliasNorms: string[],
+    /** #5984: `inline` writes in the caller's page transaction, without a savepoint. */
+    opts?: { inline?: boolean },
   ): Promise<void>;
 
   /**
@@ -2550,11 +2563,21 @@ export interface BrainEngine {
    * by then get cancelled (Postgres: query.cancel(); PGLite: in-process,
    * Promise.race against signal-rejection — documented gap because PGLite
    * has no kernel-level cancellation).
+   *
+   * #6278: `opts.timeoutMs` runs an autocommit statement under a
+   * transaction-local `statement_timeout` of that many milliseconds (Postgres:
+   * a reserved connection runs `BEGIN; SET LOCAL statement_timeout`, the
+   * statement and `COMMIT` as one pipelined round trip, so the bound holds
+   * through a transaction-mode pooler that drops the session's startup
+   * parameters; a statement past it fails with SQLSTATE 57014). Inside a
+   * transaction the option is ignored (a `SET LOCAL` there would change the
+   * enclosing transaction). PGLite ignores it: one in-process connection has
+   * no other session to wait on.
    */
   executeRaw<T = Record<string, unknown>>(
     sql: string,
     params?: unknown[],
-    opts?: { signal?: AbortSignal },
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<T[]>;
 
   /**

@@ -1,5 +1,5 @@
 import { registerManagedFilesystemEngine } from './persistence/filesystem-guard.ts';
-import { replaceDerivedLinks, type DerivedLinkOrigin, type DerivedLinkReplacementOptions } from './derived-links.ts';
+import { replaceDerivedLinks, replaceDerivedLinksBatch, type DerivedLinkBatchItem, type DerivedLinkOrigin, type DerivedLinkReplacementOptions } from './derived-links.ts';
 import { trackPgliteDatabase, PgliteClosingError, notifyPgliteOpened } from './pglite-lifecycle.ts';
 import { mutatePageTag } from './page-state/tags.ts';
 import type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions } from './page-state/types.ts';
@@ -68,14 +68,13 @@ import {
 import {
   valueHash,
   normalizeDimension,
-  isNovelDimension, isBackdatedObservation,
+  isNovelDimension, isBackdatedObservation, ONTOLOGY_SUPERSEDE_GUARD,
 } from './chronicle/ontology.ts';
 import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatchExhausted } from './audit/batch-retry-audit.ts';
-import { runMigrations } from './migrate.ts';
 import { supportsHnswIterativeScan } from './vector-index.ts';
-import { searchVectorPool, readVectorPool } from './search/vector-pool.ts';
+import { searchIndexWalk, searchVectorPool, readVectorPool, type VectorPoolAttempt } from './search/vector-pool.ts';
 import { beforePlannerRead, plannerRead } from './planner-stats.ts';
-import { buildVectorSearchStatement, VECTOR_EXTENSION_VERSION_SQL } from './search/vector-statement.ts';
+import { buildVectorSearchStatement, PAGE_SOURCE_STATS_SQL, SCOPE_CHUNKS_SQL, VECTOR_EXTENSION_VERSION_SQL, vectorScopeLoader, type PageSourceStats, type ScopeChunkCount } from './search/vector-statement.ts';
 import { withVectorSettings } from './search/vector-settings.ts';
 import { PGLITE_SCHEMA_SQL, getPGLiteSchema } from './pglite-schema.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
@@ -117,7 +116,7 @@ import { sanitizeForJsonb, sanitizeText, buildLinkRows, buildTimelineRows } from
 import { PAGE_SORT_SQL } from './types.ts';
 import { finalizeLastSeen } from './chronicle/last-seen.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
-import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery, boundWebsearchQuery } from './search/sql-ranking.ts';
+import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery, boundWebsearchQuery, collapseWebsearchDashRuns } from './search/sql-ranking.ts';
 import { privatePagesFilterFragment, privateSnapshotFilterFragment, privateLinkOriginFilterFragment, privateTimelineEventFilterFragment, privateProvenanceFilterFragment } from './search/private-visibility.ts';
 import { EMBED_SKIP_FILTER_FRAGMENT } from './embed-skip.ts';
 import {
@@ -706,6 +705,7 @@ export async function probePgliteScratchStore(
 
 export class PGLiteEngine implements BrainEngine {
   private vectorIterativeScan?: Promise<boolean>;
+  private readonly vectorScope = vectorScopeLoader(() => this.executeRaw<PageSourceStats>(PAGE_SOURCE_STATS_SQL), ids => this.executeRaw<ScopeChunkCount>(SCOPE_CHUNKS_SQL, [ids]));
   /** Transaction clones keep chunk invalidation and replacement atomic. */
   private _chunkWritesInTransaction = false;
   private _checkpointGuard: PgliteCheckpointGuard | undefined;
@@ -1139,7 +1139,7 @@ export class PGLiteEngine implements BrainEngine {
     await this.applyForwardReferenceBootstrap();
     await this.db.exec(getPGLiteSchema(dims, model));
 
-    const { applied } = await runMigrations(this);
+    const { applied } = await (await import('./migrate.ts')).runMigrations(this); // engine-dynamic-import-ok: initSchema only, keeps the ~220 migration modules off every connect
     if (applied > 0) {
       process.stderr.write(`  ${applied} migration(s) applied\n`);
     }
@@ -1216,14 +1216,15 @@ export class PGLiteEngine implements BrainEngine {
 
   async putPage(slug: string, page: PageInput, opts?: PageWriteOptions): Promise<Page> {
     slug = validateSlug(slug);
-    return this.transaction(async tx => {
+    const write = async (tx: BrainEngine) => {
       const sourceId = opts?.sourceId ?? 'default';
       await tx.lockPageKeys([{ sourceId, slug }]);
       if (opts?.expectedRevision !== undefined || opts?.force !== undefined) {
         assertPageRevision(await tx.readPageSnapshot(slug, { sourceId, includeDeleted: true }), opts);
       }
       return pagesImpl.putPage((tx as PGLiteEngine).engineSql, slug, page, opts, (s, src) => tx.getPage(s, { sourceId: src }));
-    });
+    };
+    return opts?.inline && this._pageTransaction ? write(this) : this.transaction(write);
   }
 
   async deletePage(slug: string, opts?: { sourceId?: string }): Promise<void> {
@@ -1413,7 +1414,7 @@ export class PGLiteEngine implements BrainEngine {
     }
 
     // v0.20.0 Cathedral II Layer 10 C1/C2: language + symbol-kind filters.
-    const params: unknown[] = [query, innerLimit, limit, offset];
+    const params: unknown[] = [collapseWebsearchDashRuns(query), innerLimit, limit, offset];
     let extraFilter = '';
     if (opts?.language) {
       params.push(opts.language);
@@ -1570,7 +1571,7 @@ export class PGLiteEngine implements BrainEngine {
       dedup: boolean;
     },
   ): Promise<SearchResult[]> {
-    return searchKeywordCJK(async (read) => read(scopedRead(this.engineSql)), query, ctx);
+    return searchKeywordCJK(async (read) => read(scopedRead(this.engineSql)), query, ctx, 'pglite');
   }
 
   /**
@@ -1613,7 +1614,7 @@ export class PGLiteEngine implements BrainEngine {
       });
     }
 
-    const params: unknown[] = [query, limit, offset];
+    const params: unknown[] = [collapseWebsearchDashRuns(query), limit, offset];
     let extraFilter = '';
     if (opts?.language) {
       params.push(opts.language);
@@ -1681,7 +1682,7 @@ export class PGLiteEngine implements BrainEngine {
     }
     // Same statement as postgres-engine (search/vector-statement.ts); the
     // PGLite dialect adds the timeline `stale` flag and has no exact fallback.
-    const stmt = buildVectorSearchStatement({ dialect: 'pglite', embedding, limit, offset: opts?.offset || 0, opts });
+    const stmt = buildVectorSearchStatement({ dialect: 'pglite', embedding, limit, offset: opts?.offset || 0, opts, scope: await this.vectorScope(opts) });
     this.vectorIterativeScan ??= this.executeRaw<{ extversion: string }>(VECTOR_EXTENSION_VERSION_SQL)
       .then(rows => supportsHnswIterativeScan(rows[0]?.extversion));
     const probe = this.vectorIterativeScan;
@@ -1691,14 +1692,14 @@ export class PGLiteEngine implements BrainEngine {
       if (this.vectorIterativeScan === probe) this.vectorIterativeScan = undefined;
       throw error;
     }
-    const rows = await searchVectorPool(limit, stmt.innerLimit, iterative, stmt.indexed, 'pglite',
-      async ({ innerLimit: requested, maxScanTuples }) => this.db.transaction(async tx => {
-        return withVectorSettings(async (sql, values) => (await tx.query<Record<string, unknown>>(sql, values)).rows, iterative, requested, maxScanTuples, async () => {
-          const bound = [...stmt.params];
-          bound[stmt.innerLimitIdx] = requested;
-          return readVectorPool((await tx.query<Record<string, unknown>>(stmt.sql, bound)).rows);
-        });
-      }),
+    const attempt = ({ innerLimit: requested, maxScanTuples, indexWalk, scopeScan }: VectorPoolAttempt) => this.db.transaction(async tx => withVectorSettings(
+      async (sql, values) => (await tx.query<Record<string, unknown>>(sql, values)).rows, iterative, requested, maxScanTuples, async () => {
+        const bound = [...stmt.params];
+        bound[stmt.innerLimitIdx] = requested;
+        return readVectorPool((await tx.query<Record<string, unknown>>(scopeScan && stmt.scopeScanSql || indexWalk && stmt.indexWalkSql || stmt.sql, bound)).rows);
+      }, undefined, opts?.hnswIterativeScan, indexWalk && stmt.indexWalkSql ? stmt.indexWalkOverfetch : undefined));
+    const rows = await searchIndexWalk(stmt, limit, attempt) ?? await searchVectorPool(limit, stmt.innerLimit, iterative, stmt.indexed, 'pglite',
+      attempt,
       async pool => {
         const { rows } = await this.db.query<{ eligible: number }>(stmt.hasMoreSql, [...stmt.params.slice(0, stmt.innerLimitIdx), pool + 1]);
         return Number(rows[0].eligible) > pool;
@@ -1759,13 +1760,13 @@ export class PGLiteEngine implements BrainEngine {
   // Chunks SQL lives once in ./engine-sql/chunks.ts (refactor wave 1, W1-extended).
   // The engine keeps the retry + transaction wrapper, the RLS scope
   // transaction and the source-scope / active-column resolution.
-  async upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number } & BatchOpts): Promise<void> {
+  async upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; pageId?: number } & BatchOpts): Promise<void> {
     if (this._chunkWritesInTransaction) return this._upsertChunksOnce(slug, chunks, opts);
     return this.batchRetry(opts?.auditSite ?? 'upsertChunks', opts?.signal,
       () => this.transaction(tx => (tx as PGLiteEngine)._upsertChunksOnce(slug, chunks, opts)), chunks.length);
   }
 
-  private async _upsertChunksOnce(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number }): Promise<void> {
+  private async _upsertChunksOnce(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; pageId?: number }): Promise<void> {
     return chunksImpl.upsertChunksOnce(this.engineSql, {
       lockPageKeys: (keys) => this.lockPageKeys(keys),
       readPageSnapshot: (pageSlug, snapshotOpts) => this.readPageSnapshot(pageSlug, snapshotOpts),
@@ -1881,6 +1882,10 @@ export class PGLiteEngine implements BrainEngine {
 
   async replaceDerivedLinks(origin: DerivedLinkOrigin, links: LinkBatchInput[], opts?: DerivedLinkReplacementOptions) {
     return replaceDerivedLinks(this, origin, links, opts);
+  }
+
+  async replaceDerivedLinksBatch(items: readonly DerivedLinkBatchItem[]) {
+    return replaceDerivedLinksBatch(this, items);
   }
 
   // #3674 — see BrainEngine.removeLinksByPagesAndSource JSDoc. Identical SQL
@@ -2112,11 +2117,11 @@ export class PGLiteEngine implements BrainEngine {
       const forward = validFrom == null || current.valid_from == null
         || new Date(validFrom).getTime() >= new Date(current.valid_from).getTime();
       if (forward) {
-        await this.db.query(
-          `UPDATE facts SET valid_until = COALESCE($1::timestamptz, now()), superseded_by = $2 WHERE id = $3 AND valid_until IS NULL`,
+        const closed = await this.db.query(
+          `UPDATE facts SET valid_until = COALESCE($1::timestamptz, now()), superseded_by = $2 WHERE id = $3 AND valid_until IS NULL${ONTOLOGY_SUPERSEDE_GUARD} RETURNING id`,
           [validFrom, newId, current.id],
         );
-        supersededId = current.id;
+        supersededId = closed.rows.length ? current.id : null;
       }
     }
     return { action: supersededId ? 'superseded_prior' : 'inserted', factId: newId, supersededId };
@@ -2429,7 +2434,7 @@ export class PGLiteEngine implements BrainEngine {
 
   async listSupersessions(
     source_id: string,
-    opts?: { since?: Date; limit?: number; visibility?: ('private' | 'world')[] },
+    opts?: { since?: Date; limit?: number; visibility?: ('private' | 'world')[]; eligibility?: import('./engine.ts').FactListOpts['eligibility'] },
   ): Promise<FactRow[]> {
     return factsImpl.listSupersessions(unscopedExecutor(this.engineSql, 'facts: unscoped on master (EO4 inventory)'), source_id, opts);
   }
@@ -2545,14 +2550,14 @@ export class PGLiteEngine implements BrainEngine {
 
   async searchTakes(
     query: string,
-    opts: SearchOpts & { takesHoldersAllowList?: string[] } = {},
+    opts: SearchOpts & { takesHoldersAllowList?: string[]; eligibility?: import('./eligibility/policy.ts').ReadEligibility } = {},
   ): Promise<TakeHit[]> {
     return takesImpl.searchTakes(unscopedExecutor(this.engineSql, 'takes: unscoped on master (EO4 inventory)'), query, opts);
   }
 
   async searchTakesVector(
     embedding: Float32Array,
-    opts: SearchOpts & { takesHoldersAllowList?: string[] } = {},
+    opts: SearchOpts & { takesHoldersAllowList?: string[]; eligibility?: import('./eligibility/policy.ts').ReadEligibility } = {},
   ): Promise<TakeHit[]> {
     return takesImpl.searchTakesVector(unscopedExecutor(this.engineSql, 'takes: unscoped on master (EO4 inventory)'), embedding, opts);
   }
@@ -2749,7 +2754,8 @@ export class PGLiteEngine implements BrainEngine {
     return readAliases(this.executeRaw.bind(this), aliasNorms, opts);
   }
 
-  async setPageAliases(slug: string, sourceId: string, aliasNorms: string[]): Promise<void> {
+  async setPageAliases(slug: string, sourceId: string, aliasNorms: string[], opts?: { inline?: boolean }): Promise<void> {
+    if (opts?.inline && this._pageTransaction) return pagesImpl.setPageAliases(this.engineSql, this, slug, sourceId, aliasNorms);
     return this.transaction(tx => pagesImpl.setPageAliases((tx as PGLiteEngine).engineSql, tx, slug, sourceId, aliasNorms));
   }
 

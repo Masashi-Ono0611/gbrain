@@ -47,10 +47,11 @@ export interface WaveCheckSpec {
 
 /**
  * #6188 (D7): what clears malformed fences, from a check's `auto_repair` detail: the next maintenance run while
- * one is active and `fences.repair.enabled` is on, otherwise `gbrain repair fences` (whose preview prints the apply command).
+ * one is active and `fences.repair.enabled` is on, otherwise the preview `command`: the content lane for held files (#6377), `gbrain repair fences`
+ * for malformed fences stored pages carry (whose preview prints the apply command).
  */
-function fenceRepairHow(details: Record<string, any>, source?: string): string {
-  const preview = `preview with: gbrain repair fences${source ? ` --source ${source}` : ''}`;
+function fenceRepairHow(details: Record<string, any>, source: string | undefined, command: 'fences' | 'content'): string {
+  const preview = `preview with: gbrain repair ${command}${source ? ` --source ${source}` : ''}`;
   const auto = details.auto_repair as { active?: boolean; enabled?: boolean } | undefined;
   if (auto && auto.active === false) return `not repaired automatically (${auto.enabled === false ? 'fences.repair.enabled is false' : 'no maintenance run is active'}); ${preview}`;
   const manual = Array.isArray(details.sources) ? details.sources.reduce((sum: number, c: { by_tier?: { manual?: number } }) => sum + Number(c.by_tier?.manual ?? 0), 0) : 0;
@@ -111,6 +112,22 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async engine => (await import('./checks/persistence-requests.ts')).requestGrowthCheck(engine),
   },
   {
+    id: 'persistence_write_stall', resolution: 'operator', registration: 'wave',
+    count: d => Number(d.count ?? 0),
+    hostOnly: 'Request ids, roots and the owning process are brain-host persistence state outside any source scope.',
+    impact: 'A write request has held its claim past persistence.max_claim_ms, so later writes on its root wait behind it',
+    instruction: 'Inspect it with `gbrain sources writer status --source <id> --json`, then restart the `gbrain serve` that owns the root (docs/guides/troubleshooting.md#persistence-write-stall).',
+    run: async engine => (await import('./checks/persistence-requests.ts')).writeStallCheck(engine),
+  },
+  {
+    id: 'persistence_session_timeouts', resolution: 'operator', registration: 'wave',
+    count: d => d.reason === 'session_timeouts_not_applied' ? 1 : 0,
+    hostOnly: 'The connection URL and its pooler are brain-host configuration outside any source scope.',
+    impact: 'A transaction-mode pooler drops the configured session statement_timeout, so autocommit statements outside a transaction have no server-side bound',
+    instruction: 'Set the default on the role instead: `ALTER ROLE <gbrain role> SET statement_timeout = \'5min\'` (docs/guides/troubleshooting.md#session-timeouts-not-applied).',
+    run: async engine => (await import('./checks/persistence-requests.ts')).sessionTimeoutsCheck(engine),
+  },
+  {
     id: 'connector_held_items', resolution: 'operator', registration: 'wave',
     count: d => Number(d.held ?? 0),
     impact: 'Some connector items are held after repeated failures and are not imported',
@@ -122,14 +139,14 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     hostOnly: 'Held file paths are host-local; remote callers see held counts on sync results, get_page and search.',
     count: d => Number(d.held ?? 0),
     impact: 'Some Git source files are held instead of imported, so their pages are missing or keep an older revision',
-    bannerHow: (d, how, source) => !d.fences ? how : d.fences >= Number(d.held ?? 0) ? `fence holds: ${fenceRepairHow(d, source)}` : `${how}; fence holds: ${fenceRepairHow(d, source)}`,
+    bannerHow: (d, how, source) => !d.fences ? how : d.fences >= Number(d.held ?? 0) ? `fence holds: ${fenceRepairHow(d, source, 'content')}` : `${how}; fence holds: ${fenceRepairHow(d, source, 'content')}`,
     run: async (engine, scope) => (await import('./checks/git-holds.ts')).gitHeldFilesCheck(engine, scope.sourceIds),
   },
   {
     id: 'fence_integrity', resolution: 'repair', registration: 'doctor.ts',
     count: d => Number(d.total ?? 0),
     impact: 'Some facts or takes fences are malformed and wait for repair; none of them blocks a sync',
-    bannerHow: (d, _how, source) => fenceRepairHow(d, source),
+    bannerHow: (d, _how, source) => fenceRepairHow(d, source, 'fences'),
     run: async (engine, scope) => (await import('./checks/fence-integrity.ts')).fenceIntegrityCheck(engine, scope.sourceIds),
   },
   {
@@ -231,6 +248,21 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => (await import('./checks/extractor-facts.ts')).extractorFactsCheck(engine, scope.sourceIds),
   },
   {
+    id: 'conversation_label_facts', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Retiring label-misattributed conversation facts is a host-side, explicit-only repair.',
+    count: d => Number(d.evidenced ?? 0),
+    impact: 'Some conversation facts were extracted from meeting-note labels read as speakers by an older parser, and recall still returns them',
+    run: async (engine, scope) => (await import('./checks/conversation-outcomes.ts')).conversationLabelFactsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'conversation_outcomes_stale', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Re-extracting conversation facts spends model calls on the brain host.',
+    instruction: 'Preview re-extracting a page the check names with gbrain extract-conversation-facts --source-id <id> --slug <slug> --force --dry-run, then run it without --dry-run after the user agrees to the spend.',
+    count: d => Number(d.stale ?? 0),
+    impact: 'Some conversation pages keep an extraction outcome recorded by an older conversation parser, which is never reopened automatically',
+    run: async (engine, scope) => (await import('./checks/conversation-outcomes.ts')).conversationOutcomesStaleCheck(engine, scope.sourceIds),
+  },
+  {
     id: 'captured_facts_active', resolution: 'repair', registration: 'wave',
     hostOnly: 'Classifying captured facts reads harness transcripts and the session corpus on the brain host; the repair is explicit-only.',
     count: d => Number(d.evidenced ?? 0) + Number(d.ambiguous ?? 0),
@@ -243,6 +275,13 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     count: d => Number(d.drifted ?? 0),
     impact: 'Some closed commitment loops still have an active commitment fact, so recall keeps the finished promise',
     run: async (engine, scope) => (await import('./checks/loop-facts.ts')).loopFactsDriftCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'ontology_facts_fenced', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Restoring fenced ontology observations is a host-side, explicit-only repair.',
+    count: d => Number(d.fenced ?? 0) + Number(d.retired ?? 0),
+    impact: 'Some ontology observations were moved onto an entity page\'s Facts table, and ontology_get no longer returns the ones a later page write retired',
+    run: async (engine, scope) => (await import('./checks/ontology-facts.ts')).ontologyFactsCheck(engine, scope.sourceIds),
   },
 ];
 

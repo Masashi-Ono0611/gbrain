@@ -174,6 +174,11 @@
               "no shared declaration; 0 non-automation client(s) active in 30d"
             ],
             "backstop_visibility": "private",
+            "capture_lanes": {
+              "compact": "extract",
+              "session_end": "extract",
+              "writeback": "retire"
+            },
             "counters_note": "local, append-only, loss-tolerant observability over the last 7d — never a source of truth",
             "cross_lane_duplicates_7d": 0,
             "instruction_visibility": "world",
@@ -185,7 +190,7 @@
             "ttl_valid": true,
             "visibility_note": "world = readable by agents authorized on THIS brain, not the public internet"
           },
-          "message": "ambient writeback off (default). Enable: gbrain config set memory.auto_writeback salient",
+          "message": "ambient writeback off (default): Stop-hook turn capture is off, but the compaction harvest and SessionEnd transcripts still extract (installing the harness hooks opted into them; stop them: gbrain config set memory.auto_writeback off). Enable: gbrain config set memory.auto_writeback salient",
           "name": "memory_writeback",
           "status": "ok"
         },
@@ -374,7 +379,7 @@
             "next": "report",
             "requires_exclusive": false,
             "user_message": "Which agent app should get gbrain memory? The install guide has a one-line command for each.",
-            "why": "Register `<absolute path to gbrain> serve --surface starter` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
+            "why": "Register `<absolute path to gbrain> serve --surface full` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
           },
           "message": "No agent harness was detected. Wire one when the user picks an agent app.",
           "name": "harness_wiring",
@@ -497,7 +502,7 @@
         },
         {
           "category": "ops",
-          "message": "RLS enabled on 120/120 public tables",
+          "message": "RLS enabled on 132/132 public tables",
           "name": "rls",
           "status": "ok"
         },
@@ -509,7 +514,7 @@
         },
         {
           "category": "meta",
-          "message": "986 column(s) verified against live schema",
+          "message": "1072 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
@@ -809,6 +814,36 @@
           "status": "ok"
         },
         {
+          "category": "ops",
+          "details": {
+            "config_key": "persistence.max_claim_ms",
+            "count": 0,
+            "docs": "docs/guides/troubleshooting.md#persistence-write-stall",
+            "max_claim_ms": "<volatile>",
+            "preparation_policy": {
+              "maintenance_preparation_ms": "<volatile>",
+              "max_preparation_attempts": 2,
+              "preparation_ceiling_ms": "<volatile>",
+              "sync_preparation_ms": "<volatile>"
+            },
+            "stalls": []
+          },
+          "message": "No write request has held its claim longer than persistence.max_claim_ms (600000 ms).",
+          "name": "persistence_write_stall",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "applied": "5min",
+            "configured": "5min",
+            "docs": "docs/guides/troubleshooting.md#session-timeouts-not-applied"
+          },
+          "message": "The session statement_timeout (5min) reaches the server.",
+          "name": "persistence_session_timeouts",
+          "status": "ok"
+        },
+        {
           "category": "brain",
           "details": {
             "docs": "docs/guides/repair.md#connector-held-items",
@@ -967,6 +1002,33 @@
         {
           "category": "brain",
           "details": {
+            "capped": false,
+            "docs": "docs/guides/repair.md#conversation-labels",
+            "evidenced": 0,
+            "repair": "conversation-labels"
+          },
+          "message": "No conversation fact carries the pre-fix meeting-label signature (a 1970-01-01 segment on a label page).",
+          "name": "conversation_label_facts",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "capped": false,
+            "docs": "docs/guides/repair.md#conversation-labels",
+            "extractor_version": 1,
+            "sample": [],
+            "scanned": 0,
+            "stale": 0,
+            "unstamped": 0
+          },
+          "message": "No conversation extraction outcome predates extractor version 1.",
+          "name": "conversation_outcomes_stale",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
             "ambiguous": 0,
             "docs": "docs/guides/repair.md#explicit-only-repair-kinds",
             "evidenced": 0,
@@ -987,6 +1049,19 @@
           },
           "message": "Every closed commitment loop has its fact retired.",
           "name": "loop_facts_drift",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "docs": "docs/guides/repair.md#explicit-only-repair-kinds",
+            "excluded": 0,
+            "fenced": 0,
+            "repair": "ontology-facts",
+            "retired": 0
+          },
+          "message": "No ontology observation is held by a page's Facts table.",
+          "name": "ontology_facts_fenced",
           "status": "ok"
         },
         {
@@ -1230,6 +1305,17 @@
           },
           "message": "Every active legacy token has explicit scopes.",
           "name": "legacy_token_null_scope",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "docs": "docs/mcp/ADMIN.md#grants-that-cannot-reach-new-operations",
+            "grants": [],
+            "server_surface": "full"
+          },
+          "message": "Every active client and token can call the operations its scopes allow.",
+          "name": "grant_new_ops_available",
           "status": "ok"
         },
         {
@@ -1697,6 +1783,111 @@
         {
           "category": "brain",
           "details": {
+            "backfill": {
+              "completed_at": "<ts>",
+              "interrupted": false
+            },
+            "by_tier": {
+              "agent_written": 0,
+              "external_untrusted": 0,
+              "operator_curated": 0,
+              "tool_observed": 0,
+              "unknown": 0,
+              "user_confirmed": 0
+            },
+            "derived": {
+              "external_pct": 0,
+              "external_untrusted": 0,
+              "rows": 0
+            },
+            "rows": 0,
+            "tables": [
+              {
+                "by_tier": {
+                  "agent_written": 0,
+                  "external_untrusted": 0,
+                  "operator_curated": 0,
+                  "tool_observed": 0,
+                  "unknown": 0,
+                  "user_confirmed": 0
+                },
+                "rows": 0,
+                "table": "pages"
+              },
+              {
+                "by_tier": {
+                  "agent_written": 0,
+                  "external_untrusted": 0,
+                  "operator_curated": 0,
+                  "tool_observed": 0,
+                  "unknown": 0,
+                  "user_confirmed": 0
+                },
+                "rows": 0,
+                "table": "facts"
+              },
+              {
+                "by_tier": {
+                  "agent_written": 0,
+                  "external_untrusted": 0,
+                  "operator_curated": 0,
+                  "tool_observed": 0,
+                  "unknown": 0,
+                  "user_confirmed": 0
+                },
+                "rows": 0,
+                "table": "takes"
+              },
+              {
+                "by_tier": {
+                  "agent_written": 0,
+                  "external_untrusted": 0,
+                  "operator_curated": 0,
+                  "tool_observed": 0,
+                  "unknown": 0,
+                  "user_confirmed": 0
+                },
+                "rows": 0,
+                "table": "timeline_entries"
+              }
+            ],
+            "unknown_pct": 0
+          },
+          "message": "No facts, takes, timeline entries or pages yet.",
+          "name": "trust_tiers",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "completed_at": null,
+            "detector_version": 2,
+            "total_unscanned": 0,
+            "unscanned": {
+              "facts": 0,
+              "pages": 0,
+              "takes": 0,
+              "timeline_entries": 0
+            }
+          },
+          "message": "Every agent-written or lower row has been scanned by the current write-gate detector; flagged rows carry their flag, and proactive surfaces withhold them when trust.agent_activation is suppress.",
+          "name": "trust_scan",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "legacy_unknown": 0,
+            "pending": [],
+            "unclaimed": []
+          },
+          "message": "No unclaimed source holds rows from before trust tiers.",
+          "name": "trust_sources_unclaimed",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
             "bad_config": [],
             "chars_limit": 4000,
             "chars_used": 0,
@@ -1707,6 +1898,54 @@
           },
           "message": "Core memory is off (opt-in). If the user wants a profile loaded in every session: gbrain config set memory.core.enabled true, then gbrain core init.",
           "name": "core_memory",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/troubleshooting.md#managed-sync-not-moving",
+            "parked": 0,
+            "sources": []
+          },
+          "message": "No managed sync is pending.",
+          "name": "managed_sync_not_moving",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "consumers": [],
+            "count": 0,
+            "docs": "docs/guides/troubleshooting.md#two-consumers-on-host",
+            "min_age_ms": "<volatile>"
+          },
+          "message": "No persistence consumer is running on this host.",
+          "name": "two_consumers_on_host",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/troubleshooting.md#two-consumers-on-host",
+            "owners": []
+          },
+          "message": "Every owner of a live running claim on this host has a consumer heartbeat row.",
+          "name": "consumers_without_heartbeat",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/troubleshooting.md#host-identity-mismatch",
+            "host_id": "<uuid>",
+            "host_json_path": "<home>/.gbrain/persistence/host.json",
+            "mismatches": []
+          },
+          "message": "This process's host identity (<home>/.gbrain/persistence/host.json) owns every binding this filesystem holds.",
+          "name": "host_identity_mismatch",
           "status": "ok"
         },
         {
@@ -1775,6 +2014,11 @@
               }
             ],
             "uncommitted_repairs": 0,
+            "unrenderable_legacy_facts": {
+              "complete": true,
+              "pages": [],
+              "total": 0
+            },
             "warn_at_normalized_7d": 20
           },
           "message": "No malformed facts or takes fence is held, stored or waiting in a checkout (1 source(s) scanned).",
@@ -1913,7 +2157,7 @@
           "category": "meta",
           "details": {
             "counts": {
-              "global": 13,
+              "global": 14,
               "mixed": 2,
               "source": 12
             },
@@ -1922,6 +2166,7 @@
               "calibration_profile": "global",
               "chronicle": "global",
               "consolidate": "source",
+              "content_repair": "global",
               "conversation_facts_backfill": "source",
               "drift": "global",
               "edge_contradictions": "global",
@@ -1947,7 +2192,7 @@
               "synthesize_concepts": "global"
             }
           },
-          "message": "Phase taxonomy: 12 source-scoped, 13 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
+          "message": "Phase taxonomy: 12 source-scoped, 14 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
           "name": "cycle_phase_scope",
           "status": "ok"
         },

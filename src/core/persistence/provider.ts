@@ -8,7 +8,7 @@ import { dispatchToolCall } from '../../mcp/dispatch.ts';
 import { registerLocalWriter, withVerifiedLocalRegistration } from './identity.ts';
 import { startPersistenceConsumer, assertPersistenceAccepting } from './service.ts';
 import { isWriteErrorCode, isWriteReceipt } from './types.ts';
-import type { PersistenceIpcProvider } from './ipc.ts';
+import { LOCAL_CLI_OWNER_OPERATIONS, type PersistenceIpcProvider } from './ipc.ts';
 import { runPersistenceAdministration } from './administration.ts';
 import { boundedWriteWaitMs } from './write-wait.ts';
 export { residentPersistenceConfig } from './local-client.ts';
@@ -18,6 +18,13 @@ import type { Action } from '../agent-output.ts';
 
 const localWritersFix: Action = { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'], consent: [], actor: 'agent',
   why: 'Shows this brain\'s local writer registrations with their grants, read-only.', requires_exclusive: false };
+
+/**
+ * localOnly operations the verified local CLI may run through the resident
+ * owner: dispatched with the `stdio` locality marker so the localOnly
+ * backstop admits them; remote principals never get it.
+ */
+const LOCAL_CLI_LOCAL_ONLY_OPS = new Set(['takes_remove', 'takes_rebuild']);
 
 /** Resident lifecycle owns the consumer; each connection proves its own durable registration. */
 export async function createPersistenceIpcProvider(engine: BrainEngine, config: GBrainConfig): Promise<PersistenceIpcProvider> {
@@ -39,7 +46,8 @@ export async function createPersistenceIpcProvider(engine: BrainEngine, config: 
     }
     const operation = operations.find(op => op.name === request.operation);
     const localSkillAdministration = !verified.remote && verified.principal.kind === 'local_cli'
-      && ['get_skill_policy', 'set_skill_policy', 'get_skill_retention', 'prune_skill_revisions', 'retain_skill_revision', 'import_skill_proposal'].includes(request.operation);
+      && (['get_skill_policy', 'set_skill_policy', 'get_skill_retention', 'prune_skill_revisions', 'retain_skill_revision', 'import_skill_proposal'].includes(request.operation)
+        || LOCAL_CLI_OWNER_OPERATIONS.has(request.operation));
     if (!operation || (!localSkillAdministration && !hasScope(verified.grant.scopes, operation.scope ?? 'read'))
       || (verified.remote && !operationScopesAllowed(verified.grant.scopes, operation))
       || (verified.grant.operations !== null && !verified.grant.operations.includes(operation.name))) {
@@ -70,7 +78,7 @@ export async function createPersistenceIpcProvider(engine: BrainEngine, config: 
       return (await import('../transcripts.ts')).listRecentTranscripts(engine, { days: typeof p.days === 'number' ? p.days : undefined,
         summary: typeof p.summary === 'boolean' ? p.summary : undefined, limit: typeof p.limit === 'number' ? p.limit : undefined });
     }
-    const localCliLocalOnly = !verified.remote && verified.principal.kind === 'local_cli' && request.operation === 'takes_remove';
+    const localCliLocalOnly = !verified.remote && verified.principal.kind === 'local_cli' && LOCAL_CLI_LOCAL_ONLY_OPS.has(request.operation);
     const writeWaitMs = boundedWriteWaitMs(request.write_wait_ms);
     const result = await dispatchToolCall(engine, request.operation, params, {
       config, remote: verified.remote, transport: verified.remote || localSkillAdministration || localCliLocalOnly ? 'stdio' : undefined, sourceId, auth,

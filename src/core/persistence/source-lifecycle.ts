@@ -14,6 +14,7 @@ import { redactSourceConfig } from '../source-config-redact.ts';
 import { discoverGitRoot } from '../sync-git.ts';
 import { isInsideGitRepo, hasTrackedContent } from '../git-remote.ts';
 import { containsPath, getWorktreeBinding, humanManifestProgress, type WorktreeBinding, type WorktreeManifest, worktreeManifest } from './ownership.ts';
+import { manifestDifferences, storedManifestScope, type WorktreeManifestScope } from './worktree-manifest.ts';
 import { localHostId } from './identity.ts';
 import { advanceTopology, lockTopologyPrincipal, lockTopologyRows, settleTopologyRequests, topologyCanonicalStamp, topologyPrincipal, withTopologyLocks } from './topology-locks.ts';
 import { priorTopologyChange, recordTopologyChange, topologyReceipt } from './topology-receipts.ts';
@@ -150,16 +151,28 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     // connection checked out. The final transaction rejects new pending mirrors.
     const manifests=new Map<string,WorktreeManifest>();
     let missingCheckout:string|undefined;
+    // Retirements transfer no canonical bytes; a symlink-blocked manifest walk
+    // must not prevent the registry lifecycle change. Other operations keep it strict.
+    const retirementOp=['archive','remove','purge'].includes(input.operation);
     for(const path of new Set([...bindings.map(binding=>binding.local_path!).filter(Boolean),...(root?[root.worktree]:[])])) {
       if(!existsSync(path)) {
         if(input.operation==='add'&&input.createDirectory&&path===root?.worktree)continue;
         // #5219: retiring may skip a vanished checkout; the transaction proves the source is empty and its sole member.
-        if(['archive','remove','purge'].includes(input.operation)&&!root){missingCheckout=path;continue;}
+        if(retirementOp&&!root){missingCheckout=path;continue;}
         throw missingCheckoutError(input.sourceId,path);
       }
-      const manifest=worktreeManifest(path,{progress:humanManifestProgress()});
+      let manifest:WorktreeManifest;
+      try{manifest=worktreeManifest(path,{progress:humanManifestProgress()});}catch(error){
+        if(!retirementOp||(error as {code?:string}|undefined)?.code!=='writer_manifest_unsafe') throw error;
+        continue;
+      }
       manifests.set(path,manifest);
     }
+    // #6099: a rebind compares the new directory in the scope of the current checkout's manifest (Git-tracked files for a Git checkout).
+    const currentRoot=bindings.find(binding=>binding.source_id===input.sourceId)?.local_path;
+    if(input.operation==='rebind'&&root&&currentRoot&&currentRoot!==root.worktree&&manifests.has(currentRoot)&&manifests.has(root.worktree)
+      &&storedManifestScope(manifests.get(currentRoot))!==storedManifestScope(manifests.get(root.worktree)))
+      manifests.set(root.worktree,worktreeManifest(root.worktree,{progress:humanManifestProgress(),scope:storedManifestScope(manifests.get(currentRoot))}));
     return topologyTransaction(engine,async tx=>{
     await assertWriterAdminState(tx,input.expectedAdminState);
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
@@ -213,9 +226,8 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
       if(!binding?.local_path || !existsSync(binding.local_path)) throw opError('recovery_required','The original checkout is unavailable; recover its last verified manifest before rebinding.',
         `Nothing was rebound. Restore the original checkout of '${input.sourceId}' at the path the command in fix reports, with its last verified contents, then rerun set-path.`,
         {fix:ownerStatusFix(input.sourceId)});
-      if(manifests.get(binding.local_path)!.digest!==manifests.get(root!.worktree)!.digest) throw opError('writer_manifest_mismatch','The new checkout differs from the current canonical manifest, including deletions.',
-        `Nothing was rebound. Make the new directory an exact copy of the current checkout of '${input.sourceId}' (same files, nothing extra or missing), then rerun set-path.`,
-        {fix:ownerStatusFix(input.sourceId)});
+      if(manifests.get(binding.local_path)!.digest!==manifests.get(root!.worktree)!.digest) throw rebindManifestMismatch(input.sourceId,binding.local_path,root!.worktree,
+        storedManifestScope(manifests.get(binding.local_path)));
     }
     const ownedSourcePath=currentBinding?.local_path?join(currentBinding.local_path,currentBinding.relative_path):source?.local_path;
     if(input.operation==='restore'&&ownedSourcePath&&!existsSync(ownedSourcePath)) throw opError('recovery_required','Restore requires the verified canonical checkout. Reclone it before restoring the source.',
@@ -268,4 +280,16 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     return topologyReceipt(row);
     });
   },root?.worktree);
+}
+
+/** #6099: a rebind's new directory does not match the current checkout; names the first differing paths (Git-tracked paths in git scope). */
+function rebindManifestMismatch(sourceId:string,current:string,candidate:string,scope:WorktreeManifestScope):OperationError{
+  const diff=manifestDifferences(current,candidate,scope);
+  const named=diff.total?` ${diff.total} file(s) differ, are missing or are extra${scope==='git'?' among the tracked Git files':''}: ${diff.paths.join(', ')}${diff.total>diff.paths.length?', …':''}.`:'';
+  return opError('writer_manifest_mismatch','The new checkout differs from the current canonical manifest, including deletions.',
+    scope==='git'
+      ?`Nothing was rebound.${named} The comparison covers files Git tracks, so ignored files (such as .env files) never need copying. Make ${candidate} a clean clone of the current checkout `
+        +`(for example move it aside, then git clone ${current} ${candidate}), then rerun gbrain sources set-path ${sourceId} ${candidate}.`
+      :`Nothing was rebound.${named} Make the new directory an exact copy of the current checkout of '${sourceId}' (same files, nothing extra or missing), then rerun set-path.`,
+    {fix:ownerStatusFix(sourceId)});
 }

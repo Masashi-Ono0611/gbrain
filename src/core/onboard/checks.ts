@@ -572,6 +572,19 @@ export async function checkPackUpgradeAvailable(
       };
     }
     const successor = successors[0];
+    const { managedPersistenceEnabled } = await import('../persistence/ownership.ts');
+    if (await managedPersistenceEnabled(engine)) {
+      // #6196: retype runs outside the persistence coordinator, so a managed brain cannot run the apply job.
+      return {
+        check: {
+          name: 'pack_upgrade_available', status: 'ok', severity: 'info', readiness_state: 'degraded',
+          message: `Active pack: ${active.identity}. Successor available: ${successor.identity}. On a managed brain unify-types switches the pack only when no page needs retyping, linking or aliasing; coordinated retype is not available yet, so do not submit the apply job while the preview shows pages to change. Preview: \`gbrain onboard --check --explain\``,
+          fix: { argv: ['gbrain', 'onboard', '--check', '--explain'], consent: [], actor: 'agent', requires_exclusive: false,
+            why: 'Previews the pack upgrade read-only. Applying it on a managed brain waits for coordinated retype unless the preview shows nothing to change.' },
+        },
+        remediations: [],
+      };
+    }
     return {
       check: {
         name: 'pack_upgrade_available',
@@ -590,7 +603,7 @@ export async function checkPackUpgradeAvailable(
           severity: 'medium',
           est_seconds: 600,  // ~10min on 186K-page brain (production proxy)
           est_usd_cost: 0,   // pure SQL; no LLM spend
-          protected: true,   // PROTECTED handler + manual_only via render allowlist
+          protected: true,   // PROTECTED handler; manual-only by job name (remediation/manual-only.ts)
           rationale:
             `Pack upgrade ${active.manifest.name} → ${successor.manifest.name}; ` +
             `collapses redundant page types into the new canonical taxonomy. ` +

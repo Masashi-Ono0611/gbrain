@@ -4,7 +4,8 @@
 //   1. Discover transcripts via discoverTranscripts() AND brain pages
 //      via a single raw SQL query (NOT EXISTS subquery filters out
 //      pages already extracted by content hash — see "Idempotency" below).
-//   2. Dedup by content_hash; transcripts win on collision.
+//   2. Drop physical-file twins owned by live source pages, then dedup
+//      by content_hash; remaining transcripts win on hash collision.
 //   3. Per work-item, ask the configured extract_atoms model (key-aware
 //      utility-tier default, see resolveExtractAtomsModel below) for 1-3 atoms.
 //   4. Write each atom via importFromContent(slug, markdown, {sourceId})
@@ -68,7 +69,9 @@ import { chat as gatewayChat, withBudgetTracker, isAvailable } from '../ai/gatew
 import { createGlobalLlmHaltTracker, haltedClassOf, providerContentBlockReason, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { importFromContent } from '../import-file.ts';
 import { derivedWriteThrough } from './derived-write-through.ts';
-import { serializeMarkdown } from '../markdown.ts';
+import { realpath } from 'node:fs/promises';
+import { isAbsolute, relative, sep } from 'node:path';
+import { resolveSourceLocalFilePath, serializeMarkdown } from '../markdown.ts';
 import { truncateUtf8 } from '../text-safe.ts';
 import { corpusTextForExtraction } from '../context/corpus-segments.ts';
 import { claudeCliSelfSessionIds } from '../ai/providers/claude-cli-scratch.ts';
@@ -94,9 +97,12 @@ import type { WriteReceipt } from '../persistence/types.ts';
 import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
 import { AtomPageStateError, completeAtomReceipts, readAtomPageIdentity, writeAtomPageState, type AtomPageInput } from './extract-atoms-page-state.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { deriveTrust, lowerDerivedPage } from '../trust/taint.ts';
+import { derivedGateInput } from '../trust/derived-gate.ts';
 import { ATOM_TYPES, ATOMS_RESPONSE_SCHEMA } from './extract-atoms-schema.ts';
 import { parseAtomsOutcome } from './extract-atoms-parse.ts';
 export { parseAtomsOutcome, parseAtomsResponse, type AtomsParseOutcome } from './extract-atoms-parse.ts';
+import { countSourceChangedAtoms } from './extract-atoms-source-drift.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 // #4529 + #4540: per-item extractor caps, overridable via
@@ -138,6 +144,10 @@ const SYNTHESIS_OUTPUT_TYPES = new Set<string>(['atom', 'concept']);
 
 const PAGE_DISCOVERY_BUDGET = 50;
 const MIN_PAGE_CHARS_FOR_EXTRACTION = 500;
+/** `compiled_truth` has >= `param` characters: octet_length reads a TOASTed size from its header and a character is
+ *  1-4 bytes, so only bodies of param..4x param bytes are decompressed (length() decompressed all: 1.3 s at 50k). */
+const minCompiledTruthChars = (param: string) =>
+  `(octet_length(p.compiled_truth) >= 4 * ${param} OR (octet_length(p.compiled_truth) >= ${param} AND length(p.compiled_truth) >= ${param}))`;
 // Source pages whose frontmatter declares a `raw` payload pointer hold raw
 // import data, not extractable prose. Extraction on them yields zero atoms,
 // so no atom row is ever written and they re-enter discovery + the doctor
@@ -410,7 +420,7 @@ export async function discoverExtractablePages(
       AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
       AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
       ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
-      AND length(COALESCE(p.compiled_truth, '')) >= $3
+      AND ${minCompiledTruthChars('$3')}
       ${MANAGED_ATOM_DISCOVERY_SQL}
       ${PAGE_SCAN_STATE_EXCLUSION_SQL}
       ${connectorExclusion}
@@ -494,7 +504,7 @@ export async function countExtractAtomsBacklog(
            AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
            AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
            ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
-           AND length(COALESCE(p.compiled_truth, '')) >= $3
+           AND ${minCompiledTruthChars('$3')}
            ${MANAGED_ATOM_DISCOVERY_SQL}
            ${PAGE_SCAN_STATE_EXCLUSION_SQL}
            ${connectorExclusion}
@@ -512,7 +522,7 @@ export async function countExtractAtomsBacklog(
            AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
            AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
            ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
-           AND length(COALESCE(p.compiled_truth, '')) >= $2
+           AND ${minCompiledTruthChars('$2')}
            ${MANAGED_ATOM_DISCOVERY_SQL}
            ${PAGE_SCAN_STATE_EXCLUSION_SQL}
            ${connectorExclusion}
@@ -533,6 +543,55 @@ export async function countExtractAtomsBacklog(
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[extract_atoms] backlog count failed: ${msg}`);
     return null;
+  }
+}
+
+/**
+ * Synced pages own transcripts that resolve to the same file in the source
+ * checkout, but only extractable page types own notes so neither door loses them.
+ * Scan live pages independently of the extraction batch.
+ */
+async function filterTranscriptPageTwins(
+  engine: BrainEngine,
+  sourceId: string,
+  transcripts: NonNullable<ExtractAtomsOpts['_transcripts']>,
+) {
+  if (transcripts.length === 0) return transcripts;
+  try {
+    const sources = await engine.executeRaw<{ local_path: string | null }>(
+      'SELECT local_path FROM sources WHERE id = $1', [sourceId],
+    );
+    const localPath = sources[0]?.local_path;
+    if (!localPath) return transcripts;
+    const root = await realpath(localPath);
+    const transcriptFiles = new Map<typeof transcripts[number], string>();
+    for (const transcript of transcripts) {
+      try {
+        const path = await realpath(transcript.filePath);
+        const withinRoot = relative(root, path);
+        if (withinRoot !== '..' && !withinRoot.startsWith(`..${sep}`)
+          && !isAbsolute(withinRoot)) transcriptFiles.set(transcript, path);
+      } catch { /* keep transcripts whose physical path is unavailable */ }
+    }
+    if (transcriptFiles.size === 0) return transcripts;
+    const pages = await engine.executeRaw<{ source_path: string | null; slug: string }>(
+      `SELECT source_path, slug FROM pages
+       WHERE source_id = $1 AND deleted_at IS NULL AND type = ANY($2::text[])`,
+      [sourceId, await resolveExtractableTypes()],
+    );
+    const pageFiles = new Set<string>();
+    for (const page of pages) {
+      try {
+        const path = resolveSourceLocalFilePath(localPath, page.source_path, page.slug);
+        if (path) pageFiles.add(await realpath(path));
+      } catch { /* unresolved page cannot establish a twin */ }
+    }
+    return transcripts.filter(transcript => {
+      const path = transcriptFiles.get(transcript);
+      return path === undefined || !pageFiles.has(path);
+    });
+  } catch {
+    return transcripts; // fail-soft: extraction still proceeds
   }
 }
 
@@ -733,6 +792,10 @@ export async function runPhaseExtractAtoms(
     }
   }
 
+  const transcriptsBeforeTwins = transcripts.length;
+  transcripts = await filterTranscriptPageTwins(engine, sourceId, transcripts);
+  const transcriptPageTwinsSkipped = transcriptsBeforeTwins - transcripts.length;
+
   // 1b. Get pages (test seam OR production discovery).
   //     _pages === undefined triggers discovery; _pages: [] suppresses it
   //     deliberately (transcript-only regression tests).
@@ -859,12 +922,14 @@ export async function runPhaseExtractAtoms(
         reason: 'no_work',
         source_id: sourceId,
         atoms_extracted: 0,
+        atoms_source_changed: 0,
         transcripts_processed: 0,
         transcripts_total: 0,
         transcripts_skipped_budget: 0,
         pages_processed: 0,
         pages_total: 0,
         duplicates_skipped: 0,
+        transcript_page_twins_skipped: transcriptPageTwinsSkipped,
         failures: [],
         estimated_spend_usd: 0,
         budget_usd: DEFAULT_BUDGET_USD,
@@ -875,6 +940,8 @@ export async function runPhaseExtractAtoms(
 
   // 4. Per work-item: extract atoms via the configured extract_atoms model
   let totalAtomsExtracted = 0;
+  // Read-only drift visibility; see ./extract-atoms-source-drift.ts.
+  let atomsSourceChanged = 0;
   let transcriptsProcessed = 0;
   let pagesProcessed = 0;
   let transcriptsSkipped = 0;
@@ -976,7 +1043,7 @@ export async function runPhaseExtractAtoms(
   }
 
   // ── gbrain#4148 helpers ────────────────────────────────────────────
-  let malformedOutputs = 0;
+  let malformedOutputs = 0, stoppedOutputs = 0; // #6260: stopped = clipped, or empty under an unconfirmed stop
   const tombstonedForFailures: string[] = [];
   // v146: transcript tombstones ride a SEPARATE array. `tombstoned_for_failures`
   // is a list of page SLUGS; transcripts are filesystem paths, and mixing the two
@@ -1132,11 +1199,11 @@ export async function runPhaseExtractAtoms(
 
       // gbrain#4148: typed outcome — malformed output is a FAILURE (counted
       // toward the bounded tombstone below), never a zero-yield success.
-      const parseOutcome = parseAtomsOutcome(result.text);
+      const parseOutcome = parseAtomsOutcome(result.text, result.stopReason);
       if (!parseOutcome.ok) {
-        malformedOutputs++;
+        if (parseOutcome.stopped) stoppedOutputs++; else malformedOutputs++;
         if (!opts.dryRun && managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, [], parseOutcome.reason));
-        await recordDeterministicFailure(item, originLabel, `malformed model output: ${parseOutcome.reason}`);
+        await recordDeterministicFailure(item, originLabel, parseOutcome.stopped ? parseOutcome.reason : `malformed model output: ${parseOutcome.reason}`);
         continue;
       }
       const atoms = parseOutcome.atoms;
@@ -1163,6 +1230,10 @@ export async function runPhaseExtractAtoms(
           if (managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, []));
           else if (item.kind === 'page') await stampAtomsScanHash(item);
           else await stampTranscriptTombstone(item.filePath, item.contentHash);
+        }
+        // Zero yield ≠ zero atoms: earlier runs can have left stale rows.
+        if (item.kind === 'page') {
+          atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
         }
         if (item.kind === 'transcript') transcriptsProcessed++;
         else pagesProcessed++;
@@ -1256,10 +1327,8 @@ export async function runPhaseExtractAtoms(
             { type: 'atom', title: atom.title, tags: [] },
           );
           if (managed) managedAtoms.push({ slug, content: md, links: [] });
-          else await importFromContent(engine, slug, md, {
-              sourceId,
-              noEmbed: !isAvailable('embedding'),
-            });
+          else { const taint = await deriveTrust(engine, item.kind === 'page' ? [{ table: 'pages', sourceId, slug: item.slug }] : [], { channel: 'derive:atoms' }); // #5575 I2/B3: gated and stamped at the origin's taint
+            await importFromContent(engine, slug, md, { sourceId, preserveGateMarkers: true, noEmbed: !isAvailable('embedding'), writeGate: derivedGateInput(taint.trust) }).then(() => lowerDerivedPage(engine, taint, sourceId, slug)); }
           importedSlugs.push(slug);
           if (item.kind === 'page') {
             provenanceLinks.push({
@@ -1311,6 +1380,11 @@ export async function runPhaseExtractAtoms(
         // atom-rows-mean-done semantics — safe, not lossy.
         throwIfAborted(opts.signal, 'extract_atoms');
         await completeAtomReceipts(engine, sourceId, importedSlugs, hash16, item.kind === 'page' ? item : undefined);
+        if (item.kind === 'page') {
+          // Preserve the pre-cleanup drift population in the diagnostic. The
+          // following stale-atom retirement remains the upstream write contract.
+          atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
+        }
         // C-14: atoms are keyed by LLM-chosen titles, which drift between
         // extractions. Once this extraction is complete, retire the atoms an
         // earlier extraction of the same source produced that this one did not.
@@ -1323,6 +1397,11 @@ export async function runPhaseExtractAtoms(
         }
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting
+      }
+      // Dry-run wrote nothing, so report the pre-run live population. Normal
+      // writes counted after receipt completion and before upstream cleanup.
+      if (opts.dryRun && item.kind === 'page') {
+        atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
       }
       if (item.kind === 'transcript') transcriptsProcessed++;
       else pagesProcessed++;
@@ -1442,9 +1521,11 @@ export async function runPhaseExtractAtoms(
       (failures.length > 0 ? ` (${failures.length} failed)` : '') +
       (transcriptsSkipped + pagesSkipped > 0
         ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
-        : ''),
+        : '') +
+      (atomsSourceChanged > 0 ? ` (${atomsSourceChanged} source-changed atoms)` : ''),
     details: {
       atoms_extracted: totalAtomsExtracted,
+      atoms_source_changed: atomsSourceChanged,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,
       transcripts_skipped_budget: transcriptsSkipped,
@@ -1453,10 +1534,11 @@ export async function runPhaseExtractAtoms(
       pages_skipped_budget: pagesSkipped,
       duplicates_skipped: duplicatesSkipped,
       write_pending: writesPending,
+      transcript_page_twins_skipped: transcriptPageTwinsSkipped,
       failures,
       ...(managed ? { write_requests: writeRequests } : {}),
       ...(abortedGlobalError ? { aborted_global_error: abortedGlobalError } : {}),
-      malformed_outputs: malformedOutputs,
+      malformed_outputs: malformedOutputs, stopped_outputs: stoppedOutputs,
       tombstoned_for_failures: tombstonedForFailures,
       tombstoned_transcripts: tombstonedTranscripts,
       estimated_spend_usd: estimatedSpendUsd,

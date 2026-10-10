@@ -17,6 +17,8 @@ import { publicWriteReceipt, type WriteErrorCode, type WriteReceipt } from '../p
 // renderer below when it loads.
 import type { Action, Notice } from '../agent-output.ts';
 import type { RegistryCode } from '../error-registry.ts';
+import type { WriteAuthority } from '../persistence/model.ts';
+import type { TrustTier } from '../trust/tier.ts';
 import type { StdioSurfaceState } from '../../mcp/surface.ts';
 
 /** Agent contract v1: the wire renderer for `fix`/`notices` in toJSON(), registered by agent-output.ts on load. */
@@ -80,6 +82,8 @@ export class OperationError extends Error {
   public why?: string;
   /** Agent contract v1: the one next step. Rendered (`next`, `command`) only at serialization. */
   public fix?: Action;
+  /** Site-level override of the code's class-derived `retryable` (#6278: `owner_unavailable` / `host_mismatch` is never worth a retry). */
+  public retryable?: boolean;
   /** Agent contract v1: advice that rides the error (rendered into the envelope's `notices`). */
   public notices?: Notice[];
   /** #6188 (D16, D18): a fence refusal's location and its blocking issues; location and class only, never a cell value. */
@@ -158,6 +162,8 @@ export interface OpErrorOpts {
   fix?: Action;
   docs?: string;
   detail?: string;
+  /** Overrides the class-derived `retryable` on the envelope for this site. */
+  retryable?: boolean;
   /**
    * The frozen v1 `error` wire value when this site historically threw a
    * different code (A1 frozen pairs). `error` keeps this value; `code` is the
@@ -178,6 +184,7 @@ export function opError(code: RegistryCode, message: string, suggestion: string,
   if (opts.why !== undefined) e.why = opts.why;
   if (opts.fix !== undefined) e.fix = opts.fix;
   if (opts.detail !== undefined) e.detail = opts.detail;
+  if (opts.retryable !== undefined) e.retryable = opts.retryable;
   e.contractVersion = 1;
   return e;
 }
@@ -371,6 +378,14 @@ export interface AuthInfo {
    * projection degraded, or the brain predates migration v127.
    */
   surface?: string;
+  /**
+   * #5575 (CEO-18): the token's read floor (`oauth_clients.min_trust` /
+   * `access_tokens.min_trust`), set only by the local CLI (`gbrain auth create
+   * --min-trust`, `gbrain auth set-min-trust`). Every read op applies
+   * max(this floor, the caller's `min_trust` param), so a client can raise it
+   * but never lower it. Undefined = no floor (or a brain before the column).
+   */
+  minTrust?: TrustTier;
   /** Current transport ceiling applied to this authenticated request. */
   effectiveSurface?: 'verbs' | 'starter' | 'full';
   /**
@@ -492,6 +507,17 @@ export interface OperationContext {
    * v0.15 behavior; pure addition, no regression).
    */
   allowedSlugPrefixes?: string[];
+  /**
+   * #5994: the stored authority of a failed write that `gbrain repair
+   * failed-writes` replays. Set only by that trusted local repair lane; no
+   * transport, dispatcher or job hydrates it. Admission reuses it as the
+   * write's authority ceiling (principal, delegation, source incarnation,
+   * autoLinkTrusted), re-authorized against the live grant, instead of
+   * deriving local authority from the replay context. The subagent fence
+   * accepts a missing `subagentId` only with this marker and a non-empty
+   * allow-list equal to the stored delegated prefixes.
+   */
+  replayAuthority?: WriteAuthority;
   /**
    * #4216 — defer chunk embeddings on put_page writes: importFromContent runs
    * noEmbed and the standing embed machinery (embed phase / phase-end
@@ -765,6 +791,14 @@ export interface Operation {
     hidden?: boolean;
   };
 }
+
+/**
+ * Everything about an operation except its handler: the data tools/list,
+ * surface filtering, publish gates and CLI arg parsing read. Checked in as
+ * src/core/operation-manifest.generated.ts so `gbrain serve` and the CLI
+ * dispatcher can answer without loading every handler module.
+ */
+export type OperationMeta = Omit<Operation, 'handler'>;
 
 /**
  * An op that declares its own `source` param (timeline-add, ontology-add,

@@ -459,7 +459,7 @@ reads it; doctor cross-references the pack version).
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - A schema change (`gbrain schema add-type`, `gbrain schema use`) needs the user's confirmation; present it and stop if they decline.
 - `gbrain schema suggest` runs heuristic-only without an API key: say the suggestions are heuristic, not LLM-refined.
@@ -539,12 +539,3 @@ Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) f
   plus undeclared types, the same classification as `schema lint
   --with-db`); over MCP, `run_doctor`'s schema_pack_consistency check
   carries the same verdict.
-
-## Tools outside your MCP surface
-
-This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
-
-- `add_link` → `gbrain link`
-
-To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

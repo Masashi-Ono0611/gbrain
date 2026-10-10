@@ -82,9 +82,12 @@ import { queueHealthEntry, indexAuditEntry, imageAssetsEntry } from './checks/qu
 import { globalMaintenanceTimeoutsEntry } from './checks/global-maintenance-timeouts.ts';
 import { legacyJobAuthorityEntry } from './checks/legacy-job-authority.ts';
 import { legacyTokenGrantsEntry } from './checks/legacy-token-grants.ts';
+import { grantNewOpsEntry } from './checks/grant-new-ops.ts';
 import { syncFreshnessEntry, searchModeEntry } from './checks/sync-search.ts';
+import { persistenceConsumersEntry } from './checks/persistence-consumers.ts';
 import { gitConvergenceEntry } from './checks/git-convergence.ts';
 import { retrievalFeedbackEntry } from './checks/retrieval-feedback.ts';
+import { transcriptSecretExposureEntry } from './checks/transcript-secrets.ts';
 import { autoChronicleEntry } from './checks/auto-chronicle.ts';
 import { factsDrainEntry } from './checks/facts-drain.ts';
 import { factTakeVectorsEntry } from './checks/vector-coverage.ts';
@@ -94,14 +97,19 @@ import { edgeValidityEntry } from './checks/edge-validity.ts';
 import { coreMemoryEntry } from './checks/core-memory.ts';
 import { plannerStatsEntry } from './checks/planner-stats.ts';
 import { revisionBackfillEntry } from './checks/revision-backfill.ts';
+import { trustTiersEntry } from './checks/trust-tiers.ts';
+import { trustScanEntry } from './checks/trust-scan.ts';
+import { trustSourcesUnclaimedEntry } from './checks/trust-sources-unclaimed.ts';
 import { harnessWiringDoctorEntry } from './checks/harness-wiring.ts';
 import { agentContractEntry } from './checks/agent-contract.ts';
 import { chatFallbackChainEntry } from './checks/chat-fallback.ts';
 import { behaviorChangesEntry } from './checks/behavior-changes.ts';
 import { fenceIntegrityEntry } from './checks/fence-integrity.ts';
+import { managedSyncMovementEntry } from './checks/managed-sync-movement.ts';
 import { STOP_DOCTOR, type DoctorContext, type DoctorEntry } from './context.ts';
 import type { Check } from '../doctor.ts';
 import { infoCheck } from './check-fix.ts';
+import { withGitListingCache } from '../../core/git-visible-files.ts';
 
 export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   resolverHealthEntry,
@@ -159,6 +167,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   globalMaintenanceTimeoutsEntry,
   legacyJobAuthorityEntry,
   legacyTokenGrantsEntry,
+  grantNewOpsEntry,
   indexAuditEntry,
   imageAssetsEntry,
   syncFreshnessEntry,
@@ -171,8 +180,14 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   factTakeVectorsEntry,
   plannerStatsEntry,
   retrievalFeedbackEntry,
+  transcriptSecretExposureEntry,
   revisionBackfillEntry,
+  trustTiersEntry,
+  trustScanEntry,
+  trustSourcesUnclaimedEntry,
   coreMemoryEntry,
+  managedSyncMovementEntry,
+  persistenceConsumersEntry,
   fenceIntegrityEntry,
   searchModeEntry,
 ];
@@ -221,16 +236,20 @@ function onlyResult(checks: Check[], only: ReadonlySet<string>, stopped: boolean
  * Run the registry in order. A STOP_DOCTOR result ends the run with the checks
  * gathered so far; a completed run finishes the DB-checks progress phase.
  * Under `--only`, entries that emit none of the requested checks are skipped
- * (the connection lane always runs so its early stops still hold).
+ * (the connection lane always runs so its early stops still hold). The run is
+ * one `withGitListingCache` scope, so entries that list the same source
+ * checkout share one `git ls-files` per listing.
  */
-export async function runDoctorRegistry(ctx: DoctorContext): Promise<Check[]> {
-  const checks: Check[] = [];
-  for (const entry of DOCTOR_CHECK_REGISTRY) {
-    if (!selected(entry, ctx.only)) continue;
-    const result = await entry.run(ctx);
-    if (result === STOP_DOCTOR) return ctx.only ? onlyResult(checks, ctx.only, true) : checks;
-    checks.push(...result);
-  }
-  ctx.progress.finish();
-  return ctx.only ? onlyResult(checks, ctx.only, false) : checks;
+export function runDoctorRegistry(ctx: DoctorContext): Promise<Check[]> {
+  return withGitListingCache(async () => {
+    const checks: Check[] = [];
+    for (const entry of DOCTOR_CHECK_REGISTRY) {
+      if (!selected(entry, ctx.only)) continue;
+      const result = await entry.run(ctx);
+      if (result === STOP_DOCTOR) return ctx.only ? onlyResult(checks, ctx.only, true) : checks;
+      checks.push(...result);
+    }
+    ctx.progress.finish();
+    return ctx.only ? onlyResult(checks, ctx.only, false) : checks;
+  });
 }

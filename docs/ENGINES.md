@@ -171,6 +171,40 @@ the object is absent. Highly selective queries may correctly choose an exact
 plan. The [retrieval guide](architecture/RETRIEVAL.md#named-thing-retrieval-per-page-pool--title--alias--evidence)
 describes bounded candidate recovery and incomplete-result metadata.
 
+On Postgres the same refresh also analyzes the page columns every search
+filter reads (`deleted_at`, `source_id`, `type`, `slug`) and
+`content_chunks(model, modality, page_id)`, and an embed drain that embedded
+anything analyzes those chunk columns once at its end (each ANALYZE bounded by
+a 30 s statement and 2 s lock timeout). Without those statistics the vector
+candidate statement sorts every eligible chunk instead of walking the HNSW
+index, and at 1M chunks and above that sort runs past the 8 s vector budget,
+so hybrid search falls back to keyword-only results until autovacuum
+analyzes the tables. If a refresh is skipped (a lock, or a role that does not
+own the tables), run `ANALYZE content_chunks(model, modality, page_id)` and
+`ANALYZE pages` as the table owner.
+
+### Vector index sizing
+
+The chunk HNSW index stores each vector beside its graph links, so at 1,024
+dimensions it takes about 7.6 GiB per million chunks as `vector` (about
+9.8 GiB for a 1.28M-chunk brain) and a third of that as `halfvec`. The
+deferred ANN build (`gbrain migrate embeddings`, `gbrain reindex --vectors`)
+runs `CREATE INDEX CONCURRENTLY` with the server's `maintenance_work_mem`.
+When the graph does not fit, pgvector logs `hnsw graph no longer fits into
+maintenance_work_mem` and the build slows several-fold: 4.3x at 250k chunks
+with 256 MB. Before a large build, raise it on the brain host to the index
+size plus about 10% (Supabase: `supabase postgres-config update --config
+maintenance_work_mem=12GB --project-ref <ref> --experimental`, which reloads
+without a restart; self-hosted: `ALTER SYSTEM SET maintenance_work_mem =
+'12GB'` and `SELECT pg_reload_conf()`), and give it
+`max_parallel_maintenance_workers` of about half the cores: a 1M-chunk build
+took 103 s on 16 vCPU with 12 GB and 8 workers. Measured, not shipped:
+`halfvec` gives the same recall with an index a third the size, and
+`ef_construction` 128 adds about 0.02 to 0.03 unfiltered recall@10 for about
+25% more build time. Both need a migration or a rebuild, so the defaults stay
+(m 16, ef_construction 64, `vector`). Measurements and method:
+[`docs/eval/hnsw-scale-bench.md`](eval/hnsw-scale-bench.md).
+
 ### Opt-in RLS source-scope binding (`GBRAIN_RLS_SCOPE_BINDING`)
 
 Defense-in-depth layer for Postgres deployments that want the database itself
@@ -602,6 +636,14 @@ long-running processes x GBRAIN_POOL_SIZE
 When the sum does not fit, run fewer long-running processes (for example one
 shared `gbrain serve --http` instead of one stdio `serve` per agent session),
 or raise the pooler's limit. Do not lower a long-running process below 6.
+
+With a direct route configured, the persistence consumer's own tick
+statements (idle probe, switch read, recovery and expired-claim scans,
+capacity marking) take the direct pool beside the claims, renewals and the
+heartbeat, so a transaction-mode pooler never sits between the owner and its
+bookkeeping (#6317; `gbrain sources writer status --json` shows
+`connection.lane: direct`). `GBRAIN_CONSUMER_DIRECT_LANE=0` keeps those scans
+on the ordinary pool when the direct pool is too small for them.
 `pool_exhausted` errors (SQLSTATE `53300`) and the
 [serve boot timeout](#serve-boot-timeout) print this guidance.
 
@@ -651,18 +693,57 @@ checkpoint did not advance. The message names both errors (redacted, at most
 the SQLSTATE (for example `53300` when a pooler's client limit is reached),
 a write-error code, `storage_error`, or `deadline_exceeded` when the phase
 overran its five-second budget. `message` is the redacted error text, one line,
-at most 200 characters. Connection-wait evidence follows on Postgres:
+at most 200 characters. When an unexpected exception in the owner failed a
+write (`storage_error` with a generic public message; the class and frame stay owner-only),
+the line also carries `class=`, `errno=` and `frame=` (the top gbrain source
+frame, repo-relative, for example `src/core/persistence/page-prepare.ts:120`):
+the owner diagnostics the receipt points at. The stored receipt keeps the same
+identifiers (never the error message) owner-side in `error_detail`, with the
+build that ran the attempt; `gbrain write-request <id>` names an owner on
+another build than the CLI (`owner_build`) and the restart to run. Connection-wait evidence follows on Postgres:
 `first_conn_ms` is the time from phase start until the phase obtained a
 connection; `checkout=not_observed conn_wait_ms=<n>` means it had not obtained
 one after `n` milliseconds (a saturated pool or pooler, not a slow query); and
 `loop_lag_ms` is the longest event-loop delay during the phase (a busy or
 starved process). The same fields appear in the consumer's status snapshot
-under `phase`. Unfinished work stays tracked and is retried; nothing is lost. Run `gbrain sources writer status --json` to see what is waiting. The
+under `phase`. Unfinished work stays tracked and is retried; nothing is lost. Run `gbrain sources writer status --json` to see what is waiting.
+A `deadline_exceeded` phase is also how a round-trip a transaction-mode pooler
+(Supavisor port 6543, PgBouncer) never completed ends: the backend sits in
+`ClientRead`, the cancel request the deadline sends may never reach it, so
+`GBRAIN_CANCEL_SETTLE_MS` (default 2000) after the cancel the owner discards
+that reserved connection, the statement settles client-side, and the next tick
+runs. The connection end is not reported as `storage_error`; doctor's
+`persistence_session_timeouts` names a transaction-mode URL, and the
+session-mode URL of the same pooler (Supabase: port 5432) avoids the class.
+`phase=preparation` lines name a write whose preparation ran past its budget:
+`reason=deadline_exceeded` (the claim is released with `blocked_reason`
+`preparation_deadline` and one attempt is counted; the budget is
+`persistence.sync_preparation_ms` for a managed sync member,
+`persistence.maintenance_preparation_ms` for every other managed kind and 30 s
+for `remember`, `put_page` and `edit_page`), `reason=preparation_stalled` (the
+request reached `persistence.max_preparation_attempts` and was finished
+`failed` instead of being claimed again) and `reason=ceiling_exceeded` (the
+preparation ignored cancellation past `persistence.preparation_ceiling_ms`; the
+message names the step and what it waited on, and ends `restart_required` when
+this process holds as many such preparations as it tolerates and has stopped
+claiming). The runbook is
+[catch-up stuck](guides/troubleshooting.md#catch-up-stuck). The
 line is rate-limited (one per second, one per phase and code every 30 seconds).
 An idle consumer keeps one ordinary-pool connection for its work probe and
 never holds a direct or session-pooler connection, so a
 `GBRAIN_DIRECT_DATABASE_URL` that points at a session pooler is not pinned by
 idle `gbrain serve` processes.
+
+<a id="persistence-claim-phase"></a>**Claim phases.** Each claim renewal also records the claimed write's phase
+(`preparing` or `publishing`); `gbrain sources writer status --json` shows it as
+`claim` on running blockers, and doctor `persistence_write_stall` warns past
+`persistence.max_claim_ms` (default 600000, 60000 to 86400000). A running
+claim also carries the preparation `step`, how long it has been in it, what it
+waits on (`git`, `fs`, `db`, `pool` or `unknown`) and the owner process (kind,
+pid, gbrain version); past its budget, `claim.stall` reads
+`preparation_overdue`. Each request counts the cut-offs of its preparation in
+`persistence_requests.preparation_attempts`. See
+[troubleshooting](guides/troubleshooting.md#persistence-write-stall).
 
 ## JSONB writes: never double-encode
 

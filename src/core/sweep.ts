@@ -1,6 +1,6 @@
 import { lookupRefsForSlugs } from './link-reconciliation.ts';
 import { collectWantedLinks, isWantedPagesEnabled, type WantedLinkInput } from './wanted-links.ts';
-import { lineGrammarOptions } from './line-grammar.ts';
+import { readLineGrammarSettings } from './line-grammar.ts';
 /**
  * Serve-resident maintenance sweep [CX-P0.1, CX-P0.3, CX2-4].
  *
@@ -49,6 +49,7 @@ import { lineGrammarOptions } from './line-grammar.ts';
 
 import { join } from 'node:path';
 import { readdir, readFile, writeFile, rm, stat } from 'node:fs/promises';
+import type { CorpusFactTime } from './context/corpus-windows.ts';
 import type { BrainEngine, LinkBatchInput, TimelineBatchInput } from './engine.ts';
 import type { FactsBackstopCtx } from './facts/backstop.ts';
 import type { CapabilityReport } from './capability.ts';
@@ -99,6 +100,8 @@ export interface SweepOpts {
   batchLimit?: number;
   /** Wall-clock budget; the sweep stops between items when exceeded. Default 5000. */
   budgetMs?: number;
+  /** The clock the budget reads (test seam, so a test's timing does not depend on machine load). Default Date.now. */
+  now?: () => number;
   /** Recency window (days) for "recently-modified pages". Default 7. */
   recentDays?: number;
   /** Diagnostic sink (stderr in serve contexts). Default: silent. */
@@ -130,6 +133,17 @@ export interface SweepReport {
 }
 
 /**
+ * #6159: the session file's write time as its facts' time (`turnAt`), or
+ * undefined when the file time is not trusted (logged; the facts are then
+ * dated at extraction).
+ */
+function corpusTurnAt(name: string, factTime: CorpusFactTime, log: (line: string) => void): Date | undefined {
+  if ('at' in factTime) return factTime.at;
+  log(`[sweep] ${name}: file time not trusted (${factTime.rejected}); its facts are dated at extraction time.`);
+  return undefined;
+}
+
+/**
  * Run one bounded maintenance sweep. Never throws — failures land in
  * report.skipped with a per-pass reason.
  */
@@ -137,7 +151,8 @@ export async function runMaintenanceSweep(
   engine: BrainEngine,
   opts: SweepOpts = {},
 ): Promise<SweepReport> {
-  const started = Date.now();
+  const now = opts.now ?? Date.now;
+  const started = now();
   const sourceId = opts.sourceId ?? 'default';
   const batchLimit = Math.max(1, opts.batchLimit ?? 20);
   const budgetMs = Math.max(0, opts.budgetMs ?? 5_000);
@@ -162,7 +177,7 @@ export async function runMaintenanceSweep(
     if (existing) existing.count += count;
     else report.skipped.push({ reason, count });
   };
-  const overBudget = () => Date.now() >= deadline;
+  const overBudget = () => now() >= deadline;
 
   // Budget abort signal: threads into the fence pass's per-page loop so a
   // long item can be interrupted at its own checkpoints. unref'd — the sweep must never hold the
@@ -170,7 +185,7 @@ export async function runMaintenanceSweep(
   const budgetController = new AbortController();
   const budgetTimer = setTimeout(
     () => budgetController.abort(),
-    Math.max(0, deadline - Date.now()),
+    Math.max(0, deadline - now()),
   );
   budgetTimer.unref?.();
 
@@ -272,7 +287,7 @@ export async function runMaintenanceSweep(
     clearTimeout(budgetTimer);
   }
 
-  report.durationMs = Date.now() - started;
+  report.durationMs = now() - started;
   return report;
 }
 
@@ -420,7 +435,9 @@ async function runLinksTimelinePass(
   const incomplete = new Set<string>();
   const wantedBySlug = new Map<string, WantedLinkInput[]>();
   const wantedEnabled = await isWantedPagesEnabled(engine);
-  const lineGrammar = await lineGrammarOptions(engine);
+  // One settings snapshot per sweep; publication refuses a page if the settings move meanwhile (it stays unstamped).
+  const grammar = await readLineGrammarSettings(engine);
+  const lineGrammar = { enabled: grammar.enabled, allowUndeclaredTypes: grammar.allowUndeclaredTypes };
   if (pageCandidates.length > 0) {
     const needed = new Set<string>();
     for (const { slug, candidates } of pageCandidates) {
@@ -533,7 +550,7 @@ async function runLinksTimelinePass(
         const snapshot = snapshots.get(ref.slug)!;
         const result = await engine.replaceDerivedLinks({ slug: ref.slug, sourceId,
           expectedRevision: snapshot.revision, sourceIncarnation: snapshot.sourceIncarnation }, desired,
-        { includeFrontmatter: false, preserveExisting: true,
+        { includeFrontmatter: false, preserveExisting: true, lineGrammar: grammar,
           wanted: { producers: ['body'], rows: wantedBySlug.get(ref.slug) ?? [] }, expectedEndpoints: [...new Set(desired.flatMap(row =>
           [`${row.from_source_id}\0${row.from_slug}`, `${row.to_source_id}\0${row.to_slug}`]))].map(key => {
           const endpoint = endpointMetadata.get(key)!;
@@ -612,36 +629,27 @@ async function runCorpusIngestPass(
   skip('already_ingested', alreadyIngested);
   if (candidates.length === 0) return;
 
-  // Ambient-writeback turn files (`.wb-` basenames) ride this pass as the
-  // batch backstop when serve/IPC was away (OV2-11) — but they answer to the
-  // AUTHORITATIVE `memory.auto_writeback` gate, resolved once per pass: off ⇒
-  // terminal sidecar (operator intent beats a leftover hook-side bank), on ⇒
-  // extracted with the lane's own provenance + salient notability filter.
-  // Resolved BEFORE the keyless/kill-switch short-circuits so an operator's
-  // OFF retires banked turns even when the brain cannot extract — otherwise
-  // the files linger eligible and a later re-enable would extract turns the
-  // operator already revoked (codex re-review, this wave).
-  const { parseWbFileName, writebackOffSidecarJson, selfCaptureSidecarJson, corpusFileSessionId, corpusTextForExtraction } = await import('./context/corpus-segments.ts');
-  const { resolveWritebackConfig } = await import('./facts/writeback-config.ts');
-  const { loadConfig: loadFileCfg } = await import('./config.ts');
+  // #6091: every corpus file answers to the capture gate, resolved once per
+  // pass from the AUTHORITATIVE DB plane ({gate:true}: never a last-known-good
+  // enabled bundle) with the file mirror for drift. `.wb-` turn files (the
+  // Stop-hook backstop when serve/IPC was away, OV2-11) retire on off or unset;
+  // `.seg-` segments and SessionEnd `<sid>.txt` transcripts retire on an
+  // explicit off and extract while unset; a read error, plane drift or an
+  // invalid mode holds them untouched. Retirement runs BEFORE the
+  // keyless/kill-switch short-circuits so an operator's OFF retires banked
+  // files even when the brain cannot extract — otherwise they linger eligible
+  // and a later re-enable would extract text the operator already revoked.
+  const { parseWbFileName, selfCaptureSidecarJson, corpusFileSessionId, corpusTextForExtraction } = await import('./context/corpus-segments.ts');
+  const { applyCaptureGate, captureLaneForFile, resolveCaptureGate } = await import('./context/capture-consent.ts');
   const { isValidSourceId } = await import('./source-id.ts');
-  // Gate semantics: never extract on a last-known-good ENABLED bundle — an
-  // operator's off wins even during a DB blip; read_error, plane drift (DB
-  // row absent + file mirror enabled = failed dual-write, not intent), and
-  // an unrecognized mode value all skip wb files WITHOUT a terminal sidecar
-  // so the next sweep retries them once the config is coherent.
-  const wbCfg = await resolveWritebackConfig(engine, loadFileCfg(), { gate: true });
-  // Genuinely-resolved OFF: terminal-sidecar the wb candidates regardless of
-  // extraction capability (idempotent one-line writes; a lost race with a
-  // concurrent sweep writing the same sidecar is benign).
-  const wbGenuinelyOff = !wbCfg.enabled && wbCfg.mode_valid && !wbCfg.plane_drift && !wbCfg.read_error;
-  const retireWbCandidatesIfOff = async (): Promise<Set<string>> => {
+  const gate = await resolveCaptureGate(engine);
+  const retireCandidatesIfOff = async (): Promise<Set<string>> => {
     const retired = new Set<string>();
-    if (!wbGenuinelyOff) return retired;
     for (const name of candidates) {
-      if (!parseWbFileName(name)) continue;
+      const decision = gate[captureLaneForFile(name)];
+      if (decision.action !== 'retire') continue;
       try {
-        await writeFile(join(dir, name) + CORPUS_INGESTED_SUFFIX, writebackOffSidecarJson());
+        if ((await applyCaptureGate(join(dir, name), decision)).action !== 'retire') continue;
         retired.add(name);
         skip('writeback_off');
       } catch { /* per-file best effort — the next sweep retries */ }
@@ -653,7 +661,7 @@ async function runCorpusIngestPass(
   // whole pass. Agent-authored fences (pass 1) carry keyless memory.
   const { extractionAvailableForEngine } = await import('./facts/extraction-availability.ts');
   if (!(await extractionAvailableForEngine(engine, ctx.capabilities))) {
-    const retired = await retireWbCandidatesIfOff();
+    const retired = await retireCandidatesIfOff();
     skip('keyless', candidates.length - retired.size);
     return;
   }
@@ -662,7 +670,7 @@ async function runCorpusIngestPass(
   // stop ALL fact extraction brain-wide (facts/extract.ts:43).
   const { isFactsExtractionEnabled } = await import('./facts/extract.ts');
   if (!(await isFactsExtractionEnabled(engine))) {
-    const retired = await retireWbCandidatesIfOff();
+    const retired = await retireCandidatesIfOff();
     skip('extraction_disabled', candidates.length - retired.size);
     return;
   }
@@ -715,23 +723,13 @@ async function runCorpusIngestPass(
         continue;
       }
 
+      // #6091: the capture gate, under the claim, before any provider call.
+      const applied = await applyCaptureGate(full, gate[captureLaneForFile(name)]);
+      if (applied.action !== 'extract') {
+        skip(applied.reason);
+        continue;
+      }
       const wbMeta = parseWbFileName(name);
-      if (wbMeta && wbCfg.read_error) {
-        skip('writeback_gate_unreadable');
-        continue; // no sidecar — retry next sweep once the config is readable
-      }
-      if (wbMeta && !wbCfg.enabled && (wbCfg.plane_drift || !wbCfg.mode_valid)) {
-        // Diverged planes / unrecognized mode value ≠ operator intent: no
-        // terminal sidecar — the file survives until the config re-coheres
-        // (doctor names the re-sync command).
-        skip(wbCfg.plane_drift ? 'writeback_plane_drift' : 'writeback_mode_invalid');
-        continue;
-      }
-      if (wbMeta && !wbCfg.enabled) {
-        await writeFile(full + CORPUS_INGESTED_SUFFIX, writebackOffSidecarJson());
-        skip('writeback_off');
-        continue;
-      }
 
       const fileStat = windows.corpusFileStat(await stat(full));
       const raw = await readFile(full, 'utf-8');
@@ -760,19 +758,17 @@ async function runCorpusIngestPass(
         engine,
         sourceId: wbMeta ? wbSourceId : sourceId,
         sessionId: wbMeta ? wbMeta.sessionId : `sweep:corpus:${name}`,
-        // Provenance tag outside FactsBackstopCtx's enumerated writers —
-        // facts.source is free text at the DB layer; the cast only
-        // side-steps the ctx union, which predates the sweep. Writeback turn
-        // files keep their lane's provenance + salient notability filter so
-        // batch-extracted turns are indistinguishable from prompt-harvested.
-        source: wbMeta ? 'hook:writeback' : ('sweep:corpus' as FactsBackstopCtx['source']),
+        // Writeback turn files keep their lane's provenance + salient
+        // notability filter so batch-extracted turns are indistinguishable
+        // from prompt-harvested ones.
+        source: wbMeta ? 'hook:writeback' : 'sweep:corpus',
         mode: 'inline',
         remote: false,
         abortSignal: signal,
-        // #5888: the file's write time anchors the capture dedup window, not the (possibly late) sweep.
-        turnAt: await stat(full).then(st => st.mtime, () => undefined),
+        // #5888/#6159: the file's write time anchors the dedup window and dates the facts (never validFrom: a batch-key input).
+        turnAt: corpusTurnAt(name, windows.corpusFactTime(fileStat.mtime_ms), log),
         reAdmitFileRefusals: true,
-        ...(wbMeta && wbCfg.mode === 'salient' ? { notabilityFilter: 'medium-and-up' as const } : {}),
+        ...(wbMeta && gate.mode === 'salient' ? { notabilityFilter: 'medium-and-up' as const } : {}),
         // visibility deliberately unset → resolveDefaultVisibility [ENG-8]
       };
       // #5812: pasted blocks never reach the extractor (file unchanged). A wb
@@ -863,6 +859,8 @@ async function runCorpusIngestPass(
       if (e instanceof Error && e.name === 'AbortError') {
         skip('budget_exhausted:corpus', candidates.length - i);
         abortLoop = true;
+      } else if ((e as { code?: unknown }).code === 'ambient_capture_off') {
+        skip('writeback_off_inflight');
       } else {
         skip('corpus_file_error');
         log(`[sweep] corpus ingest failed for ${name}: ${e instanceof Error ? e.message : String(e)}`);

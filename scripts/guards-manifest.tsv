@@ -44,7 +44,7 @@ check-gateway-routed-no-direct-anthropic.sh	scanner	yes	no runtime @anthropic-ai
 check-engine-dynamic-import.sh	scanner	yes	.ts companion is its implementation, not a separate guard; scans engine façades, their module dirs, engine-sql/ and schema-migrations/; GBRAIN_GUARD_ROOT seam
 check-key-files-current-state.sh	scanner	todo
 check-trailing-newline.sh	scanner	yes	tracked src/test/root text files end with a newline (guard fixtures excluded); GBRAIN_GUARD_ROOT seam scans with find
-check-test-isolation.sh	scanner	yes	allowlist data file: check-test-isolation.allowlist; fixture mode (GBRAIN_GUARD_ROOT) lints *.test.fixture.ts (bad: R5, bad-r1: R1)
+check-test-isolation.sh	scanner	yes	allowlist data file: check-test-isolation.allowlist; fixture mode (GBRAIN_GUARD_ROOT) lints *.test.fixture.ts (bad: R5, bad-r1: R1, bad-r6: R6)
 check-compile-autoload.sh	scanner	yes	every `bun build --compile` invocation (CLI one-liners + TS spawn arrays) in package.json/.github/scripts/docs/CLAUDE.md/CONTRIBUTING.md must carry --no-compile-autoload-bunfig (a cwd bunfig.toml preload runs before cli-preflight in a compiled binary); also every curated help record in src/cli/command-table.ts loads its src/cli/help/<name>.ts module through a literal () => import() (D3), and every spec module has a record
 check-admin-build.sh	buildfresh	exempt	runs the admin build; the build is the test
 check-admin-embedded.sh	buildfresh	exempt	embed freshness diff; not in verify CHECKS: duplicates check:admin-build's build
@@ -89,3 +89,4 @@ check-test-env-opt-ins.ts	scanner	yes	D7 (GBRA-47): execution-gating process.env
 check-postgres-lane-coverage.ts	scanner	yes	GBRA-47 D8 (TS AST): a test file outside test/e2e/ with a DATABASE_URL-gated PostgreSQL arm (testBackends(), gated process.env.DATABASE_URL) must be named by a DATABASE_URL workflow step, a test/e2e registerPostgresTests wrapper, a tests/heavy script or the backend matrix; reasoned ALLOWLIST, stale rows fail
 check-weight-coverage.ts	scanner	yes	C2 (GBRA-47): weight-map entries naming missing files fail; unweighted share per lane warns, failing only on the scheduled run
 check-recipe-pricing.ts	scanner	yes	X1 (wave 9 lane A, D22): every model a recipe touchpoint lists resolves through isModelPriceable or is named in the recipe's unpriced_models; stale markers fail; GBRAIN_GUARD_ROOT seam reads <root>/recipes.json against the real price tables
+check-write-gate-regex.ts	scanner	yes	#5575 ENG-16: write-gate detector patterns (WRITE_GATE_PATTERNS) are bounded (no * + {n,}, bound <= 200, no nested repeats, no backrefs), longest match <= MAX_MATCH_CHARS, preceded contexts $-anchored and <= MAX_PRECEDING_CHARS, non-global with lowercase anchors; GBRAIN_GUARD_ROOT reads <root>/patterns.json

@@ -49,7 +49,7 @@ the same registry.
 
 ```bash
 gbrain init --pglite                                      # 2-second local brain
-claude mcp add gbrain -- "$(command -v gbrain)" serve --surface starter   # the verbs plus page tools
+claude mcp add gbrain -- "$(command -v gbrain)" serve --surface full   # every operation, the verbs included
 gbrain remember "gbrain install check" --provenance install-check
 gbrain recall --query "gbrain install check"              # …now ask your agent in a NEW session
 ```
@@ -64,28 +64,28 @@ If `claude` is not found: install Claude Code first, or use a block below.
 
 **Codex**
 ```bash
-codex mcp add gbrain -- "$(command -v gbrain)" serve --surface starter
+codex mcp add gbrain -- "$(command -v gbrain)" serve --surface full
 ```
 
 **Grok Build** (verify with `grok mcp doctor gbrain` — the add is lazy)
 ```bash
-grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- "$(command -v gbrain)" serve --surface starter
+grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- "$(command -v gbrain)" serve --surface full
 ```
 
 **opencode** (verify with `opencode mcp list` — the add is lazy, and list SPAWNS the server)
 ```bash
-opencode mcp add gbrain --env GBRAIN_HOME=$HOME -- "$(command -v gbrain)" serve --surface starter
+opencode mcp add gbrain --env GBRAIN_HOME=$HOME -- "$(command -v gbrain)" serve --surface full
 ```
 
 **OpenClaw / any stdio MCP host** — register the server command
-`gbrain serve --surface starter`. Remote brains: `gbrain serve --http` on the
+`gbrain serve --surface full`. Remote brains: `gbrain serve --http` on the
 host, then `gbrain connect https://host/mcp --token gbrain_xxx --install` on
 each client.
 
 **Surface modes:** `--surface verbs` exposes EXACTLY the seven verbs —
 advertised list AND dispatch are filtered fail-closed (a hidden op returns
 `unknown_tool` even when called by name). `--surface starter` exposes the
-~27-op daily-driver set (`STARTER_OPS` in `src/mcp/surface.ts`): the seven
+40-op daily-driver set (`STARTER_OPS` in `src/mcp/surface.ts`): the seven
 verbs plus the daily brain-tool slice, the agent lane, `whoami`, `capture`, and the
 `request_tools` discovery meta-op (re-derivable from production usage via
 `scripts/derive-starter-ops.ts`). Monotonic by construction: verbs ⊆ starter ⊆ full
@@ -93,8 +93,9 @@ verbs plus the daily brain-tool slice, the agent lane, `whoami`, `capture`, and 
 verb semantics. `--surface full` (the default for a bare `serve`) exposes
 every operation, verbs included. Every stdio registration gbrain writes
 (`gbrain init`'s quickstart, readiness, `gbrain bootstrap hooks`, the plugins)
-pins `starter`, because `verbs` lacks the page reads and writes bootstrap's
-instructions use and `full` puts the whole catalogue in front of the model.
+pins `full`, callable and advertised: in the held-out agent benchmark, listing
+only `starter` or `verbs` lowered task success and saved no tokens. A harness
+that caps its tool count can register `--surface starter` or `--surface verbs`.
 Persist a default for bare `serve` with `gbrain config set mcp_surface verbs`.
 On stdio, `GBRAIN_SURFACE` in the server's env overrides `--surface`; a
 session widens itself with `request_tools {"surface":"full"}` (see
@@ -292,6 +293,18 @@ text equal to the target is `status: duplicate` and changes nothing. On success
 `superseded_by` and its `## Facts` row is struck with `superseded by #N` in
 the same publication. Every `superseded` response carries `superseded_fact_id`.
 
+#### remember content_origin (additive)
+
+`content_origin` (string: `user_said`, `tool_output` or `inferred`): where the
+fact's text came from. `tool_output` (a web page, email, file or other tool's
+text) stores the fact as `external_untrusted`; `user_said` and `inferred` store
+it at the agent tier (`agent_written`), so `user_said` never confers owner
+authority. Any other value is `invalid_params` listing the accepted values.
+Optional, and safety never depends on it. Like `replaces`, it is advertised on
+the verbs and full surfaces but left out of the starter surface's schema (to
+keep that tool list inside its size budget); a starter client that passes it
+is still honored. `put_page` and `capture` take the same parameter.
+
 #### remember entity attribution fields (additive)
 
 Optional response fields; clients must ignore any they do not know.
@@ -486,6 +499,14 @@ already-expired fact returns `expired: false` (success); unknown id ⇒
 
 Response: `{ id, expired, reason, protocol_version }`.
 
+#### forget and purge (additive note)
+
+`forget` keeps this contract: it expires, never deletes. Removing a claim's
+text from live stores is a separate owner-only operation, `purge_fact` (CLI:
+`gbrain forget <id> --purge` on the brain host), which is not a memory verb and
+is never callable over MCP; a remote call gets `trusted_local_only` with the
+command for the user. See [expire versus purge](../guides/memory-boundaries.md#purge).
+
 #### forget similar_active and semantic_review (additive)
 
 `semantic_review` (boolean, default `true`): `false` keeps this claim out of
@@ -639,25 +660,27 @@ From the CLI: `gbrain call edit_page '{"slug":"projects/example","expected_revis
 
 One deterministic, budget-packed bundle for a set of standing
 entities — entity cards + open threads + hot facts. Built for **session
-boundaries**: call it at session start to warm cold context, and immediately
-after compaction to rehydrate what the summary dropped. Composes existing arms
-(`entity` card builder + the hot-facts arm); never calls an LLM.
+boundaries**: call it at session start and right after compaction. Never
+calls an LLM.
 
 `entities` is comma-separated, capped at 8 (the response echoes the capped list). `budget_tokens` packs
-server-side (cards first, then facts; each item costs its rendered line and the
-envelope + section headers are reserved first, so `text` fits the budget) and the
-response reports `budget_used` (the token estimate of `text`) + `dropped_count`
-— it never trims client-side. `since` filters
+server-side (cards first, then facts; each item costs its rendered line after the
+envelope and headers are reserved, so `text` fits) and reports `budget_used`
+(tokens of `text`) + `dropped_count`. `since` filters
 open-thread events to those after the cursor. **Visibility is WORLD-ONLY by
-default** on every arm (a pack is injected into an agent context window that may
-be logged or synced to a cloud model). `include_private` widens ALL arms in
+default** on every arm (a pack lands in a context window that may be logged or
+synced to a cloud model). `include_private` widens ALL arms in
 lockstep, and is honored ONLY for trusted-local callers (`remote === false`); a
 remote caller never widens (fail-closed).
 
 Response: `{ protocol_version, entities, cards[], open_threads[], facts[], text,
 degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core? }`. `text` is the
-pre-rendered, envelope-wrapped injectable block; with `budget_tokens` it is
-rendered from the packed sets and never exceeds the declared budget.
+envelope-wrapped injectable block, rendered from the packed sets within `budget_tokens`.
+
+`entities` scopes cards and threads, not the hot facts (the session's recent
+memory), so other facts can appear; `recall` with `entity` reads one entity
+strictly. `facts[]` here and in `delta` carry `fact_id` (what `forget` takes)
+and `provenance` (the stored source), never rendered into `text`.
 
 #### context_pack core memory (additive)
 
@@ -778,7 +801,7 @@ isolation on every read. Remote callers see `visibility = world` facts only.
 Read verbs redact credential-shaped values in their responses with the
 canonical secret scanner: a value becomes `<REDACTED:pattern>`. `recall`,
 `context_pack` and `delta` redact the facts' `fact`, `context` and `source`
-fields for remote callers (`ctx.remote !== false`; every MCP transport,
+(`provenance`) fields for remote callers (`ctx.remote !== false`; every MCP transport,
 including stdio, and thin clients) and return them as stored to the trusted
 local CLI, so a remembered credential is readable only with `gbrain recall` on
 the brain host. Search results, the rendered `text` and `entity` cards are

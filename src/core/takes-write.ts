@@ -59,6 +59,7 @@ import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
 import { atomicWriteFileSync } from './atomic-write.ts';
 import { commitWriteThroughFile, isDurabilityHardened } from './brain-repo-durability.ts';
 import { maintenanceTransaction } from './persistence/attribution.ts';
+import type { WriteTrust } from './trust/tier.ts';
 
 export type TakesWriteErrorCode =
   | 'page_not_found'      // slug has no pages row (scoped)
@@ -96,6 +97,8 @@ export interface TakesWriteTarget {
   allowList?: HolderAllowList;
   /** Lock wait budget. CLI keeps the 30s default; ops pass ~2000. */
   lockTimeoutMs?: number;
+  /** #5575 I2: a deriver's tier for the added row (`think --take`); absent, the row is undeclared. */
+  trust?: WriteTrust;
 }
 
 /**
@@ -393,8 +396,12 @@ function assertFenceRoundTrips(parsed: ParseResult): void {
   }
 }
 
-function replaceFence(body: string, rows: ParsedTake[]): string {
-  const newFence = renderTakesFence(rows);
+/**
+ * Re-render the body's takes fence with `rows`. The fence's reservation rows
+ * stay, and `reserve` adds new ones (W9F item 4: `takes remove`).
+ */
+function replaceFence(body: string, rows: ParsedTake[], reserve: readonly number[] = []): string {
+  const newFence = renderTakesFence(rows, [...parseTakesFence(body).reservedRowNums, ...reserve]);
   const { beginIdx, endIdx } = locateOutsideCode(body, TAKES_FENCE_BEGIN, TAKES_FENCE_END);
   return body.slice(0, beginIdx) + newFence + body.slice(endIdx + TAKES_FENCE_END.length);
 }
@@ -572,7 +579,7 @@ export async function addTakeToPage(
         holder: input.holder, weight: input.weight ?? 0.5,
         since_date: input.sinceDate, source: input.source,
         active: true, superseded_by: null,
-      }]));
+      }]), target.trust);
     } catch (err) {
       // P1-4/F4: md is canonical + already written — a failed DB mirror is
       // healed by the next reconcile, so surface a warning instead of throwing

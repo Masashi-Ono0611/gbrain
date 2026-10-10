@@ -194,7 +194,7 @@ When presenting facts from brain pages, include inline citations:
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - `gbrain waiting` refuses on stale data: run the sync command it names (or tell the user to, when it needs the brain host), then retry. Do not build the "waiting on you" section from stale mail.
 - `recall` / `query` sections come back empty with a degraded notice: write "the brain is searching keywords only right now" in that section instead of "nothing happened".
@@ -215,12 +215,3 @@ Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) f
 - List pages in gbrain by type (list_pages)
 - Check gbrain health (get_health)
 - View timeline entries in gbrain (get_timeline)
-
-## Tools outside your MCP surface
-
-This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
-
-- `get_timeline` → `gbrain timeline`
-
-To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

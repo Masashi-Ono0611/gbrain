@@ -6,6 +6,7 @@
  */
 import type { BrainEngine } from '../../../core/engine.ts';
 import { resolveHoursEnv } from '../../../core/env-number.ts';
+import { isSyncDisabledConfig } from '../../../core/sync-policy.ts';
 import type { Check } from '../../doctor.ts';
 import type { Action } from '../../../core/agent-output.ts';
 import { agentFix, checkError, infoCheck } from '../check-fix.ts';
@@ -34,6 +35,14 @@ const _resolveSyncFreshnessHours = resolveHoursEnv;
  * Single-source brains get `ok` with a "not applicable" message.
  * SQL error → `warn` (own try/catch, not relying on the outer doctor
  * dispatcher — codex flagged this).
+ *
+ * A managed brain refuses that line (`writer_coordinator_required`: managed
+ * sync needs `--no-pull` and rejects `--skip-failed`), so it gets the recipe
+ * it accepts: `gbrain sync --all --no-pull --hard-deadline 13m` every 15
+ * minutes on the owner host, after `gbrain sources refresh <id>` for each
+ * checkout that tracks a remote. Managed sync takes no per-source lock, so
+ * the deadline stays under the interval to keep ticks from overlapping. A
+ * schema without `persistence_brain` reads as unmanaged.
  */
 export async function checkSyncConsolidation(engine: BrainEngine): Promise<Check> {
   try {
@@ -48,6 +57,18 @@ export async function checkSyncConsolidation(engine: BrainEngine): Promise<Check
         name: 'sync_consolidation',
         status: 'ok',
         message: 'Single-source brain — sync --all consolidation not applicable.',
+      };
+    }
+    const { managedPersistenceEnabled } = await import('../../../core/persistence/ownership.ts');
+    if (await managedPersistenceEnabled(engine).catch(() => false)) {
+      return {
+        name: 'sync_consolidation',
+        status: 'ok',
+        message:
+          `${sourceCount} active sources on a managed brain. Recommended cron on the owner host, every 15 minutes: ` +
+          '`gbrain sync --all --no-pull --hard-deadline 13m`. Managed sync never pulls: for each checkout that tracks a remote, ' +
+          'chain `gbrain sources refresh <id>;` in front of it to take upstream commits. ' +
+          'Keep the deadline under the interval: managed sync takes no per-source lock, so a tick that outlives the interval would overlap the next one.',
       };
     }
     return {
@@ -144,7 +165,13 @@ export async function checkCycleFreshness(
   opts?: { nowMs?: number },
 ): Promise<Check> {
   try {
-    const sources = await engine.listAllSources({ localPathOnly: true });
+    // #4399: a source the operator has deliberately excluded from automatic
+    // sync (config.syncEnabled=false — already honored by performSync's
+    // choke point and the autopilot freshness dispatcher, #4952) must not
+    // be reported as a stale-cycle [FAIL]/[WARN] here either.
+    const sources = (await engine.listAllSources({ localPathOnly: true })).filter(
+      (s) => !isSyncDisabledConfig(s.config),
+    );
     if (sources.length === 0) {
       return {
         name: 'cycle_freshness',

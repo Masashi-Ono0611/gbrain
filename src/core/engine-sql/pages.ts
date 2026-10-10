@@ -20,9 +20,10 @@ import { PAGE_SORT_SQL } from '../types.ts';
 import type { PageWriteOptions } from '../page-state/types.ts';
 import { moveSlugBindings, recordRenameAlias } from '../page-state/rename-alias.ts';
 import { sanitizeText } from '../batch-rows.ts';
-import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion } from '../search/safe-chunks.ts';
+import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion, currentTextProjectionFilter, safeChunksFilter } from '../search/safe-chunks.ts';
 import { privatePagesFilterFragment, privateSnapshotFilterFragment } from '../search/private-visibility.ts';
-import { quarantineFilterFragment } from '../quarantine.ts';
+import { QUARANTINE_FILTER_FRAGMENT, quarantineFilterFragment } from '../quarantine.ts';
+import { buildVisibilityClause } from '../search/sql-ranking.ts';
 import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
 import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
 import { jsonbParam, type SqlExecutor } from './executor.ts';
@@ -119,10 +120,17 @@ export async function putPage(
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date() : null;
+    // #5984: the contextual retrieval stamp, when the caller passes it, rides in this statement.
+    const cr = opts?.contextualRetrieval && opts.contextualRetrieval.mode !== 'none' ? opts.contextualRetrieval : null;
+    const crColumns = cr ? sqlFragment`, contextual_retrieval_mode, corpus_generation` : sqlFragment``;
+    const crValues = cr ? sqlFragment`, ${cr.mode}, ${cr.corpusGeneration}` : sqlFragment``;
+    const crSet = cr ? sqlFragment`
+        contextual_retrieval_mode = EXCLUDED.contextual_retrieval_mode,
+        corpus_generation     = EXCLUDED.corpus_generation,` : sqlFragment``;
     const { rows } = await exec.run(sqlFragment`
-      INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
-      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${sanitizeText(page.title)}, ${sanitizeText(page.compiled_truth)}, ${sanitizeText(page.timeline || '')}, ${jsonbParam(frontmatter)}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, ${chunkerVersion}::smallint, ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
-      ON CONFLICT (source_id, slug) DO UPDATE SET
+      INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at${crColumns})
+      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${sanitizeText(page.title)}, ${sanitizeText(page.compiled_truth)}, ${sanitizeText(page.timeline || '')}, ${jsonbParam(frontmatter)}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, ${chunkerVersion}::smallint, ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt}${crValues})
+      ON CONFLICT (source_id, slug) DO UPDATE SET${crSet}
         type = EXCLUDED.type,
         page_kind = EXCLUDED.page_kind,
         title = EXCLUDED.title,
@@ -340,7 +348,7 @@ export async function updatePageContextualRetrievalState(
           RETURNING p.id, previous.old_mode, previous.skipped
         )
         UPDATE content_chunks cc SET ${vector}=NULL, embedded_at=NULL,
-          embedded_text_hash=NULL, embedding_input_hash=NULL
+          embedded_text_hash=NULL, embedding_input_hash=NULL, embedding_pending_since=now()
         FROM changed WHERE cc.page_id=changed.id
           AND changed.old_mode IN ('title','per_chunk_synopsis') AND NOT changed.skipped
           AND cc.${vector} IS NOT NULL`);
@@ -368,6 +376,10 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
 
     const typeCondition = filters?.type ? sqlFragment`AND p.type = ${filters.type}` : sqlFragment``;
     const tagJoin = filters?.tag ? sqlFragment`JOIN tags t ON t.page_id = p.id` : sqlFragment``;
+    const requireVisibility = filters?.requireLiveVisibility === true || filters?.requireSafeChunks === true;
+    const joins = requireVisibility
+      ? sqlFragment`${tagJoin} JOIN sources s ON s.id = p.source_id`
+      : tagJoin;
     const tagCondition = filters?.tag ? sqlFragment`AND t.tag = ${filters.tag}` : sqlFragment``;
     // v0.45.7 keyset (updated_at, slug) supersedes updated_after when set.
     const keyset = filters?.updatedAfterKeyset;
@@ -405,6 +417,14 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
     const privateCondition = filters?.excludePrivate === true
       ? trustedSql(`AND ${privatePagesFilterFragment('p')}`)
       : sqlFragment``;
+    // Opt-in search visibility for canonical bodies; administrative listPages calls retain their existing behavior.
+    const visibilityPrivate = filters?.excludePrivate
+      ? sqlFragment` AND ${trustedSql(privatePagesFilterFragment('p'))}` : sqlFragment``;
+    const visibilitySafeChunks = (filters?.requireSafeChunks ?? filters?.excludePrivate)
+      ? sqlFragment` AND ${trustedSql(safeChunksFilter('p'))}` : sqlFragment``;
+    const visibilityCondition = sqlFragment`AND p.deleted_at IS NULL AND ${trustedSql(currentTextProjectionFilter('p'))} AND NOT s.archived AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)}${visibilityPrivate}${visibilitySafeChunks}`;
+    const privateAndVisibilityCondition = requireVisibility
+      ? sqlFragment`${privateCondition} ${visibilityCondition}` : privateCondition;
     const effectiveAfterCondition = filters?.effective_after
       ? sqlFragment`AND p.effective_date >= ${filters.effective_after}::timestamptz`
       : sqlFragment``;
@@ -422,8 +442,8 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       : sqlFragment`p.*`;
       const { rows } = await exec.run(sqlFragment`
         SELECT ${columns}, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
-        ${tagJoin}
-        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
+        ${joins}
+        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${sourceCondition} ${deletedCondition} ${privateAndVisibilityCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
         ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}
       `);
       return rows.map(rowToPage);
@@ -501,10 +521,11 @@ export async function listPrefixSampledPages(scoped: ScopedReadRunner, opts: Dom
           p.source_id,
           p.title,
           p.compiled_truth,
-          p.last_retrieved_at,
+          GREATEST(p.last_retrieved_at, r.last_retrieved_at) AS last_retrieved_at,
           substring(p.slug from '^[^/]+/[^/]+') AS prefix,
           COUNT(pl.id) AS connection_count
         FROM pages p
+        LEFT JOIN page_retrievals r ON r.page_id = p.id
         LEFT JOIN page_links pl ON pl.to_page_id = p.id
         WHERE p.deleted_at IS NULL
           AND substring(p.slug from '^[^/]+/[^/]+') = ANY(${opts.prefixes}::text[])
@@ -514,7 +535,7 @@ export async function listPrefixSampledPages(scoped: ScopedReadRunner, opts: Dom
             OR (${sourceIds}::text[] IS NULL AND ${sourceId}::text IS NOT NULL AND p.source_id = ${sourceId})
             OR (${sourceIds}::text[] IS NULL AND ${sourceId}::text IS NULL)
           )
-        GROUP BY p.id, p.slug, p.source_id, p.title, p.compiled_truth, p.last_retrieved_at
+        GROUP BY p.id, p.slug, p.source_id, p.title, p.compiled_truth, p.last_retrieved_at, r.last_retrieved_at
       ),
       ranked AS (
         SELECT
@@ -587,10 +608,11 @@ export async function listCorpusSample(scoped: ScopedReadRunner, opts: CorpusSam
           p.source_id,
           p.title,
           p.compiled_truth,
-          p.last_retrieved_at,
+          GREATEST(p.last_retrieved_at, r.last_retrieved_at) AS last_retrieved_at,
           substring(p.slug from '^[^/]+/[^/]+') AS prefix,
           (SELECT COUNT(*) FROM page_links pl WHERE pl.to_page_id = p.id) AS connection_count
         FROM pages p
+        LEFT JOIN page_retrievals r ON r.page_id = p.id
         WHERE p.deleted_at IS NULL
           AND (cardinality(${exclude}::text[]) = 0 OR NOT (p.slug = ANY(${exclude}::text[])))
           AND (

@@ -284,7 +284,7 @@ up 100 bad pages is enormous.
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - The sub-skill this routes to fails: report which one and why, using that skill's own failure guidance; do not silently re-route to a generic page write.
 - `put_page` returns `write_pending` (exit 10) or `revision_conflict`: poll `gbrain write-request <request_id>`, or re-read and merge; never write a duplicate page.
@@ -326,13 +326,3 @@ Raw source: [preserved at path / uploaded to cloud]
 - Tag a page in gbrain (add_tag)
 - Store raw data in gbrain (put_raw_data)
 - Check backlinks in gbrain (get_backlinks)
-
-## Tools outside your MCP surface
-
-This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
-
-- `add_link` → `gbrain link`
-- `sync_brain` → `gbrain sync`
-
-To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.
