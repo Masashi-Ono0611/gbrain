@@ -79,6 +79,20 @@ describe('query CRAG auto-think source scope', () => {
     expect(thinkCalls[0].allowedSources).toEqual(['source-a', 'source-b']);
   });
 
+  test('local federated set (no explicit source) is what think reads, as the query did', async () => {
+    await query({ sourceId: 'source-a', localFederatedSourceIds: ['source-a', 'source-b'] });
+    expect(thinkCalls).toHaveLength(1);
+    expect(thinkCalls[0].sourceId).toBeUndefined();
+    expect(thinkCalls[0].allowedSources).toEqual(['source-a', 'source-b']);
+  });
+
+  test('explicit __all__ spans every source for think too, whatever ctx.sourceId is', async () => {
+    await query({ sourceId: 'source-b' }, '__all__');
+    expect(thinkCalls).toHaveLength(1);
+    expect(thinkCalls[0].sourceId).toBeUndefined();
+    expect(thinkCalls[0].allowedSources).toBeUndefined();
+  });
+
   test.each([true, undefined])('remote=%s keeps the hint without running think', async remote => {
     const crag = await query({ remote, sourceId: 'source-a' }, 'source-a');
     expect(crag.think).toBeUndefined();
