@@ -168,7 +168,14 @@ summary.
 Failure reporting rides the same machinery. `scripts/capture-test-log.ts`
 adds the last 50 failures to a red job's step summary (file, test, backend
 arm, first error block and a `bun test … -t` reproduce command), falling back
-to the log tail when no `(fail)` line exists. `run-e2e.sh` kills and names any
+to the log tail when no `(fail)` line exists. It also names one runtime
+defect: a `killed N dangling process` line followed by nothing but timeouts in
+two or more files is `bun_spawnsync_poisoned` (oven-sh/bun#34069, fixed
+upstream by oven-sh/bun#44581 but in no Bun release yet): a GC finalizer that
+ran during an earlier `Bun.spawnSync` wait leaves every later synchronous
+child spawn in that process spinning until its deadline, so the rest of the
+shard says nothing about the tests and the job is rerun (TODOS.md tracks the
+Bun bump). `run-e2e.sh` kills and names any
 process still running under a file's `HOME`, and fails that file by name when
 its `HOME` cannot be removed. Coverage lanes write `executed-files.txt` on red
 runs too; `lane-manifest.json` is written only on a green run.
