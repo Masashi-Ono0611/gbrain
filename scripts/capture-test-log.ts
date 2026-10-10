@@ -57,7 +57,7 @@ export class FailureCollector {
       return;
     }
     this.justFailed = false;
-    const bun = /^bun test v(\S+)/.exec(line);
+    const bun = /^bun\stest v(\S+)/.exec(line);
     if (bun) this.bunVersion = bun[1];
     if (/^killed \d+ dangling process(?:es)?$/.test(line)) this.danglingKills++;
     const header = /^(?:::group::|##\[group\])?(\S.*\.test\.[cm]?[jt]sx?):$/.exec(line);
