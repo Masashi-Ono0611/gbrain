@@ -10,6 +10,19 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.140.0] - 2026-10-10
+
+**CI only: unit shard 7 no longer loses its tail to a Bun runtime defect, and a red shard that does names the defect instead of blaming the tests. Nothing in gbrain itself changes.**
+
+Three runs out of three of the `Test` workflow's shard 7 at the current file composition (d4dc2d4d8 twice, c12e14adf once) went bad about ten minutes in, inside `test/persistence-git-publication.test.ts`: a `git` run through `Bun.spawnSync` spun until the test deadline printed `killed 1 dangling process`, and from then on every synchronous child spawn in the process (`spawnSync`, `execSync`, `execFileSync`) in unrelated files timed out with empty output while asynchronous spawns and in-process tests kept passing. That is oven-sh/bun#34069 in Bun 1.4.0 and 1.4.2: a GC finalizer that runs while `Bun.spawnSync` waits leaves the runtime's private spawnSync loop with a drifted poll count for the life of the process. Bun fixed it upstream on 2026-10-05 (oven-sh/bun#44581, commit 13a98b0); no release carries it yet. The release gate refused v0.60.139.0 on it.
+
+### Itemized changes
+
+- `test/helpers/git-publication.ts`: `gitAsync` and `gitFixtureAsync` run git through `Bun.spawn` on the main loop; `test/persistence-git-publication.test.ts` uses them for every call, so the shard's densest run of `spawnSync` windows is gone. The synchronous `git` stays for callers that cannot await, and both now throw on any exit that is not 0: a null exit code (signal, or a `spawnSync` that returned without a status) used to pass as success and return `''`, which turned the poisoned run into a bogus fixture and a `durability_not_enabled` assertion two lines later. Both spawns pass the live `process.env`, so a test's `PATH` or `GIT_*` override reaches the child.
+- `scripts/capture-test-log.ts`: a red shard whose log shows `killed N dangling process` followed by nothing but timeouts, at least three of them in at least two files, is named `bun_spawnsync_poisoned` in the job's step summary and on stderr, with the Bun version, the upstream issue and fix, and "rerun the job". A signal only; nothing is resumed or retried. One hung test with a dangling child, timeouts with no killed child, timeouts confined to one file, or any non-timeout failure after the kill are left for their own diagnosis.
+- `TODOS.md`: bump Bun when a release carries 13a98b0; check the compare, not the version number.
+- Tests: `test/git-publication-helper.test.ts` (a git that ends by signal throws from both helpers with the command and the status; a non-zero exit carries git's stderr; the signal case returned `''` on the previous helper), `test/scripts/capture-test-log.test.ts` (the signature is named; the four look-alike shapes are not). The detector names both real shard-7 logs and not the same shard's unrelated recall-budget failure.
+
 ## [0.60.139.0] - 2026-10-09
 
 **Your agent can now tell your own notes from something a web page told it. Everything it reads back from memory says where it came from, text that reads like instructions to an agent is flagged when it is saved, and you can remove a fact you saved by mistake with a receipt that says exactly what was removed and what was out of reach.**
