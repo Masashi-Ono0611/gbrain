@@ -57,7 +57,6 @@ import {
   stampDeepResearchIds,
   stampEvidenceSafe,
   maybeCaptureSearch,
-  thinkSourceScopeOpts,
 } from './context.ts';
 
 /**
@@ -79,6 +78,17 @@ async function resolveEffectiveLimit(ctx: OperationContext, p: Record<string, un
 // --- Search ---
 
 type SourceScope = { sourceId?: string; sourceIds?: string[]; minTrust?: TrustTier };
+
+/**
+ * runThink's scope for a CRAG escalation, taken from the scope this query already
+ * resolved (an explicit per-call source_id included) rather than re-derived from
+ * ctx. Same federated-array > scalar precedence as thinkSourceScopeOpts.
+ */
+function thinkScopeFromQuery(scope: SourceScope): { sourceId?: string; allowedSources?: string[] } {
+  return scope.sourceIds !== undefined
+    ? { allowedSources: scope.sourceIds }
+    : scope.sourceId !== undefined ? { sourceId: scope.sourceId } : {};
+}
 
 /** The caller's source scope plus its effective read floor (#5575: token floor, `min_trust`, read policy). */
 async function trustedSearchScope(ctx: OperationContext, p: Record<string, unknown>, sourceIdParam: string | undefined): Promise<SourceScope> {
@@ -1091,7 +1101,7 @@ const query: Operation = {
           try {
             const { runThink } = await import('../think/index.ts');
             const { embedQuery } = await import('../embedding.ts');
-            const thinkScope = thinkSourceScopeOpts(ctx);
+            const thinkScope = thinkScopeFromQuery(querySourceScope);
             const t = await runThink(ctx.engine, {
               question: queryText,
               since: typeof p.since === 'string' ? p.since : undefined,
