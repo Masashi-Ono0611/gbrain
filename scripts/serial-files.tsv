@@ -131,6 +131,7 @@ test/doctor-remediation-plan-observational.serial.test.ts	global-state	global-st
 test/doctor-remote.serial.test.ts	global-state	global-state: binds local servers/ports
 test/doctor-report-remote.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME)
 test/doctor-revision-backfill-journey.serial.test.ts	global-state	global-state: withEnv holds GBRAIN_HOME across awaited doctor and CLI journey runs
+test/dream-drain-failure-summary.serial.test.ts	global-state	global-state: spyOn(process, exit) and console.log/error replaced per run (mockRestore after each); file keeps its upstream name so the overlay export stays mod-only
 test/dream-owner-id-threading.serial.test.ts	R2	R2: mock.module(../src/core/cycle.ts) replaces modules for every file in the process
 test/dream-postgres.serial.test.ts	global-state	global-state: spyOn process.exit, console.error
 test/dream-publication-hold.serial.test.ts	R2	R2: mock.module(../src/core/ai/gateway.ts, ../src/core/cycle/synthesize-concepts.ts, ../src/core/cycle/synthesize.ts, ../src/core/persistence/prepared-maintenance.ts, ../src/core/minions/wait-for-completion.ts) replaces modules for every file in the process
