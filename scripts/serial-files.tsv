@@ -141,7 +141,7 @@ test/doctor-remediation-plan-observational.serial.test.ts	global-state	global-st
 test/doctor-remote.serial.test.ts	global-state	global-state: binds local servers/ports
 test/doctor-report-remote.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME)
 test/doctor-revision-backfill-journey.serial.test.ts	global-state	global-state: withEnv holds GBRAIN_HOME across awaited doctor and CLI journey runs
-test/dream-drain-failure-summary.serial.test.ts	R2	R2: mock.module(../src/core/cycle/extract-atoms-drain.ts) replaces modules for every file in the process
+test/dream-drain-failure-summary.serial.test.ts	global-state	global-state: spyOn(process, exit) and console.log/error replaced per run (mockRestore after each); file keeps its upstream name so the overlay export stays mod-only
 test/dream-owner-id-threading.serial.test.ts	R2	R2: mock.module(../src/core/cycle.ts) replaces modules for every file in the process
 test/dream-postgres.serial.test.ts	global-state	global-state: spyOn process.exit, console.error
 test/dream-publication-hold.serial.test.ts	R2	R2: mock.module(../src/core/ai/gateway.ts, ../src/core/cycle/synthesize-concepts.ts, ../src/core/cycle/synthesize.ts, ../src/core/persistence/prepared-maintenance.ts, ../src/core/minions/wait-for-completion.ts) replaces modules for every file in the process
@@ -331,6 +331,7 @@ test/query-image-date-readiness.serial.test.ts	R2	R2: mock.module(../src/core/ai
 test/query-image-flag.serial.test.ts	R2	R2: mock.module(../src/core/ai/gateway.ts) replaces modules for every file in the process
 test/query-image-mode-limit.serial.test.ts	R2	R2: mock.module(../src/core/ai/gateway.ts) replaces modules for every file in the process
 test/query-op-limit-mode-4356.serial.test.ts	R2	R2: mock.module(../src/core/search/hybrid.ts) replaces modules for every file in the process
+test/query-op-relational-meta.serial.test.ts	R2	R2: mock.module(../src/core/search/hybrid.ts) replaces the module for every file in the process
 test/readiness-embedding-enablement.serial.test.ts	global-state	global-state: R3: constructs PGLiteEngine outside beforeAll
 test/recall-budget-policy-thin.serial.test.ts	R2	R2: mock.module(../src/core/config.ts, ../src/core/mcp-client.ts) replaces modules for every file in the process
 test/recall-thin-client-fallback.serial.test.ts	R2	R2: mock.module(../src/core/config.ts, ../src/core/mcp-client.ts) replaces modules for every file in the process
