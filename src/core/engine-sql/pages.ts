@@ -501,7 +501,7 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       ? sqlFragment` AND ${trustedSql(privatePagesFilterFragment('p'))}` : sqlFragment``;
     const visibilitySafeChunks = (filters?.requireSafeChunks ?? filters?.excludePrivate)
       ? sqlFragment` AND ${trustedSql(safeChunksFilter('p'))}` : sqlFragment``;
-    const visibilityCondition = sqlFragment`AND p.deleted_at IS NULL AND ${trustedSql(currentTextProjectionFilter('p'))} AND NOT s.archived AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)}${visibilityPrivate}${visibilitySafeChunks}`;
+    const visibilityCondition = sqlFragment`AND p.deleted_at IS NULL AND ${trustedSql(currentTextProjectionFilter('p'))} AND NOT s.archived AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)} AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'pinned_question')${visibilityPrivate}${visibilitySafeChunks}`;
     const privateAndVisibilityCondition = requireVisibility
       ? sqlFragment`${privateCondition} ${visibilityCondition}` : privateCondition;
     const effectiveAfterCondition = filters?.effective_after
