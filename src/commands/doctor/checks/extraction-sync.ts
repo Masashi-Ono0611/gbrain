@@ -1018,6 +1018,7 @@ export async function computeExtractHealthCheck(
       round_completed_count: number;
       expected_limit_count: number;
       rollup_write_failures: number;
+      halt_reasons: unknown;
       last_updated_at: Date | string | null;
       last_halt_age_days: number | string | null;
     };
@@ -1026,7 +1027,7 @@ export async function computeExtractHealthCheck(
     // at an EXPECTED budget/deadline cap — successful partial progress, not
     // failures. Pre-v141 brains lack the column; retry without it (caps read
     // as 0, i.e. "unknown" — old conflated halt rows keep today's semantics).
-    const rollupQuery = (withExpected: boolean) =>
+    const rollupQuery = (withExpected: boolean, withReasons: boolean) =>
       `SELECT
          kind,
          SUM(cost_usd) AS cost_7d_usd,
@@ -1035,6 +1036,7 @@ export async function computeExtractHealthCheck(
          SUM(halt_count) AS halt_count,
          SUM(round_completed_count) AS round_completed_count,
          ${withExpected ? 'SUM(expected_limit_count)' : '0'} AS expected_limit_count,
+         ${withReasons ? 'jsonb_agg(halt_reasons)' : "'[]'::jsonb"} AS halt_reasons,
          SUM(rollup_write_failures) AS rollup_write_failures,
          MAX(updated_at) AS last_updated_at,
          CURRENT_DATE - MAX(day) FILTER (WHERE halt_count > 0) AS last_halt_age_days
@@ -1042,13 +1044,19 @@ export async function computeExtractHealthCheck(
        WHERE day >= CURRENT_DATE - 7
        GROUP BY kind
        ORDER BY kind`;
+    let withExpected = true;
+    let withReasons = true;
     let rows: RollupRow[];
-    try {
-      rows = await engine.executeRaw<RollupRow>(rollupQuery(true), []);
-    } catch (err) {
-      const msg = (err as Error).message || String(err);
-      if (!/expected_limit_count/i.test(msg)) throw err;
-      rows = await engine.executeRaw<RollupRow>(rollupQuery(false), []);
+    for (;;) {
+      try {
+        rows = await engine.executeRaw<RollupRow>(rollupQuery(withExpected, withReasons), []);
+        break;
+      } catch (err) {
+        const msg = (err as Error).message || String(err);
+        if (withExpected && /expected_limit_count/i.test(msg)) withExpected = false;
+        else if (withReasons && /halt_reasons/i.test(msg)) withReasons = false;
+        else throw err;
+      }
     }
 
     if (rows.length === 0) {
@@ -1069,6 +1077,7 @@ export async function computeExtractHealthCheck(
       eval_pass_count: number;
       eval_fail_count: number;
       halt_count: number;
+      halt_reasons: Record<string, number>;
       round_completed_count: number;
       expected_limit_count: number;
       halt_rate: number;
@@ -1080,6 +1089,20 @@ export async function computeExtractHealthCheck(
       const halts = Number(r.halt_count) || 0;
       const completed = Number(r.round_completed_count) || 0;
       const expectedLimits = Number(r.expected_limit_count) || 0;
+      const reasonRows = typeof r.halt_reasons === 'string'
+        ? JSON.parse(r.halt_reasons) as unknown
+        : r.halt_reasons;
+      const haltReasons: Record<string, number> = {};
+      if (Array.isArray(reasonRows)) {
+        for (const item of reasonRows) {
+          const parsed = typeof item === 'string' ? JSON.parse(item) as unknown : item;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+          for (const [reason, value] of Object.entries(parsed)) {
+            const count = Number(value);
+            if (Number.isFinite(count) && count > 0) haltReasons[reason] = (haltReasons[reason] ?? 0) + count;
+          }
+        }
+      }
       // #4482: cap stops join the DENOMINATOR (they are runs, and successful
       // ones) but not the numerator — the failure rate measures failures,
       // not self-imposed capacity limits. A backlog-bigger-than-budget brain
@@ -1091,6 +1114,7 @@ export async function computeExtractHealthCheck(
         eval_pass_count: Number(r.eval_pass_count) || 0,
         eval_fail_count: Number(r.eval_fail_count) || 0,
         halt_count: halts,
+        halt_reasons: haltReasons,
         round_completed_count: completed,
         expected_limit_count: expectedLimits,
         halt_rate: total > 0 ? halts / total : 0,
@@ -1126,7 +1150,13 @@ export async function computeExtractHealthCheck(
         .map(k => {
           const ageDays = k.last_halt_age_days;
           const ageSuffix = ageDays === null ? '' : ageDays <= 0 ? ', last halt today' : `, last halt ${ageDays}d ago`;
-          return `${k.kind}=${(k.halt_rate * 100).toFixed(1)}%${ageSuffix}`;
+          const highest = Math.max(0, ...Object.values(k.halt_reasons));
+          const topReasons = Object.entries(k.halt_reasons)
+            .filter(([, count]) => count === highest && highest > 0)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([reason, count]) => `${reason} x${count}`);
+          const reasonSuffix = topReasons.length ? ` (top reason: ${topReasons.join(', ')})` : '';
+          return `${k.kind}=${(k.halt_rate * 100).toFixed(1)}%${ageSuffix}${reasonSuffix}`;
         })
         .join(', ');
       return {

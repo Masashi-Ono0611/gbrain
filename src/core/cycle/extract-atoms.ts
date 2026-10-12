@@ -77,7 +77,7 @@ import type { MaintenanceWriteWait } from '../persistence/maintenance-wait.ts';
 import { connectorAtomExclusionSql } from './connector-atoms.ts';
 import { resolveExtractAtomsCostGate, resolveEmbedModelForCostGate, settleExtractAtomsCostGate } from './extract-atoms-cost-gate.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
-import { classifyRunStop, upsertExtractRollup } from '../extract/rollup-writer.ts';
+import { classifyRunStop, upsertExtractRollup, type HaltReason } from '../extract/rollup-writer.ts';
 import { abortableSleep } from '../retry.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { createHash } from 'crypto';
@@ -996,6 +996,7 @@ export async function runPhaseExtractAtoms(
   let hardFailureCount = 0;
   let writesPending = 0; // #5601: accepted atom batches still publishing (progress, not failures)
   let heldFailed = 0;
+  let haltReason: HaltReason | undefined;
 
   async function stampAtomsScanHash(item: AtomPageInput): Promise<void> {
     await writeAtomPageState(engine, sourceId, item, 'complete');
@@ -1137,6 +1138,7 @@ export async function runPhaseExtractAtoms(
       const parseOutcome = parseAtomsOutcome(result.text, result.stopReason);
       if (!parseOutcome.ok) {
         if (parseOutcome.stopped) stoppedOutputs++; else malformedOutputs++;
+        haltReason ??= 'item_error'; // recordDeterministicFailure below counts the hard failure
         if (!opts.dryRun && managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, [], parseOutcome.reason));
         await recordDeterministicFailure(item, originLabel, parseOutcome.stopped ? parseOutcome.reason : `malformed model output: ${parseOutcome.reason}`);
         continue;
@@ -1363,7 +1365,14 @@ export async function runPhaseExtractAtoms(
       const decision = llmHalt.observe(err);
       if (decision !== 'continue') {
         abortedGlobalError = haltedClassOf(decision);
-        if (abortedGlobalError !== 'rate_limit') hardFailureCount++;
+        if (abortedGlobalError !== 'rate_limit') {
+          hardFailureCount++;
+          haltReason = abortedGlobalError === 'auth'
+            ? 'provider_auth'
+            : abortedGlobalError === 'billing'
+              ? 'provider_billing'
+              : 'provider_rate_limit';
+        }
         failures.push({
           source: originLabel,
           error: `aborting phase: ${llmHalt.note()} (${message})`,
@@ -1375,6 +1384,11 @@ export async function runPhaseExtractAtoms(
       if (!transient) {
         await recordItemFailureCount(item);
         hardFailureCount++;
+        if (err instanceof OperationError && err.code === 'writer_coordinator_required') {
+          haltReason ??= 'coordinator_refused';
+        } else {
+          haltReason ??= 'item_error';
+        }
       }
       failures.push({
         source: originLabel,
@@ -1420,6 +1434,7 @@ export async function runPhaseExtractAtoms(
       source_id: sourceId,
       cost_delta: estimatedSpendUsd,
       ...classifyRunStop({ deadline_hit: stoppedEarly, error: hardFailureCount > 0 }),
+      halt_reason: haltReason,
     });
   }
 
