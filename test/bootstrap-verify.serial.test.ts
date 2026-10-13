@@ -646,6 +646,41 @@ describe('verifyWorkspace — real corpus graph floor + qrels recall', () => {
 });
 
 describe('verifyWorkspace — managed brain (#5280)', () => {
+  test('verify can roundtrip twice after purging both probe pages', async () => {
+    await claimWorktree(engine, 'workspace', join(ws, 'brain'));
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    try {
+      const opts = { sourceId: 'workspace', gbrainHomeDir: home, capabilities: KEYLESS, skipHooksSmoke: true };
+      const first = await verifyWorkspace(engine, ws, opts);
+      expect(check(first.checks, 'roundtrip').every((c) => c.ok)).toBe(true);
+
+      const firstPurges = await engine.executeRaw<{ slug: string }>(
+        `SELECT DISTINCT slug FROM page_purges WHERE source_id = 'workspace' AND slug = ANY($1::text[])`,
+        [[VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]],
+      );
+      expect(new Set(firstPurges.map((row) => row.slug))).toEqual(new Set([VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]));
+
+      const second = await verifyWorkspace(engine, ws, opts);
+      const secondRoundtrip = check(second.checks, 'roundtrip');
+      const secondFailures = secondRoundtrip.filter((c) => !c.ok);
+      if (secondFailures.length > 0) {
+        const purgedWrites = await engine.executeRaw<{ request_id: string }>(
+          `SELECT request_id::text AS request_id FROM persistence_requests
+            WHERE source_id = 'workspace' AND operation = 'put_page' AND error_code = 'purged_content'
+              AND slug = ANY($1::text[])`,
+          [[VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]],
+        );
+        expect(purgedWrites.length).toBeGreaterThan(0);
+        expect(secondFailures.map((c) => c.detail).join('\n')).toContain('purged from this source');
+      }
+      expect(secondFailures).toEqual([]);
+      expect(secondRoundtrip.length).toBeGreaterThan(0);
+    } finally {
+      await disposePersistenceConsumer(engine);
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    }
+  }, 240_000);
+
   test('verify runs on a managed brain and purges its probes through the coordinator', async () => {
     await claimWorktree(engine, 'workspace', join(ws, 'brain'));
     await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');

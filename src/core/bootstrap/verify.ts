@@ -163,7 +163,8 @@ export function putPageFailureDetail(error: unknown, waitMs: number | undefined)
 // Probe content
 // ---------------------------------------------------------------------------
 
-const PROBE_ENTITY_CONTENT = `---
+function probeEntityContent(nonce: string): string {
+  return `---
 title: Bootstrap Verify Probe Entity
 type: concept
 ---
@@ -172,9 +173,12 @@ type: concept
 
 Anchor page for the \`gbrain bootstrap verify\` graph-floor probe. Written and
 deleted by verify; not user content.
+Verification run nonce: ${nonce}
 `;
+}
 
-const PROBE_CONTENT = `---
+function probeContent(nonce: string): string {
+  return `---
 title: Bootstrap Verify Probe
 type: concept
 ---
@@ -184,6 +188,7 @@ type: concept
 Written and deleted by \`gbrain bootstrap verify\` (fixed slug, swept on every
 run). It links to [[${VERIFY_PROBE_ENTITY_SLUG}]] so the graph floor has a
 deterministic edge to extract.
+Verification run nonce: ${nonce}
 
 ## Facts
 
@@ -193,6 +198,7 @@ deterministic edge to extract.
 | 1 | The bootstrap verify magic-moment token is ${VERIFY_MAGIC_TOKEN} | fact | 1.0 | world | low | | | bootstrap-verify | |
 <!--- gbrain:facts:end -->
 `;
+}
 
 /** Remove any prior probe state [G13]: page rows (hard — verify is a trusted
  * local caller and the probe is not user content), reconciled probe facts,
@@ -802,9 +808,10 @@ async function runRoundtrip(
   try {
     // 1. Write both probe pages through the REAL op handler [G1].
     let writeThroughDetail = '';
+    const nonce = randomUUID().slice(0, 12);
     try {
-      await putPage.handler(ctx, { slug: VERIFY_PROBE_ENTITY_SLUG, content: PROBE_ENTITY_CONTENT });
-      const res = (await putPage.handler(ctx, { slug: VERIFY_PROBE_SLUG, content: PROBE_CONTENT })) as {
+      await putPage.handler(ctx, { slug: VERIFY_PROBE_ENTITY_SLUG, content: probeEntityContent(nonce) });
+      const res = (await putPage.handler(ctx, { slug: VERIFY_PROBE_SLUG, content: probeContent(nonce) })) as {
         write_through?: { written: boolean; path?: string; skipped?: string; error?: string };
       };
       const wt = res.write_through;
