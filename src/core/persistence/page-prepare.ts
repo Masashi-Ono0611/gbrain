@@ -11,6 +11,7 @@ import type { GBrainConfig } from '../config.ts';
 import type { Page, PageVersion } from '../types.ts';
 import { importFromContent, verifyPageReadable, type ParsedPage } from '../import-file.ts';
 import { comparableFrontmatter, frontmatterHoldMessageWithoutKeys, parseMarkdown, resolveParsedSubtype, serializePageToMarkdown, resolveSourceLocalFilePath, type ParseOpts } from '../markdown.ts';
+import { applyInference } from '../frontmatter-inference.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { isOpPageSlug } from '../ops/context.ts';
@@ -136,8 +137,14 @@ export function publishesDatabaseOnly(root: string, slug: string, snapshot: Page
  * uses it to bind a repair to the revision it read before reading the file.
  */
 export async function fileMatchesSnapshot(engine: BrainEngine, slug: string, bytes: string, snapshot: PageSnapshot,
-  activePack?: ParseOpts['activePack']): Promise<boolean> {
-  const parsed = parseMarkdown(bytes, slug, { activePack });
+  activePack?: ParseOpts['activePack'], sourceRelPath?: string): Promise<boolean> {
+  // A frontmatter-less file under a directory-inference rule is stored with the frontmatter and tags the importer
+  // inferred from its path (import-prepare.ts applies the same inference before it parses). Read the file the way
+  // the importer did, or every such page compares as drift and refuses its writes (source_changed).
+  // The importer strips a leading BOM before it infers, so a BOM'd file takes the same inference here.
+  const inference = sourceRelPath ? applyInference(sourceRelPath, bytes.replace(/^\uFEFF/, '')) : null;
+  const inferred = inference !== null && inference.inferred.skipped !== true;
+  const parsed = parseMarkdown(inferred ? inference.content : bytes, slug, { activePack });
   // #5521 parity for subtype (#5928): a pack rule is not part of the file's bytes, so a file
   // without an explicit `subtype:` keeps the stored subtype (or none); the import still stamps it.
   delete parsed.inferredSubtype;
@@ -147,7 +154,8 @@ export async function fileMatchesSnapshot(engine: BrainEngine, slug: string, byt
   // (grandfather.ts): a file without a `validate:` key keeps the stored stamp, and the next coordinated write publishes it.
   if (!Object.hasOwn(parsed.frontmatter, 'validate') && snapshot.page.frontmatter?.validate === false) parsed.frontmatter.validate = false;
   // #1035 parity (#5521): a file without an explicit `type:` keeps the stored type on import.
-  const type = parsed.typeExplicit ? parsed.type : snapshot.page.type;
+  // Inference only ever applies to a file with no frontmatter, so the type it adds is not one the file declared.
+  const type = parsed.typeExplicit && !inferred ? parsed.type : snapshot.page.type;
   // Withdrawal overlays intentionally precede physical mirroring. The ledger
   // is applied by the import preparation and cannot be undone by this check.
   const actual = canonical({ ...parsed, type, ...await overlayCanonicalBodies(engine.executeRaw.bind(engine),
@@ -216,7 +224,7 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
   // A normal edit may replace only the bytes represented by its read snapshot.
   // Unknown local edits require explicit import/recovery, even for force writes.
   if (before && snapshot) {
-    if (!await fileMatchesSnapshot(engine, row.slug, before.toString('utf8'), snapshot, options.activePack)) {
+    if (!await fileMatchesSnapshot(engine, row.slug, before.toString('utf8'), snapshot, options.activePack, relative(root, path).split(sep).join('/'))) {
       const held = await heldFileRefusal(engine, row, root, path, 'drift', options.remote === true);
       if (held) throw held;
       // #6394: a page that never recorded its file reconciles against the file at its slug path only when adopted explicitly.

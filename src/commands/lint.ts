@@ -19,7 +19,7 @@ import { readSourceFileSync, writeSourceFileSync, hasSourceFilesystemLock, withS
  */
 
 import { readdirSync, statSync, lstatSync, existsSync } from 'fs';
-import { join, relative, dirname } from 'path';
+import { join, relative, dirname, sep } from 'path';
 import { isAborted } from '../core/abort-check.ts';
 import { parseMarkdown, type ParseValidationCode } from '../core/markdown.ts';
 import { parseDateLoose } from '../core/effective-date.ts';
@@ -725,7 +725,7 @@ async function publishLintFix(engine: BrainEngine, authority: MaintenanceAuthori
   const scanned = existsSync(page) ? readSourceFileSync(page, 'utf-8') : null;
   const fixed = scanned === null ? null : fixContent(scanned);
   if (scanned === null ? !authority.binding : fixed === scanned) return null;
-  if (authority.binding && (scanned === null || !await fileMatchesSnapshot(engine, slug, scanned, snapshot, activePack))) {
+  if (authority.binding && (scanned === null || !await fileMatchesSnapshot(engine, slug, scanned, snapshot, activePack, relPath.split(sep).join('/')))) {
     const current = await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
     if (current?.revision !== snapshot.revision) return pendingIssue(relPath, slug, 'revision_changed', changedWhileLinting(sourceId, slug));
     try {
