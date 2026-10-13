@@ -113,6 +113,9 @@ export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
  * #6278: each stall also carries the claim's step, what it waits on, the owner
  * process and, for a preparation past its budget, `claim.stall`
  * (`preparation_overdue`); the budgets in effect are in the details.
+ * A claim that is released and taken again every few seconds never ages past
+ * `max_claim_ms`, so a running request is also a stall once it is that old and
+ * no request on its root reached a terminal state within the same window.
  */
 export async function writeStallCheck(engine: BrainEngine): Promise<Check> {
   const docs = 'docs/guides/troubleshooting.md#persistence-write-stall';
@@ -120,22 +123,31 @@ export async function writeStallCheck(engine: BrainEngine): Promise<Check> {
     const maxClaimMs = await readMaxClaimMs(engine);
     const policy = await readPreparationPolicy(engine);
     const rows = await engine.executeRaw<{ request_id: string; source_id: string; worktree_id: string | null; operation: string; intent_kind: string | null; state: string; claim_phase: unknown;
-      execution_token: string | null; claim_lapsed: boolean | null; publication_started: boolean; request_age_ms: string; waiting: number }>(
+      execution_token: string | null; claim_lapsed: boolean | null; publication_started: boolean; request_age_ms: string; no_root_progress: boolean; waiting: number }>(
       `SELECT r.request_id::text,r.source_id,r.worktree_id::text,r.operation,r.intent->>'kind' AS intent_kind,r.state,r.claim_phase,r.execution_token::text,r.claim_expires_at<now() AS claim_lapsed,
         r.publication_started,(EXTRACT(EPOCH FROM (now()-r.created_at))*1000)::bigint::text AS request_age_ms,
+        NOT EXISTS (SELECT 1 FROM persistence_requests q WHERE ((r.worktree_id IS NOT NULL AND q.worktree_id=r.worktree_id)
+          OR (r.worktree_id IS NULL AND q.worktree_id IS NULL AND q.source_id=r.source_id))
+          AND q.state IN ('committed','conflict','failed','cancelled') AND q.completed_at>=now()-($1::double precision*interval '1 millisecond')
+          AND q.recovery IS NULL AND NOT q.compacted) AS no_root_progress,
         (SELECT count(*)::int FROM persistence_requests q WHERE q.worktree_id=r.worktree_id AND q.state='queued' AND q.sequence>r.sequence) AS waiting
-      FROM persistence_requests r WHERE r.state='running' ORDER BY r.sequence LIMIT 100`);
+      FROM persistence_requests r WHERE r.state='running' ORDER BY r.sequence LIMIT 100`, [maxClaimMs]);
     const now = Date.now();
     const stalls = rows.flatMap(row => {
       const claim = claimStateOf(row, now);
       if (!claim) return [];
       // An owner that predates phase recording never stamps its claims; the request's own age bounds the claim's.
       const held = claim.claim_age_ms ?? (row.claim_phase == null ? Math.max(0, Number(row.request_age_ms)) : null);
-      if (held === null || !(held >= maxClaimMs)) return [];
+      const stalledWithoutProgress = row.no_root_progress && Number(row.request_age_ms) >= maxClaimMs;
+      if (!(held !== null && held >= maxClaimMs) && !stalledWithoutProgress) return [];
+      const claimAgeMs = held ?? claim.claim_age_ms ?? 0;
+      const requestAgeMs = Math.max(0, Number(row.request_age_ms));
       const budget = preparationBudgetMs({ operation: row.operation, intent: row.intent_kind ? { kind: row.intent_kind } : null }, policy, 30_000);
       return [{ request_id: row.request_id, source_id: row.source_id, root: row.worktree_id, operation: row.operation, intent_kind: row.intent_kind, phase: claim.phase,
-        claim_age_ms: held, phase_age_ms: claim.phase_age_ms, step: claim.step, step_age_ms: claim.step_age_ms, waiting_on: claim.waiting_on, owner: claim.owner,
-        budget_ms: budget, stall: claimStall(claim, budget), waiting_behind: row.waiting, resumes_on_its_own: claim.resumes_on_its_own, why: claim.why }];
+        claim_age_ms: claimAgeMs, request_age_ms: requestAgeMs, phase_age_ms: claim.phase_age_ms, step: claim.step, step_age_ms: claim.step_age_ms, waiting_on: claim.waiting_on, owner: claim.owner,
+        budget_ms: budget, stall: claimStall(claim, budget), waiting_behind: row.waiting, resumes_on_its_own: claim.resumes_on_its_own,
+        why: stalledWithoutProgress && !(held !== null && held >= maxClaimMs)
+          ? `${claim.why} No request on this root reached a terminal state during the claim window, even though its claim was renewed.` : claim.why }];
     });
     const details = { max_claim_ms: maxClaimMs, config_key: MAX_CLAIM_CONFIG_KEY, count: stalls.length, stalls, docs,
       preparation_policy: { sync_preparation_ms: policy.syncMs, maintenance_preparation_ms: policy.maintenanceMs, preparation_ceiling_ms: policy.ceilingMs, max_preparation_attempts: policy.maxAttempts } };
@@ -144,9 +156,9 @@ export async function writeStallCheck(engine: BrainEngine): Promise<Check> {
     const first = stalls[0]!;
     const minutes = (ms: number) => `${Math.round(ms / 60_000)} min`;
     return { name: 'persistence_write_stall', status: 'warn', details,
-      message: `${stalls.length} write request(s) have held their claim longer than ${MAX_CLAIM_CONFIG_KEY} (${maxClaimMs} ms). `
+      message: `${stalls.length} write request(s) have stalled beyond ${MAX_CLAIM_CONFIG_KEY} (${maxClaimMs} ms). `
         + stalls.slice(0, 3).map(stall => `Request ${stall.request_id} (${stall.operation}) on source ${stall.source_id}, root ${stall.root ?? 'database-only'}, `
-          + `is stuck in phase ${stall.phase} after ${minutes(stall.claim_age_ms)}; ${stall.waiting_behind} queued write(s) wait behind it. ${stall.why}`).join(' ')
+          + `is stuck in phase ${stall.phase} after ${minutes(Math.max(stall.claim_age_ms, stall.request_age_ms))}; ${stall.waiting_behind} queued write(s) wait behind it. ${stall.why}`).join(' ')
         + ` Next: inspect it with gbrain sources writer status --source ${first.source_id} --json, then restart the gbrain serve that owns the root`
         + `${first.resumes_on_its_own ? ' if it is still stuck after its transaction ends' : ''}. The root trigger of a hang is not known yet; attach that status output when reporting it.`,
       fix: agentFix(['gbrain', 'sources', 'writer', 'status', '--source', first.source_id, '--json'],
