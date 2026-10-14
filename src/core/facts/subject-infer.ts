@@ -24,6 +24,9 @@
 import type { BrainEngine } from '../engine.ts';
 import { extractCandidates, isCommonCapitalizedWord } from '../context/entity-salience.ts';
 import { isFactEntityPage, resolveStrictEntityReference, type StrictResolution } from '../entities/resolve.ts';
+import { normalizeAlias } from '../search/alias-normalize.ts';
+import { DEFAULT_ENTITY_MENTION_IGNORE_LIST, isGenericEntityToken } from '../entity-name-quality.ts';
+import { isUndefinedTableError } from '../utils.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 
 export type InferredVia = 'page' | 'mention';
@@ -112,11 +115,62 @@ const SLUG_IN_TEXT_RE = /(?<![\w/-])[a-z0-9][a-z0-9_-]*(?:\/[a-z0-9][a-z0-9_-]*)
 
 /** Two distinct entities already make the subject unknown; more resolution is wasted work. */
 const DISTINCT_ENTITY_LIMIT = 2;
+const AMBIGUOUS_ALIAS_WORDS = new Set(DEFAULT_ENTITY_MENTION_IGNORE_LIST.map(word => word.toLowerCase()));
+
+/** Weak Latin names require an explicit alias; CJK grams are not subject evidence. */
+function eligibleWeakName(query: string, fact: string): boolean {
+  if (!/^[\p{Script=Latin}\p{N}'’ -]+$/u.test(query)) return false;
+  // The whitelist above has no regex metacharacters; marks and adjoining scripts cannot be boundaries.
+  const literal = query.split(/\s+/).join('\\s+');
+  if (!new RegExp(`(?<![\\p{L}\\p{N}\\p{M}])${literal}(?![\\p{L}\\p{N}\\p{M}])`, 'iu').test(fact)) return false;
+  const rejected = (token: string) => isNonName(token) || isGenericEntityToken(token)
+    || SENTENCE_OPENERS.has(token.toLowerCase()) || AMBIGUOUS_ALIAS_WORDS.has(token.toLowerCase());
+  return query.split(/\s+/).some(token => !rejected(token));
+}
+
+/** Batch alias-only admission. Hidden/stale pages are removed before counting collisions. */
+async function weakAliasEvidence(engine: BrainEngine, sourceId: string, queries: string[], excludePrivate?: boolean): Promise<Map<string, StrictResolution>> {
+  const out = new Map<string, StrictResolution>();
+  if (!queries.length) return out;
+  let aliases: Awaited<ReturnType<BrainEngine['resolveAliases']>>;
+  try {
+    aliases = await engine.resolveAliases([...new Set(queries.map(normalizeAlias))], { sourceId });
+  } catch (error) {
+    if (isUndefinedTableError(error)) return out;
+    throw error;
+  }
+  const slugs = [...new Set([...aliases.values()].flatMap(hits => hits.map(hit => hit.slug)))];
+  if (!slugs.length) return out;
+  const privacy = excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : '';
+  const rows = await engine.executeRaw<{ slug: string; type: string | null }>(
+    `SELECT p.slug, p.type FROM pages p WHERE p.source_id = $1 AND p.slug = ANY($2::text[]) AND p.deleted_at IS NULL ${privacy}`,
+    [sourceId, slugs],
+  );
+  const live = new Map(rows.map(row => [row.slug, row]));
+  let linkable: Set<string> | undefined;
+  for (const query of queries) {
+    const hits = [...new Set((aliases.get(normalizeAlias(query)) ?? []).map(hit => hit.slug))].filter(slug => live.has(slug));
+    if (hits.length > 1) { out.set(query.toLowerCase(), { slug: null, miss: 'ambiguous' }); continue; }
+    if (!hits.length) continue;
+    const row = live.get(hits[0]!)!;
+    let entity = isFactEntityPage(row.slug, row.type);
+    if (!entity) {
+      linkable ??= new Set((await (await import('../mentions/policy.ts')).loadLinkableTypes(engine, sourceId).catch(() => ({ types: [] as string[] }))).types);
+      entity = row.type != null && linkable.has(row.type);
+    }
+    if (entity) out.set(query.toLowerCase(), { slug: row.slug, arm: 'alias_exact' });
+  }
+  return out;
+}
 
 export async function inferFactSubject(engine: BrainEngine, sourceId: string, input: InferSubjectInput): Promise<InferResult> {
-  const candidates: Array<{ query: string; sentenceStart?: true }> = [
+  const extracted = extractCandidates(input.fact);
+  const weak = extracted.filter(c => c.weak && eligibleWeakName(c.query, input.fact));
+  const weakEvidence = await weakAliasEvidence(engine, sourceId, weak.map(c => c.query), input.excludePrivate);
+  const candidates: Array<{ query: string; sentenceStart?: true; weak?: true }> = [
     ...[...new Set(input.fact.match(SLUG_IN_TEXT_RE) ?? [])].map(query => ({ query })),
-    ...extractCandidates(input.fact).filter(c => !c.weak).map(shedOpener),
+    ...extracted.filter(c => !c.weak).map(shedOpener),
+    ...weak,
   ];
   const resolved = new Set<string>();
   const misses: Array<Exclude<StrictResolution, { slug: string }>['miss']> = [];
@@ -124,7 +178,8 @@ export async function inferFactSubject(engine: BrainEngine, sourceId: string, in
   const memo = new Map<string, StrictResolution>();
   for (const candidate of candidates) {
     const key = candidate.query.toLowerCase();
-    let r = memo.get(key);
+    let r = candidate.weak ? weakEvidence.get(key) : memo.get(key);
+    if (candidate.weak && !r) continue;
     if (!r) {
       r = await resolveStrictEntityReference(engine, sourceId, candidate.query,
         { sameName: input.mode === 'relink', excludePrivate: input.excludePrivate });

@@ -66,12 +66,39 @@ function parseSubjects(text: string, size: number): Map<number, string | null> |
   }
 }
 
+/** A code point beside a UTF-16 match offset (astral letters must remain word characters). */
+function before(text: string, offset: number): string | undefined {
+  if (!offset) return undefined;
+  const last = text.charCodeAt(offset - 1);
+  return text.slice(offset - (last >= 0xDC00 && last <= 0xDFFF ? 2 : 1), offset);
+}
+
+/** Japanese support is deliberately limited to independently segmented は/が. */
+function japaneseSubjectBoundary(text: string, start: number, end: number): boolean {
+  if (typeof Intl.Segmenter !== 'function' || !/[はが]/u.test(text[end] ?? '')) return false;
+  // A segmenter is not a parser: 田中がく can split as 田中|が|く.
+  // Hiragana-leading continuations remain unsupported rather than guessing a shorter name.
+  const following = String.fromCodePoint(text.codePointAt(end + 1) ?? 0);
+  if (/[\p{Script=Hiragana}\p{M}]/u.test(following)) return false;
+  try {
+    const segments = [...new Intl.Segmenter('ja', { granularity: 'word' }).segment(text)];
+    return segments.some(part => part.index === start)
+      && segments.some(part => part.index + part.segment.length === end)
+      && segments.some(part => part.index === end && (part.segment === 'は' || part.segment === 'が'));
+  } catch {
+    return false;
+  }
+}
+
 function quotesWholeName(fact: string, subject: string): boolean {
   const haystack = fact.toLowerCase();
   const needle = subject.toLowerCase();
-  const isWordChar = (ch: string | undefined) => ch !== undefined && /[\p{L}\p{N}]/u.test(ch);
+  const isWordChar = (ch: string | undefined) => ch !== undefined && /[\p{L}\p{N}\p{M}]/u.test(ch);
   for (let at = haystack.indexOf(needle); at >= 0; at = haystack.indexOf(needle, at + 1)) {
-    if (!isWordChar(haystack[at - 1]) && !isWordChar(haystack[at + needle.length])) return true;
+    const end = at + needle.length;
+    if (isWordChar(before(haystack, at))) continue;
+    if (!isWordChar(haystack.codePointAt(end) === undefined ? undefined : String.fromCodePoint(haystack.codePointAt(end)!))
+      || japaneseSubjectBoundary(haystack, at, end)) return true;
   }
   return false;
 }
