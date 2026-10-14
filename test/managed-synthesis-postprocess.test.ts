@@ -183,7 +183,7 @@ test('canonical synthesis receipt matching still refuses wrong source, incarnati
       [input, { ...output, revision: randomUUID() }],
       [input, { ...output, state: 'queued' }],
     ]) {
-      await engine.executeRaw(`UPDATE subagent_tool_executions SET input=$2::jsonb,output=$3::jsonb
+      await engine.executeRaw(`UPDATE subagent_tool_executions SET input=$2::text::jsonb,output=$3::text::jsonb
         WHERE job_id=$1 AND tool_name='brain_put_page'`, [ids[0], JSON.stringify(badInput), JSON.stringify(badOutput)]);
       expect(await loadCommittedSynthesisOutputs(engine, authority, ids)).toEqual([]);
       const refused = await runPhaseSynthesize(engine, ordinary);
@@ -191,7 +191,7 @@ test('canonical synthesis receipt matching still refuses wrong source, incarnati
       expect(refused.error?.code).toBe('SYNTH_PHASE_FAIL');
       expect(calls()).toBe(spent);
     }
-    await engine.executeRaw(`UPDATE subagent_tool_executions SET input=$2::jsonb,output=$3::jsonb
+    await engine.executeRaw(`UPDATE subagent_tool_executions SET input=$2::text::jsonb,output=$3::text::jsonb
       WHERE job_id=$1 AND tool_name='brain_put_page'`, [ids[0], JSON.stringify(input), JSON.stringify(output)]);
     expect(await loadCommittedSynthesisOutputs(engine, authority, ids)).toHaveLength(1);
     expect((await runPhaseSynthesize(engine, ordinary)).status).toBe('ok');
