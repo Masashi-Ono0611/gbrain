@@ -13,8 +13,10 @@ const infer = (fact: string, extra = {}) => inferFactSubject(engine, 'default', 
 
 beforeAll(async () => {
   engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema();
-  await page('projects/atlas-example', ['atlascode', 'atlas code', 'Atlas', '田中', 'sharedcode', 'documentcollision', 'privatecollision', 'deletedcollision', 'today', 'meeting', 'api', 'user', 'launched', 'Apple', 'Target', 'user updates']);
+  await page('projects/atlas-example', ['atlascode', 'atlas code', 'Atlas', '田中', 'sharedcode', 'documentcollision', 'accountcollision', 'privatecollision', 'deletedcollision', 'today', 'meeting', 'api', 'user', 'launched', 'Apple', 'Target', 'user updates']);
   await page('projects/vertex-example', ['vertexcode', 'sharedcode']);
+  await page('records/account-example', ['accountcollision']);
+  await engine.executeRaw("UPDATE pages SET type='account' WHERE source_id='default' AND slug='records/account-example'");
   await importFromContent(engine, 'meetings/subject-example', '---\ntitle: Synthetic meeting\ntype: meeting\naliases: [documentcollision, meetingonly]\n---\n\n# Synthetic meeting\n', { noEmbed: true });
   await page('projects/hidden-example', ['hiddencode', 'privatecollision'], 'visibility: private\n');
   await page('projects/deleted-example', ['deletedcode', 'deletedcollision']);
@@ -67,6 +69,41 @@ describe('curated weak Latin aliases', () => {
     expect(await infer('meetingonly ships weekly', { pageSlug: 'projects/atlas-example' }))
       .toEqual({ slug: 'projects/atlas-example', via: 'page' });
     expect((await infer('meetingonly ships weekly')).slug).toBeNull();
+  });
+  test('custom entity types compete with builtin entities through their shared alias', async () => {
+    const original = await engine.getConfig('mentions.entity_types');
+    try {
+      await engine.setConfig('mentions.entity_types', 'account');
+      expect(await infer('accountcollision ships weekly')).toMatchObject({ slug: null, reason: 'ambiguous' });
+    } finally { await engine.setConfig('mentions.entity_types', original ?? ''); }
+  });
+  test('policy and schema-pack failures cannot turn a custom-type collision into a unique alias', async () => {
+    const original = await engine.getConfig('mentions.entity_types');
+    try {
+      await engine.setConfig('mentions.entity_types', 'account');
+      const policyFault = new Proxy(engine, { get(target, key) {
+        if (key === 'executeRaw') return async (sql: string, params?: unknown[]) => {
+          if (sql.includes('SELECT key, value FROM config')) throw new Error('policy config unavailable');
+          return target.executeRaw(sql, params);
+        };
+        if (key === 'getConfig') return async (name: string) => {
+          if (name.startsWith('mentions.') || name === 'auto_link') throw new Error('policy config unavailable');
+          return target.getConfig(name);
+        };
+        const value = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value;
+      } });
+      await expect(inferFactSubject(policyFault, 'default', { fact: 'accountcollision ships weekly', mode: 'write' }))
+        .rejects.toThrow('policy config unavailable');
+      const packFault = new Proxy(engine, { get(target, key) {
+        if (key === 'getConfig') return async (name: string) => {
+          if (name === 'schema_pack') throw new Error('schema pack unavailable');
+          return target.getConfig(name);
+        };
+        const value = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value;
+      } });
+      await expect(inferFactSubject(packFault, 'default', { fact: 'accountcollision ships weekly', mode: 'write' }))
+        .rejects.toThrow('schema pack unavailable');
+    } finally { await engine.setConfig('mentions.entity_types', original ?? ''); }
   });
   test('missing alias tables abstain while other lookup failures propagate', async () => {
     const aliases = spyOn(engine, 'resolveAliases');

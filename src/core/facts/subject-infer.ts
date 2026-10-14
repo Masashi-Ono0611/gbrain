@@ -152,7 +152,7 @@ async function weakAliasEvidence(engine: BrainEngine, sourceId: string, queries:
   for (const row of rows) {
     let entity = isFactEntityPage(row.slug, row.type);
     if (!entity) {
-      linkable ??= new Set((await (await import('../mentions/policy.ts')).loadLinkableTypes(engine, sourceId).catch(() => ({ types: [] as string[] }))).types);
+      linkable ??= new Set((await (await import('../mentions/policy.ts')).loadLinkableTypes(engine, sourceId, { strict: true })).types);
       entity = row.type != null && linkable.has(row.type);
     }
     if (entity) live.set(row.slug, row);
