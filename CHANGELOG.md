@@ -10,6 +10,14 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.223.0] - 2026-10-14
+
+### Fixed
+
+- Managed dream synthesis can resume retained outputs whose tool input used uppercase letters in a page slug. Postprocessing follows the canonical slug in the committed write receipt while still rejecting mismatched sources, incarnations, revisions and unfinished writes; chunk suffixes and completed outputs stay unchanged on replay.
+
+**To take advantage of v0.60.223.0:** run `gbrain upgrade`. The next ordinary dream cycle retries any synthesis postprocessing that stopped on this slug mismatch; no manual page rewrite is needed.
+
 ## [0.60.221.0] - 2026-10-14
 
 **When a file you edited by hand blocks every write to its source, one command now shows you both versions and lets you pick which one to keep (#6650).** If you edit a page file while gbrain is publishing a write to that same file, gbrain can no longer tell whether it is safe to put the file back. It used to stop there and leave every later write to that source pending, and the only ways out were deleting the file or editing the database by hand. `gbrain repair stuck-recovery` previews the blocked file with a diff of the version from before the write against what is on disk now. You then choose: `--keep prior` restores the old version so the write publishes again, or `--keep disk` keeps your edit and drops the write. Either way, both versions are backed up first.
