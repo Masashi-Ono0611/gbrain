@@ -10,6 +10,36 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.225.0] - 2026-10-14
+
+**Facts can recognize a registered name even when you write it in lowercase.** A note such as "atlascode ships weekly" can now find the entity whose aliases include that name. The name must match an existing alias in the same source. Common words, competing registered names and partial names still leave the fact unattributed.
+
+Japanese model-assisted relinking also accepts a name immediately followed by an independent は or が when the rest of the sentence is a supported simple verb phrase. For example, an existing entity named 架空会社 can be verified in "架空会社は更新した". Longer names containing the same characters are not treated as that shorter name.
+
+### How to use it
+
+Preview the free repair tiers with `gbrain facts relink --dry-run --no-llm`. Register the intended lowercase name as an alias on its entity page before rerunning. Japanese sentence validation applies only when the model tier is enabled; the model must still quote the fact and resolve to an existing entity.
+
+| Fact text | Result when the matching alias exists |
+| --- | --- |
+| `atlascode ships weekly` | Unique eligible entity can be linked |
+| `atlascode copied Northstar Example` | Competing strong name blocks attribution |
+| `架空会社は更新した` | Supported model quotation can be verified |
+| A longer name beginning with the same characters | Shorter-name quotation is rejected |
+
+### Things to watch
+
+This is a narrow recognition repair. It does not discover arbitrary lowercase names, distinguish every dictionary meaning, or parse every Japanese sentence. Unsupported particles, conjugations and trailing clauses remain unverified. Explicit entity selection remains the reliable choice when the subject is ambiguous. There is no schema migration or automatic backlog rewrite.
+
+### Itemized changes
+
+### Fixed
+
+- Admit whole Latin weak names through unique, live, source-scoped entity aliases while retaining visibility and competing-name checks.
+- Share the existing eight-word ambiguous-name list with mention linking without changing that pass's behavior.
+- Verify independently segmented Japanese は/が boundaries only before a complete supported simple predicate; combining marks and astral letters remain part of adjacent names.
+
+
 ## [0.60.221.0] - 2026-10-14
 
 **When a file you edited by hand blocks every write to its source, one command now shows you both versions and lets you pick which one to keep (#6650).** If you edit a page file while gbrain is publishing a write to that same file, gbrain can no longer tell whether it is safe to put the file back. It used to stop there and leave every later write to that source pending, and the only ways out were deleting the file or editing the database by hand. `gbrain repair stuck-recovery` previews the blocked file with a diff of the version from before the write against what is on disk now. You then choose: `--keep prior` restores the old version so the write publishes again, or `--keep disk` keeps your edit and drops the write. Either way, both versions are backed up first.

@@ -28,6 +28,12 @@ page) stay unattributed. The response says what happened: `entity_inferred:
 "mention"` when it linked, or `warnings: ["NO_ENTITY"]` with a hint when it did
 not. Pass `infer_entity: false` to skip inference for one call.
 
+Registered lowercase Latin names, such as `atlascode`, can also resolve through
+an exact, unique alias on a live entity page in the same source. They are not
+guessed from a slug basename or a fuzzy match. Common words and the built-in
+ambiguous-name list stay excluded; a registered competing name blocks the link.
+This is curated alias evidence, not general word-sense or lowercase-name detection.
+
 Page imports work the same way, and a fact extracted from an entity page with
 no other name in it belongs to that page.
 
@@ -54,6 +60,15 @@ model's answer must quote the fact and name an existing entity page, so an
 invented or injected name never links. Private facts stay out of the model
 tier unless you pass `--include-private`. Before the first model call relink
 prints the provider and an estimated cost.
+
+The model can verify a quoted Japanese name immediately before independently
+segmented は or が when the entire remaining text is a supported simple predicate:
+two or more Han characters followed by `した`, `する`, `します`, `しました`,
+`している` or `していた`, with optional sentence punctuation. For example,
+`架空会社は更新した` can verify an existing entity named `架空会社`. Longer names,
+other particles, unsupported predicates and trailing clauses remain unverified.
+If Japanese segmentation is unavailable, the stricter ordinary name boundary
+continues to apply. This validation does not infer an arbitrary Japanese subject.
 
 Each linked fact keeps its id, embedding and provenance and is written onto
 the entity page's `## Facts` fence exactly as a fresh `remember` with that
