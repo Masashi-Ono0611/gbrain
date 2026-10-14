@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { runPhaseSynthesize } from '../src/core/cycle/synthesize.ts';
+import { __testing, runPhaseSynthesize } from '../src/core/cycle/synthesize.ts';
+import { maintenancePreflight } from '../src/core/persistence/prepared-maintenance.ts';
 import { retryWriteAdmission } from '../src/core/persistence/admission-retry.ts';
 import * as journal from '../src/core/persistence/journal.ts';
 import { OperationError } from '../src/core/ops/contract.ts';
@@ -119,6 +120,106 @@ async function outputSlug(engine: BrainEngine, sourceId: string): Promise<string
   const [row] = await engine.executeRaw<{ slug: string }>("SELECT slug FROM pages WHERE source_id=$1 AND slug LIKE 'wiki/personal/reflections/session-%'", [sourceId]);
   return row.slug;
 }
+
+test('managed synthesis correlates normalized output slugs with committed child receipts on replay', async () => {
+  await fixture(async f => {
+    const { engine, sourceId, root, calls } = f;
+    const { ordinary, slug } = await childCommittedOrdinaryCycle(f);
+    // Retained tool input predates the write's canonical case normalization,
+    // as on the agentic path. The real committed receipt remains untouched.
+    await engine.executeRaw(`UPDATE subagent_tool_executions SET input=jsonb_set(input,'{slug}',to_jsonb(replace(input->>'slug','session','SESSION')))
+      WHERE tool_name='brain_put_page' AND job_id IN (SELECT id FROM minion_jobs WHERE data->>'source_id'=$1)`, [sourceId]);
+    const [child] = await engine.executeRaw<{ job_id: number | bigint; input_slug: string; slug: string; revision: string; tool_revision: string }>(
+      `SELECT t.job_id,t.input->>'slug' AS input_slug,p.slug,p.outcome->>'revision' AS revision,t.output->>'revision' AS tool_revision
+       FROM subagent_tool_executions t JOIN persistence_requests p ON p.request_id::text=t.input->>'request_id'
+       WHERE p.source_id=$1 AND p.operation='put_page' AND t.tool_name='brain_put_page' AND t.status='complete'`, [sourceId]);
+    expect(child.input_slug).toContain('SESSION');
+    expect(child.slug).toBe(child.input_slug.toLowerCase());
+    expect(child.revision).toBe(child.tool_revision);
+    const spent = calls();
+    const first = await runPhaseSynthesize(engine, ordinary);
+    expect(first.status, JSON.stringify(first)).toBe('ok');
+    expect(first.details.pages_written).toBe(1);
+    const page = (await engine.readPageSnapshot(child.slug, { sourceId }))!;
+    expect(page.page.frontmatter.dream_generated).toBe(true);
+    expect(page.page.frontmatter.raw_source).toContain('/corpus/');
+    expect(readFileSync(join(root, `${child.slug}.md`), 'utf8')).toContain('dream_generated: true');
+    const authority = (await maintenancePreflight(engine, sourceId, root))!;
+    const { loadCommittedSynthesisOutputs } = await import('../src/core/cycle/synthesize-postprocess.ts');
+    const jobId = Number(child.job_id);
+    const refs = await __testing.collectChildPutPageSlugs(engine, [jobId],
+      new Map([[jobId, { idx: 2, hash6: slug.slice(-6) }]]), sourceId,
+      new Map([[jobId, '/transcripts/example.md']]), new Set(), await loadCommittedSynthesisOutputs(engine, authority, [jobId]));
+    expect(refs[0].slug).toBe(`${slug}-c2`);
+    expect(refs[0].raw_source).toBe('/transcripts/example.md');
+    const replay = await runPhaseSynthesize(engine, ordinary);
+    expect(replay.status).toBe('ok');
+    expect(calls()).toBe(spent);
+    expect((await engine.readPageSnapshot(child.slug, { sourceId }))!.revision).toBe(page.revision);
+    expect(child.slug).toBe(slug);
+  });
+}, 120_000);
+
+test('canonical synthesis receipt matching still refuses wrong source, incarnation, revision, slug and pending output', async () => {
+  const { loadCommittedSynthesisOutputs } = await import('../src/core/cycle/synthesize-postprocess.ts');
+  await fixture(async f => {
+    const { engine, sourceId, root, calls } = f;
+    const { ordinary } = await childCommittedOrdinaryCycle(f);
+    const authority = (await maintenancePreflight(engine, sourceId, root))!;
+    const [tool] = await engine.executeRaw<{ job_id: number | bigint; input: unknown; output: unknown }>(
+      `SELECT t.job_id,t.input,t.output FROM subagent_tool_executions t JOIN minion_jobs j ON j.id=t.job_id
+       WHERE j.data->>'source_id'=$1 AND t.tool_name='brain_put_page' AND t.status='complete'`, [sourceId]);
+    const ids = [Number(tool.job_id)];
+    expect(await loadCommittedSynthesisOutputs(engine, authority, ids)).toHaveLength(1);
+    for (const writer of [
+      { ...authority.writer, sourceId: 'unrelated-source' },
+      { ...authority.writer, sourceIncarnation: randomUUID() },
+    ]) expect(await loadCommittedSynthesisOutputs(engine, { ...authority, writer }, ids)).toEqual([]);
+    const spent = calls();
+    const input = tool.input as Record<string, unknown>;
+    const output = tool.output as Record<string, unknown>;
+    for (const [badInput, badOutput] of [
+      [{ ...input, slug: 'wiki/personal/reflections/unrelated' }, output],
+      [input, { ...output, revision: randomUUID() }],
+      [input, { ...output, state: 'queued' }],
+    ]) {
+      await engine.executeRaw(`UPDATE subagent_tool_executions SET input=$2::jsonb,output=$3::jsonb
+        WHERE job_id=$1 AND tool_name='brain_put_page'`, [ids[0], JSON.stringify(badInput), JSON.stringify(badOutput)]);
+      expect(await loadCommittedSynthesisOutputs(engine, authority, ids)).toEqual([]);
+      const refused = await runPhaseSynthesize(engine, ordinary);
+      expect(refused.status).toBe('fail');
+      expect(refused.error?.code).toBe('SYNTH_PHASE_FAIL');
+      expect(calls()).toBe(spent);
+    }
+    await engine.executeRaw(`UPDATE subagent_tool_executions SET input=$2::jsonb,output=$3::jsonb
+      WHERE job_id=$1 AND tool_name='brain_put_page'`, [ids[0], JSON.stringify(input), JSON.stringify(output)]);
+    expect(await loadCommittedSynthesisOutputs(engine, authority, ids)).toHaveLength(1);
+    expect((await runPhaseSynthesize(engine, ordinary)).status).toBe('ok');
+  });
+}, 120_000);
+
+test('chunked managed synthesis replays normalized tool slugs without changing chunk suffixes or spending again', async () => {
+  await fixture(async ({ engine, sourceId, root, opts, calls }) => {
+    writeFileSync(opts.inputFile, readFileSync(opts.inputFile, 'utf8').repeat(800));
+    await engine.setConfig('dream.synthesize.max_prompt_tokens', '100000');
+    const first = await runPhaseSynthesize(engine, opts);
+    expect(first.status, JSON.stringify(first)).toBe('ok');
+    expect(Number(first.details.pages_written)).toBeGreaterThan(1);
+    const rows = await engine.executeRaw<{ slug: string; knowledge_revision: string }>(
+      `SELECT slug,knowledge_revision FROM pages WHERE source_id=$1 AND slug LIKE 'wiki/personal/reflections/session-%' ORDER BY slug`, [sourceId]);
+    expect(rows.length).toBeGreaterThan(1);
+    expect(rows.every(row => /-c\d+$/.test(row.slug))).toBe(true);
+    const files = rows.map(row => readFileSync(join(root, `${row.slug}.md`), 'utf8'));
+    await engine.executeRaw(`UPDATE subagent_tool_executions SET input=jsonb_set(input,'{slug}',to_jsonb(replace(input->>'slug','session','SESSION')))
+      WHERE tool_name='brain_put_page' AND job_id IN (SELECT id FROM minion_jobs WHERE data->>'source_id'=$1)`, [sourceId]);
+    const spent = calls();
+    const replay = await runPhaseSynthesize(engine, opts);
+    expect(replay.status, JSON.stringify(replay)).toBe('ok');
+    expect(calls()).toBe(spent);
+    expect(await engine.executeRaw(`SELECT slug,knowledge_revision FROM pages WHERE source_id=$1 AND slug LIKE 'wiki/personal/reflections/session-%' ORDER BY slug`, [sourceId])).toEqual(rows);
+    expect(rows.map(row => readFileSync(join(root, `${row.slug}.md`), 'utf8'))).toEqual(files);
+  });
+}, 120_000);
 
 test('managed native synthesis quarantines interpretations around valid evidence before mirror/chunk publication', async () => {
   const supported = 'Reliable memories should survive every tool change.';
