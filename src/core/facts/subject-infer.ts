@@ -146,19 +146,22 @@ async function weakAliasEvidence(engine: BrainEngine, sourceId: string, queries:
     `SELECT p.slug, p.type FROM pages p WHERE p.source_id = $1 AND p.slug = ANY($2::text[]) AND p.deleted_at IS NULL ${privacy}`,
     [sourceId, slugs],
   );
-  const live = new Map(rows.map(row => [row.slug, row]));
+  // Non-entity documents are not competing subjects, even when they claim the same alias.
+  const live = new Map<string, { slug: string; type: string | null }>();
   let linkable: Set<string> | undefined;
-  for (const query of queries) {
-    const hits = [...new Set((aliases.get(normalizeAlias(query)) ?? []).map(hit => hit.slug))].filter(slug => live.has(slug));
-    if (hits.length > 1) { out.set(query.toLowerCase(), { slug: null, miss: 'ambiguous' }); continue; }
-    if (!hits.length) continue;
-    const row = live.get(hits[0]!)!;
+  for (const row of rows) {
     let entity = isFactEntityPage(row.slug, row.type);
     if (!entity) {
       linkable ??= new Set((await (await import('../mentions/policy.ts')).loadLinkableTypes(engine, sourceId).catch(() => ({ types: [] as string[] }))).types);
       entity = row.type != null && linkable.has(row.type);
     }
-    if (entity) out.set(query.toLowerCase(), { slug: row.slug, arm: 'alias_exact' });
+    if (entity) live.set(row.slug, row);
+  }
+  for (const query of queries) {
+    const hits = [...new Set((aliases.get(normalizeAlias(query)) ?? []).map(hit => hit.slug))].filter(slug => live.has(slug));
+    if (hits.length > 1) { out.set(query.toLowerCase(), { slug: null, miss: 'ambiguous' }); continue; }
+    if (!hits.length) continue;
+    out.set(query.toLowerCase(), { slug: hits[0]!, arm: 'alias_exact' });
   }
   return out;
 }

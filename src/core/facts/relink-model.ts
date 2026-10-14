@@ -73,13 +73,15 @@ function before(text: string, offset: number): string | undefined {
   return text.slice(offset - (last >= 0xDC00 && last <= 0xDFFF ? 2 : 1), offset);
 }
 
-/** Japanese support is deliberately limited to independently segmented は/が. */
+/** Only a complete, simple Japanese verbal predicate proves the new right boundary. */
+const JAPANESE_SIMPLE_PREDICATE_RE = /^[\p{Script=Han}]{2,}(?:した|する|します|しました|している|していた)[。.!！?？]?\s*$/u;
+
+/** Japanese support is deliberately limited to independent は/が plus a complete predicate. */
 function japaneseSubjectBoundary(text: string, start: number, end: number): boolean {
   if (typeof Intl.Segmenter !== 'function' || !/[はが]/u.test(text[end] ?? '')) return false;
-  // A segmenter is not a parser: 田中がく can split as 田中|が|く.
-  // Hiragana-leading continuations remain unsupported rather than guessing a shorter name.
-  const following = String.fromCodePoint(text.codePointAt(end + 1) ?? 0);
-  if (/[\p{Script=Hiragana}\p{M}]/u.test(following)) return false;
+  // Segmentation alone can split a longer name (田中が島) as 田中|が|島.
+  // Require the entire remainder to be a simple inflected predicate, never another name/clause.
+  if (!JAPANESE_SIMPLE_PREDICATE_RE.test(text.slice(end + 1))) return false;
   try {
     const segments = [...new Intl.Segmenter('ja', { granularity: 'word' }).segment(text)];
     return segments.some(part => part.index === start)

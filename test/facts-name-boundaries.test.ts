@@ -13,8 +13,9 @@ const infer = (fact: string, extra = {}) => inferFactSubject(engine, 'default', 
 
 beforeAll(async () => {
   engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema();
-  await page('projects/atlas-example', ['atlascode', 'atlas code', 'Atlas', '田中', 'sharedcode', 'privatecollision', 'deletedcollision', 'today', 'meeting', 'api', 'user', 'launched', 'Apple', 'Target', 'user updates']);
+  await page('projects/atlas-example', ['atlascode', 'atlas code', 'Atlas', '田中', 'sharedcode', 'documentcollision', 'privatecollision', 'deletedcollision', 'today', 'meeting', 'api', 'user', 'launched', 'Apple', 'Target', 'user updates']);
   await page('projects/vertex-example', ['vertexcode', 'sharedcode']);
+  await importFromContent(engine, 'meetings/subject-example', '---\ntitle: Synthetic meeting\ntype: meeting\naliases: [documentcollision, meetingonly]\n---\n\n# Synthetic meeting\n', { noEmbed: true });
   await page('projects/hidden-example', ['hiddencode', 'privatecollision'], 'visibility: private\n');
   await page('projects/deleted-example', ['deletedcode', 'deletedcollision']);
   await engine.executeRaw("UPDATE pages SET deleted_at=now() WHERE source_id='default' AND slug='projects/deleted-example'");
@@ -59,6 +60,14 @@ describe('curated weak Latin aliases', () => {
     expect(await infer('privatecollision ships weekly')).toMatchObject({ slug: null, reason: 'ambiguous' });
     expect(await infer('privatecollision ships weekly', { excludePrivate: true })).toMatchObject({ slug: 'projects/atlas-example' });
   });
+  test('a document alias does not hide the sole entity or veto trusted page provenance', async () => {
+    expect(await infer('documentcollision ships weekly')).toMatchObject({ slug: 'projects/atlas-example' });
+    expect(await infer('documentcollision ships weekly', { pageSlug: 'projects/atlas-example' }))
+      .toEqual({ slug: 'projects/atlas-example', via: 'page' });
+    expect(await infer('meetingonly ships weekly', { pageSlug: 'projects/atlas-example' }))
+      .toEqual({ slug: 'projects/atlas-example', via: 'page' });
+    expect((await infer('meetingonly ships weekly')).slug).toBeNull();
+  });
   test('missing alias tables abstain while other lookup failures propagate', async () => {
     const aliases = spyOn(engine, 'resolveAliases');
     try {
@@ -87,7 +96,7 @@ async function judge(fact: string, subject: string, resolved?: string[]) {
 
 describe('Japanese model subject quotation', () => {
   test('independent topic/subject particles admit the complete registered name', async () => {
-    for (const fact of ['Atlas は更新した', 'Atlasは更新した', 'Atlasが更新した', '田中は更新した', '田中が更新した']) {
+    for (const fact of ['Atlas は更新した', 'Atlasは更新した', 'Atlasが更新した', '田中は更新した', '田中が更新した', 'Atlasは公開しました。', 'Atlasは更新している']) {
       expect(await judge(fact, fact.startsWith('田中') ? '田中' : 'Atlas')).toEqual({ id: 1, slug: 'projects/atlas-example' });
     }
   });
@@ -97,6 +106,20 @@ describe('Japanese model subject quotation', () => {
     }
     for (const fact of ['田中はるか', '田中はる子', '田中がく', '田中はる株式会社', '山田田中は更新した']) {
       expect(await judge(fact, '田中')).toMatchObject({ slug: null, reason: 'unverified_match' });
+    }
+  });
+  test('longer names segmented at particles reject with or without a registered longer alias', async () => {
+    const cases = [['田中が島は更新した', '田中', '田中が島'], ['Atlasが原は更新した', 'Atlas', 'Atlasが原'],
+      ['田中が岳登山口は閉鎖', '田中', '田中が岳登山口']];
+    for (const [fact, subject, longer] of cases) {
+      expect(await judge(fact!, subject!)).toMatchObject({ slug: null, reason: 'unverified_match' });
+      await page('projects/longer-example', [longer!]);
+      expect(await judge(fact!, subject!)).toMatchObject({ slug: null, reason: 'unverified_match' });
+    }
+  });
+  test('unsupported predicates and trailing clauses abstain', async () => {
+    for (const fact of ['Atlasは帰った', 'Atlasは閉鎖', 'Atlasは更新した後に移動した', 'Atlasは更新した。田中は公開した', 'Atlasは更新した追加']) {
+      expect(await judge(fact, 'Atlas')).toMatchObject({ slug: null, reason: 'unverified_match' });
     }
   });
   test('combining marks and astral letters cannot become false name boundaries', async () => {
