@@ -80,6 +80,27 @@ describe('curated weak Latin aliases', () => {
     await engine.executeRaw("UPDATE pages SET deleted_at=now() WHERE source_id='default' AND slug='projects/private-origin-example'");
     expect(await infer('originprivacycode ships weekly', { excludePrivate: true })).toEqual(remote);
   });
+  test('private exact titles cannot shadow readable derived aliases, while visible titles still win', async () => {
+    await page('projects/title-alias-example', ['titleprivacycode']);
+    await engine.executeRaw("UPDATE page_aliases SET origin='declared' WHERE source_id='default' AND slug='projects/title-alias-example' AND alias_norm='titleprivacycode'");
+    const scope = { sourceId: 'default', excludePrivate: true };
+    const baseline = await infer('titleprivacycode ships weekly', { excludePrivate: true });
+    expect(baseline).toMatchObject({ slug: 'projects/title-alias-example' });
+    await importFromContent(engine, 'projects/exact-private-title-example',
+      '---\ntitle: titleprivacycode\ntype: project\nvisibility: private\n---\n\n# Synthetic private title\n', { noEmbed: true });
+    expect(await infer('titleprivacycode ships weekly', { excludePrivate: true })).toEqual(baseline);
+    expect((await engine.resolveAliases(['titleprivacycode'], scope)).get('titleprivacycode'))
+      .toEqual([{ slug: 'projects/title-alias-example', source_id: 'default' }]);
+    // The existing local exact-title veto is preserved.
+    expect((await infer('titleprivacycode ships weekly')).slug).toBeNull();
+    expect((await engine.resolveAliases(['titleprivacycode'], { sourceId: 'default' })).has('titleprivacycode')).toBe(false);
+    await engine.executeRaw("UPDATE pages SET deleted_at=now() WHERE source_id='default' AND slug='projects/exact-private-title-example'");
+    expect(await infer('titleprivacycode ships weekly', { excludePrivate: true })).toEqual(baseline);
+    await importFromContent(engine, 'projects/exact-visible-title-example',
+      '---\ntitle: titleprivacycode\ntype: project\n---\n\n# Synthetic visible title\n', { noEmbed: true });
+    expect((await infer('titleprivacycode ships weekly', { excludePrivate: true })).slug).toBeNull();
+    expect((await engine.resolveAliases(['titleprivacycode'], scope)).has('titleprivacycode')).toBe(false);
+  });
   test('custom entity types compete with builtin entities through their shared alias', async () => {
     const original = await engine.getConfig('mentions.entity_types');
     try {
