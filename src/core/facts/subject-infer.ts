@@ -116,18 +116,37 @@ const LITERAL_SLUG_WORD_CHARS = SLUG_WORD_CHARS.replace('\\p{M}', '');
 // A period or colon followed by whitespace (or end of text) still delimits a literal.
 const SLUG_IN_TEXT_RE = new RegExp(
   `(?<![\\p{L}\\p{M}\\p{N}_/.:-])[${LITERAL_SLUG_WORD_CHARS}][${LITERAL_SLUG_WORD_CHARS}_-]*(?:/[${LITERAL_SLUG_WORD_CHARS}][${LITERAL_SLUG_WORD_CHARS}_-]*)+(?![\\p{L}\\p{M}\\p{N}_/-]|[.:][\\p{L}\\p{M}\\p{N}_./:-])`, 'gu');
+const LEGACY_SLUG_IN_TEXT_RE = /(?<![\w/-])[a-z0-9][a-z0-9_-]*(?:\/[a-z0-9][a-z0-9_-]*)+(?![\w/-])/g;
+
+/** Rejected legacy literals still compete, without resolving a truncated prefix. */
+function literalSubjectEvidence(fact: string): { slugs: string[]; vetoed: boolean } {
+  const literals = [...fact.matchAll(SLUG_IN_TEXT_RE)];
+  const slugs = [...new Set(literals.map(match => match[0]))];
+  let next = 0;
+  // Both match streams are ordered: containment is positional and linear,
+  // so a complete Unicode occurrence cannot hide a separate rejected one.
+  for (const legacy of fact.matchAll(LEGACY_SLUG_IN_TEXT_RE)) {
+    while (next < literals.length && literals[next]!.index + literals[next]![0].length <= legacy.index) next++;
+    const full = literals[next];
+    if (!full || full.index > legacy.index || full.index + full[0].length < legacy.index + legacy[0].length) {
+      return { slugs, vetoed: true };
+    }
+  }
+  return { slugs, vetoed: false };
+}
 
 /** Two distinct entities already make the subject unknown; more resolution is wasted work. */
 const DISTINCT_ENTITY_LIMIT = 2;
 
 export async function inferFactSubject(engine: BrainEngine, sourceId: string, input: InferSubjectInput): Promise<InferResult> {
+  const literals = literalSubjectEvidence(input.fact);
   const candidates: Array<{ query: string; sentenceStart?: true }> = [
-    ...[...new Set(input.fact.match(SLUG_IN_TEXT_RE) ?? [])].map(query => ({ query })),
+    ...literals.slugs.map(query => ({ query })),
     ...extractCandidates(input.fact).filter(c => !c.weak).map(shedOpener),
   ];
   const resolved = new Set<string>();
   const misses: Array<Exclude<StrictResolution, { slug: string }>['miss']> = [];
-  let vetoed = false;
+  let vetoed = literals.vetoed;
   const memo = new Map<string, StrictResolution>();
   for (const candidate of candidates) {
     const key = candidate.query.toLowerCase();

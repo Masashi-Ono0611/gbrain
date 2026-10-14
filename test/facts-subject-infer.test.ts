@@ -203,6 +203,26 @@ describe('literal Unicode subject slugs (#6620)', () => {
         .toEqual({ slug: 'people/किरण', via: 'page' });
     });
 
+    test(`${mode}: rejected ASCII literals still veto attribution to another subject`, async () => {
+      for (const fact of [
+        'people/alice-example.md says Acme Example raised a seed',
+        'owner:people/alice-example says Acme Example raised a seed',
+      ]) expect(await inferFactSubject(engine, 'default', { fact, mode }))
+        .toMatchObject({ slug: null, reason: 'ambiguous' });
+      expect(await inferFactSubject(engine, 'default', {
+        fact: 'people/unregistered-example.md owns the checklist', pageSlug: 'people/alice-example', mode,
+      })).toMatchObject({ slug: null, reason: 'ambiguous' });
+    });
+
+    test(`${mode}: a contained ASCII prefix does not hide a separate rejected occurrence`, async () => {
+      expect(await inferFactSubject(engine, 'default', { fact: 'people/mixed例子-7 owns the checklist', mode }))
+        .toEqual({ slug: 'people/mixed例子-7', via: 'mention' });
+      for (const fact of [
+        'people/mixed例子-7 and people/mixed.md own the checklist',
+        'people/mixed.md and people/mixed例子-7 own the checklist',
+      ]) expect((await inferFactSubject(engine, 'default', { fact, mode })).slug).toBeNull();
+    });
+
     test(`${mode}: Unicode literals preserve competing-subject vetoes`, async () => {
       for (const fact of [
         'people/例子 and people/literal-example own the checklist',
