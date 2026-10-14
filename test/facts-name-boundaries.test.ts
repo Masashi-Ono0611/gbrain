@@ -13,8 +13,8 @@ const infer = (fact: string, extra = {}) => inferFactSubject(engine, 'default', 
 
 beforeAll(async () => {
   engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema();
-  await page('projects/atlas-example', ['atlascode', 'atlas code', 'Atlas', '田中', 'sharedcode', 'documentcollision', 'accountcollision', 'privatecollision', 'deletedcollision', 'today', 'meeting', 'api', 'user', 'launched', 'Apple', 'Target', 'user updates']);
-  await page('projects/vertex-example', ['vertexcode', 'sharedcode']);
+  await page('projects/atlas-example', ['atlascode', 'atlas code', 'Atlas', '田中', 'scope code', 'scan-name', "scan'code", 'scode', 'icode', 'sharedcode', 'documentcollision', 'accountcollision', 'privatecollision', 'deletedcollision', 'today', 'meeting', 'api', 'user', 'launched', 'Apple', 'Target', 'user updates']);
+  await page('projects/vertex-example', ['vertexcode', 'sharedcode', 'ıcode', 'mixİcode']);
   await page('records/account-example', ['accountcollision']);
   await engine.executeRaw("UPDATE pages SET type='account' WHERE source_id='default' AND slug='records/account-example'");
   await importFromContent(engine, 'meetings/subject-example', '---\ntitle: Synthetic meeting\ntype: meeting\naliases: [documentcollision, meetingonly]\n---\n\n# Synthetic meeting\n', { noEmbed: true });
@@ -33,6 +33,16 @@ describe('curated weak Latin aliases', () => {
       expect(await infer(`${name} ships weekly`, { mode })).toEqual({ slug: 'projects/atlas-example', via: 'mention' });
     }
   });
+  test('literal aliases preserve multiword whitespace, hyphens and possessives', async () => {
+    for (const fact of ['scope\t \tcode ships weekly', 'scope  code ships weekly', 'scan-name ships weekly', "scan'code's release shipped"]) {
+      expect(await infer(fact)).toMatchObject({ slug: 'projects/atlas-example' });
+    }
+  });
+  test('simple case folds preserve long-s without expanding dotted or dotless I', async () => {
+    expect(await infer('ſcodé scode ships weekly')).toMatchObject({ slug: 'projects/atlas-example' });
+    expect(await infer('ıcodé icode ships weekly')).toMatchObject({ slug: 'projects/atlas-example' });
+    expect((await infer('mixİcodé mixi̇code ships weekly')).slug).toBeNull();
+  });
   test('unregistered words, basename guesses and CJK grams remain unsupported', async () => {
     for (const fact of ['vertex example ships weekly', 'atlas-example ships weekly', 'unknowncode ships weekly', '田中は更新した']) {
       expect((await infer(fact)).slug).toBeNull();
@@ -49,7 +59,7 @@ describe('curated weak Latin aliases', () => {
     }
   });
   test('longer names and first-name guesses never match a shorter alias', async () => {
-    for (const fact of ['atlascodeplus ships weekly', 'xatlascode ships weekly', 'atlascode中文 ships weekly', 'atlascodé ships weekly', '́atlascode ships weekly', 'atlas-example ships weekly']) {
+    for (const fact of ['atlascodeplus ships weekly', 'xatlascode ships weekly', 'atlascode中文 ships weekly', 'atlascodé ships weekly', '́atlascode ships weekly', '𐐀atlascode ships weekly', 'atlascode𐐀 ships weekly', 'atlas-example ships weekly']) {
       expect((await infer(fact)).slug).toBeNull();
     }
   });

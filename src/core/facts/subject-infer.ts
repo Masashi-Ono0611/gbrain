@@ -117,12 +117,30 @@ const SLUG_IN_TEXT_RE = /(?<![\w/-])[a-z0-9][a-z0-9_-]*(?:\/[a-z0-9][a-z0-9_-]*)
 const DISTINCT_ENTITY_LIMIT = 2;
 const AMBIGUOUS_ALIAS_WORDS = new Set(DEFAULT_ENTITY_MENTION_IGNORE_LIST.map(word => word.toLowerCase()));
 
+/** Preserve simple case-insensitive matching without compatibility or expanding case folds. */
+function weakNameText(text: string): string {
+  return text.replace(/\s+/gu, ' ').replace(/[\s\S]/gu, character => {
+    const lower = character.toLowerCase();
+    return character === 'ſ' ? 's' : lower.length === character.length ? lower : character;
+  });
+}
+
+/** Literal scans use static Unicode boundaries, including combining and astral characters. */
+function hasWeakNameLiteral(fact: string, query: string): boolean {
+  const haystack = weakNameText(fact);
+  const needle = weakNameText(query);
+  for (let at = haystack.indexOf(needle); at >= 0; at = haystack.indexOf(needle, at + 1)) {
+    const end = at + needle.length;
+    if (!/[\p{L}\p{N}\p{M}]$/u.test(haystack.slice(Math.max(0, at - 2), at))
+      && !/^[\p{L}\p{N}\p{M}]/u.test(haystack.slice(end, end + 2))) return true;
+  }
+  return false;
+}
+
 /** Weak Latin names require an explicit alias; CJK grams are not subject evidence. */
 function eligibleWeakName(query: string, fact: string): boolean {
   if (!/^[\p{Script=Latin}\p{N}'’ -]+$/u.test(query)) return false;
-  // The whitelist above has no regex metacharacters; marks and adjoining scripts cannot be boundaries.
-  const literal = query.split(/\s+/).join('\\s+');
-  if (!new RegExp(`(?<![\\p{L}\\p{N}\\p{M}])${literal}(?![\\p{L}\\p{N}\\p{M}])`, 'iu').test(fact)) return false;
+  if (!hasWeakNameLiteral(fact, query)) return false;
   const rejected = (token: string) => isNonName(token) || isGenericEntityToken(token)
     || SENTENCE_OPENERS.has(token.toLowerCase()) || AMBIGUOUS_ALIAS_WORDS.has(token.toLowerCase());
   return query.split(/\s+/).some(token => !rejected(token));
