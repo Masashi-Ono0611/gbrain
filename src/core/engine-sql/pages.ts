@@ -20,9 +20,10 @@ import { PAGE_SORT_SQL } from '../types.ts';
 import type { PageWriteOptions } from '../page-state/types.ts';
 import { moveSlugBindings, recordRenameAlias } from '../page-state/rename-alias.ts';
 import { sanitizeText } from '../batch-rows.ts';
-import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion } from '../search/safe-chunks.ts';
+import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion, currentTextProjectionFilter, safeChunksFilter } from '../search/safe-chunks.ts';
 import { privatePagesFilterFragment, privateSnapshotFilterFragment } from '../search/private-visibility.ts';
-import { quarantineFilterFragment } from '../quarantine.ts';
+import { QUARANTINE_FILTER_FRAGMENT, quarantineFilterFragment } from '../quarantine.ts';
+import { buildVisibilityClause } from '../search/sql-ranking.ts';
 import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
 import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
 import { jsonbParam, type SqlExecutor } from './executor.ts';
@@ -400,6 +401,10 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
 
     const typeCondition = filters?.type ? sqlFragment`AND p.type = ${filters.type}` : sqlFragment``;
     const tagJoin = filters?.tag ? sqlFragment`JOIN tags t ON t.page_id = p.id` : sqlFragment``;
+    const requireVisibility = filters?.requireLiveVisibility === true || filters?.requireSafeChunks === true;
+    const joins = requireVisibility
+      ? sqlFragment`${tagJoin} JOIN sources s ON s.id = p.source_id`
+      : tagJoin;
     const tagCondition = filters?.tag ? sqlFragment`AND t.tag = ${filters.tag}` : sqlFragment``;
     // v0.45.7 keyset (updated_at, slug) supersedes updated_after when set.
     const keyset = filters?.updatedAfterKeyset;
@@ -441,6 +446,14 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
     const privateCondition = filters?.excludePrivate === true
       ? trustedSql(`AND ${privatePagesFilterFragment('p')}`)
       : sqlFragment``;
+    // Opt-in search visibility for canonical bodies; administrative listPages calls retain their existing behavior.
+    const visibilityPrivate = filters?.excludePrivate
+      ? sqlFragment` AND ${trustedSql(privatePagesFilterFragment('p'))}` : sqlFragment``;
+    const visibilitySafeChunks = (filters?.requireSafeChunks ?? filters?.excludePrivate)
+      ? sqlFragment` AND ${trustedSql(safeChunksFilter('p'))}` : sqlFragment``;
+    const visibilityCondition = sqlFragment`AND p.deleted_at IS NULL AND ${trustedSql(currentTextProjectionFilter('p'))} AND NOT s.archived AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)} AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'pinned_question')${visibilityPrivate}${visibilitySafeChunks}`;
+    const privateAndVisibilityCondition = requireVisibility
+      ? sqlFragment`${privateCondition} ${visibilityCondition}` : privateCondition;
     const effectiveAfterCondition = filters?.effective_after
       ? sqlFragment`AND p.effective_date >= ${filters.effective_after}::timestamptz`
       : sqlFragment``;
@@ -458,8 +471,8 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       : sqlFragment`p.*`;
       const { rows } = await exec.run(sqlFragment`
         SELECT ${columns}, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
-        ${tagJoin}
-        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${slugAfterCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
+        ${joins}
+        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${slugAfterCondition} ${sourceCondition} ${deletedCondition} ${privateAndVisibilityCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
         ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}
       `);
       return rows.map(rowToPage);
