@@ -134,7 +134,7 @@ async function weakAliasEvidence(engine: BrainEngine, sourceId: string, queries:
   if (!queries.length) return out;
   let aliases: Awaited<ReturnType<BrainEngine['resolveAliases']>>;
   try {
-    aliases = await engine.resolveAliases([...new Set(queries.map(normalizeAlias))], { sourceId });
+    aliases = await engine.resolveAliases([...new Set(queries.map(normalizeAlias))], { sourceId, excludePrivate });
   } catch (error) {
     if (isUndefinedTableError(error)) return out;
     throw error;

@@ -70,6 +70,16 @@ describe('curated weak Latin aliases', () => {
       .toEqual({ slug: 'projects/atlas-example', via: 'page' });
     expect((await infer('meetingonly ships weekly')).slug).toBeNull();
   });
+  test('private alias origins cannot hide a readable alias before origin precedence', async () => {
+    await page('projects/readable-origin-example', ['originprivacycode']);
+    await page('projects/private-origin-example', ['originprivacycode'], 'visibility: private\n');
+    await engine.executeRaw("UPDATE page_aliases SET origin='declared' WHERE source_id='default' AND slug='projects/readable-origin-example' AND alias_norm='originprivacycode'");
+    const remote = await infer('originprivacycode ships weekly', { excludePrivate: true });
+    expect(remote).toMatchObject({ slug: 'projects/readable-origin-example' });
+    expect(await infer('originprivacycode ships weekly')).toMatchObject({ slug: 'projects/private-origin-example' });
+    await engine.executeRaw("UPDATE pages SET deleted_at=now() WHERE source_id='default' AND slug='projects/private-origin-example'");
+    expect(await infer('originprivacycode ships weekly', { excludePrivate: true })).toEqual(remote);
+  });
   test('custom entity types compete with builtin entities through their shared alias', async () => {
     const original = await engine.getConfig('mentions.entity_types');
     try {
