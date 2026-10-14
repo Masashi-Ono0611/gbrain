@@ -120,8 +120,11 @@ const AMBIGUOUS_ALIAS_WORDS = new Set(DEFAULT_ENTITY_MENTION_IGNORE_LIST.map(wor
 /** Preserve simple case-insensitive matching without compatibility or expanding case folds. */
 function weakNameText(text: string): string {
   return text.replace(/\s+/gu, ' ').replace(/[\s\S]/gu, character => {
+    if (character === 'ſ') return 's';
+    if (character === 'ẛ') return 'ṡ';
+    if (character === 'ﬅ') return 'ﬆ';
     const lower = character.toLowerCase();
-    return character === 'ſ' ? 's' : lower.length === character.length ? lower : character;
+    return lower.length === character.length ? lower : character;
   });
 }
 

@@ -13,7 +13,7 @@ const infer = (fact: string, extra = {}) => inferFactSubject(engine, 'default', 
 
 beforeAll(async () => {
   engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema();
-  await page('projects/atlas-example', ['atlascode', 'atlas code', 'Atlas', '田中', 'scope code', 'scan-name', "scan'code", 'scode', 'icode', 'sharedcode', 'documentcollision', 'accountcollision', 'privatecollision', 'deletedcollision', 'today', 'meeting', 'api', 'user', 'launched', 'Apple', 'Target', 'user updates']);
+  await page('projects/atlas-example', ['atlascode', 'atlas code', 'Atlas', '田中', 'scope code', 'scan-name', "scan'code", 'scode', 'icode', 'ṡcode', 'ﬆcode', 'sharedcode', 'documentcollision', 'accountcollision', 'privatecollision', 'deletedcollision', 'today', 'meeting', 'api', 'user', 'launched', 'Apple', 'Target', 'user updates']);
   await page('projects/vertex-example', ['vertexcode', 'sharedcode', 'ıcode', 'mixİcode']);
   await page('records/account-example', ['accountcollision']);
   await engine.executeRaw("UPDATE pages SET type='account' WHERE source_id='default' AND slug='records/account-example'");
@@ -42,6 +42,9 @@ describe('curated weak Latin aliases', () => {
     expect(await infer('ſcodé scode ships weekly')).toMatchObject({ slug: 'projects/atlas-example' });
     expect(await infer('ıcodé icode ships weekly')).toMatchObject({ slug: 'projects/atlas-example' });
     expect((await infer('mixİcodé mixi̇code ships weekly')).slug).toBeNull();
+  });
+  test.each(['ẛcodé ṡcode ships', 'ﬅcodé ﬆcode ships'])('Latin simple-fold dedup preserves caller: %s', async fact => {
+    expect(await infer(fact)).toMatchObject({ slug: 'projects/atlas-example' });
   });
   test('unregistered words, basename guesses and CJK grams remain unsupported', async () => {
     for (const fact of ['vertex example ships weekly', 'atlas-example ships weekly', 'unknowncode ships weekly', '田中は更新した']) {
