@@ -22,6 +22,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { SLUG_WORD_CHARS } from '../cjk.ts';
 import { extractCandidates, isCommonCapitalizedWord } from '../context/entity-salience.ts';
 import { isFactEntityPage, resolveStrictEntityReference, type StrictResolution } from '../entities/resolve.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
@@ -108,7 +109,13 @@ const SENTENCE_OPENERS = new Set([
 ]);
 
 /** Slugs written verbatim in the fact text ("people/alice-example owns the checklist"). */
-const SLUG_IN_TEXT_RE = /(?<![\w/-])[a-z0-9][a-z0-9_-]*(?:\/[a-z0-9][a-z0-9_-]*)+(?![\w/-])/g;
+// The strict resolver does not accept combining marks yet. Keep them in the
+// boundaries, but do not promote an unsupported marked path into a vetoing candidate.
+const LITERAL_SLUG_WORD_CHARS = SLUG_WORD_CHARS.replace('\\p{M}', '');
+// Unsupported dotted/colon paths must not resolve a shorter registered prefix.
+// A period or colon followed by whitespace (or end of text) still delimits a literal.
+const SLUG_IN_TEXT_RE = new RegExp(
+  `(?<![\\p{L}\\p{M}\\p{N}_/.:-])[${LITERAL_SLUG_WORD_CHARS}][${LITERAL_SLUG_WORD_CHARS}_-]*(?:/[${LITERAL_SLUG_WORD_CHARS}][${LITERAL_SLUG_WORD_CHARS}_-]*)+(?![\\p{L}\\p{M}\\p{N}_/-]|[.:][\\p{L}\\p{M}\\p{N}_./:-])`, 'gu');
 
 /** Two distinct entities already make the subject unknown; more resolution is wasted work. */
 const DISTINCT_ENTITY_LIMIT = 2;

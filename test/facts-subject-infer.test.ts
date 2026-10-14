@@ -31,6 +31,13 @@ beforeAll(async () => {
   await page('people/dana-private-example', 'Dana Private-Example', 'person', 'visibility: private\n');
   await page('meetings/2026-04-03', 'Acme Example Sync', 'meeting');
   await page('concepts/hiring-plan-example', 'Hiring Plan Example', 'concept');
+  await page('people/literal-example', 'Literal Example', 'person');
+  await page('people/例子', 'Literal Unicode Example', 'person');
+  await page('people/日本語例', 'Japanese Literal Example', 'person');
+  await page('people/किरण', 'Marked Literal Example', 'person');
+  await page('人物/例子', 'Unicode Directory Example', 'person');
+  await page('people/mixed例子-7', 'Mixed Script Example', 'person');
+  await page('people/私的例子', 'Private Unicode Example', 'person', 'visibility: private\n');
 });
 
 afterAll(async () => {
@@ -160,6 +167,62 @@ describe('inferFactSubject reasons', () => {
       .toEqual({ slug: 'companies/acme-example', via: 'mention' });
     expect(await inferFactSubject(engine, 'default', { fact: 'raised a seed round', pageSlug: 'companies/acme-example', mode: 'write' }))
       .toEqual({ slug: 'companies/acme-example', via: 'page' });
+  });
+});
+
+describe('literal Unicode subject slugs (#6620)', () => {
+  for (const mode of ['write', 'relink'] as const) {
+    test(`${mode}: resolves complete Unicode paths at punctuation boundaries`, async () => {
+      for (const slug of ['people/例子', 'people/日本語例', '人物/例子', 'people/mixed例子-7']) {
+        expect(await inferFactSubject(engine, 'default', { fact: `「${slug}」 owns the checklist`, mode }))
+          .toEqual({ slug, via: 'mention' });
+      }
+      expect(await inferFactSubject(engine, 'default', { fact: 'checklist owner is people/例子. weekly updates follow.', mode }))
+        .toEqual({ slug: 'people/例子', via: 'mention' });
+      for (const slug of ['people/charlie-example', 'people/例子']) {
+        for (const fact of [`${slug}: owns the launch`, `${slug}:`]) {
+          expect(await inferFactSubject(engine, 'default', { fact, mode }))
+            .toEqual({ slug, via: 'mention' });
+        }
+      }
+    });
+
+    test(`${mode}: never resolves an unknown Unicode extension to its ASCII prefix`, async () => {
+      expect(await inferFactSubject(engine, 'default', { fact: 'people/literal-example未知 owns the checklist', mode }))
+        .toMatchObject({ slug: null });
+      expect(await inferFactSubject(engine, 'default', { fact: '人物people/literal-example owns the checklist', mode }))
+        .toMatchObject({ slug: null });
+      for (const literal of ['people/例子.foo', 'people/例子..foo', 'people/例子.-foo', 'people/例子./unknown', 'people/例子.:unknown', 'people/例子:unknown', 'namespace:people/例子', '.people/例子']) {
+        expect(await inferFactSubject(engine, 'default', { fact: `${literal} owns the checklist`, mode }))
+          .toMatchObject({ slug: null });
+      }
+    });
+
+    test(`${mode}: unsupported marked literals preserve trusted page attribution`, async () => {
+      expect(await inferFactSubject(engine, 'default', { fact: 'people/किरण owns the checklist', pageSlug: 'people/किरण', mode }))
+        .toEqual({ slug: 'people/किरण', via: 'page' });
+    });
+
+    test(`${mode}: Unicode literals preserve competing-subject vetoes`, async () => {
+      for (const fact of [
+        'people/例子 and people/literal-example own the checklist',
+        'people/例子 and people/literal-example未知 own the checklist',
+      ]) expect(await inferFactSubject(engine, 'default', { fact, mode }))
+        .toMatchObject({ slug: null, reason: 'ambiguous' });
+    });
+
+    test(`${mode}: Unicode literals preserve source and private visibility`, async () => {
+      await engine.executeRaw(`INSERT INTO sources (id, name) VALUES ('unicode-other', 'unicode-other') ON CONFLICT DO NOTHING`);
+      expect((await inferFactSubject(engine, 'unicode-other', { fact: 'people/例子 owns the checklist', mode })).slug).toBeNull();
+      expect(await inferFactSubject(engine, 'default', { fact: 'people/私的例子 owns the checklist', mode }))
+        .toEqual({ slug: 'people/私的例子', via: 'mention' });
+      expect((await inferFactSubject(engine, 'default', { fact: 'people/私的例子 owns the checklist', mode, excludePrivate: true })).slug)
+        .toBeNull();
+    });
+  }
+
+  test('does not promote natural-language weak CJK names', async () => {
+    expect((await inferFactSubject(engine, 'default', { fact: '例子负责项目。', mode: 'write' })).slug).toBeNull();
   });
 });
 
