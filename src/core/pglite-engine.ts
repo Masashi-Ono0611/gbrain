@@ -27,7 +27,7 @@ import { join as joinPath, resolve as resolvePath, sep as pathSep } from 'node:p
 // PGLite's WASM/fsBundle/extension assets embedded via `with { type: 'file' }`
 // so a `bun build --compile` binary can serve a PGLite brain (Bun vfs #1340).
 // The embedded `extensions` REPLACE the stock `{ vector, pg_trgm }` imports.
-import { getEmbeddedPgliteOptions } from './pglite-embedded-assets.ts';
+import { getEmbeddedPgliteOptions, withSharedBuffers } from './pglite-embedded-assets.ts';
 import {
   drainBackgroundWorkBeforeDisconnect,
   backgroundWorkSinkCount,
@@ -903,7 +903,7 @@ export class PGLiteEngine implements BrainEngine {
     // Embedded WASM/fsBundle/extension assets (Bun vfs #1340). Resolved once
     // here so both the initial create and the WAL-repair retry below share the
     // same compiled modules. Its `extensions` replaces the stock vector/pg_trgm.
-    const embedded = await getEmbeddedPgliteOptions();
+    const embedded = withSharedBuffers(await getEmbeddedPgliteOptions(), config.pglite_shared_buffers);
     try {
       this._db = this._attachDatabase(await preservingProcessExitCode(() =>
         PGlite.create({
@@ -1801,6 +1801,12 @@ export class PGLiteEngine implements BrainEngine {
     const sourceId = opts?.sourceId ?? 'default';
     const column = (await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })).name;
     return chunksImpl.getChunks(scopedRead(this.engineSql), column, slug, { sourceIds, sourceId }, opts);
+  }
+
+  async getChunkPage(slug: string, opts: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; requireSafeChunks?: boolean; fromIndex: number; limit: number }) {
+    const sourceIds = opts.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
+    const column = (await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })).name;
+    return chunksImpl.getChunkPage(scopedRead(this.engineSql), column, slug, { sourceIds, sourceId: opts.sourceId ?? 'default' }, opts);
   }
 
   /** S2: quoted identifier of the registry-ACTIVE embedding column for the

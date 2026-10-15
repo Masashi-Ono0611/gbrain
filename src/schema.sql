@@ -337,6 +337,8 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   -- doctor's embeddings check ages the backlog from it, never from created_at)
   -- is added by migration v221 on every install, after the migration-added
   -- content_chunks columns, so fresh and upgraded brains share their ordinals.
+  -- v244: projected_byte_start / projected_byte_end (a prose chunk's UTF-8
+  -- span in its source's read projection) are added the same way.
   -- #4246 (v133): md5(chunk_text) at embed time. NULL = no embedding or
   -- pre-v133 row (grandfathered by invalidateContentDriftEmbeddings).
   embedded_text_hash    TEXT,
@@ -2071,6 +2073,8 @@ CREATE TABLE IF NOT EXISTS persistence_consumers (
     persistence_home text NOT NULL,
     minted_under jsonb,
     version text NOT NULL,
+    boot_id text,
+    process_start text,
     PRIMARY KEY(host_id,pid,nonce)
   );
 

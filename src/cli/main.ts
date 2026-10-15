@@ -49,7 +49,7 @@ import { cliCommandOf, exitCliError, exitOnRepairFailed, unknownFlagError, usage
 import type { Notice } from '../core/agent-output.ts';
 import { opError, opOwnsSource } from '../core/ops/contract.ts';
 import { opParamValue } from './op-param-values.ts';
-import { serializeMarkdown } from '../core/markdown.ts';
+import { formatGetPage, readWholePageMarkdown, remoteErrorCode, wantsWholePage } from './page-render.ts';
 import { parseGlobalFlags, setCliOptions, getCliOptions } from '../core/cli-options.ts';
 import { runCliPreflight } from '../core/cli-preflight.ts';
 import { isBooleanLiteral, isKnownOpFlag } from '../core/op-flag-tokens.ts';
@@ -405,7 +405,7 @@ async function main() {
   if (strictRefusal) exitCliError(strictRefusal, command);
 
   // A command that opens the local PGLite brain compiles its WASM off the main thread while its modules load (connect awaits the same promise).
-  const prewarm = (cliOps.has(command) || cliAliases.has(command) || findCliCommand(command)?.phase === 'post-connect') && loadConfig();
+  const prewarm = (cliOps.has(command) || cliAliases.has(command) || findCliCommand(command)?.phase === 'post-connect' || findCliCommand(command)?.dispatchedBy === 'deferred-persistence') && loadConfig();
   if (prewarm && prewarm.engine === 'pglite' && prewarm.database_path) void import('../core/pglite-embedded-assets.ts').then(m => m.getEmbeddedPgliteOptions()).catch(() => {});
 
   // T5 — `gbrain search modes|stats|tune` is the read-only config dashboard,
@@ -617,7 +617,7 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
   }
 
   // No live serve owns the selected brain; connect through the normal lock path.
-  const engine = await connectEngine();
+  const engine = await connectEngine({ oneShotRead: op.scope === 'read' });
   // #2084: the teardown contract (bounded drain of every background-work sink,
   // bounded disconnect, computed-deadline backstop) lives in finishCliTeardown
   // — see src/core/cli-force-exit.ts for the full design. The hard-deadline
@@ -793,7 +793,13 @@ async function runThinClientRouted(
       timeoutMs,
       signal: sigintController.signal,
       ...(op.mutating ? { writeWaitMs: currentCliWriteWait().waitMs } : {}),
+    }).catch(async (e: unknown) => { // large pages: a page too big for one response is paged to its end, verified, then printed
+      if (op.name !== 'get_page' || remoteErrorCode(e) !== 'page_too_large_for_inline' || !wantsWholePage(params)) throw e;
+      const paged = await readWholePageMarkdown(async p => unpackToolResult(await callRemoteTool(cfg, 'get_page', p, { timeoutMs, signal: sigintController.signal })), params);
+      await writeStdoutFinal(params.json === true ? JSON.stringify({ slug: params.slug, revision: paged.revision, content: paged.markdown, windows: paged.windows }) + '\n' : paged.markdown);
+      return null;
     });
+    if (raw === null) return;
     // T15/FOV-1: lift the server's retrieval meta off the envelope before
     // unpacking (old servers lack _meta — capture is simply skipped).
     const envelopeMeta = extractResponseMeta(raw);
@@ -1626,15 +1632,7 @@ export function formatResult(
       if (!pages.length) return 'Nothing volunteered (no entity cleared the confidence gate).\n';
       return pages.map((p) => formatVolunteeredPage(p)).join('\n') + '\n';
     }
-    case 'get_page': {
-      const r = result as any;
-      if (r.error === 'ambiguous_slug') {
-        return `Ambiguous slug. Did you mean:\n${r.candidates.map((c: string) => `  ${c}`).join('\n')}\n`;
-      }
-      return serializeMarkdown(r.frontmatter || {}, r.compiled_truth || '', r.timeline || '', {
-        type: r.type, title: r.title, tags: r.tags || [],
-      });
-    }
+    case 'get_page': return formatGetPage(result as Record<string, any>);
     case 'list_pages': {
       const pages = result as any[];
       if (pages.length === 0) return 'No pages found.\n';
@@ -1760,9 +1758,9 @@ export function formatResult(
       const versions = result as any[];
       if (versions.length === 0) return 'No versions.\n';
       return versions.map(v => {
-        // Only elide when something was actually dropped — an unconditional
-        // ellipsis renders an 11-char body as `Short body....`.
-        const truth = v.compiled_truth ?? '';
+        // Only elide when something was actually dropped (no `Short body....`);
+        // metadata-only rows (get_versions' default) preview the title instead.
+        const truth = v.compiled_truth ?? v.title ?? '';
         const head = truth.slice(0, VERSION_TRUTH_PREVIEW_CHARS);
         const elided = truth.length > VERSION_TRUTH_PREVIEW_CHARS ? '...' : '';
         return `#${v.id}  ${v.snapshot_at?.toString().slice(0, 19) || '?'}  ${head}${elided}`;
@@ -2387,7 +2385,7 @@ async function runReadOnlyTimeoutDispatch(command: string, args: string[]): Prom
     const label = `gbrain ${command}`;
     let engine: BrainEngine;
     try {
-      engine = await withTimeout(connectEngine(), readOnlyTimeoutMs, `${label}: connect`);
+      engine = await withTimeout(connectEngine({ oneShotRead: command === 'search' || args[0] === 'list' || args[0] === undefined }), readOnlyTimeoutMs, `${label}: connect`);
     } catch (e) {
       if (e instanceof OperationTimeoutError) {
         const hint = userTimeoutMs ? '' : ` (default ${e.ms}ms; pass --timeout=Ns to override)`;
@@ -2742,7 +2740,7 @@ async function dispatchReadOnlyCommand(engine: BrainEngine, command: string, arg
 // re-exported) so cli.ts's own connectEngine() call sites bind it locally.
 import { buildGatewayConfig } from '../core/ai/build-gateway-config.ts';
 export { buildGatewayConfig };
-import { connectEngineForServe, noBrainError, type EngineConnectHooks } from '../core/engine-connect.ts';
+import { connectEngineForServe, noBrainError, type EngineConnectHooks, type EngineConnectOptions } from '../core/engine-connect.ts';
 
 /**
  * Which brain this process's engine targets. Set by connectEngine after brain
@@ -2788,7 +2786,7 @@ async function connectMountEngine(brainId: string): Promise<BrainEngine> {
   return handle.engine;
 }
 
-async function connectEngine(opts?: { probeOnly?: boolean }): Promise<BrainEngine> {
+async function connectEngine(opts?: EngineConnectOptions): Promise<BrainEngine> {
   // Brain axis: resolve WHICH DATABASE this invocation targets before touching
   // the host engine. --brain (global flag) / GBRAIN_BRAIN_ID / .gbrain-mount /
   // mount-path-prefix resolve via the canonical 6-tier chain — the mirror of

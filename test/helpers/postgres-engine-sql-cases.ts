@@ -108,7 +108,7 @@ export const DOMAIN_OF: Record<string, string> = {
   // files
   'upsertFile': 'files', 'getFile': 'files', 'listFilesForPage': 'files',
   // chunks
-  'upsertChunks': 'chunks', 'getChunks': 'chunks', 'getChunkWindows': 'chunks', 'countStaleChunks': 'chunks', 'sumStaleChunkChars': 'chunks',
+  'upsertChunks': 'chunks', 'getChunks': 'chunks', 'getChunkPage': 'chunks', 'getChunkWindows': 'chunks', 'countStaleChunks': 'chunks', 'sumStaleChunkChars': 'chunks',
   'setPageEmbeddingSignature': 'chunks', 'invalidateStaleSignatureEmbeddings': 'chunks',
   'invalidateContentDriftEmbeddings': 'chunks', 'listStaleChunks': 'chunks',
   'countChunklessPagesWithContent': 'chunks', 'listChunklessPagesWithContent': 'chunks', 'deleteChunks': 'chunks',
@@ -530,6 +530,10 @@ export const SQL_CASES: SqlCase[] = [
     ['excludePrivate', (e) => e.getChunks(SLUG, { excludePrivate: true })],
     ['includeUnsealed', (e) => e.getChunks(SLUG, { includeUnsealed: true })],
     ['requireSafeChunks', (e) => e.getChunks(SLUG, { requireSafeChunks: true })],
+  ]),
+  ...variants('getChunkPage', [
+    ['default', (e) => e.getChunkPage(SLUG, { fromIndex: 50, limit: 50 })],
+    ['sourceIds+excludePrivate', (e) => e.getChunkPage(SLUG, { sourceIds: SRCS, excludePrivate: true, fromIndex: 0, limit: 10 })],
   ]),
   ...variants('countStaleChunks', [
     ['default', (e) => e.countStaleChunks()],

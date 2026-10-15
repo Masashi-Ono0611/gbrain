@@ -41,7 +41,7 @@ import { isCallable, publishGatesFromDisabled } from '../core/ops/callable.ts';
 import type { AuthInfo } from '../core/operations.ts';
 import { VERSION } from '../version.ts';
 import { dispatchToolCall, requestLogStatusForResult, errorResult } from './dispatch.ts';
-import { GBRAIN_CLIENT_HEADER, resolveResultRowsMode, resultRowsForRequest } from './result-rows.ts';
+import { GBRAIN_CLIENT_HEADER, isGbrainThinClient, resolveResultRowsMode, resultRowsForRequest } from './result-rows.ts';
 import { parseStrictParamsMode } from './validate-params.ts';
 import { filterOpsForSurface, clampSurface, advertisedOps, resolveAdvertisedSurface, type McpSurface } from './surface.ts';
 import { disabledOpsForPublishGates } from './publish-gates.ts';
@@ -551,6 +551,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
           // IS the ceiling request_tools bounds catalog + persist by.
           surfaceCeiling: surface,
           resultRows: resultRowsForRequest(req.headers.get(GBRAIN_CLIENT_HEADER), await resolveResultRowsMode(engine, fileConfig)), // C1; row shape only, never authority
+          ...(isGbrainThinClient(req.headers.get(GBRAIN_CLIENT_HEADER)) ? { thinClient: true } : {}), // large pages: default body mode only, never authority
         });
         // Same status taxonomy as the OAuth transport (denied_after_list /
         // success_with_warnings feed the amendment-33 metric + E4 usage).

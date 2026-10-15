@@ -554,6 +554,13 @@ export interface OperationContext {
    */
   resultRows?: 'lean' | 'full';
   /**
+   * Large pages (Wave A): the caller identified itself as gbrain's thin client
+   * (X-Gbrain-Client header). A thin client that names no `body` mode on
+   * get_page renders compiled_truth as the whole page, so the read is full
+   * or refused, never a window. Shape only, never authority.
+   */
+  thinClient?: boolean;
+  /**
    * Whether this caller can call `opName` on its surface right now: the MCP
    * dispatch predicate (the stdio session's surface after any `request_tools`
    * widening, the HTTP client's effective surface and scopes under the

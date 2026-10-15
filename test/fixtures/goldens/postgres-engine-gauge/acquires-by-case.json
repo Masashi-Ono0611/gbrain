@@ -91,6 +91,12 @@
     "getCallersOf#chunkId": {},
     "getCallersOf#default": {},
     "getCallersOf#sourceId": {},
+    "getChunkPage#default": {
+      "raw": 1
+    },
+    "getChunkPage#sourceIds+excludePrivate": {
+      "raw": 1
+    },
     "getChunkWindows#default": {},
     "getChunkWindows#scopedPrivateSafe": {},
     "getChunks#default": {

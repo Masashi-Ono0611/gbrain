@@ -343,10 +343,10 @@ export interface SyncOpts {
   /**
    * #5984: managed sync only. Re-enter the single-pass managed sync until the
    * cursor is done, the caller's signal/deadline stops it, or it is blocked
-   * (src/core/persistence/sync-drain.ts). Set by the CLI; jobs and library
-   * callers keep the single-pass contract.
+   * (src/core/persistence/sync-drain.ts). Set by the CLI, serve and the `sync` job (#6706); others stay single-pass.
    */
   drain?: boolean;
+  /** #6706: absolute epoch ms a managed drain stops before (`resumable / deadline`). */ deadlineAtMs?: number;
   /** #5984: wall-clock ms the current drain started; managed cursors measure their rate from it. */
   drainStartedAt?: number;
   /** #5984: `--no-bulk`; and the drain's resolved bulk settings (internal; absent = one request per pass step). */ noBulk?: boolean; bulk?: import('../core/persistence/sync-group.ts').BulkSettings;

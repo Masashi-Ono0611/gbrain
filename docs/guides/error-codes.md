@@ -20,6 +20,9 @@ Under contract v1 an `error` value never changes. Where a surface sends a legacy
 | `invalid_params` | `invalid_fence` | A facts or takes fence in the page cannot be imported without dropping or guessing rows, so the page (or the file) was not written. |
 | `invalid_params` | `not_found` | The requested resource does not exist or is not visible to this caller. |
 | `page_identity_changed` | `page_not_found` | No page with that slug exists in the selected source. |
+| `invalid_params` | `page_too_large_for_inline` | The whole page does not fit one result on this connection, so get_page did not return its body. |
+| `invalid_params` | `result_too_large` | The tool's result is larger than this connection can carry in one response, so it was replaced by this error; nothing was cut. |
+| `invalid_params` | `revision_changed` | The page changed since the cursor or chunk id was issued, so that position no longer names the same text. |
 | `permission_denied` | `trusted_local_only` | The operation runs only from the trusted local CLI on the brain host; no MCP connection can call it. |
 | `unknown_operation` | `unknown_tool` | The named tool does not exist or is not callable on this connection. |
 
@@ -2063,6 +2066,26 @@ More: [docs/guides/troubleshooting.md#owner-unavailable](../../docs/guides/troub
 
 More: [docs/guides/repair.md#page-projection-conflict](../../docs/guides/repair.md#page-projection-conflict)
 
+### page_shrink_refused
+
+<a id="page_shrink_refused"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| put_page refused to replace a large page with content much smaller than the stored body; nothing was written. | Above the inline read size (mcp.inline_body_bytes, 256 KB) a get_page read returns a window, not the body, so a replacement far smaller than the page is most often a window sent back as the whole page, which would delete the unread rest. | Change part of the page with edit_page (revision from get_page body: 'none'). Pass allow_shrink: true only when the smaller content is the intended complete page. Run: gbrain get --source '{source_id}' -- '{slug}' | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/windowed-reads.md#page_shrink_refused](../../docs/guides/windowed-reads.md#page_shrink_refused)
+
+### page_too_large_for_inline
+
+<a id="page_too_large_for_inline"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The whole page does not fit one result on this connection, so get_page did not return its body. | A result is measured as the complete encoded frame; a body over the connection's cap (mcp.max_result_bytes_stdio, 4 MiB; mcp.max_result_bytes_http, 1 MiB) would be cut or rejected by the client. Nothing was truncated: windowed reads cover the whole page in pieces. | Read the outline (body: 'outline'), then windows (body: 'window' with lines, bytes, around_chunk_id or the returned next_cursor). To replace the page, edit it with edit_page and the revision from body: 'none'. Run: gbrain get --source '{source_id}' -- '{slug}' | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/windowed-reads.md#page_too_large_for_inline](../../docs/guides/windowed-reads.md#page_too_large_for_inline)
+
 ### parse_error
 
 <a id="parse_error"></a>
@@ -2601,6 +2624,16 @@ Reasons: `rename_source_changed`.
 |---|---|---|---|---|---|---|
 | Persistence response exceeds the local transport limit. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
 
+### result_too_large
+
+<a id="result_too_large"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The tool's result is larger than this connection can carry in one response, so it was replaced by this error; nothing was cut. | Results are measured as the complete encoded JSON-RPC frame (every block, notice and escape). A frame over the connection's cap (mcp.max_result_bytes_stdio, 4 MiB; mcp.max_result_bytes_http, 1 MiB) would be rejected or silently cut by the client. | Ask for less in one call: a window (get_page body: 'window'), a page of rows (limit / from_index), or metadata only (get_versions include_body: false). Run: gbrain get --source '{source_id}' -- '{slug}' | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/windowed-reads.md#result_too_large](../../docs/guides/windowed-reads.md#result_too_large)
+
 ### resume_spec_mismatch
 
 <a id="resume_spec_mismatch"></a>
@@ -2608,6 +2641,16 @@ Reasons: `rename_source_changed`.
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Resume spec mismatch. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### revision_changed
+
+<a id="revision_changed"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The page changed since the cursor or chunk id was issued, so that position no longer names the same text. | Cursors and chunk positions are bound to one page revision; reading on from them after an edit could skip or repeat text without saying so. | Read again from the position in fix (the same byte offset at the current revision), or start over with body: 'outline'. Run: gbrain get --source '{source_id}' -- '{slug}' | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/windowed-reads.md#revision_changed](../../docs/guides/windowed-reads.md#revision_changed)
 
 ### revision_conflict
 

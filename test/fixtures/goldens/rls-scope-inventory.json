@@ -813,6 +813,34 @@
         ],
         "flagOnScopes": []
       },
+      "getChunkPage#default": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "pool",
+          "tx"
+        ],
+        "flagOnScopes": [
+          "default"
+        ]
+      },
+      "getChunkPage#sourceIds+excludePrivate": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "pool",
+          "tx"
+        ],
+        "flagOnScopes": [
+          "src-a,src-b"
+        ]
+      },
       "getChunkWindows#default": {
         "flagOffLanes": [
           "pool"
@@ -3447,7 +3475,7 @@
       }
     },
     "static": {
-      "callSites": 29,
+      "callSites": 30,
       "directMethods": {
         "_searchKeywordCJK": 1,
         "countChunklessPagesWithContent": 1,
@@ -3459,6 +3487,7 @@
         "findDuplicatePages": 1,
         "getAllSlugs": 1,
         "getBacklinks": 1,
+        "getChunkPage": 1,
         "getChunkWindows": 1,
         "getChunks": 1,
         "getLinks": 1,
@@ -3538,6 +3567,7 @@
         "getCalibrationCurve": "none",
         "getCalleesOf": "none",
         "getCallersOf": "none",
+        "getChunkPage": "direct",
         "getChunkWindows": "direct",
         "getChunks": "direct",
         "getChunksWithEmbeddings": "none",

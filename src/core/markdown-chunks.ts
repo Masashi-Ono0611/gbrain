@@ -127,7 +127,8 @@ async function extractFencedChunks(
 /**
  * Truth then timeline prose chunks through a fence overlay, plus the
  * overlay's low-tier facts-fence rows as trailing chunks, each piece led by
- * the fence trust marker naming the row tier (#5575 ENG-1). `fenced` slots
+ * the fence trust marker naming the row tier (#5575 ENG-1). Prose chunks
+ * carry their projected UTF-8 span (v244), the coordinates windowed reads use. `fenced` slots
  * the recognized code-fence chunks of the overlaid truth before them.
  */
 async function overlaidChunks(page: { compiled_truth: string; timeline?: string | null }, maxTokens: number,
@@ -137,7 +138,10 @@ async function overlaidChunks(page: { compiled_truth: string; timeline?: string 
   const timeline = splitFenceOverlay(page.timeline ?? '', overlay);
   for (const [text, source] of [[truth.main, 'compiled_truth'], [timeline.main, 'timeline']] as const) {
     if (!text.trim()) continue;
-    for (const c of chunkText(text, { maxTokens })) chunks.push({ chunk_index: chunks.length, chunk_text: c.text, chunk_source: source });
+    for (const c of chunkText(text, { maxTokens, spans: true })) {
+      chunks.push({ chunk_index: chunks.length, chunk_text: c.text, chunk_source: source,
+        ...(c.byte_start !== undefined && c.byte_end !== undefined ? { projected_byte_start: c.byte_start, projected_byte_end: c.byte_end } : {}) });
+    }
   }
   if (fenced && truth.main.trim()) chunks.push(...await fenced(truth.main, chunks.length));
   for (const { tier, unconfirmed, body } of [...truth.lowTier, ...timeline.lowTier]) {

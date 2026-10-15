@@ -1553,6 +1553,13 @@ export class PostgresEngine implements BrainEngine {
     return this.withScopedReadTransaction(sourceIds, sourceIds ? undefined : sourceId, tx => chunksImpl.getChunks(scopedRead(this.engineSqlOn(tx)), column, slug, { sourceIds, sourceId }, opts));
   }
 
+  async getChunkPage(slug: string, opts: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; requireSafeChunks?: boolean; fromIndex: number; limit: number }) {
+    const sourceIds = opts.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
+    const sourceId = opts.sourceId ?? 'default';
+    const column = (await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })).name;
+    return this.withScopedReadTransaction(sourceIds, sourceIds ? undefined : sourceId, tx => chunksImpl.getChunkPage(scopedRead(this.engineSqlOn(tx)), column, slug, { sourceIds, sourceId }, opts));
+  }
+
   /** S2: quoted identifier of the registry-ACTIVE embedding column for the
    *  health plane (getStats / getHealth) — read-only sites pass fallbackToLegacy
    *  so a broken registry row can't crash diagnostics. Callers prefix the

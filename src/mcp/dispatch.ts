@@ -47,6 +47,7 @@ import { enforceReadTrustFloor } from '../core/eligibility/registry.ts';
 import { invalidateHotMemoryForEngine } from '../core/facts/meta-hook.ts';
 import { admittedPendingReceipt, type WriteReceipt } from '../core/persistence/types.ts';
 import { currentVerifiedLocalWriter, readLocalWriter, verifyLocalWriter, withVerifiedLocalRegistration } from '../core/persistence/identity.ts';
+import { frameOverCap, resultTooLargeError } from '../core/egress-budget.ts';
 
 // WP3: normalization + validation moved to validate-params.ts (direct unit
 // surface). Re-exported here so existing imports/tests keep working.
@@ -279,6 +280,8 @@ export interface DispatchOpts {
   isListed?: (op: OperationMeta) => Promise<boolean>;
   /** #5232: commit wait for coordinated writes (OperationContext.writeWaitMs); unset = agent default. */
   writeWaitMs?: number;
+  /** Large pages: the caller sent X-Gbrain-Client (OperationContext.thinClient). Shape only, never authority. */
+  thinClient?: boolean;
   /** C1: search/query row shape chosen by the transport (OperationContext.resultRows); unset = lean for remote callers. */
   resultRows?: OperationContext['resultRows'];
 }
@@ -841,6 +844,7 @@ export function buildOperationContext(
     ...(opts.revealTools ? { revealTools: opts.revealTools } : {}),
     ...(opts.writeWaitMs !== undefined ? { writeWaitMs: opts.writeWaitMs } : {}),
     ...(opts.resultRows ? { resultRows: opts.resultRows } : {}),
+    ...(opts.thinClient ? { thinClient: true } : {}),
     isCallable: (opName: string) => (render ??= dispatchRenderContext(opts)).isCallable(opName),
     auth: opts.auth,
   };
@@ -1135,6 +1139,9 @@ export async function dispatchToolCall(
         ctx.logger.warn(`[mcp] _meta hook failed for ${name}: ${msg}; degrading to no hook keys`);
       }
     }
+    // Large pages: the egress backstop measures the final frame; a read over the connection's cap is refused whole, never cut.
+    const over = op.mutating ? null : await frameOverCap(out, { remote: ctx.remote, transport: ctx.transport, engine, config: ctx.config });
+    if (over) return errorResult(resultTooLargeError(name, safeParams, over), opts, { op: name, mutating: false, idempotent: op.idempotent === true });
     return out;
   } catch (e: unknown) {
     logVerb(false);

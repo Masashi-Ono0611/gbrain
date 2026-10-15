@@ -11,6 +11,7 @@ import type { GBrainConfig } from '../config.ts';
 import type { Page, PageVersion } from '../types.ts';
 import { importFromContent, verifyPageReadable, type ParsedPage } from '../import-file.ts';
 import { comparableFrontmatter, frontmatterHoldMessageWithoutKeys, parseMarkdown, resolveParsedSubtype, serializePageToMarkdown, resolveSourceLocalFilePath, type ParseOpts } from '../markdown.ts';
+import { assertLargePageReplacement } from './large-page-guard.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { isOpPageSlug } from '../ops/context.ts';
@@ -401,10 +402,11 @@ export async function preparePageMutation(unbounded: BrainEngine, row: WriteRequ
   if ((snapshot?.page.id ?? null) !== row.page_id) throw pageIdentityError(snapshot != null || row.page_id === null, 'The accepted page identity changed.');
   const observedRevision = snapshot?.revision ?? null;
   const activePack = pack?.manifest;
-  if (row.operation === 'put_page' && p.allow_empty !== true && snapshot && !snapshot.page.deleted_at
-    && typeof p.content === 'string' && `${snapshot.page.compiled_truth}\n${snapshot.page.timeline ?? ''}`.trim()) {
+  if (row.operation === 'put_page' && snapshot && !snapshot.page.deleted_at && typeof p.content === 'string'
+    && `${snapshot.page.compiled_truth}\n${snapshot.page.timeline ?? ''}`.trim()) {
     const incoming = parseMarkdown(p.content, row.slug, { activePack });
-    if (!`${incoming.compiled_truth}\n${incoming.timeline ?? ''}`.trim()) {
+    if (!preparedIntent && row.authority.remote) assertLargePageReplacement(row.slug, row.source_id, p, snapshot, incoming);
+    if (p.allow_empty !== true && !`${incoming.compiled_truth}\n${incoming.timeline ?? ''}`.trim()) {
       throw new OperationError('invalid_params', `Refusing to overwrite existing non-empty page '${row.slug}' with empty content. Use capture --file PATH --slug SLUG for file input; set allow_empty:true to intentionally clear it.`,
         'Use capture --file PATH --slug SLUG for file input, or pass allow_empty:true with the expected revision to intentionally clear it.');
     }
