@@ -37,7 +37,7 @@ import { CJK_SLUG_CHARS } from './cjk.ts';
 import { stripCodeBlocks, isCrossSourceLinksEnabled } from './link-extraction.ts';
 // #4222: shared generic-token reject list — same list gates enrichEntity
 // minting and drives the junk_entity_hubs doctor check.
-import { isGenericEntityToken } from './entity-name-quality.ts';
+import { DEFAULT_ENTITY_MENTION_IGNORE_LIST as DEFAULT_IGNORE_LIST, isGenericEntityToken } from './entity-name-quality.ts';
 import { ALWAYS_LINKABLE_TYPES, linkableTypesFor, loadSourcePack, readMentionPolicy, type MentionPolicy, type PackTypes } from './mentions/policy.ts';
 import { siblingVerdict, type SiblingCandidate } from './mentions/siblings.ts';
 import { isShortCode } from './mentions/short-codes.ts';
@@ -56,18 +56,6 @@ let aliasGazetteerWarned = false;
  */
 const MIN_NAME_LENGTH = 4;
 const MIN_CJK_NAME_LENGTH = 2;
-
-/**
- * Built-in ignore list — common ambiguous tokens whose body-text mentions
- * are usually NOT references to the named brand/entity. Suppressed at
- * gazetteer-build time when no corresponding entity page exists.
- *
- * Per CK12 (codex outside-voice): if the user has explicitly created
- * `companies/apple` as a page, they want auto-link → ignore-list does
- * not override gazetteer presence. The list only suppresses entries
- * that would NOT otherwise be in the gazetteer.
- */
-const DEFAULT_IGNORE_LIST = ['Apple', 'Amazon', 'Square', 'Stripe', 'Box', 'Meta', 'Target', 'Oracle'];
 
 /** Where a gazetteer name came from: the page title or a `page_aliases` row's origin. */
 export type GazetteerOrigin = 'title' | 'frontmatter' | 'declared' | 'subject';
