@@ -14,7 +14,7 @@ import { opAllowedForBoundClient } from '../core/operations.ts';
 import { authTransport } from '../core/ops/contract.ts';
 import type { AuthInfo, Operation } from '../core/operations.ts';
 import { disabledOpsForPublishGates } from '../mcp/publish-gates.ts';
-import { installInstructionsResolver, resolveMcpInstructions } from '../mcp/instructions.ts';
+import { installInstructionsResolver, readInstructionContent, resolveMcpInstructions } from '../mcp/instructions.ts';
 import { httpInstructionTools } from '../mcp/initialize-context.ts';
 import { installCapabilitiesResource, mcpAdministrationGuidance } from '../mcp/capabilities.ts';
 import { createSkillResources } from '../mcp/skill-resources.ts';
@@ -203,6 +203,7 @@ function createMcpRequestServer(
   installInstructionsResolver(server, async () => resolveMcpInstructions(config, process.env, {
     writeback: writebackOpts,
     tools: await httpInstructionTools(engine, config, { ops: mcpOperations, surface, auth: authInfo, allowedOps: surfaceAllowedOps, cache: ctx.readinessCache }),
+    ...await readInstructionContent(engine),
   }));
   installCapabilitiesResource(server, async () => {
     return { transport: authTransport(authInfo), client_id: authInfo.clientId,

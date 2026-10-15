@@ -79,7 +79,9 @@ export interface MatchSpan { chunk_id: number; start: number; end: number }
  * a conversation whose matching span no longer fits the budget keeps its
  * ranked chunks too.
  */
-export type AutoReason = 'conversation_type' | 'conversation_slug' | 'not_conversation' | 'conversation_over_budget' | 'saved_fact';
+export type AutoReason = 'conversation_type' | 'conversation_slug' | 'not_conversation' | 'conversation_over_budget' | 'saved_fact'
+  /** `search.long_page_unit` delivered this long page in its unit; `long_page_chunk`: it kept its ranked chunk (`delivery.fallbacks` says why). */
+  | 'long_page' | 'long_page_chunk';
 
 export interface DeliveredEvidence {
   unit: DeliveredUnit;
@@ -132,6 +134,8 @@ export interface EvidencePlan {
   budgetClamped?: { requested: number; max: number };
   /** `search.evidence_date_header` is on: each block starts with its date header line. */
   dateHeader?: true;
+  /** F2: set only by the search/query caller (withLongPagePolicy); recall, think and assemble_evidence never carry it. */
+  longPage?: LongPagePolicy;
   /** W5: page unit + caller budget + `search.page_rank_cut: whole_pages` (page-rank-cut.ts). */
   rankCut?: PageRankCut;
 }
@@ -318,6 +322,101 @@ export function conversationSignal(hit: { type?: string | null; slug: string }):
 export function effectivePlan(plan: EvidencePlan | null, hits: SearchResult[]): EvidencePlan | null {
   if (!plan || plan.unit !== 'auto' || plan.explicitUnit || capEngaged(plan)) return plan;
   return hits.some(h => conversationSignal(h) !== null) ? plan : null;
+}
+
+// ---------------------------------------------------------------------------
+// auto: long non-conversation pages (search.long_page_unit, F2)
+// ---------------------------------------------------------------------------
+
+export const LONG_PAGE_UNIT_CONFIG_KEY = 'search.long_page_unit';
+export const LONG_PAGE_UNITS = ['off', 'window', 'section', 'page'] as const;
+export type LongPageUnit = Exclude<typeof LONG_PAGE_UNITS[number], 'off'>;
+/** A page is long when its rendered body (compiled truth, plus timeline unless `detail: "low"`) holds at least this many characters. */
+export const LONG_PAGE_MIN_CHARS_CONFIG_KEY = 'search.long_page_min_chars';
+export const DEFAULT_LONG_PAGE_MIN_CHARS = 20_000;
+/** Long pages per call that get the unit, in rank order; later ones keep their chunk (`long_page_pages`). */
+export const LONG_PAGE_MAX_PAGES = 5;
+/** Stored-body bytes those pages may bring in; a page that would cross it keeps its chunk (`long_page_bytes`), since bodies are read whole and never sliced. */
+export const LONG_PAGE_MAX_INPUT_BYTES = 1_000_000;
+/** Cooperative deadline for the size preflight plus the long-page fetch (`long_page_deadline`). */
+export const LONG_PAGE_DEADLINE_MS = 2_000;
+
+export interface LongPagePolicy { unit: LongPageUnit; minChars: number }
+
+/** The long pages one call delivers in the policy's unit, and the ones that keep their chunk (page id → fallback code). */
+export interface LongPageSelection {
+  unit: LongPageUnit;
+  minChars: number;
+  pages: ReadonlySet<number>;
+  kept: ReadonlyMap<number, string>;
+  deadlineAt: number;
+  fallbacks: string[];
+}
+
+export function longPageUnitValueProblem(value: string): string | null {
+  return (LONG_PAGE_UNITS as readonly string[]).includes(value.trim()) ? null : `${LONG_PAGE_UNIT_CONFIG_KEY} must be one of ${LONG_PAGE_UNITS.join(', ')} (got ${JSON.stringify(value.slice(0, 40))}).`;
+}
+
+export function longPageMinCharsValueProblem(value: string): string | null {
+  return /^[1-9][0-9]{0,8}$/.test(value.trim()) ? null : `${LONG_PAGE_MIN_CHARS_CONFIG_KEY} must be a positive whole number of characters (got ${JSON.stringify(value.slice(0, 40))}).`;
+}
+
+/**
+ * The F2 policy for a search/query call: only under an implied `auto` (no
+ * `return_unit`, `search.return_unit` unset or `auto`, no explicit budget).
+ * `snippet_chars` leaves it on; capDeliveredSnippets exempts widened rows.
+ * Read errors and unknown values are `off`; an unusable threshold is the default.
+ */
+export async function withLongPagePolicy(engine: BrainEngine, plan: EvidencePlan | null): Promise<EvidencePlan | null> {
+  if (!plan || plan.unit !== 'auto' || plan.explicitUnit || plan.budgetExplicit) return plan;
+  const raw = (await engine.getConfig(LONG_PAGE_UNIT_CONFIG_KEY).catch(() => null))?.trim();
+  if (raw !== 'window' && raw !== 'section' && raw !== 'page') return plan;
+  const min = (await engine.getConfig(LONG_PAGE_MIN_CHARS_CONFIG_KEY).catch(() => null)) ?? '';
+  return { ...plan, longPage: { unit: raw, minChars: longPageMinCharsValueProblem(min) ? DEFAULT_LONG_PAGE_MIN_CHARS : Number(min.trim()) } };
+}
+
+/**
+ * The plan to run for these hits once the long-page policy is applied: a
+ * size preflight (one query, the caller's read scope) finds the
+ * non-conversation pages whose stored body reaches the character threshold
+ * and keeps the rank-order ones inside the page and byte limits; delivery
+ * confirms the threshold on the rendered body. With no long page this is exactly effectivePlan, so a
+ * response without one is unchanged; a failed or late preflight is too.
+ */
+export async function selectLongPages(engine: BrainEngine, plan: EvidencePlan | null, hits: SearchResult[], scope: DeliveryScope): Promise<{ plan: EvidencePlan | null; longPages?: LongPageSelection }> {
+  const base = effectivePlan(plan, hits);
+  if (!plan?.longPage) return { plan: base };
+  const deadlineAt = Date.now() + LONG_PAGE_DEADLINE_MS;
+  const ids: number[] = [];
+  for (const h of hits) if (!h.fact_row && conversationSignal(h) === null && Number.isFinite(h.page_id) && !ids.includes(h.page_id)) ids.push(h.page_id);
+  if (ids.length === 0) return { plan: base };
+  const { unit, minChars } = plan.longPage;
+  let sizes: Map<number, { chars: number; bytes: number }>;
+  try {
+    const params: unknown[] = [ids];
+    const filter = pageReadFilter('p', scope, params, true);
+    const tl = scope.detail === 'low' ? null : `CASE WHEN COALESCE(p.timeline, '') !~ '\\S' THEN 0 ELSE ${TIMELINE_SEPARATOR.length} + `;
+    const rows = await withTimeout(engine.executeRaw<{ id: number; chars: number; bytes: number }>(
+      `SELECT p.id, char_length(COALESCE(p.compiled_truth, ''))${tl ? ` + ${tl}char_length(p.timeline) END` : ''} AS chars,
+              octet_length(COALESCE(p.compiled_truth, ''))${tl ? ` + ${tl}octet_length(p.timeline) END` : ''} AS bytes FROM pages p
+        WHERE p.id = ANY($1::int[]) AND ${filter} AND ${currentTextProjectionFilter('p')}${requiresSafeChunks(scope) ? ` AND ${safeChunksFilter('p')}` : ''}`,
+      params), LONG_PAGE_DEADLINE_MS);
+    sizes = new Map(rows.map(r => [Number(r.id), { chars: Number(r.chars), bytes: Number(r.bytes) }]));
+  } catch (e) {
+    return { plan: base, ...(base ? { longPages: { unit, minChars, pages: new Set(), kept: new Map(), deadlineAt, fallbacks: [e instanceof EvidenceTimeout ? 'long_page_deadline' : 'long_page_preflight_failed'] } } : {}) };
+  }
+  const pages = new Set<number>();
+  const kept = new Map<number, string>();
+  let total = 0;
+  for (const id of ids) {
+    const size = sizes.get(id);
+    if (size === undefined || size.chars < minChars) continue;
+    if (pages.size >= LONG_PAGE_MAX_PAGES) kept.set(id, 'long_page_pages');
+    else if (total + size.bytes > LONG_PAGE_MAX_INPUT_BYTES) kept.set(id, 'long_page_bytes');
+    else { pages.add(id); total += size.bytes; }
+  }
+  if (pages.size === 0 && kept.size === 0) return { plan: base };
+  return { plan, longPages: { unit, minChars, pages, kept, deadlineAt, fallbacks: [] } };
 }
 
 // ---------------------------------------------------------------------------
@@ -653,7 +752,7 @@ const SPAN_ONLY_LOCATE_BYTES = 1024 * 1024;
 /** fallback_reason when a 'page' (or auto) unit was cut to a window because the page is over the inline read size. */
 export const PAGE_OVER_INLINE_BYTES = 'page_over_inline_bytes';
 
-function planBlock(page: ChunkWindowPage, hits: SearchResult[], plan: EvidencePlan, includeTimeline: boolean): PlannedBlock {
+function planBlock(page: ChunkWindowPage, hits: SearchResult[], requested: Exclude<ReturnUnit, 'chunk' | 'auto'>, radius: number, includeTimeline: boolean): PlannedBlock {
   const best = hits[0];
   if (!page.sealed) return fallbackBlock(best, hits, 'unsealed_page');
   if (page.chunks.length === 0 && page.row_limited) return fallbackBlock(best, hits, 'row_limit');
@@ -674,7 +773,7 @@ function planBlock(page: ChunkWindowPage, hits: SearchResult[], plan: EvidencePl
   const labels = doc.pieces.map(p => p.speaker).filter((x): x is string => x !== null);
   const conversation = isConversationLabels(labels);
   const hasHeadings = doc.pieces.some(p => p.heading > 0);
-  let unit: DeliveredUnit = plan.unit === 'auto' ? 'page' : plan.unit;
+  let unit: DeliveredUnit = requested;
   let fallbackReason: string | undefined;
   let candidates: number[];
   // Large pages (T18): a page over the inline read size is never delivered whole; it becomes the window around its hits.
@@ -686,11 +785,11 @@ function planBlock(page: ChunkWindowPage, hits: SearchResult[], plan: EvidencePl
     if (sec) candidates = sec;
     else {
       unit = 'window';
-      if (plan.unit === 'section') fallbackReason = 'no_section_structure';
-      candidates = windowCandidates(doc, anchors, plan.window);
+      fallbackReason = 'no_section_structure';
+      candidates = windowCandidates(doc, anchors, radius);
     }
   } else {
-    candidates = windowCandidates(doc, anchors, plan.window);
+    candidates = windowCandidates(doc, anchors, radius);
   }
   return {
     hit: best, hits, doc, unit, candidates, anchors,
@@ -1027,6 +1126,8 @@ export interface DeliverOptions {
    */
   liveHits?: boolean;
   timeoutMs?: number;
+  /** F2: the long pages selectLongPages chose for these hits (search/query only). */
+  longPages?: LongPageSelection;
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -1062,50 +1163,69 @@ export async function deliverEvidence(
   type Group = { pageId: number | null; hits: SearchResult[]; rank: number; reason?: AutoReason };
   const groups: Group[] = [];
   const byPage = new Map<number, Group>();
+  const long = auto ? opts.longPages : undefined;
+  for (const code of long?.fallbacks ?? []) fallbacks.add(code);
   hits.forEach((h, rank) => {
     // A saved-fact row (facts arm) has no page to expand: it is delivered as written, paid for first.
     if (h.fact_row) { passthrough.push({ rank, hit: h, reason: 'saved_fact' }); return; }
     const signal = auto ? conversationSignal(h) : null;
-    if (auto && !signal) { passthrough.push({ rank, hit: h, reason: 'not_conversation' }); return; }
+    const longPage = !signal && long?.pages.has(h.page_id) === true;
+    if (auto && !signal && !longPage) {
+      const code = long?.kept.get(h.page_id);
+      if (code) fallbacks.add(code);
+      passthrough.push({ rank, hit: h, reason: code ? 'long_page_chunk' : 'not_conversation' });
+      return;
+    }
     const id = Number.isFinite(h.page_id) ? h.page_id : null;
     const g = id === null ? undefined : byPage.get(id);
     if (g) { g.hits.push(h); return; }
-    const ng: Group = { pageId: id, hits: [h], rank, ...(signal ? { reason: signal } : {}) };
+    const ng: Group = { pageId: id, hits: [h], rank, ...(signal ? { reason: signal } : longPage ? { reason: 'long_page' as const } : {}) };
     if (id !== null) byPage.set(id, ng);
     groups.push(ng);
   });
 
   // Chunks only anchor hits in the page text; every unit but window (and the
-  // section fallback to window) needs just the hit chunks themselves.
-  const radius = plan.window;
-  const requests: ChunkWindowRequest[] = [];
-  groups.forEach((g, rank) => {
-    if (g.pageId === null) return;
-    for (const h of g.hits) {
-      const at = Number.isFinite(h.chunk_index) ? h.chunk_index : 0;
-      requests.push({ page_id: g.pageId, from_index: Math.max(0, at - radius), to_index: at + radius, priority: rank });
-    }
-  });
-  const maxRows = Math.min(MAX_ROWS, requests.reduce((n, r) => n + (r.to_index - r.from_index + 1), 0));
-
-  let pages: Map<number, ChunkWindowPage> | null = null;
-  let fetchFailure: string | null = null;
-  if (requests.length > 0) {
+  // section fallback to window) needs just the hit chunks themselves. Long
+  // pages (F2) are read in their own bounded call under the long-page
+  // deadline, so they can neither slow nor fail the conversation fetch.
+  const fetchPages = async (want: Group[], timeoutMs: number): Promise<Map<number, ChunkWindowPage> | string> => {
+    const requests: ChunkWindowRequest[] = [];
+    want.forEach((g, rank) => {
+      if (g.pageId === null) return;
+      for (const h of g.hits) {
+        const at = Number.isFinite(h.chunk_index) ? h.chunk_index : 0;
+        requests.push({ page_id: g.pageId, from_index: Math.max(0, at - plan.window), to_index: at + plan.window, priority: rank });
+      }
+    });
+    if (requests.length === 0) return new Map();
+    if (timeoutMs <= 0) return 'fetch_timeout';
     try {
       const rows = await withTimeout(engine.getChunkWindows(requests, {
         ...(scope.sourceIds && scope.sourceIds.length > 0 ? { sourceIds: scope.sourceIds } : scope.sourceId ? { sourceId: scope.sourceId } : {}),
         excludePrivate: scope.excludePrivate,
         requireSafeChunks: requiresSafeChunks(scope),
         chunkSources: scope.detail === 'low' ? ['compiled_truth'] : ['compiled_truth', 'timeline'],
-        maxRows,
-      }), opts.timeoutMs ?? EVIDENCE_FETCH_TIMEOUT_MS);
+        maxRows: Math.min(MAX_ROWS, requests.reduce((n, r) => n + (r.to_index - r.from_index + 1), 0)),
+      }), timeoutMs);
       for (const p of rows) p.fenceOverlay = await loadFenceChunkOverlay(engine, { sourceId: p.source_id, slug: p.slug, compiled_truth: p.compiled_truth, timeline: p.timeline });
-      pages = new Map(rows.map(p => [p.page_id, p]));
+      return new Map(rows.map(p => [p.page_id, p]));
     } catch (e) {
-      fetchFailure = e instanceof EvidenceTimeout ? 'fetch_timeout' : 'fetch_failed';
-      fallbacks.add(fetchFailure);
+      return e instanceof EvidenceTimeout ? 'fetch_timeout' : 'fetch_failed';
     }
-  }
+  };
+  const longGroups = groups.filter(g => g.reason === 'long_page');
+  const [mainFetch, longFetch] = await Promise.all([
+    fetchPages(groups.filter(g => g.reason !== 'long_page'), opts.timeoutMs ?? EVIDENCE_FETCH_TIMEOUT_MS),
+    long && longGroups.length > 0 ? fetchPages(longGroups, long.deadlineAt - Date.now()) : Promise.resolve(new Map<number, ChunkWindowPage>()),
+  ]);
+  const pages = typeof mainFetch === 'string' ? null : mainFetch;
+  const fetchFailure = typeof mainFetch === 'string' ? mainFetch : null;
+  if (fetchFailure) fallbacks.add(fetchFailure);
+  // A long page that cannot be delivered in its unit keeps its ranked chunks, exactly as with the policy off.
+  const keepChunks = (g: Group, code: string) => {
+    fallbacks.add(code);
+    for (const h of g.hits) passthrough.push({ rank: hits.indexOf(h), hit: h, reason: 'long_page_chunk' });
+  };
 
   // C1 date headers: one line per block (passthrough rows included), paid for inside the budget like the title.
   const headerFor = plan.dateHeader ? await blockDateHeaders(engine, hits, () => fallbacks.add('date_header_unavailable')) : () => '';
@@ -1113,7 +1233,17 @@ export async function deliverEvidence(
   const planned: Block[] = [];
   for (const g of groups) {
     let b: PlannedBlock;
-    if (g.pageId === null) {
+    if (g.reason === 'long_page') {
+      if (typeof longFetch === 'string') { keepChunks(g, longFetch === 'fetch_timeout' ? 'long_page_deadline' : 'long_page_fetch_failed'); continue; }
+      const page = longFetch.get(g.pageId!);
+      if (!page) { dropped.not_readable = (dropped.not_readable ?? 0) + 1; continue; }
+      if (pageEvidenceText(page, scope.detail !== 'low').text.length < long!.minChars) {
+        for (const h of g.hits) passthrough.push({ rank: hits.indexOf(h), hit: h, reason: 'not_conversation' });
+        continue;
+      }
+      b = planBlock(page, g.hits, long!.unit, plan.window, scope.detail !== 'low');
+      if (b.unit === 'chunk') { keepChunks(g, b.fallbackReason ?? 'long_page_fallback'); continue; }
+    } else if (g.pageId === null) {
       b = fallbackBlock(g.hits[0], g.hits, 'page_missing');
     } else if (fetchFailure) {
       if (opts.liveHits === false) { dropped.not_readable = (dropped.not_readable ?? 0) + 1; continue; }
@@ -1121,7 +1251,7 @@ export async function deliverEvidence(
     } else {
       const page = pages?.get(g.pageId);
       if (!page) { dropped.not_readable = (dropped.not_readable ?? 0) + 1; continue; }
-      b = planBlock(page, g.hits, plan, scope.detail !== 'low');
+      b = planBlock(page, g.hits, plan.unit === 'auto' ? 'page' : plan.unit, plan.window, scope.detail !== 'low');
     }
     if (b.fallbackReason) fallbacks.add(b.fallbackReason);
     const title = b.hit.title ?? '';
@@ -1148,7 +1278,10 @@ export async function deliverEvidence(
       if (planned.length > candidates.length) dropped.rank_cut = planned.length - candidates.length;
     }
     kept = allocate(candidates, shared, tokenizer, dropped, auto
-      ? b => { for (const h of b.hits) passthrough.push({ rank: hits.indexOf(h), hit: h, reason: 'conversation_over_budget' }); }
+      ? b => {
+        if (b.reason === 'long_page') fallbacks.add('long_page_over_budget');
+        for (const h of b.hits) passthrough.push({ rank: hits.indexOf(h), hit: h, reason: b.reason === 'long_page' ? 'long_page_chunk' : 'conversation_over_budget' });
+      }
       : undefined);
   }
   let results: DeliveredSearchResult[] = kept.map(b => {
@@ -1309,7 +1442,10 @@ export function capEvidenceToBudget<T extends SearchResult & { delivered?: Deliv
 /**
  * Explicit `snippet_chars` precedence: cap delivered blocks at `cap`
  * characters (marker names the get_page recovery move), clip spans, mark
- * truncated and re-count. Non-mutating.
+ * truncated and re-count. A long-page row widened by the F2 policy
+ * (`delivered.reason: 'long_page'`) is exempt: it already fits the delivery
+ * budget and the page limits, and a head cut would drop the passage it was
+ * widened for. Non-mutating.
  */
 export function capDeliveredSnippets<T extends SearchResult & { delivered?: DeliveredEvidence }>(
   results: T[],
@@ -1321,7 +1457,7 @@ export function capDeliveredSnippets<T extends SearchResult & { delivered?: Deli
   const tokenizer = delivery.tokenizer;
   let markerOmitted = false;
   const out = results.map(r => {
-    if (typeof r.chunk_text !== 'string' || r.chunk_text.length <= cap) return r;
+    if (typeof r.chunk_text !== 'string' || r.chunk_text.length <= cap || r.delivered?.reason === 'long_page') return r;
     any = true;
     let keep = cap;
     let text = r.chunk_text.slice(0, cap) + buildSnippetMarker(r.slug, r.chunk_text.length - cap, r.follow_up);

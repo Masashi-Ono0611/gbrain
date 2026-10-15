@@ -32,7 +32,7 @@ import { CAPABILITIES_URI } from './capabilities.ts';
 import { resolveAuthCapabilities } from '../core/harness/capabilities.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { buildToolDefs } from './tool-defs.ts';
-import { resolveMcpInstructions } from './instructions.ts';
+import { readInstructionContent, resolveMcpInstructions } from './instructions.ts';
 import { httpInstructionTools } from './initialize-context.ts';
 import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
 import { operations, operationsByName, opAllowedForBoundClient } from '../core/operations.ts';
@@ -448,6 +448,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
               instructions: resolveMcpInstructions(fileConfig, process.env, {
                 writeback: ambientOptsFrom(writeback, { remember: canWriteOp('remember'), extractFacts: canWriteOp('extract_facts') }),
                 tools: await httpInstructionTools(engine, fileConfig, { ops: surfacedOps, surface, auth: auth.auth!, allowedOps: surfaceAllowedOps }), // F1
+                ...await readInstructionContent(engine),
               }),
             },
             jsonrpc: '2.0',

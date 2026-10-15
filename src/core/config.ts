@@ -1417,6 +1417,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.return_budget_conversation',
   'search.return_budget_max_remote',
   'search.auto_packing',
+  'search.long_page_unit', 'search.long_page_min_chars', // F2: delivery unit for long (rendered body >= min_chars, default 20000) non-conversation hits under an implied auto: off (default) | window | section | page (search/evidence-delivery.ts)
   'search.evidence_date_header', // C1: one-line date header per delivered block (default off; search/evidence-date.ts)
   'search.entity_anchoring', // entity-anchored retrieval for entity-scoped current-state query/search (default off; search/entity-anchor.ts)
   'search.query_facts_arm', // query adds matching active facts as rows in spare capacity (default on; search/facts-arm.ts)
@@ -1632,6 +1633,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'mcp.strict_params',
   'mcp.result_rows', // C1 row shape, read dual-plane by src/mcp/result-rows.ts
   'mcp.allow_session_widen', // stdio request_tools session widening (default on), read dual-plane by src/mcp/surface.ts
+  'entity.names_references', 'entity.record_types', 'entity.row_page_status', // names-row referenced_by_count + card `next` (default on); canonical page types listed as `records` (default empty); F3 page_status on context_pack/get_backlinks rows (default on); src/core/entity-references-config.ts
+  'mcp.instructions_governing_rule', // instruction 7: in_effect (default: the record in effect on the date asked about governs) | newest (the earlier recency sentence); src/mcp/instructions.ts
   // Skill-nag suppression (#2180): brain-resident pack install nag off-switch.
   'skillpack.nag_disabled',
   // Self-upgrade (v0.42; file plane, read on the hot path)

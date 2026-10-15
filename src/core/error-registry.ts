@@ -587,6 +587,8 @@ export const NOTICE_CODES = {
   migrations_pending: { kind: 'safety', summary: 'Schema migrations are pending or failed to apply on this brain.' },
   no_worker: { kind: 'degraded', summary: 'A job was queued but no worker is running to execute it; it waits until a worker runs.' },
   unknown_param: { kind: 'info', summary: 'The call passed a parameter the tool does not declare; it was ignored.' },
+  record_types_undeclared: { kind: 'info', summary: 'entity.record_types names a page type that neither the schema pack declares nor any page uses, so no record of that type is listed.' },
+  references_unavailable: { kind: 'degraded', summary: 'The reference count and records on entity rows did not finish (deadline or read failure); rows marked references_unavailable are unread, not empty.' },
   listing_truncated: { kind: 'info', summary: 'A listing returned a full page and more rows match; the fix is the next-page call.' },
   former_relationships_hidden: { kind: 'info', summary: 'A graph read returned live relationships only and left out ended ones; the fix repeats the call with status: "all" (or as_of) to see history.' },
   identity_siblings_capped: { kind: 'info', summary: 'More than three pages share an entity\'s title subject, so the card shows no identity siblings; the fix (for the user) lists them with `gbrain extract mentions --explain`.' },

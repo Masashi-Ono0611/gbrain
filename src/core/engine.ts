@@ -1636,6 +1636,7 @@ export interface BrainEngine {
    *   feature.
    * - `link_source='mentions'` edges are EXCLUDED by default (noisy + the
    *   densest fan-out source); opt in via `includeMentions`.
+   * - Non-ranking link types (src/core/link-ranking-policy.ts) are never walked.
    * - `deleted_at IS NULL` at seed, every neighbor, and every returned node.
    * - Deterministic ordering: hop ASC, edge_count DESC, source_id, slug.
    * Must move in lockstep with the PGLite implementation
@@ -1651,13 +1652,13 @@ export interface BrainEngine {
    * the relation's subject (`toward: 'object'`) or object (`toward:
    * 'subject'`), with every endpoint and origin authorized by the read policy
    * BEFORE the caller scores anything, at most `neighborCap` edges per frontier
-   * node, same-source edges only, mentions excluded. Deterministic order:
-   * frontier id, lowest link id. Pinned by test/e2e/engine-parity.test.ts.
+   * node, same-source edges only, mentions and non-ranking link types
+   * excluded (hops and degree). Deterministic order: frontier id, lowest link id. Pinned by test/e2e/engine-parity.test.ts.
    */
   relationalChainHop(frontierPageIds: number[], opts: ChainHopOpts): Promise<ChainHopEdge[]>;
   /**
-   * For a list of page ids, return how many inbound links each has.
-   * Used by hybrid search backlink boost. Single SQL query, not N+1.
+   * For a list of page ids, return how many pages link to each (mentions
+   * and non-ranking link types excluded). Used by hybrid search backlink boost. Single SQL query, not N+1.
    * Keyed by page id — NOT slug — so namesake slugs across sources never
    * share or sum counts (#4380). Ids with zero links map to 0.
    */
@@ -1669,7 +1670,8 @@ export interface BrainEngine {
    * Map, no SQL.
    *
    * Returned shape per page (AdjacencyRow):
-   *   - `hits`: distinct from_page_id count, in-set
+   *   - `hits`: distinct from_page_id count, in-set (non-ranking link
+   *     types excluded, src/core/link-ranking-policy.ts)
    *   - `cross_source_hits`: distinct OTHER source_ids count (excluding
    *     target's own source), in-set
    *

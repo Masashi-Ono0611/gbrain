@@ -6898,7 +6898,7 @@
         "kind": "type",
         "name": "AutoReason",
         "signature": [
-          "\"conversation_type\" | \"conversation_slug\" | \"not_conversation\" | \"conversation_over_budget\" | \"saved_fact\""
+          "\"conversation_type\" | \"conversation_slug\" | \"not_conversation\" | \"conversation_over_budget\" | \"saved_fact\" | \"long_page\" | \"long_page_chunk\""
         ]
       },
       {
@@ -6913,6 +6913,13 @@
         "name": "DEFAULT_CONVERSATION_BUDGET",
         "signature": [
           "24000"
+        ]
+      },
+      {
+        "kind": "variable",
+        "name": "DEFAULT_LONG_PAGE_MIN_CHARS",
+        "signature": [
+          "20000"
         ]
       },
       {
@@ -6933,6 +6940,7 @@
         "kind": "interface",
         "members": [
           "liveHits?: boolean | undefined",
+          "longPages?: LongPageSelection | undefined",
           "timeoutMs?: number | undefined"
         ],
         "name": "DeliverOptions"
@@ -7044,6 +7052,7 @@
           "budgetTokens: number",
           "dateHeader?: true | undefined",
           "explicitUnit: boolean",
+          "longPage?: LongPagePolicy | undefined",
           "packing: \"off\" | \"cap_only\" | \"breadth_capped\" | \"depth_first\"",
           "rankCut?: PageRankCut | undefined",
           "requestedUnit: \"auto\" | \"window\" | \"chunk\" | \"section\" | \"page\"",
@@ -7060,6 +7069,75 @@
           "source_id: string"
         ],
         "name": "FrozenHit"
+      },
+      {
+        "kind": "variable",
+        "name": "LONG_PAGE_DEADLINE_MS",
+        "signature": [
+          "2000"
+        ]
+      },
+      {
+        "kind": "variable",
+        "name": "LONG_PAGE_MAX_INPUT_BYTES",
+        "signature": [
+          "1000000"
+        ]
+      },
+      {
+        "kind": "variable",
+        "name": "LONG_PAGE_MAX_PAGES",
+        "signature": [
+          "5"
+        ]
+      },
+      {
+        "kind": "variable",
+        "name": "LONG_PAGE_MIN_CHARS_CONFIG_KEY",
+        "signature": [
+          "\"search.long_page_min_chars\""
+        ]
+      },
+      {
+        "kind": "variable",
+        "name": "LONG_PAGE_UNITS",
+        "signature": [
+          "readonly [\"off\", \"window\", \"section\", \"page\"]"
+        ]
+      },
+      {
+        "kind": "variable",
+        "name": "LONG_PAGE_UNIT_CONFIG_KEY",
+        "signature": [
+          "\"search.long_page_unit\""
+        ]
+      },
+      {
+        "kind": "interface",
+        "members": [
+          "minChars: number",
+          "unit: LongPageUnit"
+        ],
+        "name": "LongPagePolicy"
+      },
+      {
+        "kind": "interface",
+        "members": [
+          "deadlineAt: number",
+          "fallbacks: string[]",
+          "kept: ReadonlyMap<number, string>",
+          "minChars: number",
+          "pages: ReadonlySet<number>",
+          "unit: LongPageUnit"
+        ],
+        "name": "LongPageSelection"
+      },
+      {
+        "kind": "type",
+        "name": "LongPageUnit",
+        "signature": [
+          "\"window\" | \"section\" | \"page\""
+        ]
       },
       {
         "kind": "variable",
@@ -7271,6 +7349,20 @@
       },
       {
         "kind": "function",
+        "name": "longPageMinCharsValueProblem",
+        "signature": [
+          "(value: string) => string | null"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "longPageUnitValueProblem",
+        "signature": [
+          "(value: string) => string | null"
+        ]
+      },
+      {
+        "kind": "function",
         "name": "pageEvidenceText",
         "signature": [
           "(page: { compiled_truth: string; timeline: string; fenceOverlay?: FenceChunkOverlay; }, includeTimeline: boolean) => { text: string; timelineAt: number; }"
@@ -7320,6 +7412,13 @@
       },
       {
         "kind": "function",
+        "name": "selectLongPages",
+        "signature": [
+          "(engine: BrainEngine, plan: EvidencePlan | null, hits: SearchResult[], scope: DeliveryScope) => Promise<{ plan: EvidencePlan | null; longPages?: LongPageSelection; }>"
+        ]
+      },
+      {
+        "kind": "function",
         "name": "splitPieces",
         "signature": [
           "(text: string) => Array<{ start: number; end: number; lineStart: boolean; }>"
@@ -7330,6 +7429,13 @@
         "name": "unsupportedDelivery",
         "signature": [
           "(plan: EvidencePlan, reason: string) => DeliveryMeta"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "withLongPagePolicy",
+        "signature": [
+          "(engine: BrainEngine, plan: EvidencePlan | null) => Promise<EvidencePlan | null>"
         ]
       }
     ],

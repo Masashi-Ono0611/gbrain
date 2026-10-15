@@ -443,3 +443,72 @@ describe('delta p99 latency gate (v0.45.7 ambient recall)', () => {
     expect(p99).toBeLessThan(BOUNDARY_P99_BUDGET_MS);
   }, 300_000);
 });
+
+// F1: `entity names` with the reference fields and records, 50 names with two identity siblings each (150 target
+// pages). Gates: one batched referrer read per call (2 statements whatever the name count), and the reference phase
+// adds at most REFERENCES_ADDED_CEILING to the same call with every reference field off (the names lookup itself, 50
+// card resolutions, is the baseline; measured interleaved so runner load lands on both).
+const REFERENCES_ADDED_CEILING = 0.5;
+describe('entity names with records (50 names, 150 target pages)', () => {
+  it(`50 names with siblings: references add at most ${REFERENCES_ADDED_CEILING * 100}% and a constant number of referrer statements`, async () => {
+    const { lookupEntityNames } = await import('../src/core/verbs/entity-names.ts');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const db = (engine as any).db;
+    for (let i = 0; i < 50; i++) {
+      for (const [prefix, label] of [['crm', 'CRM record'], ['accounts', 'Account sheet'], ['deals', 'Deal room']]) {
+        await engine.putPage(`${prefix}/perf-account-${i}`, { type: 'company', title: `${label}: Perf Account ${i}`, compiled_truth: `Perf Account ${i}.`, frontmatter: {} }, { sourceId: 'default' });
+      }
+    }
+    await db.query(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, link_source)
+       SELECT f.id, t.id, '', 'markdown'
+         FROM (SELECT id, row_number() OVER (ORDER BY id) rn FROM pages WHERE type = 'contract' ORDER BY id LIMIT 1500) f
+         JOIN (SELECT id, row_number() OVER (ORDER BY id) rn FROM pages WHERE slug LIKE '%/perf-account-%') t ON (f.rn % 150) + 1 = t.rn
+       ON CONFLICT DO NOTHING`);
+    await engine.executeRaw('ANALYZE pages, links');
+    const names = Array.from({ length: 50 }, (_, i) => `crm/perf-account-${i}`);
+    let referrerStatements = 0;
+    const raw = engine.executeRaw.bind(engine);
+    engine.executeRaw = ((sql: string, params?: unknown[]) => {
+      if (sql.includes('refs AS MATERIALIZED')) referrerStatements++;
+      return raw(sql, params as never);
+    }) as typeof engine.executeRaw;
+    const on = async () => { await engine.setConfig('entity.record_types', 'contract'); await engine.unsetConfig('entity.names_references'); };
+    const off = async () => { await engine.unsetConfig('entity.record_types'); await engine.setConfig('entity.names_references', 'false'); };
+    try {
+      for (let i = 0; i < 2; i++) { await on(); await lookupEntityNames(engine, 'default', names, { remote: true }); await off(); await lookupEntityNames(engine, 'default', names, { remote: true }); }
+      const withRefs: number[] = [];
+      const base: number[] = [];
+      let last: Awaited<ReturnType<typeof lookupEntityNames>> | null = null;
+      let statements = 0;
+      for (let i = 0; i < 10; i++) {
+        await on();
+        referrerStatements = 0;
+        let t0 = performance.now();
+        last = await lookupEntityNames(engine, 'default', names, { remote: true });
+        withRefs.push(performance.now() - t0);
+        statements += referrerStatements;
+        await off();
+        t0 = performance.now();
+        await lookupEntityNames(engine, 'default', names, { remote: true });
+        base.push(performance.now() - t0);
+      }
+      withRefs.sort((a, b) => a - b);
+      base.sort((a, b) => a - b);
+      const added = percentile(withRefs, 50) / percentile(base, 50) - 1;
+      // eslint-disable-next-line no-console
+      console.log(`[entity-names-records-perf] 50 names / 150 targets with references p50=${percentile(withRefs, 50).toFixed(2)}ms ` +
+        `| all reference fields off p50=${percentile(base, 50).toFixed(2)}ms | added=${(added * 100).toFixed(1)}% (ceiling ${REFERENCES_ADDED_CEILING * 100}%)`);
+      const rows = last!.results.flatMap(r => (r.found ? [r, ...(r.siblings ?? [])] : []));
+      expect(rows).toHaveLength(150);
+      expect(rows.every(r => typeof r.referenced_by_count === 'number' && Array.isArray(r.records))).toBe(true);
+      expect(rows.reduce((n, r) => n + (r.records ?? []).reduce((m, g) => m + g.rows.length, 0), 0)).toBe(24);
+      expect(statements).toBe(10 * 2);
+      expect(added).toBeLessThanOrEqual(REFERENCES_ADDED_CEILING);
+    } finally {
+      engine.executeRaw = raw;
+      await engine.unsetConfig('entity.record_types');
+      await engine.unsetConfig('entity.names_references');
+    }
+  }, 300_000);
+});

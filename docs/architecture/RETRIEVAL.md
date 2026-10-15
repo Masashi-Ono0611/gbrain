@@ -430,6 +430,15 @@ relational re-pin and the page-1 evidence slot; intermediate and origin pages
 never claim them. The planner keys fold into the query-cache key only when on
 (`rp=1`, `ro=1`). Guide: [multi-hop relationship questions](../guides/multi-hop.md).
 
+### Link types that take no part in ranking
+
+Every reader that turns links into a ranking signal (backlink and adjacency
+boosts, relational fanout and chain hops, chain hub degree, enrich order,
+canonical entity picks, generated-page demotion, entity anchoring) skips the
+link types in `NON_RANKING_LINK_TYPES` (`src/core/link-ranking-policy.ts`):
+today `amends`. Those edges stay ordinary references in graph reads and cards.
+Guide: [amendments](../guides/temporal-edges.md#amendments-the-amends-link).
+
 ### Metadata boost gate: vector-only voters keep the vector order
 
 The post-fusion metadata boosts (backlink, salience, recency + chronicle,
