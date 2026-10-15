@@ -5,15 +5,21 @@
  * - A leftover fence cell the adoption reuses is re-rendered from the legacy
  *   row, so a stale world cell never publishes a private legacy fact as world
  *   and a stale cell never overwrites the fact's kind or validity; a private
- *   cell is never widened to world (the world row appends instead).
+ *   cell is never widened to world (the world row appends instead). On an
+ *   unmanaged brain (no publisher read-back before #6650) the old planner
+ *   fenced a private fact into a leftover world cell and the reconcile made
+ *   the fact world in the database too.
  * - Planner and publisher share one read-back predicate.
  * - A deterministic refusal of the same intent is not resubmitted within a
  *   day, so cycles stop minting identical failed requests; a day later, or a
  *   changed adoption planner, retries once.
+ * - A suppressed page does not count against the request-ID cap: only pages
+ *   that will submit are checked before the fence step admits anything.
  * - One unadoptable legacy row no longer stops the phantom-redirect pass for
  *   the whole source; only a phantom that owns legacy rows is held.
  * Seams: planFence against an engine stub, the managed-brain helper for the
- * coordinator path, PGLite for the extract_facts cycle.
+ * coordinator path, PGLite for the extract_facts cycle, and an unmanaged
+ * brain with a source checkout (PGLite and Postgres) for the file path.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
@@ -24,7 +30,8 @@ import { fenceCellReadBackProblem, parseFactsFence, renderFactsTable, replaceOrI
 import { fenceUnfencedFacts, planFence, planUnfencedFacts, type UnfencedFactRow } from '../src/core/facts/unfenced-facts.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
 import { serializePageToMarkdown } from '../src/core/markdown.ts';
-import { FACT_FENCE_PLANNER, maintenancePreflight, submitFactFenceAdoption } from '../src/core/persistence/prepared-maintenance.ts';
+import { FACT_FENCE_PLANNER, maintenancePreflight, planFactFenceAdoption, submitFactFenceAdoption } from '../src/core/persistence/prepared-maintenance.ts';
+import { principalKey } from '../src/core/persistence/model.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { declarePersistenceProtocol } from '../src/core/persistence/protocol.ts';
 import { managedBrain } from './helpers/managed-brain.ts';
@@ -33,6 +40,8 @@ import { requirePostgresTestDatabase, testBackends } from './helpers/test-backen
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { managedPersistenceEnabled } from '../src/core/persistence/ownership.ts';
+import { isolatedSharedSkillsEngine } from './helpers/shared-skills-engine.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 
 const SLUG = 'people/alice-example';
@@ -125,6 +134,43 @@ for (const backend of testBackends()) {
       // The planner revision is part of the intent, so a planner change gets a fresh identity rather than replaying the refusal.
       expect(await engine.executeRaw(`SELECT 1 FROM persistence_requests WHERE slug=$1 AND (intent->>'planner')::int=$2`, [LEGACY_FILE_SLUG, FACT_FENCE_PLANNER])).toHaveLength(2);
     }, { databaseUrl, setup: async ({ engine, root }) => { seed = await seedLegacyManagedContent(engine, root); } });
+  }, 120_000);
+
+  test(`${backend}: a suppressed page does not count against the request-ID cap, so it never refuses the fence step`, async () => {
+    await managedBrain(async ({ engine }) => {
+      const plan = await planUnfencedFacts(engine, { sourceId: 'default' });
+      for (const key of [...plan.groups.keys()]) if (key !== `default\0${LEGACY_FILE_SLUG}`) plan.groups.delete(key);
+      const group = plan.groups.get(`default\0${LEGACY_FILE_SLUG}`)!;
+      const authority = (await maintenancePreflight(engine, 'default'))!;
+      const snapshot = (await engine.readPageSnapshot(LEGACY_FILE_SLUG, { sourceId: 'default' }))!;
+      const fence = await planFence(engine, 'default', LEGACY_FILE_SLUG, serializePageToMarkdown(snapshot.page, snapshot.tags), group);
+      if ('warnings' in fence) throw new Error(fence.warnings.join('; '));
+      const planned = await planFactFenceAdoption(engine, authority, LEGACY_FILE_SLUG, { content: fence.body, expectedRevision: snapshot.revision,
+        assignments: fence.assignments.map(a => ({ id: Number(a.id), row_num: a.row_num })) });
+      if (planned.kind !== 'submit') throw new Error('expected a fresh plan');
+      const principal = authority.writer.principal;
+      await engine.transaction(async tx => {
+        await declarePersistenceProtocol(tx);
+        // The identical adoption was refused as a planning defect an hour ago, and the principal sits exactly at its lifetime-ID cap.
+        await tx.executeRaw(`INSERT INTO persistence_requests(principal_kind,principal_id,request_id,operation,source_id,source_incarnation,slug,digest,authority,intent_bytes,
+            terminal_reservation,state,error_code,error_message,completed_at,updated_at)
+          VALUES($1,$2,$3::uuid,'submit_job','default',(SELECT incarnation FROM sources WHERE id='default'),$4,'refused','{}'::jsonb,0,0,'failed','fence_unrenderable',
+            'The adopted fence row does not render its legacy fact.',now()-interval '1 hour',now()-interval '1 hour')`,
+        [principal.kind, principal.id, planned.requestId, LEGACY_FILE_SLUG]);
+        await tx.executeRaw(`INSERT INTO persistence_counters(key) VALUES($1) ON CONFLICT DO NOTHING`, [principalKey(principal)]);
+        await tx.executeRaw(`UPDATE persistence_counters SET lifetime_ids=1000 WHERE key=$1`, [principalKey(principal)]);
+      });
+      await engine.setConfig('persistence.limits.principal_lifetime_ids', '1000');
+      const outcome = await fenceUnfencedFacts(engine, plan);
+      expect(outcome.unadoptable_rows.filter(r => r.slug === LEGACY_FILE_SLUG && r.class === 'prior_refusal').length).toBe(fence.assignments.length);
+      expect(outcome.fenced).toBe(0);
+      // A page that would submit still needs its ID: the same cap refuses once the refusal no longer suppresses it.
+      await engine.transaction(async tx => {
+        await declarePersistenceProtocol(tx);
+        await tx.executeRaw(`UPDATE persistence_requests SET completed_at=now()-interval '25 hours' WHERE request_id=$1::uuid`, [planned.requestId]);
+      });
+      await expect(fenceUnfencedFacts(engine, await planUnfencedFacts(engine, { sourceId: 'default' }))).rejects.toMatchObject({ code: 'write_quota_exhausted' });
+    }, { databaseUrl, setup: async ({ engine, root }) => { await seedLegacyManagedContent(engine, root); } });
   }, 120_000);
 
   test(`${backend}: a legacy fact that changes after planning is not overwritten by the older plan`, async () => {
@@ -239,3 +285,42 @@ describe('extract_facts: an unadoptable row holds only its own phantom (#6650)',
     });
   });
 });
+
+for (const backend of testBackends()) {
+  const databaseUrl = backend === 'postgres' ? requirePostgresTestDatabase() : undefined;
+
+  test(`${backend}: unmanaged: a leftover world cell does not make a private legacy fact world (file or database)`, async () => {
+    const claim = 'Alice example has a private appointment';
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fence-adoption-unmanaged-'));
+    try {
+      await withEnv({ GBRAIN_HOME: home, DATABASE_URL: undefined, GBRAIN_DATABASE_URL: undefined }, async () => {
+        const { engine, close } = await isolatedSharedSkillsEngine(databaseUrl);
+        try {
+          expect(await managedPersistenceEnabled(engine)).toBe(false);
+          const brainDir = path.join(home, 'brain');
+          fs.mkdirSync(brainDir, { recursive: true });
+          await engine.executeRaw("UPDATE sources SET local_path = $1 WHERE id = 'default'", [brainDir]);
+          const page = await engine.putPage(SLUG, { type: 'person', title: 'Alice Example',
+            compiled_truth: pageWithLeftover({ rowNum: 1, claim, confidence: 1, validFrom: '2026-03-01' }) });
+          await engine.executeRaw('UPDATE pages SET source_path = $1 WHERE id = $2', [`${SLUG}.md`, page.id]);
+          // Cell 1 is a leftover: no database row owns it.
+          await engine.executeRaw('DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug = $2', ['default', SLUG]);
+          const snapshot = (await engine.readPageSnapshot(SLUG, { sourceId: 'default' }))!;
+          const file = path.join(brainDir, `${SLUG}.md`);
+          fs.mkdirSync(path.dirname(file), { recursive: true });
+          fs.writeFileSync(file, serializePageToMarkdown(snapshot.page, snapshot.tags));
+          const [legacy] = await engine.executeRaw<{ id: number }>(
+            `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence)
+             VALUES ('default', $1, $2, 'fact', 'private', 'medium', '2026-03-01', 'mcp:remember', 1.0) RETURNING id`, [SLUG, claim]);
+
+          const result = await runExtractFacts(engine, { sourceId: 'default', brainDir });
+          expect(result.unfencedRowsFenced).toBe(1);
+          expect(await engine.executeRaw('SELECT id, visibility, row_num FROM facts WHERE source_id = $1 AND fact = $2 AND expired_at IS NULL ORDER BY id',
+            ['default', claim])).toEqual([{ id: legacy.id, visibility: 'private', row_num: 1 }]);
+          expect(parseFactsFence(fs.readFileSync(file, 'utf8')).facts.filter(f => f.claim === claim).map(f => [f.rowNum, f.visibility]))
+            .toEqual([[1, 'private']]);
+        } finally { await close(); }
+      });
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  }, 120_000);
+}
