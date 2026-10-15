@@ -190,6 +190,8 @@ for (const backend of backends) describe(`[${backend}] #6511 page purge journal 
 
   test('[R1 b] a sweep that outruns the preparation budget is a charged preparation_deadline release, then preparation_stalled at the limit; the source keeps moving', async () => {
     const { slug } = await seed('budget');
+    // Seed starts a consumer: close its in-flight tick before pinning this test's preparation budget.
+    await disposePersistenceConsumer(engine);
     await engine.setConfig('persistence.maintenance_preparation_ms', '1000');
     resetWriteSwitches();
     try {
