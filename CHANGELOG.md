@@ -10,6 +10,14 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.237.0] - 2026-10-15
+
+### Fixed
+
+- Managed dream synthesis can resume retained outputs whose tool input used uppercase letters in a page slug. Postprocessing follows the canonical slug in the committed write receipt while still rejecting mismatched sources, incarnations, revisions and unfinished writes; chunk suffixes and completed outputs stay unchanged on replay.
+
+**To take advantage of v0.60.237.0:** run `gbrain upgrade`. The next ordinary dream cycle retries any synthesis postprocessing that stopped on this slug mismatch; no manual page rewrite is needed.
+
 ## [0.60.236.0] - 2026-10-15
 
 **Large pages no longer crash or stall edit_page, parsing, chunking or code indexing, and a long timeline no longer fails the page write (large pages Wave A, crash fixes).** Several steps did work that grew with the square of the page size. On a 1.79 MB chat page (about 30,000 lines), `edit_page`'s receipt diff built a full line-by-line table and ran the process out of memory. Splitting a page that uses `---` separators took 54 s at 4 MB. Chunking newline-free text took 155 s at 10 MB. The code edge extractor took over 200 s on a 10 MB source file. Separately, the page keyword vector indexed the whole timeline, so roughly 1 MB of varied timeline text overflowed Postgres's 1 MB `tsvector` limit and aborted the write. All of these now run in linear time and bounded memory. Every fix produces byte-identical output, proven by differential tests against the old code, except the two bounded behaviors below.
