@@ -24,6 +24,19 @@
  */
 
 /**
+ * Built-in ignore list — common ambiguous tokens whose body-text mentions
+ * are usually NOT references to the named brand/entity. Suppressed at
+ * gazetteer-build time when no corresponding entity page exists.
+ *
+ * Per CK12 (codex outside-voice): if the user has explicitly created
+ * `companies/apple` as a page, they want auto-link → ignore-list does
+ * not override gazetteer presence. The list only suppresses entries
+ * that would NOT otherwise be in the gazetteer. Aliases have no existing-page
+ * escape; facts weak aliases share this precision gate.
+ */
+export const DEFAULT_ENTITY_MENTION_IGNORE_LIST = ['Apple', 'Amazon', 'Square', 'Stripe', 'Box', 'Meta', 'Target', 'Oracle'];
+
+/**
  * Lowercase single tokens that are almost never a real entity's full name.
  * Conservative by design: each entry must be a word whose standalone
  * appearance in prose is overwhelmingly NOT a reference to a specific
