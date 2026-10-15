@@ -31,6 +31,22 @@ import { resolveSearchDateBounds } from '../date-bounds.ts';
 import { type DecideSearchContext, decideMetaFor, resolveAndLaunchDecide } from '../decide-stage.ts';
 import { applySearchIntent } from '../decide-retrieval.ts';
 import { liftModeCut } from '../page-rank-cut.ts';
+import { type StageTimer, UNTIMED } from '../stage-timings.ts';
+
+/**
+ * searchVector's bounded-escalation exhaustion signal: stamped on `degraded`,
+ * accumulated on `req` (the vector side passes its own stamp list).
+ */
+export function vectorPoolMetaSink(req: HybridRequest, degraded: DegradedStageEntry[]): NonNullable<SearchOpts['onVectorPoolMeta']> {
+  return (m) => {
+    if (!m.underfilled) return;
+    pushDegraded(degraded, 'vector_candidates_incomplete', m.reason === 'deadline' ? 'timeout' : m.reason ?? 'candidate_budget');
+    if (!req.vectorPoolUnderfill || m.escalations >= req.vectorPoolUnderfill.escalations) {
+      const { underfilled, ...detail } = m;
+      req.vectorPoolUnderfill = { ...detail, incomplete: true };
+    }
+  };
+}
 
 /**
  * Everything the stages read, resolved once at hybridSearch entry, plus the
@@ -74,6 +90,8 @@ export interface HybridRequest {
   rerankMeta?: { model_resolved: string };
   /** Set by the relational arm when the multi-hop planner ran (meta.relational_plan). */
   relationalPlan?: import('../relational-recall.ts').RelationalPlanMeta;
+  /** The op's stage-timing collector (`opts._timings`), or the no-op timer. */
+  timer: StageTimer;
 }
 
 const DEBUG = process.env.GBRAIN_SEARCH_DEBUG === '1';
@@ -272,14 +290,7 @@ export async function resolveHybridRequest(
     // ACCUMULATES across vector calls (adversarial F8): expansion runs N
     // sub-queries through this one opts object — last-write-wins would
     // under-report multi-query exhaustion. Keep the max-escalations event.
-    onVectorPoolMeta: (m) => {
-      if (!m.underfilled) return;
-      pushDegraded(degraded, 'vector_candidates_incomplete', m.reason === 'deadline' ? 'timeout' : m.reason ?? 'candidate_budget');
-      if (!req.vectorPoolUnderfill || m.escalations >= req.vectorPoolUnderfill.escalations) {
-        const { underfilled, ...detail } = m;
-        req.vectorPoolUnderfill = { ...detail, incomplete: true };
-      }
-    },
+    onVectorPoolMeta: (m) => vectorPoolMetaSink(req, degraded)(m),
   };
   // Post-arm identity injections re-apply the arms' exclude contract.
   const identityTierOpts: IdentityTierOpts = {
@@ -310,6 +321,7 @@ export async function resolveHybridRequest(
     expansionApplied: false,
     lastResultsCount: 0,
     lastRank1Score: undefined,
+    timer: opts?._timings ?? UNTIMED,
   };
   if (decide) req.decide = decide;
   return req;

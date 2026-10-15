@@ -174,7 +174,7 @@ export async function fuseArms(
   // runPostFusionStages so all three early-return paths share the same
   // boost surface. Salience and recency are independent axes — either,
   // both, or neither fires depending on resolved modes.
-  if (fused.length > 0) {
+  if (fused.length > 0) await req.timer.stage('post_fusion', async () => {
     await runPostFusionStages(engine, fused, {
       ...postFusionOpts, skipMetadataBoosts: !metadataBoostGate.boosts_applied,
     });
@@ -182,7 +182,7 @@ export async function fuseArms(
     // No-op when boost factor is 1.0 (general intent or weighting disabled).
     await applyIdentityBoosts(req, fused);
     fused.sort((a, b) => b.score - a.score);
-  }
+  });
   trace?.observe('fused', fused);
   return { fused, relaxedDropped, keywordArmConfidence, metadataBoostGate };
 }

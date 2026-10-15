@@ -6,12 +6,12 @@ import { claimStall, claimStateOf, MAX_CLAIM_CONFIG_KEY, readMaxClaimMs } from '
 import { preparationBudgetMs } from '../../../core/persistence/preparation-budget.ts';
 import { readPreparationPolicy } from '../../../core/persistence/switches.ts';
 import { resolvePrepare, resolveSessionTimeouts } from '../../../core/db.ts';
-import { agentFix, checkError } from '../check-fix.ts';
+import { agentFix, checkError, doctorVerify } from '../check-fix.ts';
 import { lostCallerWrites } from '../../../core/repair/failed-writes.ts';
+import { readCapacityForecast, readCapacityThresholds } from '../../../core/persistence/capacity-forecast.ts';
 
 const WINDOW_DAYS = 7;
 const SAMPLE = 10_000;
-const WARN_DAYS = 90;
 const HORIZON_DAYS = 3650;
 
 /**
@@ -46,8 +46,9 @@ export async function requestIndexesCheck(engine: BrainEngine): Promise<Check> {
  * over the last 7 days (sampled from the newest 10,000 admissions per scope,
  * one bounded index read each), lifetime request IDs against
  * `persistence.limits.*`, and the projected days until admission refuses.
- * Warns when a scope would exhaust its lifetime IDs within 90 days, with the
- * same `gbrain config set` value `persistence_capacity` prints.
+ * Warns when a scope would exhaust its lifetime IDs within
+ * `persistence.capacity.warn_days` (30), the threshold `persistence_capacity`
+ * uses, with the same `gbrain config set` value it prints.
  */
 export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
   const docs = 'docs/guides/repair.md#request-growth';
@@ -58,6 +59,7 @@ export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
     const counters = await engine.executeRaw<{ key: string; lifetime_ids: string }>(
       "SELECT key,lifetime_ids::text FROM persistence_counters WHERE key='brain' OR key LIKE 'principal:%' ORDER BY key");
     const limits = await readJournalLimits(engine);
+    const { warnDays } = await readCapacityThresholds(engine);
     const now = Date.now();
     const scopes = [];
     for (const counter of counters) {
@@ -78,11 +80,14 @@ export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
         days_to_exhaustion: daysLeft === null ? null : Math.floor(daysLeft),
         exhaustion_date: daysLeft === null ? null : new Date(now + daysLeft * 86_400_000).toISOString().slice(0, 10) });
     }
-    const soon = scopes.filter(scope => scope.days_to_exhaustion !== null && scope.days_to_exhaustion < WARN_DAYS);
+    const soon = scopes.filter(scope => scope.days_to_exhaustion !== null && scope.days_to_exhaustion < warnDays);
     // Every principal shares one brain-wide key, so each key gets the largest value any scope needs.
     const needed = new Map<string, number>();
+    const forecast = soon.length ? await readCapacityForecast(engine, { limits }).catch(() => null) : null;
     for (const scope of soon) {
-      const value = await oneYearCapacity(engine, scope.scope, 'LifetimeIds', scope.lifetime_ids, scope.limit);
+      const predicted = forecast?.rows.find(row => row.scope === scope.scope && row.resource === 'lifetime_ids');
+      const value = predicted && predicted.per_day_7d > 0 ? predicted.recommended_limit
+        : await oneYearCapacity(engine, scope.scope, 'LifetimeIds', scope.lifetime_ids, scope.limit);
       needed.set(scope.config_key, Math.max(needed.get(scope.config_key) ?? 0, value));
     }
     const commands = [...needed].map(([key, value]) => `gbrain config set ${key} ${value}`);
@@ -90,7 +95,7 @@ export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
       commands, verify: 'gbrain doctor --json (check persistence_request_growth)', docs };
     const rows = `${details.rows_exact ? '' : '~'}${details.rows} request row(s)`;
     if (!soon.length) return { name: 'persistence_request_growth', status: 'ok', details,
-      message: `${rows}; no scope exhausts its lifetime request IDs within ${WARN_DAYS} days at its last-${WINDOW_DAYS}-day rate.` };
+      message: `${rows}; no scope exhausts its lifetime request IDs within ${warnDays} days at its last-${WINDOW_DAYS}-day rate.` };
     return { name: 'persistence_request_growth', status: 'warn', details,
       message: `${rows}. ${soon.map(scope => `${scope.scope} admits ${scope.per_day}/day over the last ${scope.window_days} day(s) and reaches `
         + `${scope.config_key}=${scope.limit} (${scope.lifetime_ids} used) around ${scope.exhaustion_date}`).join('; ')}; admission refuses then. `
@@ -228,5 +233,84 @@ export async function lostCallerWritesCheck(engine: BrainEngine, sourceIds?: str
         'Read-only preview: lists each lost write with its disposition (replay, already_written, duplicate, superseded) and prints the apply command.', 'lost_caller_writes', { docs }) };
   } catch (error) {
     return checkError('lost_caller_writes', 'inspect refused caller writes', error, { details: { count: 'unknown', docs } });
+  }
+}
+
+/**
+ * #6650 (L3): terminal write receipts that did not commit, read at doctor time (`terminal-failures.ts`, one bounded
+ * aggregate; `terminal-classify.ts` names each class and its fix). Warns on any active blocker (a receipt still holding
+ * a publication recovery record, which holds its root, or a receipt PR A's `checkpoint_blockers` names) and on an
+ * unresolved gbrain-defect class, whatever the trend; the spike check (the last 24 h against the zero-filled median of
+ * the 7 days before, `persistence.terminal_failures.spike_factor` / `spike_min`) is secondary. Rows written by a build
+ * older than the release that fixed their class, and rows a later request made moot, are historical and never warn.
+ * Archived sources are skipped; with no engine (the fast path) there is nothing to read.
+ */
+export async function terminalFailuresCheck(engine: BrainEngine | null, sourceIds?: string[]): Promise<Check | null> {
+  if (!engine) return null;
+  const name = 'persistence_terminal_failures';
+  const docs = 'docs/guides/troubleshooting.md#terminal-write-failures';
+  try {
+    const { readTerminalFailureSummary, readTerminalThresholds, readCheckpointBlockerMap, isSpike, sevenDayMedian, TERMINAL_WINDOW_KEY, TERMINAL_SPIKE_FACTOR_KEY, TERMINAL_SPIKE_MIN_KEY } = await import('../../../core/persistence/terminal-failures.ts');
+    const thresholds = await readTerminalThresholds(engine);
+    const checkpointBlockers = await readCheckpointBlockerMap(engine, sourceIds);
+    const summary = await readTerminalFailureSummary(engine, { sourceIds, thresholds, checkpointBlockers });
+    const config = { window_days: { key: TERMINAL_WINDOW_KEY, value: thresholds.windowDays }, spike_factor: { key: TERMINAL_SPIKE_FACTOR_KEY, value: thresholds.spikeFactor },
+      spike_min: { key: TERMINAL_SPIKE_MIN_KEY, value: thresholds.spikeMin }, receipt_retention_days: thresholds.retentionDays, window_clamped: thresholds.clamped };
+    if (summary.status === 'unknown') {
+      return { name, status: 'warn', message: `Terminal write failures could not be read: ${summary.reason}. Health is unknown, not clear; rerun gbrain doctor --only ${name}.`,
+        details: { health: 'unknown', config, docs } };
+    }
+    const sources = summary.sources;
+    const blockers = sources.flatMap(s => s.active_blockers);
+    const defects = sources.flatMap(s => s.defects.map(d => ({ ...d, source_id: s.source_id })));
+    const unresolved = sources.reduce((n, s) => n + s.unresolved.rows, 0);
+    const historical = sources.reduce((n, s) => n + s.historical_rows, 0);
+    const last24h = sources.reduce((n, s) => n + s.new_last_24h, 0);
+    const daily = Array.from({ length: 7 }, (_, i) => sources.reduce((n, s) => n + (s.daily_7d[i] ?? 0), 0));
+    const spike = isSpike(last24h, daily, thresholds);
+    const oldest = sources.reduce<number | null>((max, s) => s.unresolved.oldest_age_seconds === null ? max : Math.max(max ?? 0, s.unresolved.oldest_age_seconds), null);
+    const details = { count: blockers.length + defects.reduce((n, d) => n + d.rows, 0), active_blockers: blockers.map(({ action: _a, ...b }) => b),
+      unresolved: { rows: unresolved, distinct_slugs: sources.reduce((n, s) => n + s.unresolved.distinct_slugs, 0), distinct_intents: sources.reduce((n, s) => n + s.unresolved.distinct_intents, 0),
+        oldest_age_seconds: oldest },
+      historical_rows: historical, new_last_24h: last24h, spike: { last_24h: last24h, median_7d: sevenDayMedian(daily), daily_7d: daily, spiking: spike },
+      defects: defects.map(({ action: _a, ...d }) => d), sources: sources.map(s => ({ source_id: s.source_id, active_blockers: s.active_blockers.length, unresolved: s.unresolved.rows,
+        historical: s.historical_rows, new_last_24h: s.new_last_24h, categories: s.categories })), window_days: summary.window_days, config, docs };
+    const counts = `${blockers.length} active blocker(s), ${unresolved} unresolved row(s) (${details.unresolved.distinct_slugs} page(s), ${details.unresolved.distinct_intents} intent(s)`
+      + `${oldest !== null ? `, oldest ${Math.round(oldest / 3600)} h` : ''}), ${historical} historical non-blocking, ${last24h} in the last 24 h`;
+    if (blockers.length) {
+      const first = blockers[0]!;
+      return { name, status: 'warn', details, fix: { ...first.action, verify: doctorVerify(name) },
+        message: `${blockers.length} write receipt(s) block work right now (${blockers.slice(0, 3).map(b => `${b.kind === 'recovery' ? 'recovery record' : 'checkpoint blocker'} ${b.request_id}`
+          + `${b.slug ? ` (${b.slug})` : ''} on source ${b.source_id}`).join('; ')}). ${counts} in the last ${summary.window_days} d. ${first.action.why}` };
+    }
+    if (defects.length) {
+      const first = defects[0]!;
+      return { name, status: 'warn', details, fix: { ...first.action, verify: doctorVerify(name) },
+        message: `${defects.reduce((n, d) => n + d.rows, 0)} unresolved write receipt(s) in the last ${summary.window_days} d are a gbrain-defect class (${defects.slice(0, 3)
+          .map(d => `${d.category}/${d.code} ×${d.rows} on ${d.source_id}`).join('; ')}). ${counts}. ${first.human_reason ?? first.action.why}` };
+    }
+    const drill = (sourceId: string) => ['gbrain', 'sources', 'writer', 'failures', sourceId, '--group-by', 'category', '--json'];
+    if (spike) {
+      const busiest = [...sources].sort((a, b) => b.new_last_24h - a.new_last_24h)[0]!;
+      // Rows a build older than their class's fix wrote are an old owner still running, not a new defect: say so and name it.
+      const older = sources.reduce((n, s) => n + s.new_last_24h_older_builds.rows, 0);
+      if (older * 2 > last24h) {
+        const builds = [...new Set(sources.flatMap(s => s.new_last_24h_older_builds.builds))].sort();
+        const owner = [...sources].sort((a, b) => b.new_last_24h_older_builds.rows - a.new_last_24h_older_builds.rows)[0]!.source_id;
+        return { name, status: 'warn', details: { ...details, spike: { ...details.spike, older_builds: { rows: older, builds } } },
+          fix: agentFix(['gbrain', 'sources', 'writer', 'status', '--source', owner, '--json'], 'Read-only: names the write owner of the source, its process and the gbrain version it runs.', name, { docs }),
+          message: `${last24h} write receipt(s) ended without committing in the last 24 h, above ${thresholds.spikeFactor}× the 7-day median (${sevenDayMedian(daily)}/day), but ${older} of them `
+            + `were written by gbrain ${builds.join(', ') || 'an older build'}, older than the release that fixed their class: an older write owner is still producing these; upgrade or restart it. ${counts}.` };
+      }
+      return { name, status: 'warn', details,
+        fix: agentFix(drill(busiest.source_id), 'Read-only: groups the source\'s unresolved receipts by code, origin and category, each with its fix and drill-down filter.', name, { docs }),
+        message: `${last24h} write receipt(s) ended without committing in the last 24 h, above ${thresholds.spikeFactor}× the 7-day median (${sevenDayMedian(daily)}/day; `
+          + `${TERMINAL_SPIKE_FACTOR_KEY}, ${TERMINAL_SPIKE_MIN_KEY}=${thresholds.spikeMin}). ${counts}. Group them: ${drill(busiest.source_id).join(' ')}` };
+    }
+    return { name, status: 'ok', details,
+      message: unresolved + historical ? `No write receipt blocks work and no gbrain-defect class is unresolved. ${counts} in the last ${summary.window_days} d.`
+        : `No terminal write failures in the last ${summary.window_days} d.` };
+  } catch (error) {
+    return checkError(name, 'read terminal write failures', error, { details: { health: 'unknown', docs } });
   }
 }

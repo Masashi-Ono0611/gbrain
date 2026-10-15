@@ -31,6 +31,7 @@
 import type { SearchResult, HybridSearchMeta } from '../types.ts';
 import type { DeliveryMeta } from './evidence-delivery.ts';
 import type { AutocutDecision } from './autocut.ts';
+import { formatTimingsSummary, type SearchTimingsMeta } from './stage-timings.ts';
 
 /**
  * Format a single result with per-stage attribution. Returns a string
@@ -201,13 +202,13 @@ export function formatDecideSummary(decide: HybridSearchMeta['decide'] | undefin
  */
 export function formatResultsExplain(
   results: SearchResult[],
-  meta?: HybridSearchMeta & { delivery?: DeliveryMeta },
+  meta?: HybridSearchMeta & { delivery?: DeliveryMeta; timings?: SearchTimingsMeta },
 ): string {
   if (results.length === 0) return 'No results.\n';
   const body = results.map((r, i) => formatResultExplain(r, i + 1)).join('\n\n') + '\n';
   // v0.42.3.0 — prepend the autocut summary when meta carries a decision;
   // v0.48.2 — and the degraded summary when any stage was skipped.
-  const head = [formatAutocutSummary(meta?.autocut), formatDegradedSummary(meta?.degraded), formatRerankGateSummary(meta?.rerank_gate), formatDeliverySummary(meta?.delivery), formatDecideSummary(meta?.decide)]
+  const head = [formatAutocutSummary(meta?.autocut), formatDegradedSummary(meta?.degraded), formatRerankGateSummary(meta?.rerank_gate), formatDeliverySummary(meta?.delivery), formatDecideSummary(meta?.decide), formatTimingsSummary(meta?.timings)]
     .filter((l): l is string => l !== null);
   return head.length > 0 ? `${head.join('\n')}\n\n${body}` : body;
 }

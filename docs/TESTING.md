@@ -440,8 +440,8 @@ self-test" below).
 `bun run typecheck` ([heap ceiling](operations/verify-and-nightly-e2e.md#typecheck-heap)) uses TypeScript's native incremental analysis in
 `node_modules/.cache/gbrain-typecheck.tsbuildinfo`. Every invocation still runs
 the compiler; source, root-file, configuration and dependency changes invalidate
-the affected analysis, and cached diagnostics remain failures. The cache is local
-and ignored by Git; CI does not restore prior typecheck results.
+the affected analysis, and cached diagnostics remain failures. CI restores it
+(#6056) and `ci:ubicloud` uploads it (scripts/ubicloud/README.md).
 
 The local Docker runner isolates root and admin `node_modules`, plus the generated
 admin bundle, in named volumes. Admin build dependencies, Vite's generated cache
@@ -557,8 +557,8 @@ nested transaction confinement and the Postgres resident-stop barrier.
 
 ### Durable persistence schedules and process crashes
 
-Persistence suites (native-matrix publication, managed writers, schedules, crash boundaries, the runtime
-matrix and read latency) are described in [scripts/persistence/README.md](../scripts/persistence/README.md#test-suites).
+Persistence suites (native-matrix publication, managed writers, schedules, crash boundaries, runtime
+matrix, read latency, convergence) live in [scripts/persistence/README.md](../scripts/persistence/README.md#test-suites).
 
 ### Engine graduation
 

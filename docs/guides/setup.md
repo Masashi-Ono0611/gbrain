@@ -53,7 +53,8 @@ Provider keys in the environment do not change these defaults.
 
 A declined provider decision holds even when provider keys sit in the
 environment: gbrain sends no request to a model provider it was not asked to
-use. OpenAI model discovery (`GET /v1/models` on engine connect) is skipped,
+use. OpenAI model discovery (`GET /v1/models`, which otherwise runs only before
+the first OpenAI-routed call) is skipped,
 and `gbrain doctor --probe` does not probe the embedding provider. `gbrain
 doctor` reports the decision as `provider_consent` ("skipped by consent").
 Only the user changes it: `gbrain setup claude-code --providers` records

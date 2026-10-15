@@ -325,8 +325,9 @@ export interface RefreshOpts {
  * Best-effort by contract: never throws, never blocks longer than
  * FETCH_TIMEOUT_MS, no-ops without a key, with GBRAIN_MODEL_DISCOVERY=off, or
  * when a `gbrain setup` receipt recorded provider use as declined.
- * Call sites: reconfigureGatewayWithEngine (engine connect) and — through
- * it — the jobs worker's per-job gateway refresh.
+ * Call site: the gateway's discoverBeforeOpenAICall, once per reconfigure,
+ * when an OpenAI-routed call is about to go out (#6607: never on engine
+ * connect, so a brain that never calls OpenAI sends nothing).
  */
 export async function refreshLatestOpenAIModels(opts: RefreshOpts = {}): Promise<void> {
   const disc = process.env.GBRAIN_MODEL_DISCOVERY;

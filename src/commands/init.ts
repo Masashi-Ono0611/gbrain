@@ -26,7 +26,9 @@ import type { McpSurface } from '../mcp/surface.ts';
 
 /** D2: `--json` writes exactly one document, after whichever branch ran (see init-json.ts). */
 export async function runInit(args: string[]) {
+  const fresh = !existsSync(configPath());
   await runInitBranches(args);
+  if (fresh && existsSync(configPath())) (await import('../core/funnel.ts')).recordFunnelEvent('clean_install');
   if (args.includes('--json')) await flushInitJsonResult();
 }
 
@@ -1277,7 +1279,7 @@ export async function initPGLite(opts: {
     if (opts.jsonOutput) {
       setInitJsonResult({ status: 'success', engine: 'pglite', path: dbPath, pages: stats.page_count, embedding_check: embedCheck, content: contentReceipt, ...firstRunJson(await firstRunBundle(engine, searchMode, registrationSurface)) });
     } else if (process.env.GBRAIN_IN_AGENT_SETUP === '1') {
-      printInAgentReady(dbPath);
+      printInAgentReady(dbPath, freshContentDatabase);
     } else {
       console.log(`\nBrain ready at ${dbPath}`);
       console.log(`${stats.page_count} pages. Engine: PGLite (local Postgres).`);

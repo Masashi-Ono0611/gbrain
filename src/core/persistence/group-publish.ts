@@ -39,10 +39,11 @@ import { acquireWorktree, acquireWorktreeShared, getWorktreeBinding, guardOwners
 import { isLockOpenFailure, type NativeLockHandle } from './native-lock.ts';
 import { awaitLaneBegin, awaitLaneTurn, LaneAbort, laneApplyBegin, laneClaimed, laneFinished, lanePolicy, stepDownLanes, type LaneState } from './sync-lanes.ts';
 import { cancelRows, laneFaultBlockedReason, laneFaultCancelMessage, windowPredecessor } from './sync-window.ts';
+import { BULK_GROUP_CANCEL_MESSAGE, knockOnDetail } from './sync-knock-on.ts';
 import { clearResolvedRecoveries, completeWrite, ENSURE_COUNTERS_SQL, getWriteRequestById, LOCK_COUNTERS_SQL, markDispatched, markRecovering, prepareRecoveries,
   foregroundPriority, independentGroup, publicationGroupKey, reclaimReleasedWrite, releaseUnpublishedClaim, renewGroupClaims } from './journal.ts';
 import { principalKey, requestPrincipal, type FileRecoveryRecord, type WriteRequest } from './model.ts';
-import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
+import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, holdClaimForPublication, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
 import { claimPhaseStamp, enterClaimPhase, startClaimPhase, type ClaimPhaseClock } from './claim-phase.ts';
 import { DEFAULT_PREPARATION_POLICY, preparationBudgetMs, startPreparation, type PreparationPolicy, type PreparationRun } from './preparation-budget.ts';
 import { setMemberAttribution, withCoordinatedWrite } from './context.ts';
@@ -51,7 +52,7 @@ import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
 import { queuePublicationEffects, queuesMentionLinks, reconcileFinishedBatch } from './effect-journal.ts';
 import { assertUnboundPublication, classifyUnboundPage } from './unbound-source.ts';
 import { declareDurablePersistence } from './protocol.ts';
-import { bindPublicationTimeouts, boundPublication, publicationTransaction, type PublicationBound } from './publication-deadline.ts';
+import { bindPublicationTimeouts, boundPublication, publicationLeaseMs, publicationTransaction, type PublicationBound } from './publication-deadline.ts';
 import { classifyMirrorPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { withFilesystemPublication } from './filesystem-guard.ts';
@@ -61,6 +62,7 @@ import { decoratePublicationOutcome, finishPreparationStalled, finishUnpublished
   publishPersistenceFile, recoverPublication, type PreparedMutation } from './coordinator.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { jsonBytes } from './digest.ts';
+import { EFFECT_BYTES_SQL, retainedReceiptBytes, TRUE_UP_CLAMP_SQL } from './receipt-bytes.ts';
 import { readJournalLimits } from './limits.ts';
 import type { JournalLimits } from './model.ts';
 import { writerStamp } from './writer-versions.ts';
@@ -185,6 +187,8 @@ export function preparationReads(engine: BrainEngine, imports?: ImportGroupReads
 
 /** Test seams around a group's commit and its rollback. */
 export interface GroupHooks {
+  /** Inside the group transaction, once BEGIN has run (a lane prefix marks its original group begun here). */
+  began?(): void;
   beforeCommit?(rows: WriteRequest[]): Promise<void>;
   /** After a failed group transaction and the restoration of any file it published. */
   rolledBack?(rows: WriteRequest[]): Promise<void>;
@@ -260,8 +264,10 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
       for (const [i, member] of files) recorded.set(i, member);
       for (const member of files.values()) await seam('prepared', member.row);
     }
-    if (lane) await awaitLaneBegin(lane, rows);
+    const markBegun = lane ? await awaitLaneBegin(lane, rows) : null;
     const done = await transaction(async opened => {
+      markBegun?.();
+      hooks.began?.();
       timed.apply?.end(rows.length);
       if (lane) timed.apply = laneApplyBegin(lane);
       const tx = groupReads(opened);
@@ -451,7 +457,8 @@ async function laneFallback(engine: BrainEngine, rows: WriteRequest[], reason: G
   // claimed again as a lane head; publishing its members one at a time would hold the lanes back.
   if (prior === 'committed' && reason !== 'busy') return null;
   if (prior !== null && ['failed', 'conflict', 'cancelled'].includes(prior)) {
-    for (const done of await cancelRows(engine, rows, laneFault ? laneFaultCancelMessage(laneFault) : undefined)) run.settled(done);
+    for (const done of await cancelRows(engine, rows, laneFault ? laneFaultCancelMessage(laneFault) : undefined,
+      knockOnDetail(laneFault ? 'lane_fault' : 'window_predecessor', after))) run.settled(done);
     return true;
   }
   for (const row of rows) await releaseUnpublishedClaim(engine, row, laneFault ? laneFaultBlockedReason(laneFault) : 'group_member_waiting');
@@ -477,24 +484,34 @@ export async function completeGroup(tx: BrainEngine, rows: WriteRequest[], outco
     () => tx.executeRaw(ENSURE_COUNTERS_SQL, [keys]),
     () => tx.executeRaw(LOCK_COUNTERS_SQL, [keys]),
     () => tx.executeRaw<WriteRequest & { principal_key: string }>(`WITH m AS (
-        SELECT * FROM unnest($1::uuid[],$2::uuid[],$3::text[],$4::bigint[],$5::text[]) AS m(id,token,outcome,need,principal_key)
+        SELECT * FROM unnest($1::uuid[],$2::uuid[],$3::text[],$4::bigint[],$5::text[],$8::bigint[]) AS m(id,token,outcome,need,principal_key,retained)
       ), e AS (
-        SELECT request_id,SUM(octet_length(data::text)+octet_length(kind)+1024) AS bytes FROM persistence_effects WHERE request_id=ANY($1::uuid[]) GROUP BY request_id
+        SELECT request_id,SUM(${EFFECT_BYTES_SQL}) AS bytes,bool_or(state<>'committed') AS unfinished FROM persistence_effects WHERE request_id=ANY($1::uuid[]) GROUP BY request_id
+      ), prior AS (
+        SELECT r.id,r.terminal_reservation FROM persistence_requests r JOIN m ON m.id=r.id
       ), done AS (
         UPDATE persistence_requests r SET state='committed',outcome=m.outcome::jsonb,error_code=NULL,error_message=NULL,
           completed_at=now(),updated_at=now(),claim_expires_at=NULL,blocked_reason=NULL,
-          consumer_version=$6,consumer_host_id=$7::uuid,published_at=now(),preparation_attempts=0
+          consumer_version=$6,consumer_host_id=$7::uuid,published_at=now(),preparation_attempts=0,
+          terminal_reservation=CASE WHEN COALESCE(e.unfinished,false) THEN r.terminal_reservation
+            ELSE LEAST(r.terminal_reservation,m.retained+COALESCE(e.bytes,0)) END
         FROM m LEFT JOIN e ON e.request_id=m.id
         WHERE r.id=m.id AND r.execution_token=m.token AND r.state='running' AND m.need+COALESCE(e.bytes,0)<=r.terminal_reservation
         RETURNING r.*,m.principal_key
+      ), d AS (
+        SELECT k.key,count(*) AS n,SUM(done.intent_bytes) AS bytes,SUM(prior.terminal_reservation-done.terminal_reservation) AS freed
+        FROM done JOIN prior ON prior.id=done.id CROSS JOIN LATERAL (VALUES ('brain'),(done.principal_key)) AS k(key) GROUP BY k.key
       ), released AS (
-        UPDATE persistence_counters c SET outstanding_count=c.outstanding_count-d.n,intent_bytes=c.intent_bytes-d.bytes
-        FROM (SELECT k.key,count(*) AS n,SUM(done.intent_bytes) AS bytes FROM done CROSS JOIN LATERAL (VALUES ('brain'),(done.principal_key)) AS k(key) GROUP BY k.key) d
-        WHERE c.key=d.key
-      )
+        UPDATE persistence_counters c SET outstanding_count=c.outstanding_count-d.n,intent_bytes=c.intent_bytes-d.bytes,
+          terminal_bytes=c.terminal_bytes-LEAST(d.freed,c.terminal_bytes)
+        FROM d WHERE c.key=d.key
+      ), ${TRUE_UP_CLAMP_SQL('SELECT count(*) FROM d JOIN persistence_counters c ON c.key=d.key WHERE d.freed>c.terminal_bytes')}
       SELECT * FROM done`, [ids, rows.map(row => row.execution_token), outcomes.map(outcome => JSON.stringify(outcome)),
       rows.map((row, i) => jsonBytes(outcomes[i]) + jsonBytes(row.authority) + 1024),
-      rows.map(row => principalKey(requestPrincipal(row))), stamp.version, stamp.hostId]),
+      rows.map(row => principalKey(requestPrincipal(row))), stamp.version, stamp.hostId,
+      // #6696 (A1): each member's true-up target, sized down at commit once none of its effects is unfinished.
+      rows.map((row, i) => retainedReceiptBytes({ intent: row.intent, authority: row.authority, outcome: outcomes[i], error_detail: row.error_detail,
+        client_request_id: row.client_request_id }, { stage: 'terminal' }))]),
   ]) as [unknown, unknown, Array<WriteRequest & { principal_key: string }>];
   if (completed.length !== rows.length) throw new OperationError('write_claim_lost', 'A group member failed its claim or terminal-reservation check before publication.',
     'The group rolls back and its members publish one at a time, where each member reports its own outcome; inspect the requests rather than resubmitting.');
@@ -659,11 +676,14 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
     const live = rows.map((row, i) => ({ row, i })).filter(({ row }) => !released.has(row.id));
     if (!live.length) return progressed;
     const liveRows = live.map(({ row }) => row);
+    if (run.publication) await holdClaimForPublication(lease, () => renewGroupClaims(engine, liveRows, publicationLeaseMs(run.publication!.ceilingMs), undefined,
+      live.map(({ i }) => stampOf(i))));
     let requeued = new Set<string>();
     if (live.every(({ i }) => 'ok' in prepared[i]!)) {
       // #6278 lanes: a prefix publishes under the original group's order key, then drops its own begun mark.
-      if (run.lane && liveRows.length < rows.length) await awaitLaneBegin(run.lane, rows);
-      const result = await bounded(() => publishGroup(engine, liveRows, live.map(({ i }) => (prepared[i] as { ok: PreparedMutation }).ok), run.hostId, run.hooks, run.lane ?? null));
+      const markOriginal = run.lane && liveRows.length < rows.length ? await awaitLaneBegin(run.lane, rows) : null;
+      const hooks = markOriginal ? { ...run.hooks, began: () => { markOriginal(); run.hooks?.began?.(); } } : run.hooks;
+      const result = await bounded(() => publishGroup(engine, liveRows, live.map(({ i }) => (prepared[i] as { ok: PreparedMutation }).ok), run.hostId, hooks, run.lane ?? null));
       if (run.lane && liveRows.length < rows.length) run.lane.begun.delete(liveRows.at(-1)!.request_id);
       if (result.done) { for (const row of result.done) run.settled(row); return true; }
       requeued = new Set(result.requeued);
@@ -673,6 +693,8 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
       if (settled !== null) return settled || progressed;
     }
     let stop: 'cancel' | 'release' | null = null;
+    /** #6643: the member whose non-commit cancels the rest of the group (the cancel's knock-on root). */
+    let stopRoot: string | null = null;
     for (const { row: member, i } of live) {
       let row = member;
       let current = await getWriteRequestById(engine, row.id);
@@ -682,14 +704,14 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
         if (reclaimed) { row = reclaimed; current = reclaimed; }
       }
       if (!current || current.execution_token !== row.execution_token || current.state !== 'running') {
-        if (current && ['committed', 'conflict', 'failed', 'cancelled'].includes(current.state)) { run.settled(current); progressed = true; if (current.state !== 'committed' && !independent) stop ??= 'cancel'; }
+        if (current && ['committed', 'conflict', 'failed', 'cancelled'].includes(current.state)) { run.settled(current); progressed = true; if (current.state !== 'committed' && !independent && stop === null) { stop = 'cancel'; stopRoot = current.request_id; } }
         else if (independent) stop ??= 'release';
         continue;
       }
       if (stop === 'release') { await releaseUnpublishedClaim(engine, row, 'group_member_waiting'); continue; }
       if (stop === 'cancel') {
         const cancelled = await engine.transaction(tx => completeWrite(tx, current, 'cancelled', {}, { code: 'cancelled',
-          message: 'An earlier page of the same bulk sync group failed; this page was not published and is re-frozen after that failure is resolved.' }));
+          message: BULK_GROUP_CANCEL_MESSAGE, detail: knockOnDetail('bulk_group', stopRoot) }));
         run.settled(cancelled); progressed = true; continue;
       }
       const p = prepared[i]!;
@@ -698,7 +720,7 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
       const done = 'ok' in p ? await bounded(() => publishMutation(engine, row, p.ok, run.hostId)) : await finishUnpublishedFailure(engine, current, p.error, 'preparation');
       run.settled(done);
       if (done.state === 'committed') { progressed = true; continue; }
-      if (['conflict', 'failed', 'cancelled'].includes(done.state)) { progressed = true; if (!independent) stop = 'cancel'; } else stop = 'release';
+      if (['conflict', 'failed', 'cancelled'].includes(done.state)) { progressed = true; if (!independent) { stop = 'cancel'; stopRoot ??= done.request_id; } } else stop = 'release';
     }
     return progressed;
   } finally {

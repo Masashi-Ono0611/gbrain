@@ -82,7 +82,13 @@ export async function runSyncStatus(engine: BrainEngine, args: string[]): Promis
   const sourceId = sourceOf(args);
   const status = await readSyncStatus(engine, sourceId);
   const ctx = cliRenderContext();
-  const rendered = { ...status, holds: status.holds.map(hold => ({ ...hold, fix: renderAction(hold.fix, ctx) })), next: status.next ? renderAction(status.next, ctx) : null };
+  // #6696 (A4): the capacity picture rides every status read (unthrottled), from the 60 s snapshot.
+  const { cachedCapacitySnapshot, capacityNotices } = await import('../../core/persistence/capacity-snapshot.ts');
+  const { renderNotice } = await import('../../core/agent-output.ts');
+  const snapshot = await cachedCapacitySnapshot(engine);
+  const notices = (await capacityNotices(engine, { throttle: false })).map(notice => renderNotice(notice, ctx));
+  const rendered = { ...status, holds: status.holds.map(hold => ({ ...hold, fix: renderAction(hold.fix, ctx) })), next: status.next ? renderAction(status.next, ctx) : null,
+    capacity: { status: snapshot.status, pause_pct: snapshot.pause_pct, low: snapshot.low, paused: snapshot.paused }, ...(notices.length ? { notices } : {}) };
   if (args.includes('--json')) return writeJsonDocument(JSON.stringify(rendered, null, 2));
   const c = status.cursor;
   console.log(`Source ${sourceId}: ${c ? c.done ? `last run finished at ${c.index}/${c.total} (pinned ${c.pinned_target?.slice(0, 8) ?? '?'})` : `cursor ${c.index}/${c.total} at pinned target ${c.pinned_target?.slice(0, 8) ?? '?'}`
@@ -91,6 +97,16 @@ export async function runSyncStatus(engine: BrainEngine, args: string[]): Promis
   console.log(`  holds: ${status.holds.length}${status.holds.length ? ` (${status.holds.filter(h => h.needs_human).length} need a person)` : ''}; last error: ${status.last_error ? `${status.last_error.code} [${status.last_error.class}]` : 'none'}`);
   for (const hold of status.holds) console.log(`    ${hold.path}${hold.slug ? ` (${hold.slug})` : ''}: ${hold.code} [${hold.class}] safe: ${hold.safe_actions.join(',')}${hold.needs_human ? ` NEEDS HUMAN: ${hold.human_reason}` : ''}${hold.attempts > 1 ? ` (held ${hold.attempts} times)` : ''}`);
   if (status.last_error) console.log(`    ${status.last_error.path ?? ''}: ${status.last_error.code} safe: ${status.last_error.safe_actions.join(',')}${status.last_error.needs_human ? ` NEEDS HUMAN: ${status.last_error.human_reason}` : ''}`);
+  const t = status.terminal_failures;
+  if (t.status === 'unknown') console.log(`  terminal write failures: unknown (${t.reason})`);
+  else {
+    const oldest = t.unresolved.oldest_age_seconds === null ? '' : `, oldest ${Math.round(t.unresolved.oldest_age_seconds / 3600)} h`;
+    console.log(`  terminal write failures (last ${t.window_days} d): ${t.active_blockers.length} active blocker(s), ${t.unresolved.rows} unresolved (${t.unresolved.distinct_slugs} page(s), `
+      + `${t.unresolved.distinct_intents} intent(s)${oldest}), ${t.historical_rows} historical, ${t.new_last_24h} in the last 24 h${t.defects ? `, ${t.defects} gbrain-defect row(s)` : ''}`);
+    for (const b of t.active_blockers) console.log(`    BLOCKING ${b.kind}: request ${b.request_id}${b.slug ? ` (${b.slug})` : ''} [${b.category}]`);
+    if (t.active_blockers.length || t.unresolved.rows) console.log(`    drill down: ${t.drill_down.join(' ')}`);
+  }
+  for (const notice of notices) console.log(`  [gbrain notice ${notice.code}] ${notice.why}`);
   if (rendered.next) console.log(`  Next: ${rendered.next.command ?? rendered.next.argv?.join(' ')}\n  Why: ${rendered.next.why}`);
   else console.log('  Next: nothing; the source is synced and holds nothing.');
 }

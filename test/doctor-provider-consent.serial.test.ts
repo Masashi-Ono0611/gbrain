@@ -2,10 +2,13 @@
  * Cat 41 wave 2 consent negative: with provider keys in the environment and
  * `gbrain setup`'s provider-use decision recorded as declined, `gbrain doctor`
  * sent one unbilled `GET /v1/models` with the user's key in every run. The
- * request was OpenAI model discovery, which runs on every engine connect
+ * request was OpenAI model discovery, which ran on every engine connect
  * (src/core/ai/openai-latest.ts). Now a recorded decline stops discovery and
  * the opt-in embedding probe, and doctor reports `provider_consent` as
- * skipped by consent with the fix that records acceptance.
+ * skipped by consent with the fix that records acceptance. Since #6607
+ * discovery runs only before an OpenAI-routed call, so plain doctor sends
+ * nothing either way; the embedding probe is the OpenAI-routed call the
+ * controls and the decline are measured on.
  *
  * Subprocess: `bun src/cli.ts` against a fresh PGLite home, OPENAI_BASE_URL
  * pointed at an in-process server that counts every request. The control runs
@@ -96,9 +99,12 @@ beforeEach(() => {
 });
 
 describe('doctor with provider keys present', () => {
-  test('control: with no recorded decision, doctor contacts the provider (model discovery)', async () => {
+  test('control: with no recorded decision, plain doctor sends nothing and an OpenAI-routed call discovers first (#6607)', async () => {
     const run = await gbrain(['doctor', '--json'], providerEnv());
-    expect(requests).toContain('GET /v1/models');
+    expect(requests).toEqual([]);
+    setConfig({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536 }, ['embedding_disabled']);
+    await gbrain(['doctor', '--only', 'embedding_provider', '--probe', '--yes', '--json'], providerEnv());
+    expect(requests.slice(0, 2)).toEqual(['GET /v1/models', 'POST /v1/embeddings']);
     const check = checksOf(run.stdout).find((c) => c.name === 'provider_consent');
     expect(check?.status).toBe('ok');
     expect(check?.readiness_state).toBe('not_applicable');
@@ -139,9 +145,12 @@ describe('doctor with provider keys present', () => {
     expect((check.fix as { argv: string[] }).argv).toEqual(['gbrain', 'setup', 'claude-code', '--providers']);
   }, 180_000);
 
-  test('setup accepted provider use: discovery runs as before', async () => {
+  test('setup accepted provider use: discovery runs before the first OpenAI-routed call', async () => {
     writeReceipt('accepted');
     const run = await gbrain(['doctor', '--json'], providerEnv());
+    expect(requests).toEqual([]);
+    setConfig({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536 }, ['embedding_disabled']);
+    await gbrain(['doctor', '--only', 'embedding_provider', '--probe', '--yes', '--json'], providerEnv());
     expect(requests).toContain('GET /v1/models');
     expect(checksOf(run.stdout).find((c) => c.name === 'provider_consent')?.details).toMatchObject({ decision: 'accepted' });
   }, 180_000);

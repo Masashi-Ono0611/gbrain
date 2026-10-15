@@ -14,6 +14,7 @@ a page needs my decision."*
 ## The loop
 
 ```bash
+gbrain doctor --only serve_build_drift --json    # first: on a warning, restart serve and workers and stop here
 gbrain sync status --source <id> --json          # every N minutes (read-only)
 gbrain sync unblock --source <id> --apply --json # when committed_last_10m is 0 and needs_human is false
 gbrain sync <next.argv...>                       # the sync unblock (or status) names: the cursor's own options
@@ -22,6 +23,10 @@ gbrain sync <next.argv...>                       # the sync unblock (or status) 
 **Say to your agent:** *"Repair the files sync held and get the catch-up
 moving again; ask me only about the ones gbrain will not decide by itself."*
 
+0. Check the build. `serve_build_drift` warns when serve or a worker on this
+   host runs an older gbrain build than this checkout; restart them with the
+   command it prints before anything else, and stop until it reads ok
+   ([serve build drift](troubleshooting.md#serve-build-drift)).
 1. Read `status`. `cursor` is where the run stands (`index/total`, the
    `pinned_target` commit, `last_advance_at`); `committed_last_10m` is the
    signal that data is moving (a live process with a flat cursor is not
@@ -98,10 +103,16 @@ Every hold and error has three fields, from one table
 | `pinned_git_worktree_conflict` | page | retry | no | the same path fails again after a rerun |
 | `source_changed` | page | retry | no | the same path fails again after a rerun |
 | `cancelled` | page | retry | no | the same group is cancelled again after a rerun |
+| `knock_on` | page | retry | no | the same root request is named again after a rerun |
+| `run_replaced` | page | retry | no | never: another run of the source superseded this one and covers its pages |
+| `outside_fence` | systemic | none | yes | always: a request published outside the cursor that admitted it |
+| `knock_on_exhausted` | systemic | none | yes | always: re-freezing did not get past the failing page |
 | `sync_incomplete` | page | retry | no | never: an unfinished cursor resumes with the same command |
 | `connection_lost` | connection | retry | no | three reruns in a row end connection_lost (the database is unreachable from this host) |
 | `database_contention` | connection | retry | no | three reruns in a row stop on it |
 | `write_capacity` | connection | retry | no | writer status shows the cap held by requests that never settle |
+| `write_capacity_backpressure` | connection | retry | no | reason lifetime_ids (request ids never free, so only the host raise lifts it), or the pause outlasts a day |
+| `capacity_paused` | connection | retry | no | reason lifetime_ids (only the host raise resumes it), or the same pause after the raise |
 | `storage_error` | connection | retry | no | the same error after a rerun (then it is not a dropped connection) |
 | `graduation_in_progress` | connection | retry | no | gbrain migrate --status --json reports no running move and the fence still refuses |
 | `preparation_systemic` | systemic | upgrade, retry | yes | always |
@@ -110,6 +121,8 @@ Every hold and error has three fields, from one table
 | `owner_unavailable` | systemic | none | yes | always |
 | `writer_coordinator_required` | systemic | none | yes | always |
 | `permission_denied` | systemic | none | yes | always |
+| `write_quota_exhausted` | systemic | none | yes | always |
+| `write_quota_insufficient` | systemic | none | yes | always |
 | `plan_stale` | systemic | none | yes | always |
 | `invalid_params` | systemic | none | yes | always |
 | `cursor_incarnation_retired` | systemic | repair | no | the repair preview lists nothing to retire, or the same code returns after the apply |
@@ -121,6 +134,24 @@ or `statement_timeout` on a parallel publish lane) also carries that fault as
 (`lane_lock_timeout`, `lane_statement_timeout`) and in the cancel message.
 The verdict is the same retry; the detail says the database, not the page,
 ended the group.
+
+A page that only waited on another page of the same sync (a knock-on: its
+group, window or lane predecessor did not commit) is re-frozen by the sync
+itself under a fresh request on the next pass; `--retry-failed` is not
+needed for it. Its error carries `last_error.detail: knock_on` and
+`last_error.root_cause` (the request, page and error it waited on); act on
+the root. A cursor refusal is classified by its recorded cause:
+`run_replaced` (another run of the source took over; nothing to do),
+`window_dropped` (a knock-on), or `outside_fence` (a request was not the
+entry its cursor held: a person stops the extra drain and reports it).
+After `sync.knock_on_refreeze_limit` re-freezes at one index (default 3;
+0 turns automatic re-freeze off), or after `sync.knock_on_run_limit`
+re-freezes in one sync invocation (default 25), the run stops with
+`knock_on_exhausted` and names the root. The per-index count resets when
+the page commits; the per-invocation count resets on the next sync. A
+checkpoint refused by a receipt that turns out to be a knock-on, or at an
+index the cursor passed without a commit, is re-assessed on every resume and
+commits without rediscovering the manifest.
 
 An unknown code is systemic and human: `gbrain errors <code>` explains it
 offline, `gbrain doctor --json` says what the brain thinks.
@@ -157,7 +188,9 @@ it and kept going; the receipt lists the hold (`held`, `held_count`) and
 - `revision_conflict`, `page_identity_changed`, `pinned_git_worktree_conflict`
   as a `last_error` come from a run on an older release; this release holds
   them. Rerun with `--retry-failed`: the stopped entry converts in place, the
-  manifest is not re-frozen.
+  manifest is not re-frozen. A `revision_conflict` or `cancelled` error with
+  `detail: knock_on` needs no flag: the next plain sync re-freezes the entry
+  (act on `root_cause` instead).
 
 ### Connection
 

@@ -1,4 +1,5 @@
 import { existsSync, lstatSync, realpathSync } from 'node:fs';
+import { sizeStateField } from '../page-embedding-budget.ts';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
 import { boundedReads } from './bounded-reads.ts';
 import { basename, dirname, join } from 'node:path';
@@ -7,6 +8,7 @@ import type { GBrainConfig } from '../config.ts';
 import type { Page } from '../types.ts';
 import { OperationError, opError, type OpErrorOpts } from '../ops/contract.ts';
 import type { Action } from '../agent-output.ts';
+import { readFix } from '../ops/op-fix.ts';
 import type { RegistryCode } from '../error-registry.ts';
 import { ownerGateInput, ownerImportTrust } from '../trust/channel.ts';
 import { importFromContent, importCodeFile, verifyPageReadable } from '../import-file.ts';
@@ -37,7 +39,8 @@ import type { CompanyBrainPlan } from '../company-brain/types.ts';
 import { companyBrainProfile } from '../company-brain/profile.ts';
 import { companyBrainPolicyFingerprint } from '../company-brain/policy.ts';
 import { isUnboundSourcePage, UNBOUND_COLLISION_MESSAGE } from './unbound-source.ts';
-import { checkpointRetryCommand, findIncompleteSyncReceipt } from './checkpoint-validation.ts';
+import { checkpointRetryCommand, findIncompleteSyncReceipt, type SyncSettledIndexes } from './checkpoint-validation.ts';
+import { CURSOR_CHANGED_REFUSAL_MESSAGE, EARLIER_PAGE_REFUSAL_MESSAGE, knockOnDetail, SYNC_CURSOR_FENCE_ORIGIN } from './sync-knock-on.ts';
 import { checkpointCursorReplaced } from './sync-checkpoint-replaced.ts';
 import { frontmatterSlugConflictMessage } from './verb-errors.ts';
 import { chunkerStamp } from '../chunkers/code.ts';
@@ -74,12 +77,16 @@ export interface SyncIntent extends Record<string, unknown> {
   slice?: SyncSliceState;
   /** #5988: the run's discovery time; committing this entry clears the path's hold unless a newer run wrote it. */
   holdObservedAt?: string;
+  /** #6696: the run that froze this entry deferred embedding at runtime (cost gate); the cursor's `noEmbed` may still be false. */
+  embedDeferred?: boolean;
   /** #5988 checkpoint only: held paths that left the source (excluded); their holds clear when the run checkpoints. */
   releasedHolds?: string[];
   /** #5988: the pinned Git blob of the imported content, recorded as import provenance. */
   blobOid?: string;
   /** #5988 checkpoint only: failed content-refusal requests of this run converted in place; they no longer block the checkpoint. */
   supersededRequests?: string[];
+  /** #6643 checkpoint only: the indexes the cursor passed without a commit (waived or held), from the index it began recording them. */
+  settled?: SyncSettledIndexes;
   syncAuthority: SyncAuthority; cursorKey: string; runId: string; index: number;
   from: string | null; target: string; total: number; slugMode: 'git-root' | 'source-root';
 }
@@ -93,16 +100,20 @@ export interface SyncIntent extends Record<string, unknown> {
  * admitted ahead (`window`). FOR KEY SHARE keeps the cursor row in place without blocking the drain's
  * cursor saves, so the next group is admitted while this one publishes.
  */
-async function readSyncCursorFence(tx: BrainEngine, cursorKey: string): Promise<{ run_id: string; request_id: string | null; group: string[] | null } | undefined> {
-  const [held] = await tx.executeRaw<{ run_id: string; request_id: string | null; group: string[] | null }>(
-    `SELECT completed_keys->0->>'runId' AS run_id,completed_keys->0->'pending'->>'requestId' AS request_id,
+export interface SyncCursorFence { run_id: string; request_id: string | null; group: string[] | null; index: string | number | null;
+  /** #6643: the cursor's record of the window members it dropped (sync-run.ts `Cursor.dropped`). */
+  dropped?: Array<{ requestId: string; root: string | null }> | null }
+async function readSyncCursorFence(tx: BrainEngine, cursorKey: string): Promise<SyncCursorFence | undefined> {
+  const [held] = await tx.executeRaw<SyncCursorFence>(
+    `SELECT completed_keys->0->>'runId' AS run_id,completed_keys->0->'pending'->>'requestId' AS request_id,completed_keys->0->>'index' AS index,
       (SELECT jsonb_agg(m->>'requestId') FROM (SELECT m FROM jsonb_array_elements(COALESCE(completed_keys->0->'group','[]'::jsonb)) m
-        UNION ALL SELECT m FROM jsonb_array_elements(COALESCE(completed_keys->0->'window','[]'::jsonb)) g, jsonb_array_elements(g) m) members) AS group
+        UNION ALL SELECT m FROM jsonb_array_elements(COALESCE(completed_keys->0->'window','[]'::jsonb)) g, jsonb_array_elements(g) m) members) AS group,
+      completed_keys->0->'dropped' AS dropped
      FROM op_checkpoints WHERE op='managed-sync' AND fingerprint=$1 FOR KEY SHARE`, [cursorKey]);
   return held;
 }
-const sharedValidations = new WeakMap<object, Map<string, Promise<{ run_id: string; request_id: string | null; group: string[] | null } | null>>>();
-function sharedSyncValidation(tx: BrainEngine, key: string, run: () => Promise<{ run_id: string; request_id: string | null; group: string[] | null } | null>) {
+const sharedValidations = new WeakMap<object, Map<string, Promise<SyncCursorFence | null>>>();
+function sharedSyncValidation(tx: BrainEngine, key: string, run: () => Promise<SyncCursorFence | null>) {
   if ((tx as { _pageTransaction?: boolean })._pageTransaction !== true) return run();
   let byKey = sharedValidations.get(tx);
   if (!byKey) { byKey = new Map(); sharedValidations.set(tx, byKey); }
@@ -123,8 +134,8 @@ async function sourceSyncChecks(tx: BrainEngine, row: WriteRequest, p: SyncInten
     },
     () => readSyncCursorFence(tx, p.cursorKey),
     async () => {
-      if (after && !await windowPredecessorAllows(tx, row)) throw syncPublicationRefusal('revision_conflict', 'An earlier page of this sync did not commit.', row, p,
-        `Request ${row.request_id} was admitted ahead of request ${after} of the same sync run, which did not commit, so this page must not publish after it.`);
+      if (after && !await windowPredecessorAllows(tx, row)) throw withSyncRefusal(knockOnRefusal(EARLIER_PAGE_REFUSAL_MESSAGE, row,
+        `Request ${row.request_id} was admitted ahead of request ${after} of the same sync run, which did not commit, so this page must not publish after it.`), knockOnDetail('window_predecessor', after));
     },
     async () => {
       const current = await getWorktreeBinding(tx, row.source_id);
@@ -159,6 +170,49 @@ function syncPublicationRefusal(code: RegistryCode, message: string, row: WriteR
 }
 
 /**
+ * #6643: a refusal that is not a failure of its page (a knock-on, or a request whose run another run replaced). Its
+ * next step is the status read, never a `--retry-failed` rerun: the next sync pass re-freezes the entry by itself.
+ */
+function knockOnRefusal(message: string, row: WriteRequest, cause: string, superseded = false): OperationError {
+  const status = ['gbrain', 'sync', 'status', '--source', row.source_id, '--json'];
+  return opError('revision_conflict', message, superseded
+    ? `${cause} Request ${row.request_id} in ${row.source_id} published nothing; the run that replaced its cursor covers its page, and ${status.join(' ')} shows that run. Do not resubmit it.`
+    : `${cause} Request ${row.request_id} in ${row.source_id} published nothing, and the next sync pass re-freezes its page by itself; `
+    + `${status.join(' ')} names the request it waited on (root_cause). Do not resubmit it.`,
+    { fix: readFix('Shows the sync cursor, the root cause of this refusal and the next step, read-only.', { argv: status }) });
+}
+
+/** #6643: attaches the owner-side classification the coordinator stores as the receipt's `error_detail`. */
+function withSyncRefusal(error: OperationError, detail: object): OperationError {
+  error.syncRefusal = { ...detail };
+  return error;
+}
+
+/**
+ * #6643: "The accepted sync cursor changed before publication." has three causes, recorded with a fence snapshot:
+ * - `run_replaced`: another run of the source replaced the cursor; this request's run is superseded, not failed.
+ * - `window_dropped`: the cursor recorded this request as a member of a window it dropped after an earlier page did
+ *   not commit (a lane row the window cancel skipped because it was already claimed). A knock-on of the request whose
+ *   failure dropped it, as recorded then.
+ * - `outside_fence`: anything else (a duplicate admission, a request ahead of the cursor it never dropped): a
+ *   coordination fault, a root.
+ */
+export function cursorFenceRefusal(row: WriteRequest, p: SyncIntent, cursor: SyncCursorFence): OperationError {
+  const cursorIndex = cursor.index == null ? null : Number(cursor.index);
+  const drop = cursor.run_id === p.runId && p.kind !== 'managed_sync_checkpoint' && Array.isArray(cursor.dropped)
+    ? cursor.dropped.find(member => member?.requestId === row.request_id) : undefined;
+  const cause = cursor.run_id !== p.runId ? 'run_replaced' : drop ? 'window_dropped' : 'outside_fence';
+  const fence = { run_id: cursor.run_id, expected_run_id: p.runId, request_id: cursor.request_id, members: cursor.group?.length ?? 0, index: cursorIndex, request_index: p.index };
+  const error = (cause === 'outside_fence' ? (why: string) => syncPublicationRefusal('revision_conflict', CURSOR_CHANGED_REFUSAL_MESSAGE, row, p, why)
+    : (why: string) => knockOnRefusal(CURSOR_CHANGED_REFUSAL_MESSAGE, row, why, cause === 'run_replaced'))(
+    cause === 'run_replaced' ? `Another sync run of ${row.source_id} replaced the cursor this request belongs to.`
+      : cause === 'window_dropped' ? `Request ${row.request_id} was admitted ahead of the cursor of ${row.source_id}, which dropped it after an earlier page of the same run did not commit.`
+        : `Request ${row.request_id} is not the entry the cursor of ${row.source_id} holds (cursor at index ${cursorIndex ?? 'unknown'}, request ${cursor.request_id ?? 'none'}), so it must not publish.`);
+  return withSyncRefusal(error, cause === 'window_dropped' ? { ...knockOnDetail('window_dropped', drop?.root ?? null), cause, fence }
+    : { origin: SYNC_CURSOR_FENCE_ORIGIN, cause, fence });
+}
+
+/**
  * #5988: a deterministic content refusal at publication. The wire `error`
  * stays `invalid_params` (what older receipts stored), so the stored code and
  * message keep matching `isContentRefusal`; `code` is the typed one.
@@ -167,7 +221,7 @@ function syncContentRefusal(refusal: ContentRefusal, row: WriteRequest, p: SyncI
   const where = refusal.line !== undefined ? `line ${refusal.line}${refusal.key ? ` (key "${refusal.key}")` : ''} of ${p.sourcePath}` : p.sourcePath;
   const cause = refusal.code === 'invalid_fence' ? `Edit ${fenceWhere(refusal.fence)} in ${p.sourcePath} as the message says and commit the change${p.companyApproval ? ' to the repository (a company-brain source never rewrites repository files and never holds a file)' : ''}.`
     : refusal.code === 'frontmatter_slug_conflict' ? 'Correct the frontmatter `slug:` in the file and commit the change.'
-    : refusal.code === 'file_too_large' ? `${p.sourcePath} is over the import size limit; split it into smaller files or add it to sync.exclude, then commit.`
+    : refusal.code === 'file_too_large' ? `${p.sourcePath} is over the page size limit; add it to sync.exclude, or split it into files under the limit and commit.`
     : refusal.code === 'content_rejected' ? `The content-sanity gate rejects ${p.sourcePath} under junk_disposition=reject; remove the matched junk and commit.`
     : refusal.code === 'purged_content' ? `${p.sourcePath} still carries purged content; delete or edit the file and commit, or the owner clears the tombstone with gbrain pages unpurge.`
     : refusal.code === 'write_gate_rejected' ? `The write gate refuses ${p.sourcePath}: external instruction-like content under write_gate.external_mode=reject. Tell the user; changing that setting or the file is their decision.`
@@ -417,14 +471,19 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
     await pipelined(tx, [
       () => shared,
       () => validateSyncAuthority(tx, p.syncAuthority, row.slug),
-      async () => { if (await earlierGroupMemberFailed(tx, row)) throw syncPublicationRefusal('revision_conflict', 'An earlier page of this sync did not commit.', row, p, `Request ${row.request_id} follows a page of the same bulk group that did not commit, so this page must not publish after it.`); },
+      async () => {
+        const failed = await earlierGroupMemberFailed(tx, row);
+        if (failed) throw withSyncRefusal(knockOnRefusal(EARLIER_PAGE_REFUSAL_MESSAGE, row,
+          `Request ${row.request_id} follows a page of the same bulk group that did not commit, so this page must not publish after it.`), knockOnDetail('group_member', failed));
+      },
       async () => {
         const cursor = await shared;
         // #6513: a checkpoint whose cursor another run replaced is superseded, not conflicted; a page keeps `revision_conflict`.
         const replaced = checkpointCursorReplaced(p, cursor?.run_id, row.source_id);
         if (replaced) throw syncPublicationRefusal(replaced.code, replaced.message, row, p, replaced.cause);
-        if (cursor && (cursor.run_id !== p.runId || (cursor.request_id !== row.request_id && !cursor.group?.includes(row.request_id) && !(screening?.unsaved && cursor.request_id == null)))) throw syncPublicationRefusal('revision_conflict', 'The accepted sync cursor changed before publication.', row, p,
-          `Another sync run of ${row.source_id} replaced the cursor this request belongs to.`);
+        if (cursor && (cursor.run_id !== p.runId || (cursor.request_id !== row.request_id && !cursor.group?.includes(row.request_id) && !(screening?.unsaved && cursor.request_id == null)))) {
+          throw cursorFenceRefusal(row, p, cursor);
+        }
       },
       async () => { if (p.kind !== 'managed_sync_checkpoint') await assertKnowledgePublicationAllowed(tx, row, p.path === null ? undefined : { root, path: join(root, p.path) }); },
       async () => {
@@ -464,7 +523,7 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
     const [manifest] = await tx.executeRaw<{ count: number }>("SELECT jsonb_array_length(completed_keys) AS count FROM op_checkpoints WHERE op='managed-sync-manifest' AND fingerprint=$1", [p.runId]);
     if (!manifest || Number(manifest.count) !== p.total) throw syncPublicationRefusal('storage_error', 'The immutable sync manifest is incomplete.', row, p,
       `The immutable manifest of this sync run is incomplete, so the checkpoint of ${row.source_id} did not advance.`);
-    const incomplete = await findIncompleteSyncReceipt(tx, row.worktree_id!, p.runId, p.supersededRequests ?? []);
+    const incomplete = await findIncompleteSyncReceipt(tx, row.worktree_id!, p.runId, p.supersededRequests ?? [], p.settled ?? null, p.total);
     if (incomplete) throw opError('recovery_required', `An incomplete page receipt (request ${incomplete}) still blocks the sync checkpoint.`,
       `Page request ${incomplete} of this sync run is still open or needs recovery, so checkpoint request ${row.request_id} of ${row.source_id} did not commit. `
         + `Inspect request ${incomplete} and let it finish; do not resubmit it. Then run: ${checkpointRetryCommand({ sourceId: row.source_id, processingOptions: p.processingOptions, syncOptions: p.syncOptions, repoPath: p.repoPath })}`,
@@ -512,7 +571,7 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
   // #6529: an image entry (frozen as base64 bytes) takes the coordinated image importer; its text embedding waits for embed --stale.
   if (isImageFilePath(p.sourcePath)) {
     return prepareManagedSyncImage(engine, row, { content: p.content, sourcePath: p.sourcePath, path: p.path, rawHash: p.rawHash, lineEndingOnly: p.lineEndingOnly },
-      { root, snapshot, ...(moved && moved.slug !== row.slug ? { renamedFrom: { slug: moved.slug } } : {}), noEmbed: p.processingOptions?.noEmbed === true, companyApproval: !!p.companyApproval, validate, releaseHold, clock, screening: !!screening,
+      { root, snapshot, ...(moved && moved.slug !== row.slug ? { renamedFrom: { slug: moved.slug } } : {}), noEmbed: p.processingOptions?.noEmbed === true || p.embedDeferred === true, companyApproval: !!p.companyApproval, validate, releaseHold, clock, screening: !!screening,
         refuse: (code, message, cause) => syncPublicationRefusal(code, message, row, p, cause) });
   }
   if (isCodeFilePath(p.sourcePath)) return prepareManagedSyncCode(engine, row, { content: p.content, sourcePath: p.sourcePath, rawHash: p.rawHash, lineEndingOnly: p.lineEndingOnly, companyApproval: !!p.companyApproval },
@@ -602,7 +661,7 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
     contentUnchanged: ready.noop && !moved && !writeback,
     ...(renamed ? { additionalPageKeys: [{ sourceId: row.source_id, slug: renamed.slug }] } : {}),
     validate: async tx => { await validate(tx); await ready.validate(tx); },
-    deferEmbedding: p.processingOptions?.noEmbed,
+    deferEmbedding: p.processingOptions?.noEmbed || p.embedDeferred === true,
     ...(writeback ? { file: { root, path: join(root, p.path), content: canonicalFile, expectedBeforeHash: p.rawHash } } : {}),
     ...(mirrorReadOnly ? { databaseOnlyReason: 'mirror_read_only' as const } : {}),
     apply: async (tx, preimage) => {
@@ -643,8 +702,10 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
           raw_sha256: sha256(p.content!), ...(p.blobOid ? { blob_oid: p.blobOid } : {}), working: p.working === true, gbrain_version: VERSION, ...(recovery?.length ? { recovery } : {}) }); },
       ]);
       preparedImport.postimage = final;
+      // #6722: a large or embed_skip page says what this write left its embedding in.
+      const sizeState = applied.noop ? {} : await sizeStateField(tx, row.source_id, row.slug, live?.page);
       return { status: moved ? 'renamed' : applied.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
-        chunks: applied.result.chunks, noop: applied.noop && !moved, imported_file: true, ...(moved ? { renamed_from: moved.slug } : {}),
+        chunks: applied.result.chunks, noop: applied.noop && !moved, imported_file: true, ...(moved ? { renamed_from: moved.slug } : {}), ...sizeState,
         ...(recovery?.length ? { recovered_frontmatter: true } : {}), ...(commentValue ? { comment_value: true } : {}),
         ...(fenceFixes.length ? { fences_normalized: fenceFixesWire(fenceFixes) } : {}) };
     } };

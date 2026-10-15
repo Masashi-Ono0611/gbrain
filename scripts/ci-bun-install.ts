@@ -11,8 +11,8 @@
  * printed it: the output is inherited, and a failure that is not a stall (a
  * frozen-lockfile mismatch, an unreachable registry) is retried once and then
  * reported with Bun's exit code. It uses no dependency, because it runs before
- * they are installed, and spawns asynchronously, so it behaves the same on
- * Linux, macOS and Windows.
+ * they are installed. The bound, retry and process-group handling live in
+ * `scripts/ci-bounded-run.ts`, which other setup steps share.
  *
  * Usage: bun scripts/ci-bun-install.ts [bun install flags...]
  * Environment (defaults are the CI values; the test overrides them):
@@ -20,30 +20,13 @@
  *   GBRAIN_CI_INSTALL_RETRY_SLEEP_S  pause before the retry in seconds, default 10
  *   GBRAIN_CI_INSTALL_BUN            the Bun executable to run, default this one
  */
-export {};
+import { runBounded } from './ci-bounded-run.ts';
 
-const ATTEMPTS = 2;
 const flags = process.argv.slice(2);
-const attemptSeconds = Number(process.env.GBRAIN_CI_INSTALL_ATTEMPT_S ?? 180);
-const retrySeconds = Number(process.env.GBRAIN_CI_INSTALL_RETRY_SLEEP_S ?? 10);
-const bun = process.env.GBRAIN_CI_INSTALL_BUN || process.execPath;
-const command = ['bun', 'install', ...flags].join(' ');
-
-for (let attempt = 1; ; attempt++) {
-  const started = Date.now();
-  const child = Bun.spawn([bun, 'install', ...flags], { stdin: 'ignore', stdout: 'inherit', stderr: 'inherit' });
-  let stalled = false;
-  const timer = setTimeout(() => { stalled = true; child.kill('SIGKILL'); }, attemptSeconds * 1000);
-  const code = await child.exited;
-  clearTimeout(timer);
-  if (code === 0 && !stalled) process.exit(0);
-  const why = stalled
-    ? `stalled: no result after ${attemptSeconds}s (a registry or network stall; the install normally takes seconds)`
-    : `exited ${code} after ${Math.round((Date.now() - started) / 1000)}s`;
-  if (attempt >= ATTEMPTS) {
-    console.error(`::error::${command} ${why} on attempt ${attempt} of ${ATTEMPTS}; giving up`);
-    process.exit(1);
-  }
-  console.error(`::warning::${command} attempt ${attempt} ${why}; retrying in ${retrySeconds}s`);
-  await Bun.sleep(retrySeconds * 1000);
-}
+process.exit(await runBounded({
+  argv: [process.env.GBRAIN_CI_INSTALL_BUN || process.execPath, 'install', ...flags],
+  label: ['bun', 'install', ...flags].join(' '),
+  attemptSeconds: Number(process.env.GBRAIN_CI_INSTALL_ATTEMPT_S ?? 180),
+  retrySeconds: Number(process.env.GBRAIN_CI_INSTALL_RETRY_SLEEP_S ?? 10),
+  hint: 'a registry or network stall; the install normally takes seconds',
+}));

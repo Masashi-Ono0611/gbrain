@@ -222,7 +222,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "outputRedaction": {
       "exempt": "explicit page read by slug/id; governed by page visibility, not output redaction (CEO-17 raw-read exception)"
     },
-    "description": "Read a page by slug. To edit, pass include_content:true and send `content` to put_page, or use edit_page.",
+    "description": "Read a page by slug. To edit: include_content:true, send `content` to put_page; or edit_page. >256 KB: outline+window, then `next`.",
     "params": {
       "slug": {
         "type": "string",
@@ -235,19 +235,95 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "include_content": {
         "type": "boolean",
-        "description": "Full markdown + revision, for editing."
+        "description": "Markdown + revision, to edit."
       },
       "content_only": {
         "type": "boolean",
         "description": "Round-trip fields only."
       },
+      "body": {
+        "type": "string",
+        "enum": [
+          "auto",
+          "full",
+          "none",
+          "outline",
+          "window"
+        ],
+        "description": "auto: whole up to 256 KB, else outline + window. none: revision + size.",
+        "fullSurfaceOnly": true
+      },
+      "lines": {
+        "type": "object",
+        "description": "Window: 1-based lines.",
+        "properties": {
+          "from": {
+            "type": "number",
+            "required": true
+          },
+          "count": {
+            "type": "number",
+            "required": true
+          }
+        },
+        "fullSurfaceOnly": true
+      },
+      "bytes": {
+        "type": "object",
+        "description": "Window: UTF-8 bytes (snapped to a line start).",
+        "properties": {
+          "offset": {
+            "type": "number",
+            "required": true
+          },
+          "length": {
+            "type": "number",
+            "required": true
+          }
+        },
+        "fullSurfaceOnly": true
+      },
+      "around_chunk_id": {
+        "type": "number",
+        "description": "Window around a search hit chunk_id.",
+        "fullSurfaceOnly": true
+      },
+      "context_lines": {
+        "type": "number",
+        "description": "Lines around around_chunk_id (20).",
+        "fullSurfaceOnly": true
+      },
+      "cursor": {
+        "type": "string",
+        "description": "next_cursor: read on.",
+        "fullSurfaceOnly": true
+      },
+      "max_bytes": {
+        "type": "number",
+        "description": "Window bytes (40000).",
+        "fullSurfaceOnly": true
+      },
+      "view": {
+        "type": "string",
+        "enum": [
+          "read",
+          "markdown"
+        ],
+        "description": "markdown: page the round-trip content.",
+        "fullSurfaceOnly": true
+      },
+      "outline_from": {
+        "type": "number",
+        "description": "Outline next_from_index.",
+        "fullSurfaceOnly": true
+      },
       "include_deleted": {
         "type": "boolean",
-        "description": "Include soft-deleted pages."
+        "description": "Soft-deleted too."
       },
       "include_timeline_entries": {
         "type": "boolean",
-        "description": "Also return timeline rows."
+        "description": "Timeline rows too."
       },
       "grammar_diagnostics": {
         "type": "boolean",
@@ -332,6 +408,12 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         "type": "boolean",
         "required": false,
         "description": "Allow emptying the page."
+      },
+      "allow_shrink": {
+        "type": "boolean",
+        "required": false,
+        "description": "Allow content under half a >256 KB page.",
+        "fullSurfaceOnly": true
       },
       "drop_timeline": {
         "type": "boolean",
@@ -643,7 +725,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "outputRedaction": {
       "exempt": "explicit page read by slug/id; governed by page visibility, not output redaction (CEO-17 raw-read exception)"
     },
-    "description": "Fetch the full text of one search result by its opaque, source-qualified `id` (OpenAI deep-research contract: the search/fetch pair). Pass the id unchanged; it does not grant access. Legacy slug ids work only when unambiguous within your current read scope. Returns { id, title, text, url, metadata } — `text` is the page's canonical markdown. For fuzzy slugs, soft-delete recovery, or lossless edit round-trips, use get_page.",
+    "description": "Fetch the full text of one search result by its opaque, source-qualified `id` (OpenAI deep-research contract: the search/fetch pair). Pass the id unchanged; it does not grant access. Legacy slug ids work only when unambiguous within your current read scope. Returns { id, title, text, url, metadata } — `text` is the page's canonical markdown; a page over 256 KB returns the window around the searched chunk instead, with metadata.total_bytes and metadata.next_id (fetch it to read on). For fuzzy slugs, soft-delete recovery, or lossless edit round-trips, use get_page.",
     "params": {
       "id": {
         "type": "string",
@@ -759,6 +841,10 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
               "type": "boolean",
               "description": "Allow emptying a non-empty page."
             },
+            "allow_shrink": {
+              "type": "boolean",
+              "description": "Allow content under half a >256 KB page."
+            },
             "drop_timeline": {
               "type": "boolean",
               "description": "Content without a Timeline section deletes its dated entries."
@@ -834,6 +920,33 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "area": "pages",
     "cliHints": {
       "name": "write-requests"
+    }
+  },
+  {
+    "name": "list_write_conflicts",
+    "idempotent": true,
+    "outputRedaction": "no_stored_text",
+    "description": "Pages whose writes keep ending in a source_changed conflict, grouped by slug.",
+    "params": {
+      "source_id": {
+        "type": "string",
+        "description": "Default: yours."
+      },
+      "limit": {
+        "type": "number",
+        "default": 25,
+        "description": "1-100 slugs (default 25)."
+      },
+      "cursor": {
+        "type": "string",
+        "description": "Previous page's next."
+      }
+    },
+    "scope": "read",
+    "mutating": false,
+    "area": "pages",
+    "cliHints": {
+      "name": "write-conflicts"
     }
   },
   {
@@ -1911,10 +2024,35 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Run brain health checks and return a structured DoctorReport (thin-client doctor surface).",
-    "params": {},
+    "description": "Run brain health checks and return a structured DoctorReport (thin-client doctor surface). tier \"ops\": only the operational sections under a 4 s deadline; only: just the named checks.",
+    "params": {
+      "tier": {
+        "type": "string",
+        "enum": [
+          "ops"
+        ],
+        "description": "ops: capacity, write failures, embedding state, sync movement, compaction, serve build and schema pack, under one 4 s deadline. Omit for the focused remote report."
+      },
+      "only": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Run just these checks (doctor check names, for example persistence_capacity)."
+      }
+    },
     "scope": "admin",
     "localOnly": false,
+    "area": "admin"
+  },
+  {
+    "name": "get_brain_health",
+    "mutating": false,
+    "idempotent": true,
+    "outputRedaction": "no_stored_text",
+    "description": "Brain health as bands for agents without admin scope: write capacity (ok, low or critical, with a days band) and counts of write failures, ghost pages and unsearchable chunks as bands, for the sources you can read. No slugs. Cached 60 s.",
+    "params": {},
+    "scope": "read",
     "area": "admin"
   },
   {
@@ -1924,7 +2062,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "outputRedaction": {
       "exempt": "full page version snapshots by slug; a page read governed by visibility like get_page (CEO-17)"
     },
-    "description": "Page version history, newest snapshot first. Trusted local and admin callers also get written_by and archived_by (who wrote each snapshot and whose write archived it). `limit` returns only the newest N; `include_body: false` returns metadata only.",
+    "description": "Page version history, newest snapshot first: metadata only (id, snapshot_at, title, type, tags, frontmatter) for the newest 20 versions by default. Pass include_body: true for each version's compiled_truth and timeline, and a larger limit (at most 100 over MCP) for older versions. Trusted local and admin callers also get written_by and archived_by (who wrote each snapshot and whose write archived it). revert_version takes the id field.",
     "params": {
       "slug": {
         "type": "string",
@@ -1933,11 +2071,11 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "limit": {
         "type": "number",
-        "description": "Return only the newest N versions (a positive integer). Omit for the full history."
+        "description": "Return only the newest N versions (a positive integer). Default 20; MCP callers are capped at 100."
       },
       "include_body": {
         "type": "boolean",
-        "description": "false omits compiled_truth and timeline from every version (metadata only). Default true."
+        "description": "true adds compiled_truth and timeline to every version. Default false (metadata only)."
       }
     },
     "scope": "read",
@@ -1998,7 +2136,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. Returns version, engine kind, and page/chunk counts. Read-scope.",
+    "description": "Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. Returns version, engine kind, page/chunk counts and capabilities (large_pages_v1: windowed get_page). Read-scope.",
     "params": {},
     "scope": "read",
     "area": "identity"
@@ -2837,7 +2975,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "outputRedaction": {
       "exempt": "explicit chunk read by slug, the page-read twin of get_page (CEO-17 raw-read exception)"
     },
-    "description": "Return a page's indexed content chunks (the units search ranks). Use when debugging why search did or did not match a page. Needs read scope. On page_not_found: resolve the slug with resolve_slugs.",
+    "description": "Return a page's indexed content chunks (the units search ranks), in chunk_index order, 50 at a time by default. Use when debugging why search did or did not match a page. A large page has more chunks than one call returns: the last chunk of a cut list carries truncated: true and next_from_index, _meta.pagination carries total_chunks and next_from_index, and a listing_truncated notice names the next call (from_index). Needs read scope. On page_not_found: resolve the slug with resolve_slugs.",
     "params": {
       "slug": {
         "type": "string",
@@ -2856,6 +2994,14 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         ],
         "description": "Lowest trust tier to return (the connection floor still applies).",
         "fullSurfaceOnly": true
+      },
+      "from_index": {
+        "type": "number",
+        "description": "Return chunks from this chunk_index on (a non-negative integer). Default 0."
+      },
+      "limit": {
+        "type": "number",
+        "description": "How many chunk_index positions to return (a positive integer). Default 50; MCP callers are capped at 500."
       }
     },
     "scope": "read",
@@ -4868,7 +5014,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         ]
       }
     },
-    "description": "MEMORY VERB (v1): read saved facts by entity, since or session_id; `query` also searches pages. Remote callers see world facts only. One card: entity; reasoning: synthesize.",
+    "description": "MEMORY VERB (v1): read facts by entity, since or session_id; `query` also searches pages. Remote callers: world facts only. One card: entity; reasoning: synthesize.",
     "params": {
       "entity": {
         "type": "string",
@@ -4896,7 +5042,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "source_id": {
         "type": "string",
-        "description": "One source you may read."
+        "description": "One readable source."
       },
       "since": {
         "type": "string",
@@ -4908,7 +5054,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "include_expired": {
         "type": "boolean",
-        "description": "Include expired."
+        "description": "Also expired; question ranks them."
       },
       "supersessions": {
         "type": "boolean",
@@ -4939,7 +5085,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "return_window": {
         "type": "number",
-        "description": "Window size 1-3."
+        "description": "Window 1-3."
       },
       "min_trust": {
         "type": "string",
@@ -5012,6 +5158,20 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "include_quarantined": {
         "type": "boolean",
         "description": "Admin or memory_confirm: quarantined cards.",
+        "fullSurfaceOnly": true
+      },
+      "counterparty": {
+        "type": "string",
+        "description": "Person or company (name or slug): adds a pulled brief of dated items about them.",
+        "fullSurfaceOnly": true
+      },
+      "intent": {
+        "type": "string",
+        "enum": [
+          "meeting",
+          "reply"
+        ],
+        "description": "With counterparty: the task the brief is for.",
         "fullSurfaceOnly": true
       }
     },

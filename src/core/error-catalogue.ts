@@ -45,17 +45,30 @@ export const ERROR_CATALOGUE = {
   page_projection_conflict: { code: 'page_projection_conflict', docs: 'docs/guides/repair.md#page-projection-conflict' },
   explicit_kind_required: { code: 'explicit_kind_required', docs: 'docs/guides/repair.md#explicit-only-repair-kinds' },
   repair_kind_unavailable: { code: 'unavailable', docs: 'docs/guides/repair.md#explicit-only-repair-kinds' },
+  // #6650: gbrain repair stuck-recovery resolves page recovery records only; a shared-skill bundle record is refused.
+  recovery_bundle_unsupported: { code: 'recovery_bundle_unsupported', docs: 'docs/guides/repair.md#recovery-bundle-unsupported' },
+  // #6650: a (request state, --keep) pair stuck-recovery cannot make safe: a terminal request, or a choice the record cannot support.
+  recovery_choice_refused: { code: 'recovery_choice_refused', docs: 'docs/guides/repair.md#recovery-choice-refused' },
+  // #6650: a withdrawal-mirror effect recovery only finishes forward, so stuck-recovery lists it as refused.
+  recovery_effect_unsupported: { code: 'recovery_effect_unsupported', docs: 'docs/guides/repair.md#recovery-effect-unsupported' },
   colon_slug_windows_write_through: { code: 'colon_slug_windows_write_through', docs: 'docs/guides/write-refusals.md#colon_slug_windows_write_through' },
   embedding_auth_failed: { code: 'embedding_auth_failed', docs: 'docs/guides/write-refusals.md#embedding_auth_failed' },
   activation_source_path_missing: { code: 'source_changed', docs: 'docs/guides/write-refusals.md#activation_source_path_missing' },
   facts_absorb_write_refused: { code: 'facts_absorb_write_refused', docs: 'docs/guides/write-refusals.md#facts_absorb_write_refused' },
   source_checkout_missing: { code: 'recovery_required', docs: 'docs/guides/write-refusals.md#source_checkout_missing' },
   managed_pull_skipped: { code: 'managed_pull_skipped', docs: 'docs/guides/write-refusals.md#managed_pull_skipped' },
+  // #6696 C2: --skip-failed / --include-gitignored on a managed source, refused at parse and before delegation.
+  managed_sync_flag_refused: { code: 'managed_sync_flag_refused', docs: 'docs/guides/write-refusals.md#managed_sync_flag_refused' },
   no_pricing: { code: 'no_pricing', docs: 'docs/guides/write-refusals.md#no_pricing' },
   timeline_comment_markup: { code: 'timeline_comment_markup', docs: 'docs/guides/repair.md#timeline-comments' },
   timeline_rows_would_be_removed: { code: 'timeline_rows_would_be_removed', docs: 'docs/guides/write-refusals.md#timeline_rows_would_be_removed' },
   reconcile_private_facts: { code: 'permission_denied', docs: 'docs/guides/write-refusals.md#reconcile-private-facts' },
   maintenance_backpressure: { code: 'maintenance_backpressure', docs: 'docs/guides/write-refusals.md#maintenance_backpressure' },
+  // #6696: cumulative write caps (A5 background pause, A6 refusal at the cap, A7 bulk-run preflight).
+  write_capacity_backpressure: { code: 'write_capacity_backpressure', docs: 'docs/guides/write-refusals.md#write_capacity_backpressure' },
+  write_quota_exhausted: { code: 'write_quota_exhausted', docs: 'docs/guides/write-refusals.md#write_quota_exhausted' },
+  write_quota_insufficient: { code: 'write_quota_insufficient', docs: 'docs/guides/write-refusals.md#write_quota_insufficient' },
+  write_capacity_low: { code: 'write_capacity_low', docs: 'docs/guides/write-refusals.md#write_capacity_low' },
   // F0 `gbrain sources refresh` (worktree-wide coordinated ff-only refresh).
   refresh_not_managed: { code: 'refresh_not_managed', docs: 'docs/guides/write-refusals.md#refresh_not_managed' },
   refresh_not_owner: { code: 'refresh_not_owner', docs: 'docs/guides/write-refusals.md#refresh_not_owner' },
@@ -79,6 +92,7 @@ export const ERROR_CATALOGUE = {
   sync_drain_preparation_systemic: { code: 'preparation_systemic', docs: 'docs/guides/write-refusals.md#preparation_systemic' },
   sync_drain_write_capacity: { code: 'queue_capacity', docs: 'docs/guides/write-refusals.md#drain-write-capacity' },
   sync_drain_connection_lost: { code: 'connection_lost', docs: 'docs/guides/write-refusals.md#drain-connection-lost' },
+  sync_drain_capacity_paused: { code: 'capacity_paused', docs: 'docs/guides/write-refusals.md#drain-capacity-paused' },
   sync_drain_head_blocked: { code: 'drain_stalled', docs: 'docs/guides/write-refusals.md#head-blocked' },
   // D8 `gbrain setup <harness>` (src/commands/setup.ts).
   setup_harness_unsupported: { code: 'setup_harness_unsupported', docs: 'docs/guides/repair.md#setup-harness-unsupported' },

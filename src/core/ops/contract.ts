@@ -94,6 +94,8 @@ export class OperationError extends Error {
   public fenceIssues?: Array<Record<string, unknown>>;
   /** A `fact_withdrawn` refusal's withdrawal: when and for which subject the exact claim was forgotten. Absence carries no meaning. */
   public withdrawn?: WithdrawnDetail;
+  /** #6643: a managed-sync refusal's owner-side classification (knock-on root, cursor fence snapshot); stored as the receipt's error_detail, never in the envelope. */
+  public syncRefusal?: Record<string, unknown>;
   /** Set to 1 by opError(); toJSON() emits `contract_version` only when set. */
   public contractVersion?: 1;
   /**
@@ -440,6 +442,11 @@ export interface OperationContext {
    */
   remote: boolean;
   /**
+   * #6696 (A5): who this caller's writes are for, set only by trusted host-side entry points (the CLI, the MCP
+   * transports). Unset is `background`; it is never derived from `remote` (persistence/admission-origin.ts).
+   */
+  admissionOrigin?: import('../persistence/admission-origin.ts').AdmissionOrigin;
+  /**
    * Transport marker for auth-less remote surfaces (#1061). The stdio MCP
    * dispatch sets 'stdio' — it is deliberately `remote: true` (agent-facing,
    * untrusted) but has no per-token auth (local pipe), so identity ops like
@@ -551,6 +558,13 @@ export interface OperationContext {
    * Shape only, never authority: nothing security-relevant reads it.
    */
   resultRows?: 'lean' | 'full';
+  /**
+   * Large pages (Wave A): the caller identified itself as gbrain's thin client
+   * (X-Gbrain-Client header). A thin client that names no `body` mode on
+   * get_page renders compiled_truth as the whole page, so the read is full
+   * or refused, never a window. Shape only, never authority.
+   */
+  thinClient?: boolean;
   /**
    * Whether this caller can call `opName` on its surface right now: the MCP
    * dispatch predicate (the stdio session's surface after any `request_tools`
