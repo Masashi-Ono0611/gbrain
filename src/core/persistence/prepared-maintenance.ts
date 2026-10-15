@@ -198,8 +198,12 @@ export function maintenanceDriftRefusal(sourceId: string, slug: string): Operati
       { argv: ['gbrain', 'sources', 'reconcile', sourceId, '--brain', 'host', '--audit', '--conflicts', '--json'] }) });
 }
 
-/** #6696 (A12): maintenance kinds whose preparer passes `allowMissingFile` (chronicle, stale-atom retirement): a missing canonical file publishes, so it is no ghost. */
-export const PUBLISHES_WITHOUT_FILE: ReadonlySet<string> = new Set(['managed_maintenance_chronicle_event', 'managed_maintenance_chronicle_retire', 'managed_maintenance_retire_stale_atoms']);
+/**
+ * #6696 (A12): maintenance kinds whose preparer passes `allowMissingFile` (chronicle, stale-atom retirement, ghost-page
+ * retirement, which exists to soft-delete pages whose canonical file is gone): a missing canonical file publishes, so it is no ghost.
+ */
+export const PUBLISHES_WITHOUT_FILE: ReadonlySet<string> = new Set(['managed_maintenance_chronicle_event', 'managed_maintenance_chronicle_retire', 'managed_maintenance_retire_stale_atoms',
+  'managed_maintenance_retire_ghost_page']);
 
 /** #6696 (A12): `source_changed` / `canonical_file_missing` before admission: the page's recorded file is gone; never a new request. */
 export function maintenanceGhostRefusal(sourceId: string, slug: string): OperationError {
@@ -543,6 +547,7 @@ async function prepareMaintenanceKind(engine: BrainEngine, row: WriteRequest, co
     return (await import('../chronicle/publish.ts')).prepareChronicleMutation(engine, row, config);
   }
   if (row.intent?.kind === 'managed_maintenance_retire_stale_atoms') return (await import('../repair/stale-atoms.ts')).prepareStaleAtomRetirement(engine, row, config);
+  if (row.intent?.kind === 'managed_maintenance_retire_ghost_page') return (await import('../repair/ghost-pages.ts')).prepareGhostPageRetirement(engine, row, config);
   if (row.intent?.kind !== 'managed_maintenance_consolidate') throw opError('invalid_params', 'Unsupported maintenance request.',
     `Request ${row.request_id} for ${row.slug} in ${row.source_id} carries a maintenance kind this gbrain version does not publish (likely queued by a newer release); nothing changed. Upgrade gbrain on the brain host, and read the receipt before submitting anything new.`,
     { fix: receiptFix(row) });

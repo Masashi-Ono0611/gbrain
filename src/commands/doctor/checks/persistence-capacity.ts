@@ -3,7 +3,7 @@ import type { Check } from '../../doctor.ts';
 import { capacityDiagnostics } from '../../../core/persistence/diagnostics.ts';
 import { oneYearCapacity, readJournalLimits } from '../../../core/persistence/limits.ts';
 import { readCapacityForecast, type CapacityForecast } from '../../../core/persistence/capacity-forecast.ts';
-import { doctorVerify } from '../check-fix.ts';
+import { capacityVerify } from '../../../core/persistence/capacity-view.ts';
 import { BACKGROUND_PRODUCERS, readBackgroundPauseShare } from '../../../core/persistence/admission-origin.ts';
 
 const VERIFY = 'gbrain doctor --only persistence_capacity --json';
@@ -17,6 +17,7 @@ const DOCS = 'docs/guides/concurrent-writes.md#quota-near-exhaustion';
  * the full 7-day aggregate (capacity-forecast.ts); receipt bytes forecast at
  * their compacted (net) size. Each key gets the one value that covers a year.
  * A scope past the background pause line (A5) names the producers it pauses.
+ * The fix verifies through doctor and the read-scope `get_brain_health` band (#6696 B2).
  */
 export async function checkPersistenceCapacity(engine: BrainEngine): Promise<Check> {
   try {
@@ -60,7 +61,7 @@ export async function checkPersistenceCapacity(engine: BrainEngine): Promise<Che
     const [first] = [...needed];
     return { name: 'persistence_capacity', status: worst, details,
       fix: { argv: ['gbrain', 'config', 'set', first![0], String(first![1])], consent: [], actor: 'host_admin', requires_exclusive: false,
-        verify: doctorVerify('persistence_capacity'), docs: DOCS,
+        verify: capacityVerify(), docs: DOCS,
         why: `Raises ${first![0]} to a value that covers about one more year at the 7-day rate; reversible with gbrain config unset.${commands.length > 1 ? ` Also run: ${commands.slice(1).join('; ')}.` : ''}` },
       message: `${resources.length} managed write limit(s) near exhaustion: ${resources.map(r => `${r.scope} ${r.resource} ${r.used}/${r.limit}`
         + ('days_to_exhaustion' in r && r.days_to_exhaustion !== null ? ` (about ${r.days_to_exhaustion} day(s) left at the 7-day rate, ${r.basis})` : '')).join('; ')}. `

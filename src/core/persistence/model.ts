@@ -114,10 +114,13 @@ export interface JournalLimits {
  * (the reported autopilot workload) runs at least one year: lifetime IDs last
  * about 417 days; receipt bytes hold a 30-day window of 16 KiB reservations
  * plus about 4 KiB retained per compacted receipt for about 590 days.
+ * Outstanding intent per principal holds two page-ceiling writes
+ * (page-size-policy.ts, 24 MiB each, JSON-escaped) plus headroom, so one
+ * large write never refuses another from the same principal.
  */
 export const DEFAULT_JOURNAL_LIMITS: Readonly<JournalLimits> = Object.freeze({
   principalOutstanding: 100, brainOutstanding: 1000,
-  principalIntentBytes: 32 * 1024 ** 2, brainIntentBytes: 256 * 1024 ** 2,
+  principalIntentBytes: 64 * 1024 ** 2, brainIntentBytes: 256 * 1024 ** 2,
   // #6696 (A2): sized for 5,000 admissions a day for a year (docs/guides/concurrent-writes.md#growth-model).
   principalLifetimeIds: 2_000_000, brainLifetimeIds: 8_000_000,
   principalTerminalBytes: 16 * 1024 ** 3, brainTerminalBytes: 64 * 1024 ** 3,

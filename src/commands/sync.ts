@@ -22,7 +22,7 @@ export interface SyncResult {
   /** #6643: the request a `--retry-failed` rediscovery waits for (its producer and slug), instead of a silent no-op. */
   retryWait?: import('../core/persistence/sync-run.ts').RetryWait;
   /** #6643: knock-on pages this run re-froze automatically, and the limits that bound it. */
-  knockOns?: { refrozen: number };
+  knockOns?: { refrozen: number }; /** #6722: pages this run left large or embed_skip (chunked, keyword-searchable) and their embedding state. */ size_states?: import('../core/page-embedding-budget.ts').SyncSizeStates;
   status: 'up_to_date' | 'synced' | 'first_sync' | 'dry_run' | 'blocked_by_failures' | 'partial';
   fromCommit: string | null;
   toCommit: string;
@@ -178,6 +178,8 @@ export interface SyncOpts {
   capacityPreflight?: boolean;
   /** Processing options this caller set; an unfinished managed cursor supplies the rest (unset = all explicit). */
   explicitProcessing?: Array<'noEmbed' | 'noExtract' | 'noSchemaPack'>;
+  /** #6696: a runtime paid-work constraint (the cost gate deferred this run's embedding); never a processing option, never lifted by cursor adoption. */
+  embedDeferred?: boolean;
   /**
    * v0.18.0 Step 5 — sync a specific named source. When set, sync reads
    * local_path + last_commit from the sources table (not the global

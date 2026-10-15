@@ -127,7 +127,7 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => (await import('./checks/persistence-requests.ts')).lostCallerWritesCheck(engine, scope.sourceIds),
   },
   {
-    id: 'persistence_terminal_failures', resolution: 'operator', registration: 'wave',
+    id: 'persistence_terminal_failures', resolution: 'operator', registration: 'doctor.ts',
     hostOnly: 'Request ids, roots and recovery records are brain-host persistence state outside any source scope.',
     count: d => Number(d.count ?? 0),
     impact: 'A write receipt that did not commit blocks work now (a recovery record or a checkpoint blocker), or an unresolved receipt is a gbrain-defect class',

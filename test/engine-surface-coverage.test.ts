@@ -58,7 +58,7 @@ const INTERFACE_METHODS: readonly string[] = [
   // Chunks
   'upsertChunks', 'getChunks', 'getChunkPage', 'getChunkWindows', 'countStaleChunks', 'sumStaleChunkChars', 'setPageEmbeddingSignature',
   'invalidateStaleSignatureEmbeddings', 'invalidateContentDriftEmbeddings', 'listStaleChunks',
-  'countChunklessPagesWithContent', 'listChunklessPagesWithContent', 'deleteChunks',
+  'countChunklessPagesWithContent', 'listChunklessPagesWithContent', 'readEmbeddingStateCounts', 'listEmbeddingStateRows', 'deleteChunks',
   // Extraction watermark
   'countStalePagesForExtraction', 'listStalePagesForExtraction', 'markPagesExtractedBatch', 'markPagesAttendanceBlocked',
   // #6454 stale reserved frontmatter keys

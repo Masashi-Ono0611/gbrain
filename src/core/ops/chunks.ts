@@ -47,7 +47,7 @@ const get_chunks: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: { exempt: 'explicit chunk read by slug, the page-read twin of get_page (CEO-17 raw-read exception)' },
-  description: `Return a page's indexed content chunks (the units search ranks), in chunk_index order, ${GET_CHUNKS_DEFAULT_LIMIT} at a time by default. Use when debugging why search did or did not match a page. A large page has more chunks than one call returns: _meta.pagination carries total_chunks and next_from_index, and a listing_truncated notice names the next call (from_index). Needs read scope. On page_not_found: resolve the slug with resolve_slugs.`,
+  description: `Return a page's indexed content chunks (the units search ranks), in chunk_index order, ${GET_CHUNKS_DEFAULT_LIMIT} at a time by default. Use when debugging why search did or did not match a page. A large page has more chunks than one call returns: the last chunk of a cut list carries truncated: true and next_from_index, _meta.pagination carries total_chunks and next_from_index, and a listing_truncated notice names the next call (from_index). Needs read scope. On page_not_found: resolve the slug with resolve_slugs.`,
   params: {
     slug: { type: 'string', required: true, description: 'Slug of the page whose content chunks to return.' },
     min_trust: MIN_TRUST_PARAM,
@@ -72,8 +72,9 @@ const get_chunks: Operation = {
     const { floor } = await resolveReadEligibility(ctx, { minTrust: p.min_trust });
     const chunks = (await stampPageTrust(ctx.engine, page.chunks.map(c => ({ ...c, slug: p.slug as string })), floor))
       .map(({ slug: _slug, ...chunk }) => chunk);
-    reportChunkPage(ctx, p, { fromIndex, limit, clampedFrom, returned: chunks.length, totalChunks: page.total_chunks, maxChunkIndex: page.max_chunk_index });
-    return chunks;
+    const next = reportChunkPage(ctx, p, { fromIndex, limit, clampedFrom, returned: chunks.length, totalChunks: page.total_chunks, maxChunkIndex: page.max_chunk_index });
+    if (next === undefined || chunks.length === 0) return chunks;
+    return [...chunks.slice(0, -1), { ...chunks[chunks.length - 1], truncated: true, next_from_index: next }];
   },
   scope: 'read',
 };

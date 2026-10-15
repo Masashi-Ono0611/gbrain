@@ -127,6 +127,7 @@ const MATRIX: Row[] = [
   // Deliberately brain-wide (config / registry / identity — not source data).
   { name: 'search_modes', mode: 'brainwide', args: {}, rationale: 'reports search config knobs, no page data' },
   { name: 'get_brain_identity', mode: 'brainwide', args: {}, rationale: 'brain-level identity document by design' },
+  { name: 'get_brain_health', mode: 'skip', reason: 'returns count bands with no slug or source identity, so the beta-marker scan here would pass vacuously; test/doctor-ops-remote-6696.test.ts seeds per-source write failures and pins the handler to the scalar and federated grant' },
   { name: 'whoami', mode: 'brainwide', args: {}, rationale: 'caller identity/transport echo, no page data' },
   { name: 'sources_list', mode: 'brainwide', args: {}, rationale: 'listing sources is its purpose; exposes ids/names only' },
   { name: 'request_tools', mode: 'brainwide', args: { tools: ['get_page'] }, rationale: 'tool registry surface, no page data' },

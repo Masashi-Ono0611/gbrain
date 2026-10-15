@@ -79,6 +79,19 @@ describe('get_chunks paging', () => {
     expect(c.notices[0].fix?.mcp).toEqual({ tool: 'get_chunks', arguments: { slug: BIG, from_index: 50, limit: 50 } });
   });
 
+  test('a default call on a page with more than 50 chunks marks the cut in the array itself (clients that ignore _meta)', async () => {
+    for (const remote of [true, false]) {
+      const rows = await chunks(remote, { slug: BIG }) as Array<{ chunk_index: number; truncated?: boolean; next_from_index?: number }>;
+      expect(rows).toHaveLength(50);
+      expect(rows[49]).toMatchObject({ chunk_index: 49, truncated: true, next_from_index: 50 });
+      expect(rows.slice(0, 49).some(row => 'truncated' in row || 'next_from_index' in row)).toBe(false);
+    }
+    const whole = await chunks(true, { slug: SMALL }) as Array<Record<string, unknown>>;
+    expect(whole.some(row => 'truncated' in row || 'next_from_index' in row)).toBe(false);
+    const last = await chunks(true, { slug: BIG, from_index: 600, limit: 50 }) as Array<Record<string, unknown>>;
+    expect(last.some(row => 'truncated' in row)).toBe(false);
+  });
+
   test('paging boundaries: consecutive pages cover every chunk exactly once', async () => {
     const seen: number[] = [];
     let from: number | undefined = 0;
@@ -164,6 +177,7 @@ describe('get_chunks paging', () => {
       const body = JSON.parse(res.content[0].text);
       expect(Array.isArray(body)).toBe(true);
       expect(body).toHaveLength(100);
+      expect(body[99]).toMatchObject({ chunk_index: 99, truncated: true, next_from_index: 100 });
       expect(res._meta?.pagination).toEqual({ from_index: 0, limit: 100, returned: 100, total_chunks: BIG_CHUNKS, next_from_index: 100 });
       const notice = res.content.slice(1).map(b => b.text).find(t => t.startsWith('[gbrain notice listing_truncated'));
       expect(notice).toContain(`fix: get_chunks {"slug":"${BIG}","from_index":100,"limit":100}`);

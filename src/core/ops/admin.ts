@@ -168,9 +168,13 @@ const run_doctor: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: 'no_stored_text',
-  description: 'Run brain health checks and return a structured DoctorReport (thin-client doctor surface).',
-  params: {},
-  handler: async (ctx) => {
+  description: 'Run brain health checks and return a structured DoctorReport (thin-client doctor surface). tier "ops": only the operational sections under a 4 s deadline; only: just the named checks.',
+  params: {
+    tier: { type: 'string', enum: ['ops'], description: 'ops: capacity, write failures, embedding state, sync movement, compaction, serve build and schema pack, under one 4 s deadline. Omit for the focused remote report.' },
+    only: { type: 'array', items: { type: 'string' }, description: 'Run just these checks (doctor check names, for example persistence_capacity).' },
+  },
+  handler: async (ctx, p) => {
+    if (p.tier !== undefined || p.only !== undefined) return (await import('../../commands/doctor/remote-tier.ts')).runRemoteDoctorTier(ctx, p);
     const { doctorReportRemote } = await import('../../commands/doctor.ts');
     // Source isolation (cross-model P1): a source-bound caller's report must
     // not aggregate other sources' activity. Scope-aware checks (connection,
@@ -293,8 +297,29 @@ const quarantine_list: Operation = {
   },
 };
 
+/**
+ * #6696 B2 (Garry decision d2b): banded brain health for any read-scope caller,
+ * the `verify.mcp` of every write-capacity fix. Capacity band with a days band,
+ * write-failure, ghost-page and unsearchable-chunk counts as bands, scoped to
+ * the sources the caller may read; no slugs, paths or exact counters.
+ */
+const get_brain_health: Operation = {
+  name: 'get_brain_health',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description: 'Brain health as bands for agents without admin scope: write capacity (ok, low or critical, with a days band) and counts of write failures, ghost pages and unsearchable chunks as bands, for the sources you can read. No slugs. Cached 60 s.',
+  params: {},
+  handler: async (ctx) => {
+    const scope = sourceScopeOpts(ctx);
+    const sourceIds = scope.sourceIds ?? (scope.sourceId ? [scope.sourceId] : undefined);
+    return (await import('../../commands/doctor/brain-health-bands.ts')).readBrainHealthBands(ctx.engine, { sourceIds });
+  },
+  scope: 'read',
+};
+
 // Ops in EXACTLY the canonical `operations` array order.
 export const adminOperations: Operation[] = [
-  get_stats, get_health, run_doctor, get_versions, revert_version,
+  get_stats, get_health, run_doctor, get_brain_health, get_versions, revert_version,
   get_brain_identity, quarantine_list,
 ];

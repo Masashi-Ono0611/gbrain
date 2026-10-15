@@ -6,10 +6,13 @@
  * Doubling the input must roughly double the time with spans on, for chat-log
  * text and for a page of one-word paragraphs (the most pieces per chunk). The
  * bound is generous (linear is 2x, quadratic 4x) and each size takes its best
- * of three runs, so a busy machine does not fail it.
+ * of three runs, so a busy machine does not fail it. Each run is timed in
+ * process CPU time, which measures the work rather than how long the
+ * scheduler made it wait.
  */
 import { describe, test, expect } from 'bun:test';
 import { chunkText } from '../src/core/chunkers/recursive.ts';
+import { cpuMs } from './helpers/cpu-time.ts';
 
 function chatLog(chars: number): string {
   let a = 0x9e3779b9;
@@ -38,9 +41,8 @@ function chatLog(chars: number): string {
 function bestMs(text: string): number {
   let best = Infinity;
   for (let k = 0; k < 3; k++) {
-    const t0 = performance.now();
-    const chunks = chunkText(text, { spans: true });
-    best = Math.min(best, performance.now() - t0);
+    let chunks: ReturnType<typeof chunkText> = [];
+    best = Math.min(best, cpuMs(() => { chunks = chunkText(text, { spans: true }); }));
     expect(chunks.every(c => c.byte_start !== undefined)).toBe(true);
   }
   return best;

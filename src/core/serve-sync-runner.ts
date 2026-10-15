@@ -56,7 +56,7 @@
 
 import { isAdmissionOrigin, withAdmissionOrigin } from './persistence/admission-origin.ts';
 import { randomUUID } from 'node:crypto';
-import { withLegacySyncDelegation } from './persistence/sync-authority.ts';
+import { typedSyncProcessing, withLegacySyncDelegation } from './persistence/sync-authority.ts';
 import { verifyLocalWriter, withVerifiedLocalRegistration } from './persistence/identity.ts';
 import { readManagedMode } from './persistence/managed-mode.ts';
 import { OperationError } from './ops/contract.ts';
@@ -352,7 +352,9 @@ async function startVerifiedDelegatedSync(
           // The managed drain is the CLI's own path: the cursor owns processing options, so the CLI's effective
           // flags ride through; the classic path keeps the always-deferred embed rule of the legacy lane.
           ...(managed
-            ? { drain: true, noBulk: options.noBulk, lanes: options.lanes, noEmbed: options.noEmbed, explicitProcessing: options.explicitProcessing }
+            ? { drain: true, noBulk: options.noBulk, lanes: options.lanes, noEmbed: options.noEmbed, embedDeferred: options.embedDeferred,
+              // #6696: an older CLI omits the list but still sends true for each processing flag its user typed.
+              explicitProcessing: options.explicitProcessing ?? typedSyncProcessing(options) }
             : { noEmbed: true }),
           signal: job.controller.signal,
           onProgress: (p) => {

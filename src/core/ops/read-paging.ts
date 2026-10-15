@@ -9,7 +9,11 @@
  * - the model-visible `listing_truncated` notice for remote callers when more
  *   rows remain, whose fix is the exact next call;
  * - one stderr line for the trusted local CLI when the caller named no limit
- *   and the default cut the result.
+ *   and the default cut the result;
+ * - get_chunks only: the last chunk of a cut list carries `truncated: true`
+ *   and `next_from_index`, so a client that reads only the array (and ignores
+ *   `_meta` and notices) still sees the list is incomplete. Additive fields on
+ *   one element keep the array shape older clients parse.
  */
 import type { Notice } from '../agent-output.ts';
 import type { OperationContext } from './contract.ts';
@@ -39,10 +43,10 @@ function emitTruncated(ctx: OperationContext, why: string, fix: Notice['fix']): 
   ctx.emitNotice?.({ code: 'listing_truncated', kind: 'info', why, ...(fix ? { fix } : {}) });
 }
 
-/** get_chunks: meta, notice and local stderr for one page of chunks. */
+/** get_chunks: meta, notice and local stderr for one page of chunks; returns next_from_index when more chunks remain. */
 export function reportChunkPage(ctx: OperationContext, p: Record<string, unknown>, page: {
   fromIndex: number; limit: number; clampedFrom?: number; returned: number; totalChunks: number; maxChunkIndex: number | null;
-}): void {
+}): number | undefined {
   const more = page.maxChunkIndex !== null && page.maxChunkIndex >= page.fromIndex + page.limit;
   const next = more ? page.fromIndex + page.limit : undefined;
   ctx.emitResponseMeta?.('pagination', {
@@ -50,12 +54,12 @@ export function reportChunkPage(ctx: OperationContext, p: Record<string, unknown
     ...(page.clampedFrom !== undefined ? { clamped_from: page.clampedFrom } : {}),
     ...(next !== undefined ? { next_from_index: next } : {}),
   });
-  if (next === undefined) return;
+  if (next === undefined) return undefined;
   if (ctx.remote === false) {
     if (p.limit === undefined || p.limit === null) {
       console.error(`[get_chunks] output truncated at ${page.limit} chunks (default ${GET_CHUNKS_DEFAULT_LIMIT}) of ${page.totalChunks}. Pass --limit <n>, or continue with --from-index ${next}.`);
     }
-    return;
+    return next;
   }
   const clamp = page.clampedFrom !== undefined ? ` (limit ${page.clampedFrom} was capped at ${page.limit})` : '';
   emitTruncated(ctx, `The page has ${page.totalChunks} chunks; chunks from chunk_index ${page.fromIndex} below ${next} were returned${clamp}, so this list is not complete.`, {
@@ -63,6 +67,7 @@ export function reportChunkPage(ctx: OperationContext, p: Record<string, unknown
     consent: [], actor: 'agent', requires_exclusive: false,
     why: 'Fetches the next chunks; every other parameter stays the same. Keep paging until no listing_truncated notice comes back.',
   });
+  return next;
 }
 
 /** get_versions: meta, notice and local stderr when the limit cut the history. */

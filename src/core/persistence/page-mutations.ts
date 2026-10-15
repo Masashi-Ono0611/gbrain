@@ -20,6 +20,8 @@ import { assertPersistenceAccepting, estimatedRetryAfterMs, waiterOnlyOwner, onP
 import { parseWireWriteWaitMs } from './write-wait.ts';
 import { assertTimelineNotOmitted, isTimelineSection, timelineSectionOf, type TimelineSection } from './timeline-omission.ts';
 import { contentOriginTier } from '../trust/tier.ts';
+import { PAGE_MAX_BYTES } from '../page-size-policy.ts';
+import { contentSizeHold } from '../markdown.ts';
 import { throwIfHeld } from '../trust/gate-outcomes.ts';
 import { admitWrite, assertPageRequestIdentity, assertReplayIntent, getWriteRequest, intentDigest, type WriteAdmission } from './journal.ts';
 import { submissionAuthority, authorizeStoredRequest } from './authority.ts';
@@ -244,6 +246,15 @@ export async function preparePageAdmission(ctx: OperationContext,
   if (Object.hasOwn(input.params, 'fence_repair') && (input.operation !== 'put_page' || ctx.remote !== false || !parseFenceRepairReceipt(input.params.fence_repair))) {
     throw new OperationError('invalid_params', 'fence_repair is reserved for the trusted fence repair.',
       'Drop fence_repair and submit the page without it; gbrain repair fences records its own receipt on the brain host. To fix a malformed facts or takes fence, correct it in content (or write facts with remember and takes with takes_add); a held file is repaired by the brain host operator with gbrain repair fences, so ask the user to run it.');
+  }
+  // A body over the page ceiling can never be admitted: refuse it as a caller error before the journal
+  // reserves intent bytes, so an oversized write never reads as retryable queue_capacity.
+  const body = input.params.content;
+  const bodyBytes = (input.operation === 'put_page' || input.operation === 'capture') && typeof body === 'string' && body.length > PAGE_MAX_BYTES / 3
+    ? Buffer.byteLength(body, 'utf-8') : 0;
+  if (bodyBytes > PAGE_MAX_BYTES) {
+    throw new OperationError('request_too_large', contentSizeHold(bodyBytes, PAGE_MAX_BYTES)!.message,
+      `Nothing was admitted or written, and the same content is refused on every retry. Pages up to ${PAGE_MAX_BYTES} bytes are stored and searchable; send a smaller page.`);
   }
   const { page_batch: _forged, timeline_section: _section, ...params } = input.params;
   const p: Record<string, unknown> = { ...params, ...parseMutationPrecondition(params) };

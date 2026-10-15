@@ -59,9 +59,9 @@ export { parseLegacyTokenScope } from '../core/legacy-token-scope.ts';
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
 
-/** #6007: what an agent does after a 413: nothing was processed, so split the request. */
+/** #6007: what an agent does after a 413: nothing was processed; a batch goes smaller, a big page goes by file. */
 function oversizeSuggestion(bodyCap: number): string {
-  return `Nothing was processed. Send smaller requests: split put_pages into calls under ${bodyCap} bytes each (a new request_id per call). The host operator sets this limit with GBRAIN_HTTP_MAX_BODY_BYTES.`;
+  return `Nothing was processed: this transport reads at most ${bodyCap} bytes per request (GBRAIN_HTTP_MAX_BODY_BYTES on the brain host). Send put_pages as smaller batches, a new request_id per call. Do not split a page: one page over this limit goes by file instead, so ask the user to write it into the brain repository and run gbrain sync, or to run gbrain import <file> or gbrain put <slug> < file on the brain host.`;
 }
 
 function hashToken(token: string): string {

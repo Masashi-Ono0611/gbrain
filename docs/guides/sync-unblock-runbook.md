@@ -14,6 +14,7 @@ a page needs my decision."*
 ## The loop
 
 ```bash
+gbrain doctor --only serve_build_drift --json    # first: on a warning, restart serve and workers and stop here
 gbrain sync status --source <id> --json          # every N minutes (read-only)
 gbrain sync unblock --source <id> --apply --json # when committed_last_10m is 0 and needs_human is false
 gbrain sync <next.argv...>                       # the sync unblock (or status) names: the cursor's own options
@@ -22,6 +23,10 @@ gbrain sync <next.argv...>                       # the sync unblock (or status) 
 **Say to your agent:** *"Repair the files sync held and get the catch-up
 moving again; ask me only about the ones gbrain will not decide by itself."*
 
+0. Check the build. `serve_build_drift` warns when serve or a worker on this
+   host runs an older gbrain build than this checkout; restart them with the
+   command it prints before anything else, and stop until it reads ok
+   ([serve build drift](troubleshooting.md#serve-build-drift)).
 1. Read `status`. `cursor` is where the run stands (`index/total`, the
    `pinned_target` commit, `last_advance_at`); `committed_last_10m` is the
    signal that data is moving (a live process with a flat cursor is not

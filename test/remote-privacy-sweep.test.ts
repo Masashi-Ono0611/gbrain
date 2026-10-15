@@ -304,6 +304,7 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   list_jobs: 'ok', // base unused — per-shape override in EXPECTED_BY_SHAPE (above)
   quarantine_list: 'ok',
   run_doctor: 'ok',
+  get_brain_health: 'ok', // bands only: counts as ranges, no slugs or stored text
   get_ingest_log: 'ok',
   code_callers: 'error',
   code_callees: 'error',

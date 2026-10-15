@@ -1299,6 +1299,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'agent.max_output_tokens',
   // #4921: subagent per-turn chat timeout (minions/handler-timeouts.ts, default 30 min).
   'ai.chat.per_turn_timeout_ms',
+  'context.proactive_brief', // DB-plane, default off: wave 5 D5 brief (src/core/context/proactive-brief.ts)
   // File-plane bootstrap hook-lane keys (routed to ~/.gbrain/config.json by
   // `config set` — engine-free hook/push children read loadConfigFileOnly).
   'push.allow_unverified_remote',

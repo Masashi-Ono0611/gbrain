@@ -4,7 +4,8 @@ import { getCompanyBrainProfile } from '../../core/company-brain/profile.ts';
 import { slog, withSourcePrefix } from '../../core/console-prefix.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { msysToNativePath } from '../../core/path-confine.ts';
-import { syncFailureJsonFields, readManagedSyncFailures, managedSyncRetryCommand } from '../../core/persistence/sync-failures.ts';
+import { syncFailureJsonFields, readManagedSyncFailures } from '../../core/persistence/sync-failures.ts';
+import { formatManagedRetryAction, managedRetryActions } from '../../core/persistence/managed-retry-actions.ts';
 import { managedSyncCursorKey } from '../../core/persistence/sync-run.ts';
 import { syncHoldJsonFields } from '../../core/persistence/sync-holds.ts';
 import { printHoldNotes } from '../sync-diagnostics.ts';
@@ -24,7 +25,7 @@ import { composeAbortSignals } from '../../core/sync-reconcile.ts';
 import { acknowledgeFailures, unacknowledgedSyncFailures } from '../../core/sync.ts';
 import type { SyncResult, SyncOpts } from '../sync.ts';
 import { printSyncHelp, parseSyncFlags, parseSyncFanoutFlags } from './args.ts';
-import { implyManagedNoPull } from './managed-no-pull.ts';
+import { implyManagedNoPull, refuseManagedForbiddenFlags } from './managed-no-pull.ts';
 import { legacyLedgerRows } from '../../core/persistence/legacy-sync-failures.ts';
 import type { SyncFlags, SyncFanoutFlags } from './args.ts';
 import { manageGitignoreAtGitRoot } from './gitignore.ts';
@@ -105,6 +106,7 @@ export async function runSyncInner(engine: BrainEngine, args: string[]) {
   if (breakLock || forceBreakLock) return await runSyncBreakLock(engine, args, { syncAll, jsonOut, forceBreakLock, maxAgeSeconds });
 
   const fanout = parseSyncFanoutFlags(args, syncAll);
+  await refuseManagedForbiddenFlags(engine, flags, args);
 
   // --skip-failed: acknowledge pre-existing unacked failures BEFORE the sync
   // runs, not only ones the current run produces. Without this, the common
@@ -504,6 +506,8 @@ async function runSyncAll(
       repoPath: msysToNativePath(src.local_path!), // #2955: heal MSYS /c/... before joins
       dryRun, full, noPull,
       noEmbed: effectiveNoEmbed,
+      // #6696: a planned or cost-gate deferral (not the user's --no-embed) survives cursor adoption.
+      embedDeferred: effectiveNoEmbed && !noEmbed,
       noExtract,
       skipFailed, retryFailed, noSchemaPack, explicitProcessing,
       includeGitignored,
@@ -829,6 +833,8 @@ async function runSingleSourceSync(
       if (gate.stop) return;
       if (gate.autoDeferEmbeds) {
         opts.noEmbed = true;
+        // #6696: a runtime constraint, not an explicit flag: adopting an unfinished cursor's options must not lift it.
+        opts.embedDeferred = true;
         singleSourceAutoDefer = true;
       }
     }
@@ -847,8 +853,8 @@ async function runSingleSourceSync(
       const other = key ? managed.filter(f => f.cursor_key !== key) : [];
       failures = key ? managed.filter(f => f.cursor_key === key) : managed;
       if (other.length) {
-        slog(`${other.length} previously-failed file(s) of this source belong to a run with different sync options and are not retried by this invocation. Retry them with:`);
-        for (const command of new Set(other.map(f => managedSyncRetryCommand(f)))) slog(`  ${command}`);
+        slog(`${other.length} previously-failed file(s) of this source belong to a run with different sync options and are not retried by this invocation. Each, with the action that settles it:`);
+        for (const action of await managedRetryActions(engine, opts, other)) slog(`  ${formatManagedRetryAction(action)}`);
       }
     }
     const legacyRows = managedBrain ? legacyLedgerRows(sourceId).length : 0;

@@ -1,4 +1,5 @@
 import { pageMutationSource, submitPageMutation, validateMutationSlug } from '../persistence/page-mutations.ts';
+import { funnelPassThrough } from '../funnel.ts';
 import { suffixedSlugDryRun } from '../persistence/suffixed-slug.ts';
 import { AGENT_CONTENT_PARAMS, PAGE_MUTATION_PARAMS, CAPTURE_EVENT_PARAMS, CAPTURE_CLI_PROVENANCE_PARAMS, WRITE_WAIT_PARAM } from '../persistence/params.ts';
 import { assertPurgeParams } from '../persistence/purge-params.ts';
@@ -353,7 +354,7 @@ const put_page: Operation = {
       return { dry_run: true, action: 'put_page', slug: p.slug };
     }
     if (ctx.remote !== false && typeof p.slug === 'string') await assertLargePageAdmission(ctx.engine, p.slug, sourceId, p);
-    return submitPageMutation(ctx, { operation: 'put_page', params: p }).catch(error => rethrowNamingRevisionSource(ctx, sourceId, p, error));
+    return submitPageMutation(ctx, { operation: 'put_page', params: p }).then(funnelPassThrough('save')).catch(error => rethrowNamingRevisionSource(ctx, sourceId, p, error));
   },
   cliHints: { name: 'put', positional: ['slug'], stdin: 'content' },
 };

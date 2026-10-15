@@ -432,6 +432,16 @@ Reasons: `auto_chronicle_off`, `auto_chronicle_invalid`, `slug_bound_client`, `o
 
 More: [docs/guides/life-chronicle.md#skip-and-failure-codes](../../docs/guides/life-chronicle.md#skip-and-failure-codes)
 
+### chunkless_pages_healable
+
+<a id="chunkless_pages_healable"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Live pages have body text but no chunk rows, so search cannot read their body. | A page written without the chunking step (an enrichment stub, an interrupted write) has nothing for search to match; `gbrain embed --stale` chunks it first, which makes paid embedding calls. | List them with `gbrain pages unsearchable --state chunkless_healable --json`, then run `gbrain embed --stale --catch-up --yes` once embedding spend is approved. Run: gbrain pages unsearchable --state chunkless_healable --json | agent | `gbrain doctor --only embedding_state --json` | 1 | no |
+
+More: [docs/guides/troubleshooting.md#embedding-state](../../docs/guides/troubleshooting.md#embedding-state)
+
 ### claim_already_used
 
 <a id="claim_already_used"></a>
@@ -776,6 +786,16 @@ Reasons: `pending`, `timeout`, `error`.
 
 More: [docs/ENGINES.md#serve-deep-health](../../docs/ENGINES.md#serve-deep-health)
 
+### deleted_page_chunks_overdue
+
+<a id="deleted_page_chunks_overdue"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Chunks of pages soft-deleted longer than the purge window (72h) are still stored. | Search never reads them; the purge lifecycle (`gbrain pages purge-deleted`, the autopilot purge phase) hard-deletes such pages and their chunks. The purge is brain-wide and irreversible, so it needs the user. | Preview with `gbrain pages purge-deleted --dry-run --json`, then run `gbrain pages purge-deleted --yes` once the user agrees. Run: gbrain pages purge-deleted --dry-run --json | agent | `gbrain doctor --only embedding_state --json` | 1 | no |
+
+More: [docs/guides/troubleshooting.md#embedding-state](../../docs/guides/troubleshooting.md#embedding-state)
+
 ### delta_cursor_upgrade_required
 
 <a id="delta_cursor_upgrade_required"></a>
@@ -833,6 +853,16 @@ More: [docs/guides/ambient-recall.md#replay-after-a-degraded-wake](../../docs/gu
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Commit or stash canonical skill edits before optimization. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### doctor_tier_unavailable
+
+<a id="doctor_tier_unavailable"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The remote serve cannot answer this doctor tier or check for this client, so the thin client ran nothing. | A serve older than the doctor ops tier does not advertise run_doctor's tier and only parameters or get_brain_health, and a token without admin scope cannot call run_doctor; the thin client never falls back to the full report. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. Run: gbrain doctor --tier ops --json | host_admin | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/troubleshooting.md#doctor-ops-tier](../../docs/guides/troubleshooting.md#doctor-ops-tier)
 
 ### drain_stalled
 
@@ -921,6 +951,16 @@ More: [docs/guides/write-refusals.md#embedding_auth_failed](../../docs/guides/wr
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Embedding plane split. | A capability this request needs is not configured or not reachable on this brain. | A required capability is not available on this brain. Run `gbrain doctor --json` to see what is missing. | agent | `gbrain doctor --json` | 1 | no |
+
+### embedding_state_unknown
+
+<a id="embedding_state_unknown"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The ops tier could not count embedding state: the active embedding column has no covering partial index, and the ops tier never scans. | Without an index on `WHERE <active column> IS NULL`, counting vector-less chunks means a full table scan, which the bounded ops tier refuses. | Run the standard tier (`gbrain doctor --only embedding_state --json`) for exact counts. Run: gbrain doctor --only embedding_state --json | agent | `gbrain doctor --only embedding_state --json` | 1 | no |
+
+More: [docs/guides/troubleshooting.md#embedding-state](../../docs/guides/troubleshooting.md#embedding-state)
 
 ### embedding_storage_unavailable
 
@@ -1128,7 +1168,9 @@ More: [docs/guides/repair.md#file-removed-during-scan](../../docs/guides/repair.
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| The file is over the import size limit (5 MB for Markdown and code, 10 MiB for any sync read), so it was not imported. | Size limits bound parsing, chunking and embedding cost. The same bytes refuse on every retry. | Split the file into smaller files, or leave it out of the source (sync.exclude), then sync or import again. | agent | `repeat the read that failed` | 1 | no |
+| The file is over the page size limit (24 MiB for a Markdown page, 5 MB for a code file), so it was not imported. | Every page under the limit is stored, chunked and searchable whatever its size; the limit bounds what one page may hold in this release. The same bytes refuse on every retry. A smaller page refused by an MCP or HTTP transport is a different refusal. | Leave the file out of the source (sync.exclude), or, if it must be in the brain, split it into files under the limit; then sync or import again. Never split a page under the limit. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/write-refusals.md#file_too_large](../../docs/guides/write-refusals.md#file_too_large)
 
 ### fix_not_writable
 
@@ -1181,6 +1223,28 @@ More: [docs/guides/shared-brain-skills.md#approve-publication-following-and-edit
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The eval gate found retrieval regressions or correctness below its thresholds. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### ghost_mass_delete_refused
+
+<a id="ghost_mass_delete_refused"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| gbrain repair ghost-pages refused to soft-delete more than half of a source's file-backed pages; nothing was changed. | The sync mass-delete valve (#2828) applied to ghost pages: that many missing canonical files almost always means the checkout is the wrong path, unmounted or half-cloned, not that the files were deleted. | Check the source checkout on its owner host first. If removing these pages is genuinely intended, ask the user, then rerun the same apply command with GBRAIN_ALLOW_MASS_RECONCILE=1. Run: gbrain sources writer status --source '{source_id}' --json | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/repair.md#ghost-pages](../../docs/guides/repair.md#ghost-pages)
+
+### ghost_storage_unknown
+
+<a id="ghost_storage_unknown"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Ghost pages of a source cannot be classified because its canonical checkout cannot be read reliably; nothing was listed or changed. | A page is never reported or removed as a ghost while its file may only be unreadable: a missing or non-directory root (storage_unavailable), or a stat error, an invalid gbrain.yml or an inconclusive page check (ambiguous_storage), fails closed. | Inspect the source checkout on its owner host (writer status shows its root), fix it, then preview gbrain repair ghost-pages --source <id> again. Run: gbrain sources writer status --source '{source_id}' --json | agent | `gbrain doctor --json` | 1 | no |
+
+Reasons: `storage_unavailable`, `ambiguous_storage`.
+
+More: [docs/guides/repair.md#ghost-pages](../../docs/guides/repair.md#ghost-pages)
 
 ### git_branch_unborn
 
@@ -1788,7 +1852,7 @@ More: [docs/guides/open-loops.md#two-detectors](../../docs/guides/open-loops.md#
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| Managed maintenance stopped admitting requests because this writer's outstanding requests, reserved receipt bytes or permanent request ids would pass 80% of their limit; nothing more was submitted. | Each page of a maintenance run publishes as its own request under the local CLI writer the user's own CLI writes share. Stopping at 80% leaves room for those writes: reserved receipt bytes free only when receipts compact, request ids never. | Wait briefly, then retry the same request (writes: reuse the same request_id). Run: gbrain sources writer status --source '{source_id}' --json | agent | `repeat the read that failed` | 12 | yes |
+| Managed maintenance stopped admitting requests because this writer's outstanding requests, reserved receipt bytes or permanent request ids would pass 80% of their limit; nothing more was submitted. | Each page of a maintenance run publishes as its own request under the local CLI writer the user's own CLI writes share. Stopping at 80% leaves room for those writes: reserved receipt bytes free only when receipts compact, request ids never. | Wait briefly, then retry the same request (writes: reuse the same request_id). Run: gbrain sources writer status --source '{source_id}' --json | agent | `gbrain doctor --only persistence_capacity --json` | 12 | yes |
 
 More: [docs/guides/write-refusals.md#maintenance_backpressure](../../docs/guides/write-refusals.md#maintenance_backpressure)
 
@@ -1819,6 +1883,16 @@ More: [docs/guides/cron-schedule.md#dream-beside-autopilot](../../docs/guides/cr
 | The managed pull was skipped. | A temporary condition (a lock, a pending write, a rate limit); the same request can succeed later. | Wait briefly, then retry the same request (writes: reuse the same request_id). | agent | `repeat the read that failed` | 1 | yes |
 
 More: [docs/guides/write-refusals.md#managed_pull_skipped](../../docs/guides/write-refusals.md#managed_pull_skipped)
+
+### managed_sync_flag_refused
+
+<a id="managed_sync_flag_refused"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A managed source refuses --skip-failed and --include-gitignored: managed sync keeps every failed-receipt and ignored-file guard, so the run was refused before anything ran. | --skip-failed would acknowledge a failed receipt instead of retrying it, and --include-gitignored would import files Git ignores; neither has a managed meaning. `detail` names the flag. | Rerun the same gbrain sync command without the named flag; fix a failed file and retry it with --retry-failed, or commit an ignored file to sync it. Run: gbrain sources status --json | agent | `gbrain sources status --json` | 1 | no |
+
+More: [docs/guides/write-refusals.md#managed_sync_flag_refused](../../docs/guides/write-refusals.md#managed_sync_flag_refused)
 
 ### managed_sync_not_moving
 
@@ -1910,9 +1984,9 @@ Reasons: `orchestrator_failed`, `orchestrator_threw`, `ledger_write_failed`, `pr
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| Schema migrations are behind (or could not be confirmed at head), so the command did not report success. | apply-migrations reasons: not_applied: the run had no --yes (or --non-interactive), so it did not apply the schema migrations; the fix applies them with --yes. still_behind: an authorized run tried them and they did not apply; another --yes repeats the failure, so run `gbrain doctor --json` and report. schema_unreadable: the schema version could not be read back after the orchestrators ran, so the run cannot confirm it reached head; report it. Each failure names the schema migrations still pending. | not_applied: apply them with `gbrain apply-migrations --yes`. still_behind or schema_unreadable: run `gbrain doctor --json` and report it to the user; another --yes repeats the failure. | agent | `repeat the read that failed` | 1 | no |
+| Schema migrations are behind (or could not be confirmed at head), or an orchestrator migration is wedged, so the command did not report success. | apply-migrations reasons: not_applied: the run had no --yes (or --non-interactive), so it did not apply the schema migrations; the fix applies them with --yes. still_behind: an authorized run tried them and they did not apply; another --yes repeats the failure, so run `gbrain doctor --json` and report. schema_unreadable: the schema version could not be read back after the orchestrators ran, so the run cannot confirm it reached head; report it. wedged: an orchestrator migration ended partial three or more times in a row, so runs skip it until a person fixes the cause and clears it with --force-retry. Each failure names the migrations still pending. | not_applied: apply them with `gbrain apply-migrations --yes`. still_behind or schema_unreadable: run `gbrain doctor --json` and report it to the user; another --yes repeats the failure. wedged: ask the user, fix the cause in ~/.gbrain/upgrade-errors.jsonl, then `gbrain apply-migrations --force-retry <version>` and `gbrain apply-migrations --yes`. | agent | `repeat the read that failed` | 1 | no |
 
-Reasons: `not_applied`, `still_behind`, `schema_unreadable`.
+Reasons: `not_applied`, `still_behind`, `schema_unreadable`, `wedged`.
 
 ### migrations_running
 
@@ -2031,6 +2105,18 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The requested resource does not exist or is not visible to this caller. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### not_owner_host
+
+<a id="not_owner_host"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| This host does not own the source's active canonical worktree, so ghost pages (live pages whose canonical file is missing) cannot be checked or removed here; nothing was changed. | Whether a page's canonical file is missing is only known on the host that holds the source's checkout; another host would read its own disk. | Run gbrain repair ghost-pages --source <id> in a terminal on the source's canonical owner host (writer status names it). Run: gbrain sources writer status --source '{source_id}' --json | agent | `gbrain doctor --json` | 1 | no |
+
+Reasons: `not_owner_host`, `not_applicable`.
+
+More: [docs/guides/repair.md#ghost-pages](../../docs/guides/repair.md#ghost-pages)
 
 ### overlapping_path
 
@@ -2760,6 +2846,16 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 |---|---|---|---|---|---|---|
 | A search offset was over the 10,000 limit. | The request itself was wrong or no longer matches the brain; nothing was changed. | Page with match: "keyword" and the next object each response returns; a cursor has no depth limit. | agent | `repeat the read that failed` | 1 | no |
 
+### serve_build_drift
+
+<a id="serve_build_drift"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A live `serve` or resident worker on this host runs an older gbrain build than this checkout: its `persistence_consumers` heartbeat `version` is below this binary's VERSION. | Upgrading or pulling the checkout does not restart the processes already running from it, so one-shot commands from the checkout (`gbrain sync`, `bun run src/cli.ts`) run newer code against the older consumer until serve and its workers restart. A serve older than the heartbeat table writes no row; `consumers_without_heartbeat` names it. | Restart serve with the command the check prints (`systemctl --user restart gbrain-serve.service`, `launchctl kickstart -k gui/<uid>/com.gbrain.serve`, or stop the named pid and start it again), then restart each other listed worker; nothing restarts automatically. Run: gbrain sources writer status --json | agent | `gbrain doctor --only serve_build_drift --json` | 1 | no |
+
+More: [docs/guides/troubleshooting.md#serve-build-drift](../../docs/guides/troubleshooting.md#serve-build-drift)
+
 ### serve_port_in_use
 
 <a id="serve_port_in_use"></a>
@@ -2896,6 +2992,16 @@ More: [docs/guides/repair.md#setup-owner-conflict](../../docs/guides/repair.md#s
 
 More: [docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover](../../docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover)
 
+### slug_page_mismatch
+
+<a id="slug_page_mismatch"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Managed sync files a held file as a page whose slug the file does not carry as written, so removing its frontmatter `slug:` line would not clear the `frontmatter_slug_conflict` hold; nothing was written. | The content-repair lane judges a held file with the screen managed sync froze it with (#6696). Sync keys a file to the page that records it as its origin (or its path-derived slug) and accepts a `slug:` line only when it equals the path-derived slug or that page's slug as written. When the page's slug differs from the path-derived slug (an older import that honored the line, or a source in a subdirectory of its Git repository), or the line reaches the page only through an alias, neither removing the line nor keeping it imports the file, so the lane records `slug_page_mismatch` with both slugs instead of a generic `still_invalid`. | Make the slug: line of the held file name the page it is filed as exactly (the hold slug in gbrain sources status <id> --json), or move the file to the path that derives that slug; commit and run gbrain sync --source <id> --no-pull. gbrain repair content --source <id> --only <path> previews the current state read-only. Run: gbrain sources status '{source_id}' --json | agent | `gbrain sources status '{source_id}' --json` | 1 | no |
+
+More: [docs/guides/write-refusals.md#slug_page_mismatch](../../docs/guides/write-refusals.md#slug_page_mismatch)
+
 ### source_binding_required
 
 <a id="source_binding_required"></a>
@@ -2910,7 +3016,7 @@ More: [docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover](../../
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| The source changed during the operation; nothing was committed. | Covers a replaced, archived or re-bound source and a canonical file that differs from the page's database copy (detail file_database_drift). A page that records no file of its own reconciles against the file at its slug path only with gbrain sources reconcile <source> <slug> --preview --adopt-slug-path. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+| The source changed during the operation; nothing was committed. | Covers a replaced, archived or re-bound source and a canonical file that differs from the page's database copy (detail file_database_drift). A page that records no file of its own reconciles against the file at its slug path only with gbrain sources reconcile <source> <slug> --preview --adopt-slug-path. A canonical file that is gone while its page is live (reason canonical_file_missing, a ghost page) never clears by retrying or syncing: a person restores the file and syncs, or removes the page (docs/guides/write-refusals.md#canonical_file_missing). | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
 
 ### source_id_taken
 
@@ -3330,7 +3436,7 @@ More: [docs/guides/write-refusals.md#worktree_dirty](../../docs/guides/write-ref
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A background producer (maintenance, conversation facts, an autopilot phase or an autopilot catch-up sync) stopped admitting writes because a cumulative write cap is past `persistence.capacity.background_pause_pct` (default 80); interactive writes keep the rest. Nothing was submitted and no receipt was written. | Near a cumulative cap the remaining request ids and receipt bytes are kept for the user's own writes (remember, put_page, edit_page, operator sync, approved repair). Request ids are never freed, so past the line on ids only the brain host's config raise resumes background work; receipt bytes also free as receipts compact. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. Run: gbrain doctor --only persistence_capacity --json | agent | `gbrain doctor --json` | 12 | no |
+| A background producer (maintenance, conversation facts, an autopilot phase or an autopilot catch-up sync) stopped admitting writes because a cumulative write cap is past `persistence.capacity.background_pause_pct` (default 80); interactive writes keep the rest. Nothing was submitted and no receipt was written. | Near a cumulative cap the remaining request ids and receipt bytes are kept for the user's own writes (remember, put_page, edit_page, operator sync, approved repair). Request ids are never freed, so past the line on ids only the brain host's config raise resumes background work; receipt bytes also free as receipts compact. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. Run: gbrain doctor --only persistence_capacity --json | agent | `gbrain doctor --only persistence_capacity --json` | 12 | no |
 
 More: [docs/guides/write-refusals.md#write_capacity_backpressure](../../docs/guides/write-refusals.md#write_capacity_backpressure)
 
@@ -3340,7 +3446,7 @@ More: [docs/guides/write-refusals.md#write_capacity_backpressure](../../docs/gui
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A cumulative write cap is at or past 80% or runs out within `persistence.capacity.warn_days` (30) days at its 7-day rate; writes still work. | Request ids are permanent and receipt bytes free only as receipts compact, so the cap is raised before admission refuses. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. Run: gbrain doctor --only persistence_capacity --json | agent | `gbrain doctor --json` | 1 | no |
+| A cumulative write cap is at or past 80% or runs out within `persistence.capacity.warn_days` (30) days at its 7-day rate; writes still work. | Request ids are permanent and receipt bytes free only as receipts compact, so the cap is raised before admission refuses. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. Run: gbrain doctor --only persistence_capacity --json | agent | `gbrain doctor --only persistence_capacity --json` | 1 | no |
 
 More: [docs/guides/write-refusals.md#write_capacity_low](../../docs/guides/write-refusals.md#write_capacity_low)
 
@@ -3396,7 +3502,7 @@ More: [docs/guides/write-refusals.md#write_outcome_unknown](../../docs/guides/wr
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A cumulative write cap (permanent request ids or reserved receipt bytes, for the principal or the brain) is full, so the write was not admitted and nothing changed. | Request ids are permanent replay protection and a receipt keeps its bytes until it compacts, so waiting does not free the cap; the brain host raises it with gbrain config set (reversible). | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. Run: gbrain doctor --only persistence_capacity --json | agent | `gbrain doctor --json` | 12 | no |
+| A cumulative write cap (permanent request ids or reserved receipt bytes, for the principal or the brain) is full, so the write was not admitted and nothing changed. | Request ids are permanent replay protection and a receipt keeps its bytes until it compacts, so waiting does not free the cap; the brain host raises it with gbrain config set (reversible). | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. Run: gbrain doctor --only persistence_capacity --json | agent | `gbrain doctor --only persistence_capacity --json` | 12 | no |
 
 Reasons: `lifetime_ids`, `terminal_bytes`.
 
@@ -3408,7 +3514,7 @@ More: [docs/guides/write-refusals.md#write_quota_exhausted](../../docs/guides/wr
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A bulk run (managed sync catch-up, reclone or a repair) estimated more new receipts than the remaining write capacity allows before its producer's pause line, so it did not start; other writes still work. | Starting a run that the cap would stop part way leaves a long tail of pending pages; the preflight refuses up front with the config raise that covers the run. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. Run: gbrain doctor --only persistence_capacity --json | agent | `gbrain doctor --json` | 12 | no |
+| A bulk run (managed sync catch-up, reclone or a repair) estimated more new receipts than the remaining write capacity allows before its producer's pause line, so it did not start; other writes still work. | Starting a run that the cap would stop part way leaves a long tail of pending pages; the preflight refuses up front with the config raise that covers the run. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. Run: gbrain doctor --only persistence_capacity --json | agent | `gbrain doctor --only persistence_capacity --json` | 12 | no |
 
 Reasons: `lifetime_ids`, `terminal_bytes`.
 

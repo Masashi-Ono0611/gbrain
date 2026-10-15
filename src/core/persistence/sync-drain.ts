@@ -23,7 +23,7 @@ import { ERROR_CATALOGUE, type CatalogueName } from '../error-catalogue.ts';
 import { cliRenderContext, renderAction, type Action, type RenderedAction } from '../agent-output.ts';
 import { managedSyncResumeArgs, syncResumeCommand } from '../sync-reconcile.ts';
 import { isWriteCapacityWait, outstandingCapacityOf } from './admission-retry.ts';
-import { clearDrainStep, DrainPassAbandoned, markPassAbandoned, readDrainStep } from './drain-step.ts';
+import { clearDrainStep, DrainPassAbandoned, FINISH_BUDGET_MS, markPassAbandoned, readDrainStep } from './drain-step.ts';
 import { PUBLICATION_CEILING_DEFAULT_MS, readPublicationCeilingMs } from './publication-deadline.ts';
 import { isOwnerThisProcess, stampLastSql, WAITING_ON, type ClaimLastSql, type WaitingOn } from './claim-phase.ts';
 import { describeHostConsumer, headBlockedNext, headBlockerText, headClaimability, type HeadBlocker } from './head-blocker.ts';
@@ -326,6 +326,8 @@ export interface DrainInput {
   stallMs?: number;
   /** #6405/#6423 test seams: the in-pass no-progress window, the publication ceiling and how often the in-pass governor looks. */
   noProgressMs?: number;
+  /** #6696 C4: how long the tail after a committed checkpoint (drain step `finish`) may run before the governor stops it `no_progress`. */
+  finishMs?: number;
   publicationCeilingMs?: number;
   governMs?: number;
   /** Test seam: the drain's clock for commit times, stall windows and the governor's quiet time (its timers still tick on real time). */
@@ -409,6 +411,8 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
     if (event.phase === 'managed_sync.group' && typeof event.group === 'number') { groups++; groupedPages += event.group; largestGroup = Math.max(largestGroup, event.group); }
     if (event.phase === 'managed_sync.group_ahead') admittedAhead += typeof event.group === 'number' ? 1 : 0;
     if (event.phase === 'managed_sync.lanes' && event.lanes) lanes = { effective: event.lanes.effective, stepDown: event.lanes.stepDown, overlapped: event.lanes.overlapped, fallbacks: event.lanes.fallbacks };
+    // #6696 C4: the checkpoint commit is a commit; the tail after it is governed by its own budget.
+    if (event.phase === 'managed_sync.finish') { lastCommitAt = clock(); drops = 0; noteForwardProgress(); return; }
     if (event.phase !== 'managed_sync.page_committed') return;
     if (event.waived) waived++; else written++;
     lastCommitAt = clock(); drops = 0;
@@ -426,6 +430,7 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
   // the abandoned pass: its signal is aborted (the pass's step boundaries throw, so it admits and writes nothing more) and its
   // late result or rejection is dropped.
   const noProgressMs = input.noProgressMs ?? IN_PASS_NO_PROGRESS_MS, ceilingMs = input.publicationCeilingMs ?? PUBLICATION_CEILING_DEFAULT_MS;
+  const finishMs = input.finishMs ?? FINISH_BUDGET_MS + STALL_GRACE_MS;
   const governedPass = (): Promise<{ result: SyncResult } | { stall: DrainStall } | { deadline: true }> => {
     const controller = new AbortController(), passStartedAt = clock();
     const passSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
@@ -469,10 +474,11 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
           const print = read.ok ? head ? `${head.head_state}|${claim?.phase ?? ''}|${claim?.step ?? ''}|${claim?.lapsed ?? ''}` : 'none' : 'unreadable';
           if (print !== key) { key = print; keySince = now; }
           const elapsed = now - Math.max(keySince, lastCommitAt, passStartedAt);
-          if (quiet < noProgressMs || elapsed < noProgressMs && key !== 'none') return;
+          const finishing = step?.step === 'finish', windowMs = finishing ? finishMs : noProgressMs;
+          if (quiet < windowMs || elapsed < windowMs && key !== 'none') return;
           const sql = step?.last_sql ? { label: step.last_sql.label, age_ms: now - step.last_sql.at } : claim?.last_sql ?? null;
           stop({ ...base, stalled_seconds: Math.round(quiet / 1000), phase: claim?.phase ?? null, step: head ? claim?.step ?? null : step?.step ?? null,
-            waiting_on: claim?.waiting_on ?? null, cause: read.ok && !head ? 'no_admission' : claim?.lapsed ? 'owner_missing' : 'no_progress',
+            waiting_on: claim?.waiting_on ?? null, cause: read.ok && !head && !finishing ? 'no_admission' : claim?.lapsed ? 'owner_missing' : 'no_progress',
             owner_pid: claim?.owner_pid ?? null, owner_kind: claim?.owner_kind ?? null, owner_nonce: claim?.owner_nonce ?? null, last_sql: sql });
         }).finally(() => { probing = false; });
       }, governEvery);

@@ -5,7 +5,6 @@ import { chunkCodeText, detectCodeLanguage } from './chunkers/code.ts';
 import { sanitizeRemoteBody } from './remote-body.ts';
 import { credentialSafeProjection } from './credential-projection.ts';
 import { scanFencedBlocks, MAX_FENCES_PER_PAGE } from './fence-scan.ts';
-import { isEmbedSkipped } from './embed-skip.ts';
 import { isQuarantined } from './quarantine.ts';
 import { resolveMaxChunkTokens } from './embedding-input-limit.ts';
 import { estimateEmbedTokens } from './chunkers/token-estimate.ts';
@@ -167,8 +166,9 @@ export async function prepareMarkdownChunks(page: {
   timeline?: string;
   frontmatter?: Record<string, unknown> | null;
 }, maxChunkTokens?: number, overlay?: FenceChunkOverlay): Promise<ChunkInput[]> {
-  // Both dispositions intentionally have no live chunks, including code.
-  if (isEmbedSkipped(page.frontmatter) || isQuarantined(page.frontmatter)) return [];
+  // A quarantined page has no live chunks. An embed_skip page keeps its chunks (keyword search) and gets no vectors:
+  // every embedding path skips it (#6722), so a page under the ceiling never drops out of search for its size.
+  if (isQuarantined(page.frontmatter)) return [];
   return overlaidChunks(page, maxChunkTokens ?? resolveMaxChunkTokens(), overlay, extractFencedChunks);
 }
 

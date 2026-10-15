@@ -19,6 +19,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { opError, type OperationError } from '../ops/contract.ts';
 import type { SqlEngine } from './model.ts';
+import { CAPACITY_VERIFY } from './capacity-verify.ts';
 
 export type AdmissionOrigin = 'interactive' | 'background';
 export const ADMISSION_ORIGINS: readonly AdmissionOrigin[] = ['interactive', 'background'];
@@ -70,5 +71,5 @@ export function backgroundPaused(scopeKey: string, resource: 'lifetime_ids' | 't
       fix: { argv: ['gbrain', 'config', 'set', configKey, String(value)], consent: [], actor: 'host_admin', requires_exclusive: false,
         why: resource === 'lifetime_ids' ? 'Request ids are permanent, so only a larger cap moves the pause line; the raise is reversible.'
           : 'The raise moves the pause line at once and is reversible; compaction frees reserved bytes only as receipts age out of the retention window.',
-        verify: { argv: ['gbrain', 'doctor', '--only', 'persistence_capacity', '--json'] }, docs: 'docs/guides/concurrent-writes.md#quota-near-exhaustion' } });
+        verify: CAPACITY_VERIFY, docs: 'docs/guides/concurrent-writes.md#quota-near-exhaustion' } });
 }

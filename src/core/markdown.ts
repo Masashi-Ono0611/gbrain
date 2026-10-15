@@ -477,7 +477,7 @@ export interface ContentHold {
 export function contentSizeHold(byteLength: number, maxBytes: number, codeFile = false): ContentHold | null {
   if (byteLength <= maxBytes) return null;
   return { code: 'file_too_large', message: codeFile ? `Code file too large (${byteLength} bytes)`
-    : `Content too large (${byteLength} bytes, max ${maxBytes}). Split the content into smaller files or remove large embedded assets.` };
+    : `Content too large (${byteLength} bytes, max ${maxBytes}). Every page under that limit is stored and searchable; leave this file out of the source, or split it into files under the limit.` };
 }
 
 const HOLD_GUIDANCE: Record<InvalidFrontmatterReason, string> = {

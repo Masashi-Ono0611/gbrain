@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 236239,
-    "stdoutSha256": "9f6aab59c8b33e9f2318241460f39bafd43ad8aaeeafa2e88cea1bf9e808b2db",
+    "stdoutBytes": 237965,
+    "stdoutSha256": "b60d0f2305e16e2337858abac409a0a4d971dac5b014e0afb7ae4726083d774a",
     "toolNames": [
       "remember",
       "entity",
@@ -47,6 +47,7 @@
       "get_stats",
       "get_health",
       "run_doctor",
+      "get_brain_health",
       "get_versions",
       "revert_version",
       "get_brain_identity",
@@ -2431,11 +2432,44 @@
         "scope": "admin"
       },
       {
-        "description": "Run brain health checks and return a structured DoctorReport (thin-client doctor surface).",
+        "description": "Run brain health checks and return a structured DoctorReport (thin-client doctor surface). tier \"ops\": only the operational sections under a 4 s deadline; only: just the named checks.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
         "name": "run_doctor",
+        "parameters": {
+          "only": "array?",
+          "tier": "string?"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "only": {
+              "description": "Run just these checks (doctor check names, for example persistence_capacity).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "tier": {
+              "description": "ops: capacity, write failures, embedding state, sync movement, compaction, serve build and schema pack, under one 4 s deadline. Omit for the focused remote report.",
+              "enum": [
+                "ops"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "scope": "admin"
+      },
+      {
+        "description": "Brain health as bands for agents without admin scope: write capacity (ok, low or critical, with a days band) and counts of write failures, ghost pages and unsearchable chunks as bands, for the sources you can read. No slugs. Cached 60 s.",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "get_brain_health",
         "parameters": {},
         "required_scopes": [],
         "schema": {
@@ -2443,7 +2477,7 @@
           "required": [],
           "type": "object"
         },
-        "scope": "admin"
+        "scope": "read"
       },
       {
         "description": "Page version history, newest snapshot first: metadata only (id, snapshot_at, title, type, tags, frontmatter) for the newest 20 versions by default. Pass include_body: true for each version's compiled_truth and timeline, and a larger limit (at most 100 over MCP) for older versions. Trusted local and admin callers also get written_by and archived_by (who wrote each snapshot and whose write archived it). revert_version takes the id field.",
@@ -3488,7 +3522,7 @@
         "scope": "read"
       },
       {
-        "description": "Return a page's indexed content chunks (the units search ranks), in chunk_index order, 50 at a time by default. Use when debugging why search did or did not match a page. A large page has more chunks than one call returns: _meta.pagination carries total_chunks and next_from_index, and a listing_truncated notice names the next call (from_index). Needs read scope. On page_not_found: resolve the slug with resolve_slugs.",
+        "description": "Return a page's indexed content chunks (the units search ranks), in chunk_index order, 50 at a time by default. Use when debugging why search did or did not match a page. A large page has more chunks than one call returns: the last chunk of a cut list carries truncated: true and next_from_index, _meta.pagination carries total_chunks and next_from_index, and a listing_truncated notice names the next call (from_index). Needs read scope. On page_not_found: resolve the slug with resolve_slugs.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -6028,9 +6062,11 @@
         "name": "context_pack",
         "parameters": {
           "budget_tokens": "number?",
+          "counterparty": "string?",
           "entities": "string?",
           "include_private": "boolean?",
           "include_quarantined": "boolean?",
+          "intent": "string?",
           "min_trust": "string?",
           "session_id": "string?",
           "since": "string?"
@@ -6041,6 +6077,10 @@
             "budget_tokens": {
               "description": "Token budget; cards pack first.",
               "type": "number"
+            },
+            "counterparty": {
+              "description": "Person or company (name or slug): adds a pulled brief of dated items about them.",
+              "type": "string"
             },
             "entities": {
               "description": "Comma-separated names or slugs (max 8).",
@@ -6053,6 +6093,14 @@
             "include_quarantined": {
               "description": "Admin or memory_confirm: quarantined cards.",
               "type": "boolean"
+            },
+            "intent": {
+              "description": "With counterparty: the task the brief is for.",
+              "enum": [
+                "meeting",
+                "reply"
+              ],
+              "type": "string"
             },
             "min_trust": {
               "description": "Lowest trust tier to return (the connection floor still applies).",

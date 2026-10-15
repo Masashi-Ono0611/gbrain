@@ -1,4 +1,5 @@
 import { withAIAttribution } from '../ai/invocation-guard.ts';
+import { isEmbedSkipped } from '../embed-skip.ts';
 import { trueUpRequests } from './receipt-true-up.ts';
 import { randomUUID } from 'node:crypto';
 import { targetedWithdrawalEffect, upgradeWithdrawalEffect } from './effect-targets.ts';
@@ -44,6 +45,7 @@ import { selectEffectRecoveries } from './effect-recovery-scan.ts';
 import { nativeFileTarget } from './native-file-target.ts';
 import { sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { isLockOpenFailure } from './native-lock.ts';
+import { planPageEmbedding } from '../page-embedding-budget.ts';
 
 const effectStatusFix = (effect: Pick<PersistenceEffect, 'source_id'>): Action => readFix(
   `Shows source ${effect.source_id}'s canonical owner with its blocking, retrying and parked effects, read-only.`,
@@ -307,7 +309,16 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
   if (!signature) throw opError('embedding_unconfigured', 'Configure an embedding provider before explicitly retrying.',
     `Page ${snapshot.page.slug} in source ${effect.source_id} was saved but cannot be embedded: this brain has no embedding provider. Pages and keyword search keep working; check embedding readiness and ask the user before configuring a paid provider.`,
     { fix: embeddingsFix() });
-  const { prepared, pending } = await readEmbeddingEffectProjection(engine, effect, snapshot, opts.hostId, signature, opts.embedding?.model);
+  if (isEmbedSkipped(snapshot.page.frontmatter)) { await completeEffect(engine, effect, { embedding: 'skipped', reason: 'embed_skip' }); return; }
+  const projection = await readEmbeddingEffectProjection(engine, effect, snapshot, opts.hostId, signature, opts.embedding?.model);
+  const { prepared } = projection;
+  let pending = projection.pending;
+  // A large page is metered as a whole under embed.max_usd_per_page (page-embedding-budget.ts).
+  const decision = pending.length ? await planPageEmbedding(engine, prepared.snapshot.page, pending, { signature }) : { kind: 'unmetered' as const };
+  if (decision.kind === 'held') { await completeEffect(engine, effect, { embedding: 'skipped', reason: 'budget_held' }); return; }
+  const grant = decision.kind === 'grant' ? decision.grant : undefined;
+  if (grant) pending = pending.filter(chunk => grant.chunkIndexes.has(chunk.chunk_index));
+  if (grant && !pending.length) { await grant.settle({ ok: true }); await completeEffect(engine, effect, { embedding: 'skipped', reason: 'budget_capped' }); return; }
   if (pending.length) {
     await assertEmbeddingEffectEnabled(engine, config);
     if (effect.attempts - (effect.data.embedding_retry_base ?? effect.data.embedding_attempt_base ?? 0) > MAX_RATE_LIMIT_RETRIES) {
@@ -339,7 +350,9 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
         signal.throwIfAborted();
         await assertEmbeddingEffectEnabled(engine, config);
       }, () => (opts.embedding?.embed ?? embedBatch)(wrapChunkTextsForStoredMode(prepared.snapshot.page, pending), { abortSignal: signal, maxRetries: 0 }));
+      await grant?.settle({ ok: true });
     } catch (error) {
+      await grant?.settle({ ok: isEmbeddingZeroNormError(error) }).catch(() => {});
       if (!isEmbeddingZeroNormError(error) || error.vectors.length !== pending.length) throw error;
       refused = error;
       vectors = error.vectors;
@@ -363,9 +376,11 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
       await assertEmbeddingEffectEnabled(tx, config);
       signal.throwIfAborted();
       // A partially refused page keeps its signature unstamped so `gbrain embed --stale` finds the refused chunks.
-      const installed = await installPageEmbeddings(tx, prepared, pending.map((chunk, i) => ({ chunk_index: chunk.chunk_index,
+      // A partial install (the page changed under the provider call) keeps the vectors whose chunk and input
+      // still match and settles like a superseded one: the newer revision's own effect embeds the rest.
+      const installed = (await installPageEmbeddings(tx, prepared, pending.map((chunk, i) => ({ chunk_index: chunk.chunk_index,
         chunk_text: chunk.chunk_text, chunk_source: chunk.chunk_source, embedding: vectors[i] ?? undefined, model: opts.embedding?.model })),
-      refused ? undefined : signature);
+      refused || grant?.deferred ? undefined : signature)).complete;
       if (installed && refused) {
         // A refused chunk keeps no vector from an earlier convention, and the page reads as not fully embedded.
         const ids = refused.failures.map(f => pending[f.index]?.id).filter((id): id is number => id !== undefined);

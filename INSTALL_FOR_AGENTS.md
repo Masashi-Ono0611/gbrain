@@ -66,7 +66,9 @@ key ([Step 3](#step-3-create-the-brain)). On any other harness, `gbrain init --p
 > [#218](https://github.com/garrytan/gbrain/issues/218). Run `gbrain apply-migrations --yes --no-autopilot-install`
 > to recover. It exits 0 only when the schema is at head. Exit 1 with `migrations_pending` means the schema
 > is still behind: another `--yes` repeats the failure, so run `gbrain doctor --json`, tell the user what it
-> reports, and fall back to the deterministic install path:
+> reports, and fall back to the deterministic install path (exit 1 with reason `wedged` instead means one migration
+> failed three or more times in a row: relay its `fix` to the user, who fixes the cause and clears it with
+> `gbrain apply-migrations --force-retry <version>`; reinstalling does not help):
 >
 > ```bash
 > git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain

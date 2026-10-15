@@ -24,6 +24,7 @@ import { catalogueError } from '../error-catalogue.ts';
 import { ACTIVE_REFRESH_STATES_SQL, refreshFenceClear } from './worktree-refresh-schema.ts';
 import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertGraduationAdmission } from './graduation-custody.ts';
+import { CAPACITY_VERIFY } from './capacity-verify.ts';
 import {
   isTerminal, principalKey, requestPrincipal, recoveryFiles,
   type JournalLimits, type Principal, type RecoveryRecord, type RequestState,
@@ -118,7 +119,7 @@ export function quotaExhausted(resource: string, key: string, value: number, use
       fix: { argv: ['gbrain', 'config', 'set', key, String(value)], consent: [], actor: 'host_admin', requires_exclusive: false,
         why: reason === 'lifetime_ids' ? 'Request ids are permanent, so only a larger cap admits more writes; the raise is reversible.'
           : 'The raise unblocks writes at once and is reversible; compaction frees reserved bytes only over time.',
-        verify: { argv: ['gbrain', 'doctor', '--only', 'persistence_capacity', '--json'] }, docs: 'docs/guides/concurrent-writes.md#quota-near-exhaustion' } });
+        verify: CAPACITY_VERIFY, docs: 'docs/guides/concurrent-writes.md#quota-near-exhaustion' } });
 }
 /**
  * Up-front refusal for a backfill that will admit `needed` new requests: when
@@ -160,7 +161,7 @@ export async function assertWriteHeadroom(engine: SqlEngine, principal: Principa
         `Nothing was started and other writes still work. Run on the brain host: gbrain config set ${configKey} ${value} (undo with gbrain config unset ${configKey}), then rerun the same command.`,
         { reason: resource, detail: configKey.slice('persistence.limits.'.length), docs: 'docs/guides/write-refusals.md#write_quota_insufficient',
           fix: { argv: ['gbrain', 'config', 'set', configKey, String(value)], consent: [], actor: 'host_admin', requires_exclusive: false,
-            why: 'Covers this run and about one more year at the current rate; reversible.', verify: { argv: ['gbrain', 'doctor', '--only', 'persistence_capacity', '--json'] } } });
+            why: 'Covers this run and about one more year at the current rate; reversible.', verify: CAPACITY_VERIFY } });
     }
   }
 }

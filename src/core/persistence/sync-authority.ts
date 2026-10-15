@@ -40,6 +40,10 @@ export const SYNC_PROCESSING_KEYS = ['noEmbed', 'noExtract', 'noSchemaPack'] as 
 export function explicitSyncProcessing(values: Record<string, unknown>): Array<keyof SyncProcessingOptions> {
   return SYNC_PROCESSING_KEYS.filter(key => typeof values[key] === 'boolean');
 }
+/** #6696: the processing flags a payload without an explicit list set: an older client sends true for each one typed, nothing for the rest. */
+export function typedSyncProcessing(values: Partial<Record<keyof SyncProcessingOptions, unknown>>): Array<keyof SyncProcessingOptions> {
+  return SYNC_PROCESSING_KEYS.filter(key => values[key] === true);
+}
 export function assertSyncDispatchActive(): void {
   assertSourceFilesystemActive(true);
   throwIfAborted(currentJobSignal());

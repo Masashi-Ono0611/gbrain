@@ -16,6 +16,7 @@ import type { Notice } from '../agent-output.ts';
 import { principalKey, type Principal, type SqlEngine } from './model.ts';
 import { BACKGROUND_PRODUCERS, readBackgroundPauseShare } from './admission-origin.ts';
 import { readCapacityForecast } from './capacity-forecast.ts';
+import { CAPACITY_VERIFY } from './capacity-verify.ts';
 
 export const CAPACITY_SNAPSHOT_TTL_MS = 60_000;
 export const CAPACITY_NOTICE_INTERVAL_MS = 60 * 60_000;
@@ -57,7 +58,7 @@ export function cachedCapacitySnapshot(engine: SqlEngine, now: number = Date.now
 const key = (row: CapacityAttention) => `${row.scope}|${row.resource}`;
 const describe = (row: CapacityAttention) => `${row.scope} ${row.resource} ${row.used}/${row.limit} (${row.pct}%`
   + `${row.days_to_exhaustion !== null ? `, about ${row.days_to_exhaustion} day(s) left` : ''})`;
-const VERIFY = { argv: ['gbrain', 'doctor', '--only', 'persistence_capacity', '--json'] };
+const VERIFY = CAPACITY_VERIFY;
 
 function lowNotice(rows: CapacityAttention[]): Notice {
   const [first] = rows;

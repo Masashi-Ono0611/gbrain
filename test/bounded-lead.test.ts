@@ -33,6 +33,7 @@ import { extractCandidates } from '../src/core/context/entity-salience.ts';
 import { lookupEntityNames, pageLead } from '../src/core/verbs/entity-names.ts';
 import { runGather } from '../src/core/think/gather.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
+import { cpuMs } from './helpers/cpu-time.ts';
 
 const SENTINEL = 'PRIVATE-TAKE-SENTINEL';
 const FACTS = renderFactsTable([
@@ -78,6 +79,13 @@ function oldPageLead(body: string): string {
 function bestMs(fn: () => unknown): number {
   let best = Infinity;
   for (let i = 0; i < 3; i++) { const t = performance.now(); fn(); best = Math.min(best, performance.now() - t); }
+  return best;
+}
+
+/** Best of three runs, in ms of process CPU time: it measures the work rather than how long the scheduler made it wait. */
+function bestCpuMs(fn: () => unknown): number {
+  let best = Infinity;
+  for (let i = 0; i < 3; i++) best = Math.min(best, cpuMs(fn));
   return best;
 }
 
@@ -228,8 +236,9 @@ describe('bounded work on a 4 MB page', () => {
     const body = await pageBody('people/erin-example');
     const row = { slug: 'people/erin-example', source_id: 'default', title: 'Erin Example', type: 'person', frontmatter: null, compiled_truth: body };
     const whole = bestMs(() => sanitizeRemoteBody(body));
-    expect(bestMs(() => safeSynopsis(row))).toBeLessThan(whole / 4);
-    expect(bestMs(() => pageLead(body))).toBeLessThan(whole / 4);
+    const wholeCpu = bestCpuMs(() => sanitizeRemoteBody(body));
+    expect(bestCpuMs(() => safeSynopsis(row))).toBeLessThan(wholeCpu / 4);
+    expect(bestCpuMs(() => pageLead(body))).toBeLessThan(wholeCpu / 4);
     expect(pageLead(body).length).toBeLessThanOrEqual(200);
     let lead = '';
     let best = Infinity;

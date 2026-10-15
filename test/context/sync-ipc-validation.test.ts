@@ -136,6 +136,7 @@ describe('validateDelegatedSyncOptions', () => {
     // that drift loud.
     expect(Object.keys(DELEGATED_SYNC_OPTION_FIELDS).sort()).toEqual([
       'dryRun',
+      'embedDeferred',
       'explicitProcessing',
       'full',
       'includeGitignored',

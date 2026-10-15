@@ -75,7 +75,7 @@ for (const kind of testBackends()) {
       await installPageProjection(engine, prepared, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: `Body of ${slug}` }], { seal: true });
       if (embedded) {
         const sealed = (await readProjectionSnapshot(engine, slug, sourceId))!;
-        expect(await installPageEmbeddings(engine, sealed, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: `Body of ${slug}`, embedding: vector(), model }], signature)).toBe(true);
+        expect((await installPageEmbeddings(engine, sealed, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: `Body of ${slug}`, embedding: vector(), model }], signature)).complete).toBe(true);
       }
       // Only embedding effects are due; Git and other effects of these writes wait.
       await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now()+interval '1 hour' WHERE kind<>'embedding'");
@@ -215,7 +215,7 @@ for (const kind of testBackends()) {
       expect(opened).toBe(0);
       // A stale effect that becomes a no-op behind the cursor is the runner's; a new no-op past it settles here.
       const sealed = (await readProjectionSnapshot(engine, stale[0]!.slug, stale[0]!.sourceId))!;
-      expect(await installPageEmbeddings(engine, sealed, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: `Body of ${stale[0]!.slug}`, embedding: vector(), model }], signature)).toBe(true);
+      expect((await installPageEmbeddings(engine, sealed, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: `Body of ${stale[0]!.slug}`, embedding: vector(), model }], signature)).complete).toBe(true);
       const fresh = await page('cursor/fresh', true);
       await engine.executeRaw('UPDATE persistence_effects SET next_attempt_at=now() WHERE id=ANY($1::text[]::bigint[])', [[stale[0]!.effectId, fresh.effectId]]);
       expect(await settleNoopEmbeddingEffects(engine, localHostId(), signature, second.cursor)).toMatchObject({ settled: 1, done: true });

@@ -37,7 +37,7 @@ import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
 import { repairAdmissionWindow, repairPublicationOwner, settleRepairReceipts, type PendingRepair } from './settle.ts';
 import { RECEIPT_RESERVATION_FLOOR } from '../persistence/receipt-bytes.ts';
 
-export const REPAIR_KINDS = ['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'google-file-modes', 'stale-atoms', 'extractor-facts', 'conversation-labels', 'captured-facts', 'loop-facts', 'ontology-facts', 'orphan-children', 'failed-writes', 'frontmatter', 'fences', 'slug-conflicts', 'timeline-comments', 'managed-sync-orphans', 'frontmatter-keys', 'file-drift', 'stuck-recovery', 'receipt-compaction'] as const;
+export const REPAIR_KINDS = ['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'google-file-modes', 'stale-atoms', 'extractor-facts', 'conversation-labels', 'captured-facts', 'loop-facts', 'ontology-facts', 'orphan-children', 'failed-writes', 'frontmatter', 'fences', 'slug-conflicts', 'timeline-comments', 'managed-sync-orphans', 'frontmatter-keys', 'file-drift', 'stuck-recovery', 'ghost-pages', 'receipt-compaction'] as const;
 export type RepairKind = typeof REPAIR_KINDS[number];
 
 export interface RepairScope { brain_id: string; source_ids: string[] }
@@ -215,8 +215,8 @@ async function writeCursor(engine: BrainEngine, kind: RepairKind, scope: RepairS
   [fingerprint(kind, scope, approval), JSON.stringify([{ kind, scope, cursor, run_id: runId }])]);
 }
 
-/** Cumulative journal counters this repair's admissions consume, with their 90% stop line. */
-async function capacity(ctx: OperationContext) {
+/** Cumulative journal counters this repair's admissions consume, with their 90% stop line (also the keep_db policy's headroom gate). */
+export async function capacity(ctx: OperationContext) {
   // A dry run never registers a writer; an unregistered installation has consumed nothing yet.
   const principal = await requestPrincipalForContext(ctx).then(principalKey, () => 'principal:unregistered');
   const limits = await readJournalLimits(ctx.engine);
