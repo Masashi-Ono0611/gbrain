@@ -10,6 +10,14 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.244.0] - 2026-10-15
+
+### Fixed
+
+- Managed dream synthesis can resume retained outputs whose tool input used uppercase letters in a page slug. Postprocessing follows the canonical slug in the committed write receipt while still rejecting mismatched sources, incarnations, revisions and unfinished writes; chunk suffixes and completed outputs stay unchanged on replay.
+
+**To take advantage of v0.60.244.0:** run `gbrain upgrade`. The next ordinary dream cycle retries any synthesis postprocessing that stopped on this slug mismatch; no manual page rewrite is needed.
+
 ## [0.60.243.0] - 2026-10-15
 
 **Entity rows now point at the records behind an account.** Every found `entity names` row (and each identity sibling) carries `referenced_by_count` and a `next` to its full card, so an agent that resolved a batch of names knows which ones have pages to read and how to open them. With `entity.record_types` set (off by default), the rows, the full card and `context_pack` also list the referring contracts, amendments or other record types you enroll: newest page date first, each with its page date labeled as a page date, its `status`, the record it amends (with the terms-start date when the link records one) and what it replaces, bounded per page and per call, with continuations that return exactly the rest. The order never claims which record governs. A late or failed read is marked `references_unavailable` with a degraded notice, never shown as an empty list.
