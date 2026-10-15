@@ -245,6 +245,7 @@ import { v241 } from './v241-persistence-request-slug-intent-index.ts';
 import { v242 } from './v242-extract-atoms-partial-input.ts';
 import { v243 } from './v243-persistence-consumer-process-start.ts';
 import { v244 } from './v244-chunk-projected-spans.ts';
+import { v245 } from './v245-page-search-vector-bounded-timeline.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -488,4 +489,5 @@ export const MIGRATIONS: Migration[] = [
   v242,
   v243,
   v244,
+  v245,
 ];

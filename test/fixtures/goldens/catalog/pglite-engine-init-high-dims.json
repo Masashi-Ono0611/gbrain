@@ -466,7 +466,7 @@
       "gbrain_stamp_version_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=1b28a0e5769198d86490dc20b2aee80b7e6595670428a63ac9c6825cd2a35b10",
       "gbrain_stamp_write_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=50e9b0e5bf37eeae6555dd16c8104cb0807be6c05a79e0c82237d45162c21dc2",
       "update_chunk_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=b870de46705a62891bb318ecdeca1d0d5ea1f8da9a9a79c4cec6569e515dbdeb",
-      "update_page_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=f255236df404045eebb7bc67cda1339c5be26cf508a95bca2595c8ee8f064784"
+      "update_page_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=a2a8cb721548b59c270080ad486950ea523bb6331ab085e0d543e243f2999360"
     },
     "grants": {
       "access_tokens": [

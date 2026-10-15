@@ -1156,10 +1156,10 @@ export interface BrainEngine {
    * doc_comment + symbol_name_qualified + chunk_text), so a page whose
    * title tokens are absent from its body is unreachable by searchKeyword.
    * This arm queries the PAGE-GRAIN DOCUMENT vector pages.search_vector —
-   * NOT titles alone: per trg_pages_search_vector it is title (weight 'A')
-   * + compiled_truth ('B') + timeline text ('C'). Ranked by ts_rank_cd,
-   * the 'A'-weighted title dominates, but body/timeline matches also
-   * produce (lower-ranked) candidates. Returns page-grain hits joined to
+   * NOT titles alone: per pageSearchVectorSql it is title ('A') + the
+   * first 65,536 chars of the sanitized timeline ('C'); no compiled_truth
+   * since v124. Ranked by ts_rank_cd, the 'A' title dominates, but
+   * timeline matches also produce (lower-ranked) candidates. Returns page-grain hits joined to
    * ONE representative chunk per page (compiled_truth preferred, else
    * lowest chunk_index) so rows are shaped like searchKeyword's output and
    * can enter RRF fusion in hybridSearch.

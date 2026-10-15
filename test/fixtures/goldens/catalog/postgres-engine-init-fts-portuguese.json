@@ -470,7 +470,7 @@
       "gbrain_stamp_write_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=50e9b0e5bf37eeae6555dd16c8104cb0807be6c05a79e0c82237d45162c21dc2",
       "notify_minion_job_change()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=17f7c36408688409c80befd0a9ef9314e597d78a195418d1b94426e3d0b662f8",
       "update_chunk_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=3ffbe1c80104ca23fb2581cfdb67541b31769cc5af9dcd1c8b84f8c3844275f4",
-      "update_page_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=e288cf3fefe11b32f9f006424f4a1b3b07b56d5fd5c3d1cd37ff1ce8658e1666"
+      "update_page_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=991bcae3f032fbda5fabdb1276d77e51d324ce062c1785d966de6ecc92747335"
     },
     "grants": {
       "access_tokens": [

@@ -12,11 +12,14 @@ identifiers and attribution are available in the pre-removal Git revision
 
 ## [0.60.236.0] - 2026-10-15
 
-### Fixed
+**Large pages no longer crash or stall edit_page, parsing, chunking or code indexing, and a long timeline no longer fails the page write (large pages Wave A, crash fixes).** Several steps did work that grew with the square of the page size. On a 1.79 MB chat page (about 30,000 lines), `edit_page`'s receipt diff built a full line-by-line table and ran the process out of memory. Splitting a page that uses `---` separators took 54 s at 4 MB. Chunking newline-free text took 155 s at 10 MB. The code edge extractor took over 200 s on a 10 MB source file. Separately, the page keyword vector indexed the whole timeline, so roughly 1 MB of varied timeline text overflowed Postgres's 1 MB `tsvector` limit and aborted the write. All of these now run in linear time and bounded memory. Every fix produces byte-identical output, proven by differential tests against the old code, except the two bounded behaviors below.
 
-- Managed dream synthesis can resume retained outputs whose tool input used uppercase letters in a page slug. Postprocessing follows the canonical slug in the committed write receipt while still rejecting mismatched sources, incarnations, revisions and unfinished writes; chunk suffixes and completed outputs stay unchanged on replay.
+### Itemized changes
 
-**To take advantage of v0.60.236.0:** run `gbrain upgrade`. The next ordinary dream cycle retries any synthesis postprocessing that stopped on this slug mismatch; no manual page rewrite is needed.
+- **edit_page receipt diff** (`src/core/persistence/page-edit.ts`, `src/core/skillpack/diff-text.ts`): the diff trims common leading and trailing lines and keeps the line table under 4 million cells. Past that it emits one coarse hunk marked `diff_coarse: true`. `unifiedDiff` output is unchanged for every other caller. Tested on a 50,000-line page under a 3 GB memory cap.
+- **Timeline split** (`src/core/markdown.ts`): the check for content above a `---` or `## Timeline` line is O(1) per line instead of re-joining every line above it. Output is byte-identical, so `content_hash` is unchanged.
+- **Chunker and edge extractor** (`src/core/chunkers/recursive.ts`, `src/core/chunkers/edge-extractor.ts`): `splitAtDelimiters` is covered by a differential test and a scan-count probe. The edge extractor resolves receivers through a lazy per-file binding index and locates chunks by binary search, and emits identical edges.
+- **Bounded page keyword vector** (migration v245, `src/schema.sql`, `src/core/fts-language.ts`): the title arm indexes the first 65,536 characters of the timeline and the first 32,768 characters of timeline entries. The densest worst-case page stays under the 1 MB limit on both engines. The upgrade rebuilds pages with long timelines once.
 
 ## [0.60.235.0] - 2026-10-14
 

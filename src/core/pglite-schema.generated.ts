@@ -637,15 +637,15 @@ CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET searc
 DECLARE
   timeline_text TEXT;
 BEGIN
-  SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
+  SELECT coalesce(string_agg(summary || ' ' || detail, ' ' ORDER BY id), '')
   INTO timeline_text
   FROM timeline_entries
   WHERE page_id = NEW.id;
 
   NEW.search_vector :=
     setweight(to_tsvector('english', gbrain_fts_input(coalesce(NEW.title, ''))), 'A') ||
-    setweight(to_tsvector('english', gbrain_fts_input(coalesce(NEW.timeline, ''))), 'C') ||
-    setweight(to_tsvector('english', gbrain_fts_input(coalesce(timeline_text, ''))), 'C');
+    setweight(to_tsvector('english', gbrain_fts_input(left(coalesce(NEW.timeline, ''), 65536))), 'C') ||
+    setweight(to_tsvector('english', gbrain_fts_input(left(coalesce(timeline_text, ''), 32768))), 'C');
 
   RETURN NEW;
 END;

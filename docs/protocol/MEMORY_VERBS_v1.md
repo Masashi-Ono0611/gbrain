@@ -765,6 +765,9 @@ semantics: removing a materialized timeline bullet removes its timeline row.
 
 Success returns the committed receipt with the new `revision` and `diff`, a
 unified diff of your view capped at 8 KB (`diff_truncated: true` when cut).
+On a large page only the changed region is diffed; when that region is over
+4 million old-by-new line pairs the diff is one hunk replacing it whole and
+the receipt says `diff_coarse: true`.
 Refusals name the edit and never include protected text:
 
 | Error | `detail` | Fix |

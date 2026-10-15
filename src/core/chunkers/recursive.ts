@@ -361,8 +361,10 @@ function recursiveSplit(text: string, level: number, target: number, base: numbe
  * of the piece that precedes them (lossless). Each delimiter's next
  * occurrence is searched once and reused until the cursor passes it, so the
  * scan is linear in the text.
+ *
+ * @internal exported for the differential test.
  */
-function splitAtDelimiters(text: string, delimiters: string[], base: number): Piece[] {
+export function splitAtDelimiters(text: string, delimiters: string[], base: number): Array<{ text: string; s: number }> {
   const pieces: Piece[] = [];
   const next = delimiters.map(() => -2);
   let pos = 0;
