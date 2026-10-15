@@ -10,6 +10,35 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.244.0] - 2026-10-15
+
+**Facts can recognize a registered name even when you write it in lowercase.** A note such as "atlascode ships weekly" can now find the entity whose aliases include that name. The name must match an existing alias in the same source. Common words, competing registered names and partial names still leave the fact unattributed.
+
+Japanese model-assisted relinking also accepts a name immediately followed by an independent は or が when the rest of the sentence is a supported simple verb phrase. For example, an existing entity named 架空会社 can be verified in "架空会社は更新した". Longer names containing the same characters are not treated as that shorter name.
+
+### How to use it
+
+Preview the free repair tiers with `gbrain facts relink --dry-run --no-llm`. Register the intended lowercase name as an alias on its entity page before rerunning. Japanese sentence validation applies only when the model tier is enabled; the model must still quote the fact and resolve to an existing entity.
+
+| Fact text | Result when the matching alias exists |
+| --- | --- |
+| `atlascode ships weekly` | Unique eligible entity can be linked |
+| `atlascode copied Northstar Example` | Competing strong name blocks attribution |
+| `架空会社は更新した` | Supported model quotation can be verified |
+| A longer name beginning with the same characters | Shorter-name quotation is rejected |
+
+### Things to watch
+
+This is a narrow recognition repair. It does not discover arbitrary lowercase names, distinguish every dictionary meaning, or parse every Japanese sentence. Unsupported particles, conjugations and trailing clauses remain unverified. Explicit entity selection remains the reliable choice when the subject is ambiguous. There is no schema migration or automatic backlog rewrite.
+
+### Itemized changes
+
+### Fixed
+
+- Admit whole Latin weak names through unique, live, source-scoped entity aliases while retaining visibility and competing-name checks.
+- Share the existing eight-word ambiguous-name list with mention linking without changing that pass's behavior.
+- Verify independently segmented Japanese は/が boundaries only before a complete supported simple predicate; combining marks and astral letters remain part of adjacent names.
+
 ## [0.60.243.0] - 2026-10-15
 
 **Entity rows now point at the records behind an account.** Every found `entity names` row (and each identity sibling) carries `referenced_by_count` and a `next` to its full card, so an agent that resolved a batch of names knows which ones have pages to read and how to open them. With `entity.record_types` set (off by default), the rows, the full card and `context_pack` also list the referring contracts, amendments or other record types you enroll: newest page date first, each with its page date labeled as a page date, its `status`, the record it amends (with the terms-start date when the link records one) and what it replaces, bounded per page and per call, with continuations that return exactly the rest. The order never claims which record governs. A late or failed read is marked `references_unavailable` with a degraded notice, never shown as an empty list.
