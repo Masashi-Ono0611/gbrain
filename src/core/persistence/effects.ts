@@ -1,4 +1,5 @@
 import { withAIAttribution } from '../ai/invocation-guard.ts';
+import { trueUpRequests } from './receipt-true-up.ts';
 import { randomUUID } from 'node:crypto';
 import { targetedWithdrawalEffect, upgradeWithdrawalEffect } from './effect-targets.ts';
 import { existsSync, statSync } from 'node:fs';
@@ -465,7 +466,7 @@ async function recordFailure(engine: BrainEngine, effect: PersistenceEffect, err
 /** Waits that say nothing about the target never count toward parking. */
 const CONTENTION_CODES = ['projection_pending', 'revision_conflict', 'writer_busy', 'writer_pool_capacity', 'git_index_locked'];
 // #6305: writer_lock_unavailable is this process failing to open the lock file, not the effect failing; it never parks the effect.
-const DEPENDENCY_CODES = ['recovery_required', 'owner_unavailable', 'write_claim_lost', 'queue_capacity', 'writer_lock_unavailable'];
+const DEPENDENCY_CODES = ['recovery_required', 'owner_unavailable', 'write_claim_lost', 'queue_capacity', 'write_quota_exhausted', 'write_capacity_backpressure', 'writer_lock_unavailable'];
 
 /**
  * A scan sets its failing target aside and moves on; a single-target effect,
@@ -493,6 +494,13 @@ const GIT_YIELD_MS = 250;
  * Resolves with the number of effects attempted, so a caller can keep draining.
  */
 export async function runPersistenceEffects(engine: BrainEngine, config: GBrainConfig, opts: EffectWorkerOptions): Promise<number> {
+  // #6696 (A1): every request whose effect this pass claimed is trued up after the pass, outside the settling transactions.
+  const touched = new Set<string>();
+  try { return await runEffectPass(engine, config, opts, touched); }
+  finally { await trueUpRequests(engine, touched).catch(() => { /* idempotent; the next settlement of the request retries it */ }); }
+}
+
+async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: EffectWorkerOptions, touched: Set<string>): Promise<number> {
   const limit = Math.max(1, Math.min(opts.limit ?? 2, 20));
   const recoveries = await selectEffectRecoveries(engine, opts.hostId, limit);
   let attempted = 0;
@@ -508,7 +516,7 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
       // can provide that proof and no second process can steal this claim now.
       [claimed] = await engine.executeRaw<PersistenceEffect>(`UPDATE persistence_effects SET state='running',execution_token=$2::uuid,
         claim_expires_at=now()+interval '2 minutes',attempts=attempts+1,updated_at=now() WHERE id=$1 AND recovery IS NOT NULL AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING *`, [recovery.id, randomUUID()]);
-      if (claimed) { attempted++; await recoverEffectPublication(engine, claimed, opts.hostId, opts); }
+      if (claimed) { attempted++; touched.add(claimed.request_id); await recoverEffectPublication(engine, claimed, opts.hostId, opts); }
     } catch (error) { if (claimed) await recordFailure(engine, claimed, error); }
     finally { await lock.release(); }
   }
@@ -679,6 +687,7 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
       const effect = await claimPersistenceEffect(engine, opts.hostId);
       if (!effect) break;
       attempted++;
+      touched.add(effect.request_id);
       let binding: WorktreeBinding | null = null;
       try {
         if (effect.worktree_id && !['embedding', 'facts-backstop', 'links'].includes(effect.kind)) binding = await getWorktreeBinding(engine, effect.source_id, opts.hostId);
@@ -689,6 +698,7 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
         if (!probes.has(root)) probes.set(root, gitDurabilityPolicy(binding, root).then(policy => ({ durable: policy.durable }), error => ({ error })));
         const group = singleFileGitEffect(effect) && effect.worktree_id
           ? [effect, ...await claimCoalescedGitEffects(engine, opts.hostId, effect.worktree_id, GIT_GROUP_SIZE - 1)] : [effect];
+        for (const member of group) touched.add(member.request_id);
         deferred.push({ effects: group, binding, hardened: probes.get(root)! });
       } else await run(effect, binding);
     }

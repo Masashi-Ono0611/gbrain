@@ -75,7 +75,7 @@ import {
   type CliDispatchContext,
 } from './command-table.ts';
 import { formatRememberResult } from './remember-format.ts';
-import { applyCliOpNotices, captureOpNotice } from './op-notices.ts';
+import { applyCliOpNotices, captureCapacityNotices, captureOpNotice } from './op-notices.ts';
 
 // db-availability loop: best-effort brain-id for the GBRAIN_DB_ACCESS marker,
 // so a MOUNT's DB failure reads as `brain=<id>` instead of masquerading as a
@@ -688,6 +688,7 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
       }
     } else {
       rawResult = await op.handler(ctx, params);
+      if (op.mutating) await captureCapacityNotices(engine); // #6696 (A4)
     }
     // ENG-2 (renderer parity by data shape): JSON-round-trip the local-engine
     // path's return value so renderers see the same shape they'd see on the
@@ -1520,7 +1521,7 @@ export async function makeContext(engine: BrainEngine, params: Record<string, un
     dryRun: (params.dry_run as boolean) || false,
     // Local CLI invocation — the user owns the machine; do not apply remote-caller
     // confinement (e.g., cwd-locked file_upload).
-    remote: false,
+    remote: false, admissionOrigin: 'interactive', // #6696 (A5): the user's own CLI writes
     cliOpts: getCliOptions(),
     writeWaitMs: currentCliWriteWait().waitMs, // #5232
     // v0.34 D4: sourceId is REQUIRED at the type level. Fall back to 'default'

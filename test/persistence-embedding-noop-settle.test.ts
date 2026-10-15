@@ -28,6 +28,9 @@ import { installPageEmbeddings, installPageProjection, readProjectionSnapshot } 
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { testBackends } from './helpers/test-backends.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { declarePersistenceProtocol } from '../src/core/persistence/protocol.ts';
+import { EFFECT_BYTES_SQL, RECEIPT_RESERVATION_FLOOR, retainedReceiptBytes } from '../src/core/persistence/receipt-bytes.ts';
+import type { WriteRequest } from '../src/core/persistence/model.ts';
 
 const databaseUrl = process.env.DATABASE_URL;
 const signature = 'test:model:1536';
@@ -122,6 +125,23 @@ for (const kind of testBackends()) {
       expect(reembedded.filter(slug => !embedded.some(text => text.includes(`Body of ${slug}`)))).toEqual([]);
       expect(embedded.filter(text => /Body of mixed\/(noop-|stale-attempted)/.test(text))).toEqual([]);
       for (const p of [pending, ...Object.values(stale).filter(p => p.slug !== 'mixed/stale-unsealed')]) expect((await row(p.effectId)).state).toBe('committed');
+    });
+
+    check('#6696 (A1): after embed --stale, the bulk settle that finishes a request\'s last effect gives back its unused reservation', async () => {
+      await reset();
+      const p = await page('trueup/noop', true);
+      await engine.transaction(async tx => {
+        await declarePersistenceProtocol(tx);
+        await tx.executeRaw("UPDATE persistence_effects SET state='committed',outcome='{}'::jsonb WHERE request_id=$1::uuid AND kind<>'embedding'", [p.requestId]);
+      });
+      const reservation = async () => Number((await engine.executeRaw<{ n: string }>('SELECT terminal_reservation::text AS n FROM persistence_requests WHERE id=$1::uuid', [p.requestId]))[0]!.n);
+      expect(await reservation()).toBe(RECEIPT_RESERVATION_FLOOR);
+      await engine.executeRaw('UPDATE persistence_effects SET next_attempt_at=now() WHERE id=$1', [p.effectId]);
+      expect((await settleNoopEmbeddingEffects(engine, localHostId(), signature)).settled).toBe(1);
+      const [request] = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid', [p.requestId]);
+      const [{ bytes }] = await engine.executeRaw<{ bytes: string }>(`SELECT SUM(${EFFECT_BYTES_SQL})::text AS bytes FROM persistence_effects WHERE request_id=$1::uuid`, [p.requestId]);
+      expect(await reservation()).toBe(retainedReceiptBytes(request!, { stage: 'terminal', effects: Number(bytes) }));
+      expect(await reservation()).toBeLessThan(RECEIPT_RESERVATION_FLOOR);
     });
 
     check('a settled no-op ends with the same row the runner leaves for one', async () => {

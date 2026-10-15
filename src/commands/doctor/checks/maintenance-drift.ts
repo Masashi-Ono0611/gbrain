@@ -1,6 +1,7 @@
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import { agentFix, checkError } from '../check-fix.ts';
+import { listSuppressedWrites, type SuppressedWrite } from '../../../core/persistence/refusal-breaker.ts';
 import { auditConflictsCommand, FILE_DRIFT_MESSAGE, fileDriftRepairCommand, liveFileDrift, readDriftSkips } from '../../../core/persistence/drift-conflicts.ts';
 
 /** Newest request sequences scanned for drift conflicts (one range read of the unique sequence index). */
@@ -16,6 +17,8 @@ const LIVE_LIMIT = 100;
  * It measures the drift itself, not conflict-row growth: producers back off
  * before admission, so a drifted page stops adding receipts. Names the
  * read-only audit and the explicit-only `gbrain repair file-drift` preview.
+ * #6696 (A12): also lists the maintenance writes the refusal breaker holds
+ * back (`suppressed`, each with the action that releases it).
  */
 export async function maintenanceWriteDriftCheck(engine: BrainEngine, sourceIds?: string[]): Promise<Check> {
   const docs = 'docs/guides/troubleshooting.md#maintenance-write-drift';
@@ -25,7 +28,9 @@ export async function maintenanceWriteDriftCheck(engine: BrainEngine, sourceIds?
     const floor = String(Math.max(0, Number(bounds?.top ?? 0) - WINDOW));
     const skips = await readDriftSkips(engine);
     const rows = [];
+    const suppressed: SuppressedWrite[] = [];
     for (const sourceId of sources) {
+      suppressed.push(...await listSuppressedWrites(engine, sourceId));
       const candidates = await engine.executeRaw<{ slug: string }>(`SELECT DISTINCT r.slug FROM persistence_requests r
         WHERE r.sequence > $2::bigint AND r.source_id=$1 AND r.state='conflict' AND r.error_code='source_changed' AND r.error_message=$3
         ORDER BY r.slug LIMIT ${LIVE_LIMIT + 1}`, [sourceId, floor, FILE_DRIFT_MESSAGE]);
@@ -42,7 +47,14 @@ export async function maintenanceWriteDriftCheck(engine: BrainEngine, sourceIds?
     }
     const count = rows.reduce((sum, row) => sum + row.drifted, 0);
     const skipCount = rows.reduce((sum, row) => sum + row.concept_skips, 0);
-    const details = { count, concept_skips: skipCount, sources: rows, window_sequences: WINDOW, repair: 'file-drift', docs };
+    const details = { count, concept_skips: skipCount, sources: rows, window_sequences: WINDOW, repair: 'file-drift', docs, suppressed };
+    if (!count && !skipCount && suppressed.length) {
+      return { name: 'maintenance_write_drift', status: 'warn', details,
+        message: `${suppressed.length} maintenance write(s) are held back after repeated identical refusals (#6696), so they stop adding receipts: `
+          + `${suppressed.slice(0, 5).map(row => `${row.source_id}:${row.slug} ${row.error_code} x${row.refusals}${row.cause ? ` (${row.cause})` : ''} -> ${row.exit}`).join('; ')}. `
+          + 'Each is tried again once its page, planner or write changes, or after a day.',
+        fix: agentFix(['gbrain', 'write-request', '--', suppressed[0]!.last_request_id], 'Read-only: the last refused attempt and what it names.', 'maintenance_write_drift', { docs }) };
+    }
     if (!count && !skipCount) {
       const unknown = rows.reduce((sum, row) => sum + row.unknown, 0);
       return { name: 'maintenance_write_drift', status: 'ok', details,

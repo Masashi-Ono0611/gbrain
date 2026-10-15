@@ -57,6 +57,18 @@ type PerSourceResult = {
   localPath?: string;
 };
 
+/**
+ * #6696 (A4): a sync receipt carries the capacity notices (60 s snapshot, at most once an hour per process per
+ * scope): under `--json` as rendered `notices`, otherwise as stderr lines.
+ */
+async function syncCapacityNotices(engine: BrainEngine, json: boolean): Promise<{ notices?: unknown[] }> {
+  const { capacityNotices } = await import('../../core/persistence/capacity-snapshot.ts');
+  const { cliRenderContext, renderNotice } = await import('../../core/agent-output.ts');
+  const notices = (await capacityNotices(engine).catch(() => [])).map(notice => renderNotice(notice, cliRenderContext()));
+  if (!json) for (const notice of notices) process.stderr.write(`[gbrain notice ${notice.code}] ${notice.why}\n`);
+  return notices.length ? { notices } : {};
+}
+
 export async function runSyncInner(engine: BrainEngine, args: string[]) {
   // v0.40 Federated Sync v2: `gbrain sync trigger` subcommand
   // Routes to runSyncTrigger which queues a 'sync' minion job with
@@ -930,9 +942,10 @@ async function runSingleSourceSync(
         process.stderr.write(`  → embed-backfill submission failed: ${e instanceof Error ? e.message : String(e)}\n`);
       }
     }
+    const capacity = await syncCapacityNotices(engine, jsonOut);
     if (jsonOut) {
       emitJson(JSON.stringify({ ...buildSingleSyncJsonEnvelope(sourceId, result, singleEmbedBackfill, singleCostGate),
-        ...(result.managedWrite ? { managed_write: result.managedWrite } : {}), ...drainJsonFields(result, resumeCommand, sourceId) }));
+        ...(result.managedWrite ? { managed_write: result.managedWrite } : {}), ...drainJsonFields(result, resumeCommand, sourceId), ...capacity }));
     }
     return;
   }

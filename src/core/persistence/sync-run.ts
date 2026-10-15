@@ -9,6 +9,7 @@ import { currentSourceFilesystemSignal } from '../minions/source-filesystem.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { digest, sha256 } from './digest.ts';
 import { getWriteRequest, admitWriteInTransaction, foregroundPriority, intentDigest, receiptFor } from './journal.ts';
+import { preflightSyncCapacity } from './sync-capacity-preflight.ts';
 import { preparationConfigView } from './config-snapshot.ts';
 import { isWriteCapacityWait, retryWriteAdmission } from './admission-retry.ts';
 import { assertPersistenceAccepting, awaitWrite, foregroundWriteCompletions, startPersistenceConsumer } from './service.ts';
@@ -1521,6 +1522,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
     const sliceStarted = performance.now(), sliceFirstIndex = cursor.index, drainStartedAt = opts.drainStartedAt ?? Date.now();
     const bulk: BulkPass = { settings: opts.bulk && !company ? opts.bulk : { enabled: false, reason: null, size: 1, maxTxnMs: 0 }, perMemberMs: null, foregroundFirst: await foregroundPriority(engine) };
     const waiveBatch = noopWaiversEnabled() && await waiverBatchEnabled(startupConfig);
+    if (opts.capacityPreflight && !cursor.done) await preflightSyncCapacity(engine, { root: cursor.root, writer: cursor.authority.writer, entries: cursor.entries.slice(cursor.index) });
     opts.onProgress?.({ phase: 'managed_sync.start', bankedFiles: cursor.index, total: cursor.entries.length });
     while (!cursor.done) {
       assertActive();

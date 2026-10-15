@@ -55,6 +55,7 @@ export const DELEGATED_SYNC_OPTION_FIELDS = {
   lanes: 'number',
   explicitProcessing: 'string[]',
   timeoutSeconds: 'number',
+  origin: 'string',
 } as const;
 
 /** `--lanes N` bounds (`src/commands/sync/args.ts`). */
@@ -84,6 +85,8 @@ export interface DelegatedSyncOptions {
   noBulk?: boolean;
   /** #6317: `--lanes N` / `--no-lanes` (1..DELEGATED_SYNC_LANES_MAX) for the managed catch-up. */
   lanes?: number;
+  /** #6696 (A5): who the run's writes are for; the operator's CLI sends `interactive`, absent is `background`. */
+  origin?: 'interactive' | 'background';
   /** #6317: the processing options the caller set itself; the managed cursor supplies the rest. */
   explicitProcessing?: Array<typeof DELEGATED_SYNC_PROCESSING_KEYS[number]>;
   /**
@@ -136,6 +139,9 @@ export function validateDelegatedSyncOptions(raw: unknown): DelegatedSyncValidat
     if (keys.length > DELEGATED_SYNC_PROCESSING_KEYS.length || keys.some(key => !(DELEGATED_SYNC_PROCESSING_KEYS as readonly string[]).includes(key))) {
       return { ok: false, error: 'invalid_options:explicitProcessing' };
     }
+  }
+  if (out.origin !== undefined && out.origin !== 'interactive' && out.origin !== 'background') {
+    return { ok: false, error: 'invalid_options:origin' };
   }
   const timeout = out.timeoutSeconds;
   if (typeof timeout !== 'number' || !Number.isInteger(timeout) || timeout < 0) {

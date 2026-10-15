@@ -1,6 +1,6 @@
 import type { BrainEngine, ReservedConnection } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
-import { claimableWriteSql, foregroundPrioritySql, claimGroupFollowers, claimNextLaneHead, claimNextWrite, independentGroup, publicationGroupKey, compactWriteReceipts, floorPreparationAttempts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues } from './journal.ts';
+import { claimableWriteSql, foregroundPrioritySql, claimGroupFollowers, claimNextLaneHead, claimNextWrite, independentGroup, publicationGroupKey, floorPreparationAttempts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues } from './journal.ts';
 import { finishPreparationStalled, finishUnpublishedFailure, preparationAbortReason, recoverPublication, type PreparedMutation } from './coordinator.ts';
 import { localHostId } from './identity.ts';
 import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX, publishSingleWrite, singleWrite } from './group-publish.ts';
@@ -17,6 +17,7 @@ import { claimedHeadOrder } from './sync-window.ts';
 import { laneClaim, laneOf, laneRoots, laneTask } from './sync-lanes.ts';
 import { runPersistenceEffects } from './effects.ts';
 import { settleNoopEmbeddingEffects, type NoopSettleCursor } from './embedding-noop-settle.ts';
+import { runCompactionPass } from './compaction-pass.ts';
 import { currentEmbeddingSignature } from '../embedding.ts';
 import { PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { isWriteErrorCode } from './types.ts';
@@ -490,7 +491,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
           await this.phase('refresh_roots', signal => refreshManagedFilesystemRoots(this.engine,
             this.engine.kind === 'pglite' ? this.config.database_path : undefined, signal));
           // F4b: idle maintenance also refreshes stale PGLite planner statistics (a no-op on Postgres).
-          this.maintenanceWorker = compactWriteReceipts(this.engine).then(() => maybeRefreshPlannerStats(this.engine, 'idle'))
+          this.maintenanceWorker = runCompactionPass(this.engine, { hostId: this.hostId, notice: this.opts.drainNotice }).then(() => maybeRefreshPlannerStats(this.engine, 'idle'))
             .catch(error => this.report(error)).finally(() => { this.maintenanceWorker = undefined; });
         }
         return;
@@ -526,7 +527,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     if (!this.maintenanceWorker && (Date.now() >= this.nextMaintenance || this.publishedSinceMaintenance >= this.maintenanceVolume)) {
       this.nextMaintenance = Date.now() + 60_000;
       this.publishedSinceMaintenance = 0;
-      this.maintenanceWorker = compactWriteReceipts(this.engine).then(() => vacuumPersistenceQueues(this.engine))
+      this.maintenanceWorker = runCompactionPass(this.engine, { hostId: this.hostId, notice: this.opts.drainNotice }).then(() => vacuumPersistenceQueues(this.engine))
         .then(rows => { this.maintenanceVolume = 50 + Math.ceil(rows * 0.2); }).catch(error => this.report(error))
         .finally(() => { this.maintenanceWorker = undefined; });
     }

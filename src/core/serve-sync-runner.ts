@@ -54,6 +54,7 @@
  * CLI's effective flags (the managed cursor owns processing options).
  */
 
+import { isAdmissionOrigin, withAdmissionOrigin } from './persistence/admission-origin.ts';
 import { randomUUID } from 'node:crypto';
 import { withLegacySyncDelegation } from './persistence/sync-authority.ts';
 import { verifyLocalWriter, withVerifiedLocalRegistration } from './persistence/identity.ts';
@@ -159,6 +160,17 @@ export function startDelegatedSync(
   rawOptions: unknown,
   clientToken: string,
   opts: { boundSourceId?: string; registration?: unknown } = {},
+): SyncStartResponse | Promise<SyncStartResponse> {
+  // #6696 (A5): the client's admission origin scopes every write of the job (validated below; a client that sends none is background).
+  const origin = (rawOptions as { origin?: unknown } | null)?.origin;
+  return withAdmissionOrigin(isAdmissionOrigin(origin) ? origin : 'background', () => startDelegatedSyncScoped(engine, rawOptions, clientToken, opts));
+}
+
+function startDelegatedSyncScoped(
+  engine: BrainEngine,
+  rawOptions: unknown,
+  clientToken: string,
+  opts: { boundSourceId?: string; registration?: unknown },
 ): SyncStartResponse | Promise<SyncStartResponse> {
   if (typeof clientToken !== 'string' || clientToken.length === 0 || clientToken.length > 128) {
     return { ok: false, protocol: 2, error: 'invalid_options:clientToken' };

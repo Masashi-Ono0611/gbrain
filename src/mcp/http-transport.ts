@@ -535,6 +535,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         }
         const result = await dispatchToolCall(engine, toolName, args, {
           remote: true,
+          admissionOrigin: 'interactive',
           // WP1/D7: network transport — the dispatch-layer localOnly
           // backstop keys off this marker.
           transport: 'http',

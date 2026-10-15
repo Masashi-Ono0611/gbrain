@@ -39,7 +39,16 @@ export type DrainStopReason = 'deadline' | 'drain_stalled' | 'database_contentio
   /** #6278 (B7): the sync's next admission was refused for the whole no-progress window because other requests held the writer's outstanding-request cap. */
   | 'write_capacity'
   /** #6340: the database connection dropped `CONNECTION_STRIKES` times in a row with no page committed between the drops; the cursor stands, the same command resumes it. */
-  | 'connection_lost';
+  | 'connection_lost'
+  /** #6696 (A7): a cumulative write cap (or the background pause line) refused the next admission after the preflight passed; resumable once capacity returns. */
+  | 'capacity_paused';
+/** #6696 (A7): the refusal that paused the drain (`capacity_paused`); `fix` is the host's config raise. */
+export interface DrainCapacityPause { code: string; reason: string | null; detail: string | null; message: string; fix?: Action }
+/** A capacity refusal raised by an admission after the run's preflight (the preflight's own refusal stops the command up front). */
+export function isCapacityPause(error: unknown): boolean {
+  return error instanceof OperationError && ['write_quota_exhausted', 'write_capacity_backpressure', 'write_quota_insufficient'].includes(error.code)
+    && (error as { capacityPreflight?: true }).capacityPreflight !== true;
+}
 /** #6278 (B7): what the drain waited on when `write_capacity` stopped it: the counts the last refusal carried and how long it waited. */
 export interface DrainCapacityWait { outstanding: number | null; limit: number | null; scope: 'principal' | 'brain' | null; waited_seconds: number }
 /** #6278: what a stalled head's live claim says it is doing (`claim_phase`, stamped by its owner on every renewal). */
@@ -126,6 +135,8 @@ export interface DrainReport {
   retry_after_ms?: number;
   stall?: DrainStall;
   capacity?: DrainCapacityWait;
+  /** #6696 (A7): present on `capacity_paused`. */
+  capacity_pause?: DrainCapacityPause;
   /** #6340 `connection_lost`: how many drops in a row ended the drain and the last error's text (message only, never a URL). */
   connection?: { drops: number; last_error: string };
   /** #6340: HEAD moved past the pinned target while the run drained, so the drain took exactly one more pass for the commits since (never a second). */
@@ -517,6 +528,12 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
         // #6278 (B7): other requests (another writer on the same principal, or the brain) hold the outstanding-request cap, so the pass
         // could not admit its next write. They settle on their own: wait with backoff, say so, and past the no-progress window stop
         // `blocked` with the counts and the writer to inspect, never an uncaught exit without a drain summary.
+        // #6696 (A7): past the preflight, a cumulative cap or the background pause stops the run resumable, never as a failure.
+        if (isCapacityPause(error)) {
+          const e = error as OperationError;
+          return finish(last ?? NO_PASS_RESULT, 'resumable', 'capacity_paused', { capacity_pause: { code: e.code, reason: e.reason ?? null, detail: e.detail ?? null,
+            message: e.message, ...(e.fix ? { fix: e.fix } : {}) } });
+        }
         if (isWriteCapacityWait(error) && !signal?.aborted) {
           capacity ??= { since: clock(), attempts: 0 };
           const counts = outstandingCapacityOf(error), waitedMs = clock() - capacity.since;
@@ -768,11 +785,17 @@ export async function drainManagedSync(engine: BrainEngine, opts: SyncOpts, anno
       + `a round trip it never answers stops the drain no_admission after ${formatDuration(IN_PASS_NO_PROGRESS_MS / 1000)}. A session-mode (5432) or direct database URL avoids it.`);
   }
   let result: SyncResult | undefined;
+  // #6696 (A7): the first pass checks the run's estimated receipts against the capacity left before any admission.
+  let preflighted = false;
   try {
     result = await runDrain({ signal: opts.signal, deadlineAtMs: opts.deadlineAtMs, onProgress: opts.onProgress, probe: engineStallProbe(engine, opts.sourceId), announce, publicationCeilingMs,
       reconnect: error => engine.reconnect({ error }),
       bulk: { enabled: bulk.enabled, reason: bulk.reason, lanes: bulk.lanes ?? 1, lanesMax: bulk.lanesMax, lanesReason: bulk.lanesReason ?? null, lanesCap: bulk.lanesCap },
-      pass: (signal, onProgress) => performManagedSync(engine, { ...opts, signal, onProgress, drainStartedAt, ...(bulk.enabled ? { bulk: { ...bulk, laneRun } } : {}) }) });
+      pass: (signal, onProgress) => {
+        const capacityPreflight = !preflighted;
+        preflighted = true;
+        return performManagedSync(engine, { ...opts, signal, onProgress, drainStartedAt, capacityPreflight, ...(bulk.enabled ? { bulk: { ...bulk, laneRun } } : {}) });
+      } });
   } finally {
     if (laneRun) {
       // #6706: a caller deadline bounds lane teardown too; stats a late close would have added are simply left out of the report.
@@ -872,7 +895,7 @@ const STOP_DOCS: Record<DrainStopReason, CatalogueName> = {
   recovery_required: 'sync_drain_writer_blocked', owner_unavailable: 'sync_drain_writer_blocked', unexpected_file_bytes: 'sync_drain_writer_blocked',
   unexpected_staging_bytes: 'sync_drain_writer_blocked', blocked_by_failures: 'sync_drain_blocked_by_failures',
   preparation_abandoned: 'sync_drain_preparation_abandoned', preparation_systemic: 'sync_drain_preparation_systemic', write_capacity: 'sync_drain_write_capacity',
-  connection_lost: 'sync_drain_connection_lost',
+  connection_lost: 'sync_drain_connection_lost', capacity_paused: 'sync_drain_capacity_paused',
 };
 
 /** What the agent runs next, or null when the sync is done (DX-A2). */
@@ -882,6 +905,14 @@ export function drainNext(result: SyncResult, resumeCommand: string, sourceId: s
   const d = result.drain;
   const estimate = { eta_seconds: d?.eta_seconds ?? null, rate_pages_per_min: d?.rate_pages_per_min ?? null };
   const docs = d?.stop_reason ? ERROR_CATALOGUE[STOP_DOCS[d.stop_reason]].docs : undefined;
+  if (outcome === 'resumable' && d?.stop_reason === 'capacity_paused') {
+    const pause = d.capacity_pause;
+    const raise = pause?.fix?.argv?.join(' ');
+    return { command: resumeCommand, safe_to_loop: false, retry_after_ms: 0, ...estimate, code: 'capacity_paused',
+      why: `The sync paused: ${pause?.message ?? 'a cumulative write cap refused its next admission'} Nothing failed; the cursor and every accepted write are intact. `
+        + `${pause?.reason === 'lifetime_ids' ? 'Request ids never free, so ' : ''}${raise ? `the brain host runs ${raise} (reversible)` : 'the brain host raises the cap gbrain doctor --only persistence_capacity --json names'}`
+        + `${pause?.reason === 'terminal_bytes' ? ', or receipts compact over time' : ''}; then rerun: ${resumeCommand}`, ...(docs ? { docs } : {}) };
+  }
   if (outcome === 'resumable') {
     const abandoned = d?.stop_reason === 'preparation_abandoned';
     return { command: resumeCommand, safe_to_loop: true, retry_after_ms: d?.retry_after_ms ?? 0, ...estimate,

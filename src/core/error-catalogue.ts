@@ -62,6 +62,11 @@ export const ERROR_CATALOGUE = {
   timeline_rows_would_be_removed: { code: 'timeline_rows_would_be_removed', docs: 'docs/guides/write-refusals.md#timeline_rows_would_be_removed' },
   reconcile_private_facts: { code: 'permission_denied', docs: 'docs/guides/write-refusals.md#reconcile-private-facts' },
   maintenance_backpressure: { code: 'maintenance_backpressure', docs: 'docs/guides/write-refusals.md#maintenance_backpressure' },
+  // #6696: cumulative write caps (A5 background pause, A6 refusal at the cap, A7 bulk-run preflight).
+  write_capacity_backpressure: { code: 'write_capacity_backpressure', docs: 'docs/guides/write-refusals.md#write_capacity_backpressure' },
+  write_quota_exhausted: { code: 'write_quota_exhausted', docs: 'docs/guides/write-refusals.md#write_quota_exhausted' },
+  write_quota_insufficient: { code: 'write_quota_insufficient', docs: 'docs/guides/write-refusals.md#write_quota_insufficient' },
+  write_capacity_low: { code: 'write_capacity_low', docs: 'docs/guides/write-refusals.md#write_capacity_low' },
   // F0 `gbrain sources refresh` (worktree-wide coordinated ff-only refresh).
   refresh_not_managed: { code: 'refresh_not_managed', docs: 'docs/guides/write-refusals.md#refresh_not_managed' },
   refresh_not_owner: { code: 'refresh_not_owner', docs: 'docs/guides/write-refusals.md#refresh_not_owner' },
@@ -85,6 +90,7 @@ export const ERROR_CATALOGUE = {
   sync_drain_preparation_systemic: { code: 'preparation_systemic', docs: 'docs/guides/write-refusals.md#preparation_systemic' },
   sync_drain_write_capacity: { code: 'queue_capacity', docs: 'docs/guides/write-refusals.md#drain-write-capacity' },
   sync_drain_connection_lost: { code: 'connection_lost', docs: 'docs/guides/write-refusals.md#drain-connection-lost' },
+  sync_drain_capacity_paused: { code: 'capacity_paused', docs: 'docs/guides/write-refusals.md#drain-capacity-paused' },
   sync_drain_head_blocked: { code: 'drain_stalled', docs: 'docs/guides/write-refusals.md#head-blocked' },
   // D8 `gbrain setup <harness>` (src/commands/setup.ts).
   setup_harness_unsupported: { code: 'setup_harness_unsupported', docs: 'docs/guides/repair.md#setup-harness-unsupported' },

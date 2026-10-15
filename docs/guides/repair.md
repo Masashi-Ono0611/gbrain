@@ -143,6 +143,7 @@ work behind exits 0, so scripts should also check `results[].complete`.
 | `planner-stats` | `planner_stats_stale` | Runs `ANALYZE` on the hot tables (pages, links, facts, takes, content_chunks, timeline_entries) whose planner statistics are stale, so search and graph reads stop planning as slow nested loops. PGLite also resets each table's pending row count; Postgres runs each `ANALYZE` with a 60 s statement timeout and a 2 s lock timeout. No journal admission, no user data changes, brain-wide. | none |
 | `contextual-mode` | `contextual_retrieval_coverage` (pages with no recorded mode) | Stamps the contextual retrieval mode on markdown pages imported without one (for example by a large `--no-embed` sync, or by a connector source on an older gbrain), exactly as a fresh import of the page would: the page, source and brain settings decide, and the per-chunk synopsis tier lands at the free title tier. It rebuilds projections only: no page write, no new page version and no request ID. A page whose stored vectors already match the stamped convention keeps them and queues no re-embedding; a page whose embedding input changes has only those vectors cleared and is re-embedded once, unless you pass `--no-embed`. | `unsealed_projection`: pages whose chunks lag their text; `gbrain embed --stale` or `safe-chunks` seals them first, and the next run stamps them. `embed_skip`: pages marked to skip embedding keep their stored vectors and are not stamped. |
 | `file-drift` | `maintenance_write_drift` | Explicit-only, preview-bound. Resolves pages whose canonical file differs from the database copy (`source_changed` / `file_database_drift`) through canonical reconciliation, preferring the file or the database copy within reconcile's protections. `--all-drifted` refuses mixed drift classes unless `--class` keeps one. See [file drift](#file-drift). | Protected metadata, the tag union and protected takes or private fact rows, listed per page as `exceptions`; pages changed after the preview (`changed_since_preview`). |
+| `receipt-compaction` | `persistence_capacity` (terminal bytes) | Explicit-only, preview-bound, destructive consent. Compacts terminal write receipts now instead of on the idle maintenance tick (#6696): the intent and error message are dropped, the outcome, error code and detail stay, and the unused reservation returns to the receipt-bytes counters. `--older-than <72h\|30d>` is floored at the configured retention unless `--force`; committed receipts only unless `--include-failures`. No admission, so it runs at a full cap. See [receipt compaction](#receipt-compaction). | `failures_kept`: failed, conflict and cancelled receipts left without `--include-failures`. Receipts of a run whose sync cursor is still open, and the newest sync receipt of each worktree, are never listed. |
 
 Timeline rows that an earlier version of a page produced and its current text
 no longer has are removals, not history, so `timeline` neither counts nor
@@ -241,6 +242,39 @@ warns when that date is less than 90 days away and prints the exact
 one more year, the same value `persistence_capacity` prints) and the check to
 re-run. Request IDs are permanent, so raising the limit is the intervention;
 nothing is evicted.
+
+<a id="receipt-compaction"></a>
+### Receipt compaction
+
+A brain whose receipt-bytes cap is close (doctor `persistence_capacity`, a
+`write_quota_exhausted` refusal with reason `terminal_bytes`) gets bytes back
+by compacting terminal receipts, which the resident consumer otherwise does
+on idle ticks once a receipt is older than `persistence.receipt_retention_days`
+(default 30). The repair runs the same per-receipt compaction on demand:
+
+```bash
+gbrain repair receipt-compaction --json                     # preview at the retention floor
+gbrain repair receipt-compaction --apply --expect <hash> --yes
+```
+
+- `--older-than <72h|30d>` sets the age; it may not be younger than the
+  configured retention unless `--force` (a younger receipt is how a caller
+  replays its request id in full). With retention 90 days, `--older-than 30d`
+  is refused and the refusal's fix is the preview at `90d`.
+- Committed receipts only, unless `--include-failures` (a failed receipt's
+  error message is what `gbrain write-request` shows; the code and detail stay).
+- A receipt of a run whose managed-sync cursor is still open, and the newest
+  committed sync receipt of each worktree, are never compacted: a resumed run
+  finds what it committed through them.
+- The preview binds an absolute cutoff and the newest request it saw; the apply
+  compacts only receipts of that set, each in its own short transaction
+  (counters locked first, `lock_timeout` 2 s, `statement_timeout` 15 s), and a
+  rerun of the same apply resumes after an interruption.
+- No admission and no receipt of its own, so it runs at a full cap and its
+  preview charges nothing. Brain-wide.
+
+Verify with `gbrain doctor --only persistence_capacity --json`: the
+`terminal_bytes` row drops by the bytes the apply freed.
 
 <a id="projection-drain"></a>
 ### Drain queued text projections

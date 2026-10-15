@@ -163,7 +163,7 @@ for (const backend of testBackends()) {
         await declarePersistenceProtocol(tx);
         await tx.executeRaw(`UPDATE persistence_requests SET completed_at=now()-interval '25 hours' WHERE request_id=$1::uuid`, [planned.requestId]);
       });
-      await expect(fenceUnfencedFacts(engine, await planUnfencedFacts(engine, { sourceId: 'default' }))).rejects.toMatchObject({ code: 'queue_capacity' });
+      await expect(fenceUnfencedFacts(engine, await planUnfencedFacts(engine, { sourceId: 'default' }))).rejects.toMatchObject({ code: 'write_quota_exhausted' });
     }, { databaseUrl, setup: async ({ engine, root }) => { await seedLegacyManagedContent(engine, root); } });
   }, 120_000);
 

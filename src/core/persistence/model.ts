@@ -118,8 +118,9 @@ export interface JournalLimits {
 export const DEFAULT_JOURNAL_LIMITS: Readonly<JournalLimits> = Object.freeze({
   principalOutstanding: 100, brainOutstanding: 1000,
   principalIntentBytes: 32 * 1024 ** 2, brainIntentBytes: 256 * 1024 ** 2,
-  principalLifetimeIds: 250_000, brainLifetimeIds: 1_000_000,
-  principalTerminalBytes: 1536 * 1024 ** 2, brainTerminalBytes: 8 * 1024 ** 3,
+  // #6696 (A2): sized for 5,000 admissions a day for a year (docs/guides/concurrent-writes.md#growth-model).
+  principalLifetimeIds: 2_000_000, brainLifetimeIds: 8_000_000,
+  principalTerminalBytes: 16 * 1024 ** 3, brainTerminalBytes: 64 * 1024 ** 3,
   brainRecoveryBytes: 1024 ** 3, worktreeRecoveryBytes: 256 * 1024 ** 2,
 });
 export type SqlEngine = Pick<BrainEngine, 'executeRaw'>;

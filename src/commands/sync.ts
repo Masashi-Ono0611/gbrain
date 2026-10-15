@@ -174,6 +174,8 @@ export interface SyncOpts {
    * Threaded through performSync AND syncOneSource so `sync --all` honors it.
    */
   noSchemaPack?: boolean;
+  /** #6696 (A7): server-only; the drain's first pass checks the run's estimated receipts against the capacity left before admitting. */
+  capacityPreflight?: boolean;
   /** Processing options this caller set; an unfinished managed cursor supplies the rest (unset = all explicit). */
   explicitProcessing?: Array<'noEmbed' | 'noExtract' | 'noSchemaPack'>;
   /**

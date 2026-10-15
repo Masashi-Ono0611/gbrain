@@ -442,6 +442,11 @@ export interface OperationContext {
    */
   remote: boolean;
   /**
+   * #6696 (A5): who this caller's writes are for, set only by trusted host-side entry points (the CLI, the MCP
+   * transports). Unset is `background`; it is never derived from `remote` (persistence/admission-origin.ts).
+   */
+  admissionOrigin?: import('../persistence/admission-origin.ts').AdmissionOrigin;
+  /**
    * Transport marker for auth-less remote surfaces (#1061). The stdio MCP
    * dispatch sets 'stdio' — it is deliberately `remote: true` (agent-facing,
    * untrusted) but has no per-token auth (local pipe), so identity ops like

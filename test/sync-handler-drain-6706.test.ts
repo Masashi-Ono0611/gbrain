@@ -190,6 +190,36 @@ test('an accepted remote sync job drains through the handler: worker drain contr
   }
 }), 240_000);
 
+test('a remote sync job cannot switch off the capacity preflight: the parameter is refused at submission and the worker always runs it', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  const { prepareRemoteJob, withSubmissionAuthority } = await import('../src/core/minions/submission-authority.ts');
+  for (const engine of engines) {
+    await disposePersistenceConsumer(engine);
+    const f = await fixture(engine, 3);
+    const clientId = `sync-client-${randomUUID()}`;
+    await engine.executeRaw(`INSERT INTO oauth_clients(client_id,client_name,client_secret_hash,scope,source_id,allowed_operations)
+      VALUES($1,'example-client','test-only','admin',$2,ARRAY['submit_job'])`, [clientId, f.id]);
+    const ctx = { engine, remote: true, sourceId: f.id, auth: { clientId, principal: { kind: 'oauth_client', id: clientId }, scopes: ['admin'], sourceId: f.id, allowedOperations: ['submit_job'] } } as unknown as import('../src/core/ops/contract.ts').OperationContext;
+    const requests = async () => (await engine.executeRaw<{ n: number }>('SELECT count(*)::int AS n FROM persistence_requests WHERE source_id=$1', [f.id]))[0]!.n;
+    try {
+      for (const capacityPreflight of [false, true]) {
+        await expect(prepareRemoteJob(ctx, 'sync', { noPull: true, capacityPreflight })).rejects.toThrow('unsupported remote job parameter');
+      }
+      const accepted = await prepareRemoteJob(ctx, 'sync', { noPull: true });
+      // Three files and room for one more request id: the preflight refuses before any admission, even with a forged off switch in the job data.
+      await engine.setConfig('persistence.limits.principal_lifetime_ids', '1');
+      for (const data of [accepted.data, { ...accepted.data, capacityPreflight: false }]) {
+        const run = withSubmissionAuthority(accepted.authority, () => makeSyncHandler(engine)({ ...job(910_200, data), submission_authority: accepted.authority } as MinionJobContext));
+        await expect(run).rejects.toMatchObject({ code: 'write_quota_insufficient', reason: 'lifetime_ids' });
+        expect(await requests()).toBe(0);
+        expect(await pageCount(engine, f.id)).toBe(0);
+      }
+    } finally {
+      await engine.unsetConfig('persistence.limits.principal_lifetime_ids');
+      await disposePersistenceConsumer(engine); await engine.executeRaw('DELETE FROM oauth_clients WHERE client_id=$1', [clientId]);
+    }
+  }
+}), 240_000);
+
 test('a live sync job reads as the source\'s live drain in movement, and a lapsed one does not', async () => withEnv({ GBRAIN_HOME: home }, async () => {
   const { readSourceMovement, liveSyncJob } = await import('../src/core/persistence/sync-movement.ts');
   for (const engine of engines) {
