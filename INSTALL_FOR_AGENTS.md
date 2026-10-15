@@ -292,7 +292,8 @@ Estimated downstream input cost of the retrieved payload @ 10K queries/mo:
 >
 > Expansion follows the mode for `gbrain query` only: on in `tokenmax`, off in
 > `balanced` and `conservative`; `--expand` (`expand: true` over MCP) forces it
-> and `--no-expand` (`expand: false`) skips it. `gbrain search` and the memory
+> and `--no-expand` (`expand: false`) skips it. `gbrain config set search.expansion false`
+> turns the default off for the brain in any mode. `gbrain search` and the memory
 > verbs never expand. See [search modes](docs/guides/search-modes.md) for the
 > current contract.
 >

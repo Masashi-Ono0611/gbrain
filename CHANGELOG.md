@@ -12,11 +12,12 @@ identifiers and attribution are available in the pre-removal Git revision
 
 ## [0.60.234.0] - 2026-10-15
 
-### Fixed
+**You can turn query expansion off for a whole brain with one command: `gbrain config set search.expansion false` (docs and tests only, no behavior change).** The setting already worked: `gbrain query` over the CLI, MCP and `gbrain serve --http` all skip the expansion LLM call when a call leaves `expand` unset, and an explicit `--expand` / `expand: true` still expands. It was just not written down where people look. On a 300-question LongMemEval run, expansion added about 1.8 s per query with no measurable quality gain. The init mode picker, the search-modes guide and the install guide now name the command, and say that the brain host sets it (a thin client can't) on gbrain v0.60.188.0 or later.
 
-- Managed dream synthesis can resume retained outputs whose tool input used uppercase letters in a page slug. Postprocessing follows the canonical slug in the committed write receipt while still rejecting mismatched sources, incarnations, revisions and unfinished writes; chunk suffixes and completed outputs stay unchanged on replay.
+### Itemized changes
 
-**To take advantage of v0.60.234.0:** run `gbrain upgrade`. The next ordinary dream cycle retries any synthesis postprocessing that stopped on this slug mismatch; no manual page rewrite is needed.
+- **Docs** (`src/core/search/mode-advice.ts`, `docs/guides/search-modes.md`, `INSTALL_FOR_AGENTS.md`): the per-brain off switch, how to undo it (`gbrain config unset search.expansion`), and who can set it on a hosted brain.
+- **Tests** (`test/search/operation-expansion-contract.serial.test.ts`): `gbrain config set search.expansion false` followed by CLI-parsed `query` calls: unset expands in `tokenmax`, `false` does not, `false` plus `--expand` does, and unsetting the key restores expansion. `recall` never expands, even with `search.expansion=true`.
 
 ## [0.60.233.0] - 2026-10-14
 
