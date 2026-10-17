@@ -70,6 +70,7 @@ import { receiptCompactionRepair } from './receipt-compaction.ts';
 import { aliasesRepair } from './aliases.ts';
 import { renameIdentityRepair, RENAME_IDENTITY_CONSENT_TEXT } from './rename-identity.ts';
 import { overwrittenEditsRepair } from './overwritten-edits.ts';
+import { missingTablesRepair } from './missing-tables.ts';
 import { ERROR_CATALOGUE, catalogueError } from '../error-catalogue.ts';
 import type { OperationError } from '../ops/contract.ts';
 
@@ -373,6 +374,13 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'content, with no later revision holding the edit again. The preview shows a diff of the live page against the edit; --apply --expect <hash> '
       + 'reverts each page to that version through a revision-bound, database-only revert_version, then holds the committed file file_drift when it '
       + 'differs, so sync never publishes it over the edit. Narrow with --slug. Runs only when named.',
+  },
+  'missing-tables': {
+    handler: missingTablesRepair, embeds: 'none', checks: ['schema_missing_tables'], explicit_only: true, preview_bound: true,
+    summary: 'Recreate, empty, a rebuildable cache table (query_cache, code_traversal_cache) that the applied migrations created but the brain no longer '
+      + 'has (#6911), so the coordinated purge and search caching work again. A missing table that holds user data is listed for a restore, never '
+      + 'recreated. DDL only (IF NOT EXISTS), no journal admission. The preview prints a hash; --apply --expect <hash> recreates exactly that set. '
+      + 'Runs only when named; never on upgrade. Brain-wide.',
   },
 };
 

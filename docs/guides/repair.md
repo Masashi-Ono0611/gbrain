@@ -149,6 +149,7 @@ work behind exits 0, so scripts should also check `results[].complete`.
 | `aliases` | `dangling_aliases` (orphaned rows) | Explicit-only. Deletes free-text page aliases and slug redirects whose target page has no row at all (a page purged before purge removed its aliases, #6619, or a hard-deleted page), each target rechecked under its page lock; a coordinated maintenance write on a managed brain. A redirect from an old name of a page that still exists is never touched. See [aliases](#aliases). | `soft_deleted_target`: aliases of a soft-deleted page, kept for `gbrain restore` and removed when the page is purged. |
 | `rename-identity` | `rename_identity_downgrades` | Explicit-only, preview-bound, destructive consent. For an inexact Git rename that sync split into a delete plus an add (#6729): carries the old page's identity (id, version history, timeline, links, facts, aliases) onto the new slug, imports the new file onto it as an edit and retires the provisional page; or, with `--close`, settles the pair and moves nothing. `--slug <new-slug>` (and `--from <old-slug>`) names one pair; `--apply --expect <hash> --yes`. See [rename identity](#rename-identity). | `fact_rows_collide` (a fence row of the old page the new file does not keep with the same claim); `managed_remedy_unavailable` (a carry on a managed source; `--close` is the remedy there); pages changed after the preview (`changed_since_preview`). |
 | `overwritten-edits` | `sync_overwritten_db_edits` | Explicit-only, preview-bound. Restores database edits that an incremental managed sync replaced with a committed file edit and no `file_drift` hold (#6712, fixed by #6887). It restores only what the records prove: a database-only revision (its receipt published no file) archived by a managed-sync import that wrote different content, with no later revision holding the edit again. The preview diffs the live page against the edit; `--apply --expect <hash>` reverts each page to that version through a revision-bound, database-only `revert_version` and holds the committed file `file_drift` when it differs. See [overwritten edits](#overwritten-edits). | `unknown_*` findings (no persistence outcome on the writer's receipt, the import's content no longer readable, a segmented version), listed but not restored; pages that moved after the preview (`changed_since_preview`). |
+| `missing-tables` | `schema_missing_tables` | Explicit-only, preview-bound. Recreates, empty, a rebuildable cache table (`query_cache`, `code_traversal_cache`) that the applied migrations created but the brain no longer has, on a brain whose schema version already covers its creating migration, so `apply-migrations` never recreates it (#6911). DDL only (`IF NOT EXISTS`), no journal admission, brain-wide. See [missing tables](#missing-tables). | `user_data_tables`: a missing table that holds user data; this repair never recreates it, so restore its rows from a backup first. `other_tables`: a missing table that holds no user data; `gbrain init --migrate-only` recreates it if the base schema defines it. |
 
 Timeline rows that an earlier version of a page produced and its current text
 no longer has are removals, not history, so `timeline` neither counts nor
@@ -248,6 +249,72 @@ missing or INVALID; otherwise compare the elapsed time with
 
 **Say to your agent:** *"Dream keeps saying postprocessing deferred. What's wrong?"*
 
+<a id="missing-tables"></a>
+### Missing tables
+
+The schema version records which migrations ran, not which tables still
+exist. A table dropped after its migration ran stays missing:
+`gbrain apply-migrations` sees nothing to do and `gbrain db-repair` checks the
+connection, not the tables. How the #6911 brain lost its `query_cache` is not
+known; a manual drop, a restore that skipped the table, or a pooler that
+swallowed the DDL are possibilities. When that table is `query_cache`, every
+coordinated page purge used to fail with `42P01`, so the dream cycle's purge
+phase failed every night with `managed_purge_failed` (#6911).
+
+The page purge now skips a missing rebuildable cache (`query_cache`,
+`code_traversal_cache`): there is nothing in it a rebuild cannot regenerate.
+The purge receipt lists it under `purge.missing_caches`, and the store report
+shows `query_cache` as `not_present` with reason `table_missing`. The fact
+purge skips it the same way. A missing table that holds user data (facts,
+takes, notices and the like) still fails the purge, because the purge cannot
+honestly say it removed rows from it.
+
+`gbrain doctor` reports `schema_missing_tables`. At head it checks every table
+a fully migrated brain has on this engine; below head it checks the rebuildable
+caches whose creating migration already ran, because a pending migration that
+alters a missing cache fails with `42P01` and `apply-migrations` cannot finish.
+A missing rebuildable cache warns with the repair below. A missing table that
+holds user data fails. Any other missing table (locks, leases, operational
+state) warns: `gbrain init --migrate-only` recreates the ones the base schema
+defines.
+
+**Say to your agent:** *"Doctor says query_cache is missing. Fix it."*
+
+```bash
+gbrain repair missing-tables                        # read-only: the tables it would recreate empty, and a hash
+gbrain repair missing-tables --apply --expect <preview-hash>
+```
+
+The apply recreates each previewed cache table empty, in the shape a fully
+migrated brain has, in one transaction per table, then checks it exists. Every
+statement is `IF NOT EXISTS` and waits for locks only as long as a migration
+does. A table that exists by the time the apply reaches it is left alone
+(`already_present`). The approval is used once: the last table retires it, so
+a later drop needs a fresh preview. The cache refills as searches run. If the
+database role gbrain connects as may not create tables (an owner/app role
+split), the apply refuses with `schema_owner_required`, creates nothing and
+keeps the approval: run the same apply command connected as the role that owns
+the schema. If the brain schema is newer than this gbrain client, upgrade
+gbrain first; the repair refuses rather than build an older table shape.
+
+Purges that failed on the missing cache before this fix may have been parked
+after five failures, and the nightly purge skips parked pages. After the
+upgrade, preview them with `gbrain pages purge-deleted --retry-parked
+--dry-run` and run it without `--dry-run` after the user agrees; doctor
+`purge_parked_pages` lists them.
+
+A missing table that holds user data is listed under `user_data_tables`; this
+repair never recreates it, because an empty table would hide that its rows are
+gone. Restore its rows from your own database backup (a `pg_dump` of the brain,
+or your host's point-in-time recovery) **before** you run `gbrain upgrade`,
+`gbrain apply-migrations` or `gbrain init --migrate-only`: those replay the base
+schema, recreate a base-schema table empty and clear this check while the rows
+stay lost. `gbrain backup restore` restores a whole brain into a new root, not
+one table.
+
+The repair runs only when named and never on upgrade, `apply-migrations`,
+`db-repair` or the maintenance cycle.
+
 <a id="request-growth"></a>
 ### Request-table growth
 
@@ -325,6 +392,12 @@ is retried after 30 seconds. Each pass reads at most 500 queue rows: the 100
 newest (so a fresh edit behind a large image queue is reached at once) and 400
 from a cursor that walks the queue in key order and wraps, so every row is
 reached within one lap. The resident never seals images.
+
+Pages stored in segments are drained first, one build each; a page another
+gbrain process is building (its claim renewed within the last 60 seconds) is
+left to that process. This is how a brain with no resident (CLI only, or
+driven by cron) makes a large new page searchable after its post-commit build
+died.
 
 To drain now:
 
@@ -897,6 +970,41 @@ mirror pages and pages written while their source was unbound publish to the
 database only and are never ghosts. Doctor `undeclared_db_only_pages` is a
 separate audit. A preview lists at most 1,000 ghosts; apply them, then preview
 again for the rest. Sync never removes ghost pages by itself.
+
+<a id="ghost-pages-skill-paths"></a>
+**Ghosts under the shared skillpack.** When a source has an adopted shared
+skillpack, its reserved paths (`skills/` and `skillpack.json`) belong to the
+shared skill publisher, and knowledge writes there refuse
+`skill_bundle_required`. Two kinds of ghost can sit on those paths:
+
+- A legacy knowledge page that no live pack skill owns (imported before the
+  pack was adopted, say, under a `skills/<name>/` directory the pack does not
+  publish). It is an ordinary ghost: the preview lists it with the others and
+  the apply retires it as a database-only soft delete. Its file is already
+  gone and filesystem publication refuses one that reappears, so no pack file
+  changes.
+- A page on a path the pack owns: `skillpack.json`, a file of a live skill's
+  current revision, or anything under a live skill's `skills/<name>/`
+  directory. Its missing file is the pack's own, so the repair never removes
+  the page. The preview lists it apart with code `ghost_skill_pack_member`
+  (`residuals.skill_paths`, and `details.skill_paths` with the first slugs,
+  `owned_by: shared_skill_publisher` and one `restore` command per page) and
+  leaves it out of the hash. To clear it, restore the file on the owner host:
+  `git -C <source root> checkout -- <path>` when the file is committed, or
+  republish the skill with `put_skill` and its catalog `expected_revision` so
+  the publisher writes it again. The page then stops being a ghost.
+
+Doctor `ghost_pages` and `gbrain pages ghosts` count pack-member ghosts apart
+(`skill_paths`, with the same restore step), never as ghosts waiting for this
+repair; on their own they leave the check `ok`.
+
+**`refused`.** A page of the approved set that a per-page guard still refuses
+during the apply (a refusal of class `caller`, such as `skill_bundle_required`
+on a page an older preview approved) is recorded with outcome `refused` and its
+code in `outcome_items`; nothing is written for it, and the apply goes on with
+the rest of the set. Read the code (`gbrain errors <code>`) before retrying
+that page. Any other error, such as a storage fault, an unavailable owner or
+contention, still stops the apply; rerun the same apply command once it clears.
 
 <a id="rename-identity"></a>
 ### Rename identity
@@ -2553,7 +2661,7 @@ Each heading below is the `docs` anchor a refusal carries.
 ### Explicit-only repair kinds
 
 `google-file-modes`, `stale-atoms`, `extractor-facts`, `captured-facts`,
-`loop-facts`, `ontology-facts` and `file-drift` run only when named: `gbrain repair <kind>` previews, and
+`loop-facts`, `ontology-facts`, `file-drift` and `missing-tables` run only when named: `gbrain repair <kind>` previews, and
 `gbrain repair <kind> --apply` applies (every kind but `google-file-modes`
 also needs `--expect <hash>`, so it applies exactly the previewed set; `google-file-modes` re-checks each file's owner,
 type and mode at apply time). They are excluded everywhere else:
@@ -2595,6 +2703,21 @@ changed. Inspect the request read-only with `gbrain sources writer status
 put those bytes in place by hand, and let the resident writer finish the
 recovery. Pass `--request-id` to resolve the page recoveries on the same
 source.
+
+### Recovery large file unsupported
+
+`recovery_large_file_unsupported`: `gbrain repair stuck-recovery` found a page
+recovery whose prior file is over the 24 MiB single-string ceiling. Its prior
+bytes are kept as a staged copy beside the file (named in the record, with its
+SHA-256) instead of inside the record, and the preview's diff would read both
+files whole, so nothing was changed. The preview lists such a recovery under
+`refused` with this code and still lists the source's other recoveries; with
+`--request-id` naming it, the command refuses with this code. Inspect the request read-only with
+`gbrain sources writer status --source <id> --json`, ask the user which version
+to keep, put those bytes at the canonical path by hand (the staged copy holds
+the prior bytes; never delete it), and let the resident writer finish the
+recovery: it renames the copy back when the file holds the published bytes, and
+removes it when the file holds the prior ones.
 
 ### Recovery choice refused
 

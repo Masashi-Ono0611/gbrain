@@ -19,6 +19,80 @@ identifiers and attribution are available in the pre-removal Git revision
 
 **To take advantage of this release:** run `gbrain upgrade`. The next ordinary dream cycle resumes these pending publications after the outstanding writes settle; no manual page rewrite is needed.
 
+## [0.60.292.0] - 2026-10-17
+
+**Writes on a brain whose schema is behind are refused up front, `repair ghost-pages` works on a source with a shared skillpack, and large fact batches no longer stall a managed brain.** Fix wave 19 (#6910, #6904, #6898, #6906, plus two test-infra flakes).
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A managed write while the brain's schema is behind this gbrain build (#6904) | admitted, used up the request id, then failed at publication with `42703`/`42P01` | refused before admission with `migrations_pending` (reason `schema_behind`, not retryable as is) and one fix, `gbrain apply-migrations --yes` as the role that owns the gbrain tables; the same request id commits afterwards, and a replay of an accepted id still reconciles |
+| A publication that fails on a missing table or column | recorded as `owner_exception`, read as a code defect | `storage_error` reason `schema_missing` with a migrate (schema behind) or repair (schema at head: doctor `schema_missing_tables`) next step |
+| `gbrain repair ghost-pages` on a source with an adopted skillpack (#6910) | one `skill_bundle_required` refusal aborted the whole apply | legacy ghosts under `skills/` that no pack skill owns are retired from the database like any other ghost; ghosts on files the pack owns are listed as `ghost_skill_pack_member` with the command that restores their file; one refused page is recorded `refused` and the rest still apply |
+| Preparing many facts for an entity page with a large `## Facts` table (#6898) | the table was re-parsed and re-rendered once per fact: 200 facts on an 8,000-row (1.6 MB) page took 15–22 s, 1,000 facts took minutes, and every later write on that source waited | parsed and rendered once per request: the same 200 facts take 5.6–7.6 s |
+| One batch that gives an entity more than 50 facts | one publication held the brain-wide counter row for every fact (1.75 s for 800 facts on Postgres, past the 1 s lock timeout) | published in parts of at most 50, each its own `extract_facts` request with a part receipt (`publication: partial` or `final_part`); the batch's completion receipt still covers the whole group |
+| Conversation fact extraction | could suggest a retired alias page to the model | suggests the page it redirects to, or nothing |
+| OpenClaw gateways running the context engine under Node (#6906) | the turn-context envelope import failed silently and a hand-kept copy of the line was used | the envelope lives in an import-free module, byte-identical everywhere; a module on the per-turn context path that fails to load prints one stderr line naming it and the error code |
+
+### What you need to do
+
+Nothing. If a write is refused with `migrations_pending`, run `gbrain apply-migrations --yes` (as the role that owns the gbrain tables) and retry the same request.
+
+### For contributors
+
+- `test/child-job-descendants.test.ts`: every fixture process is reaped after each case, so a failed case can no longer hold the runner's stdout pipe open and hang the shard.
+- The #5762 lock-timeout contention case stops the persistence consumer before lifting the injected fault, so a retry after the fault no longer commits under the assertion.
+- `test/openclaw-assemble-node-loadable.test.ts` walks the OpenClaw import graph and fails if it reaches a Bun-only import.
+
+## [0.60.291.0] - 2026-10-17
+
+**A brain that lost its `query_cache` table can finish its nightly purge again.** On a brain where `query_cache` was missing although the schema was at head, every coordinated page purge failed with `42P01`, so the dream cycle's purge phase failed every night with `managed_purge_failed` and the tombstone was never purged (#6911). `apply-migrations` and `db-repair` both reported healthy, because the schema version said the table's migration had run.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| Page purge with `query_cache` missing | failed with `42P01` every time (`managed_purge_failed`) | commits; the receipt lists `purge.missing_caches` and shows `query_cache` as `not_present` with reason `table_missing` |
+| Fact purge with `query_cache` missing | failed with `42P01` | commits; the store report shows `query_cache` as `not_present` with reason `table_missing` |
+| Purge with a missing table that holds user data | failed | still fails, because the purge cannot say it removed rows it could not reach |
+| `gbrain doctor` with a missing table | nothing flagged it | `schema_missing_tables`: warn for a rebuildable cache or a table without user data, fail for a user-data table; below head it checks the rebuildable caches, whose absence would wedge `apply-migrations` |
+| Getting the cache back | run the old migration handler by hand | `gbrain repair missing-tables` previews, then `--apply --expect <hash>` recreates it empty in the shape a fully migrated brain has |
+| `gbrain forget --purge --vacuum` on PGLite with the cache missing | the VACUUM failed silently, so nothing was vacuumed | the other tables are vacuumed, and the receipt says whether VACUUM ran or failed |
+
+### What you need to do
+
+Nothing, unless doctor reports `schema_missing_tables`. Then ask your agent: *"Doctor says query_cache is missing. Fix it."* It runs `gbrain repair missing-tables`, shows you the preview, and applies it after you agree. The repair runs only when named; nothing changes on upgrade.
+
+If your nightly purge failed on the missing cache for a while, some deleted pages were parked after five failures and stay unpurged. Doctor `purge_parked_pages` lists them; preview with `gbrain pages purge-deleted --retry-parked --dry-run`, then run it without `--dry-run` after you agree.
+
+If doctor fails `schema_missing_tables` on a table that holds user data, restore that table's rows from a backup **before** you run `gbrain upgrade`, `apply-migrations` or `init --migrate-only`: they recreate a base-schema table empty, which clears the check while the rows stay lost.
+
+## [0.60.290.0] - 2026-10-17
+
+**Every part of gbrain can now read, protect, forget and export pages stored in segments, so large-page storage is ready to turn on in a later release.** Segmented storage (`pages.segmented_storage`) stays off by default, and with it off nothing changes for your brain: pages over 1 MiB are still stored inline up to 24 MiB. This release adds the read side and the safety work that has to exist before the switch can be turned on: reads, row-level security, forget and purge, delete and restore, export and backup, and the derived passes all handle segmented pages. A writer gate keeps the switch off while any recent writer can't read segments.
+
+### What changed
+
+| Area | With segmented storage on | With it off (the default) |
+|---|---|---|
+| Reads (`get_page`, `fetch`, `entity`, evidence, `gbrain get`) | read segmented pages in windows, with withdrawn facts, fences and credentials applied; `body: 'full'` refuses and points at `body: 'auto'` | unchanged |
+| Privacy | row-level security on the six segment tables; `docs/ENGINES.md` has a source-scoped policy recipe | search, `get_page`, `put_page`, `remember`, sync and embedding need no segment-table grant |
+| `forget` and `purge_fact` | work at any page size and never delete text an in-flight write still holds | unchanged |
+| Delete and restore | lossless up to `pages.max_bytes` on file-backed sources | unchanged |
+| Export and backup | segmented pages export byte-identical to inline pages; PGLite backups restore them | unchanged |
+| Derived passes (links, timeline, takes, facts, tags, dedup, sweep, stale extraction) | read segmented pages in blocks; a page the sweep can't fit in its budget is deferred | unchanged |
+| Search | a new page up to 4 MiB is searchable when the write returns; a larger one reports `searchable: "pending"` | unchanged |
+| Tag, timeline, takes and facts writes | `add_tag`/`remove_tag` work at any size; the others work up to 24 MiB and refuse above it, naming the limit | unchanged |
+| `gbrain doctor` | seven whole-body checks report `skipped_segmented: N`; `segmented_storage` reports the writer gate | `segmented_storage` reports the switch as off |
+| Ceilings | 256 MiB on Postgres, 128 MiB on PGLite | 24 MiB |
+
+Migrations v252–v256 add a segment-text GC index, `page_view_digests`, segment-reader marks on write requests, consumers and `ingest_log`, `page_body_staging_texts`, and a chunk retirement index. On Postgres the indexes build `CONCURRENTLY`.
+
+### What you need to do
+
+Nothing. Leave `pages.segmented_storage` unset. `gbrain doctor` shows the switch's state, and the release that turns it on will say so in its notes.
+
 ## [0.60.289.0] - 2026-10-17
 
 **The unit test matrix runs 10 shards instead of 8, so one slow CI runner no longer turns master red.** Master run 39030803745 lost `test (2)` to the 22-minute job timeout. The tests were fine: CPU steal on that runner was 2–3x the usual and every file ran about 1.5x slower. At 8 shards each shard carried about 908s of measured test time, so a normal job took about 16.5 minutes and a 1.5x slower runner overran the timeout. At 10 shards each carries about 727s.

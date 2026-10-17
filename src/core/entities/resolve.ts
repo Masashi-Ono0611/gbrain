@@ -200,7 +200,7 @@ function redirectSlug(value: string): string | null {
  * so it is followed whatever its type; the strict resolver still applies its
  * fact-entity check to the page it lands on.
  */
-async function followRetirement(
+export async function followRetirement(
   engine: BrainEngine,
   source_id: string,
   slug: string,
