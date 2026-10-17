@@ -27,6 +27,7 @@ import { catalogueError } from '../error-catalogue.ts';
 import { ACTIVE_REFRESH_STATES_SQL, refreshFenceClear } from './worktree-refresh-schema.ts';
 import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertGraduationAdmission } from './graduation-custody.ts';
+import { schemaAdmissionRefusal } from './schema-admission.ts';
 import { CAPACITY_VERIFY } from './capacity-verify.ts';
 import { readManagedMode } from './managed-mode.ts';
 import { localHostId } from './identity.ts';
@@ -294,6 +295,9 @@ async function prepareAdmission(engine: BrainEngine, input: WriteAdmission, over
       }
       return assertReplayIntent(prior, fingerprint);
     }
+    // #6904: only after a replay returned, so an accepted request id reconciles whatever the schema reads.
+    const schemaRefusal = await schemaAdmissionRefusal(tx);
+    if (schemaRefusal) throw schemaRefusal;
     if (input.targetKind === 'skill_bundle') await assertSharedSkillPersistence(tx, input.sourceId);
     for (const row of counters) {
       const brain = row.key === 'brain';
@@ -313,8 +317,8 @@ async function prepareAdmission(engine: BrainEngine, input: WriteAdmission, over
       INSERT INTO persistence_requests
       (principal_kind,principal_id,request_id,operation,source_id,source_incarnation,page_id,slug,
        worktree_id,topology_generation,digest,intent,authority,intent_bytes,terminal_reservation,target_kind,protocol_version,
-       admitter_version,admitter_host_id,client_request_id)
-      VALUES($1,$2,$3::uuid,$4,$5,$6::uuid,$7,$8,$9::uuid,$10,$11,$12::text::jsonb,$13::text::jsonb,$14,$15,$16,$17,$18,$19::uuid,$21)
+       admitter_version,admitter_host_id,client_request_id,admitter_segment_reader)
+      VALUES($1,$2,$3::uuid,$4,$5,$6::uuid,$7,$8,$9::uuid,$10,$11,$12::text::jsonb,$13::text::jsonb,$14,$15,$16,$17,$18,$19::uuid,$21,true)
       RETURNING *`, [input.principal.kind, input.principal.id, requestId, input.operation, input.sourceId,
       input.sourceIncarnation, input.pageId ?? null, input.slug, input.worktreeId ?? null, input.topologyGeneration ?? null,
       fingerprint, JSON.stringify(input.intent), JSON.stringify(input.authority), bytes, terminalBytes, input.targetKind ?? 'page', input.protocolVersion ?? 1,
@@ -376,6 +380,8 @@ export async function admitWriteGroupInTransaction(tx: BrainEngine, inputs: Writ
   }
   const fresh = items.filter(item => !priors.has(item.requestId));
   if (fresh.length) {
+    const schemaRefusal = await schemaAdmissionRefusal(tx);
+    if (schemaRefusal) throw schemaRefusal;
     const bytes = fresh.reduce((sum, item) => sum + item.bytes, 0), terminalBytes = fresh.reduce((sum, item) => sum + item.terminalBytes, 0);
     for (const row of counters) {
       const brain = row.key === 'brain', scope = brain ? 'brain' : 'principal';
@@ -391,9 +397,9 @@ export async function admitWriteGroupInTransaction(tx: BrainEngine, inputs: Writ
     const [rows] = await pipelined(tx, [() => tx.executeRaw<WriteRequest>(`INSERT INTO persistence_requests
       (principal_kind,principal_id,request_id,operation,source_id,source_incarnation,page_id,slug,
        worktree_id,topology_generation,digest,intent,authority,intent_bytes,terminal_reservation,target_kind,protocol_version,
-       admitter_version,admitter_host_id,client_request_id)
+       admitter_version,admitter_host_id,client_request_id,admitter_segment_reader)
       SELECT $1,$2,(e->>'request_id')::uuid,$3,$4,$5::uuid,(e->>'page_id')::integer,e->>'slug',$6::uuid,$7,e->>'digest',e->'intent',$8::text::jsonb,
-        (e->>'intent_bytes')::bigint,(e->>'terminal_reservation')::bigint,'page',1,$9,$10::uuid,e->>'client_request_id'
+        (e->>'intent_bytes')::bigint,(e->>'terminal_reservation')::bigint,'page',1,$9,$10::uuid,e->>'client_request_id',true
       FROM jsonb_array_elements($11::text::jsonb) WITH ORDINALITY AS t(e,n) ORDER BY n
       RETURNING *`, [first.principal.kind, first.principal.id, first.operation, first.sourceId, first.sourceIncarnation, first.worktreeId ?? null,
       first.topologyGeneration ?? null, JSON.stringify(first.authority), stamp.version, stamp.hostId,
@@ -911,6 +917,7 @@ export async function completeWrite(tx: SqlEngine, row: WriteRequest, state: 'co
       error_code=$4,error_message=$5,error_detail=COALESCE($8::text::jsonb,error_detail),completed_at=now(),updated_at=now(),claim_expires_at=NULL,blocked_reason=NULL,
       consumer_version=CASE WHEN $2='committed' THEN $6 ELSE consumer_version END,
       consumer_host_id=CASE WHEN $2='committed' THEN $7::uuid ELSE consumer_host_id END,
+      consumer_segment_reader=CASE WHEN $2='committed' THEN true ELSE consumer_segment_reader END,
       published_at=CASE WHEN $2='committed' THEN now() ELSE published_at END,
       preparation_attempts=CASE WHEN $2='committed' THEN 0 ELSE preparation_attempts END,
       terminal_reservation=CASE WHEN (SELECT unfinished FROM effects) THEN terminal_reservation
