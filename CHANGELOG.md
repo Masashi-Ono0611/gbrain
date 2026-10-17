@@ -10,6 +10,12 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [Unreleased]
+
+### Fixed
+
+- Declare built-in extraction receipts as non-extractable annotations in the standard gbrain-base-v2 pack, keeping normal receipt records out of undeclared-type warnings and catch-all retyping.
+
 ## [0.60.259.0] - 2026-10-16
 
 **Remote Postgres searches take about half the time, typed searches stop paying for JIT compilation, `tokenmax` `query` stops expanding by default, and a new harness proves a performance change leaves every answer the same.** This is LHF wave 2 (GBRA-107), the second low-hanging-fruit wave on search latency, retrieval and cost. Every performance item below was checked against master with the new contract-parity harness: on PGLite and Postgres, every remote response block, `_meta` field and database write is identical; only timings differ.

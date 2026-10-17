@@ -510,10 +510,10 @@
                   "days_to_exhaustion": null,
                   "exhaustion_date": null,
                   "limit": 68719476736,
-                  "max_day_7d": 113645,
+                  "max_day_7d": 114335,
                   "net_per_day_7d": 22378,
                   "pct": 0,
-                  "per_day_7d": 113645,
+                  "per_day_7d": 114335,
                   "reclaimable_bytes": 16318,
                   "recommended_limit": 137438953472,
                   "resource": "terminal_bytes",
@@ -521,7 +521,7 @@
                   "spike_day": null,
                   "status": "ok",
                   "under_reserved_receipts": 0,
-                  "used": 113645,
+                  "used": 114335,
                   "window_days": 1
                 },
                 {
@@ -547,10 +547,10 @@
                   "days_to_exhaustion": null,
                   "exhaustion_date": null,
                   "limit": 17179869184,
-                  "max_day_7d": 113645,
+                  "max_day_7d": 114335,
                   "net_per_day_7d": 22378,
                   "pct": 0,
-                  "per_day_7d": 113645,
+                  "per_day_7d": 114335,
                   "reclaimable_bytes": 16318,
                   "recommended_limit": 34359738368,
                   "resource": "terminal_bytes",
@@ -558,7 +558,7 @@
                   "spike_day": null,
                   "status": "ok",
                   "under_reserved_receipts": 0,
-                  "used": 113645,
+                  "used": 114335,
                   "window_days": 1
                 }
               ],
@@ -3253,14 +3253,14 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "Active pack gbrain-base-v2@1.3.0+a50a67b9 is current (no successor declared)",
+          "message": "Active pack gbrain-base-v2@1.3.1+d42b1b43 is current (no successor declared)",
           "name": "pack_upgrade_available",
           "status": "ok"
         },
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "3 distinct typed values (pack gbrain-base-v2 declares 20)",
+          "message": "3 distinct typed values (pack gbrain-base-v2 declares 21)",
           "name": "type_proliferation",
           "status": "ok"
         },
