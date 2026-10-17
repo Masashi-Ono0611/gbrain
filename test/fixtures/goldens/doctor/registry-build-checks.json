@@ -487,6 +487,10 @@
       },
       {
         "category": "brain",
+        "name": "coordination_lock_location"
+      },
+      {
+        "category": "brain",
         "name": "unbound_source"
       },
       {
@@ -866,8 +870,16 @@
         "name": "unindexed_files"
       },
       {
+        "category": "brain",
+        "name": "sync_overwritten_db_edits"
+      },
+      {
         "category": "meta",
         "name": "sync_config_keys"
+      },
+      {
+        "category": "ops",
+        "name": "managed_sync_convergence"
       },
       {
         "category": "brain",

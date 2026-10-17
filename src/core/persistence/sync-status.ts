@@ -42,7 +42,7 @@ import { classifyRecordedFault, classifyTerminal, type TerminalCategory } from '
 import type { PublicCategory } from './public-category.ts';
 import { readSyncFile, resolveManagedSyncContext } from './sync-discovery.ts';
 import { sha256 } from './digest.ts';
-import { listIdentityDowngrades } from '../sync-identity-downgrades.ts';
+import { listIdentityDowngrades, withIdentityRemedies } from '../sync-identity-downgrades.ts';
 
 export interface SyncStatusHold extends SyncFaultVerdict {
   code: string;
@@ -89,8 +89,12 @@ export interface SyncStatus {
   rate_pages_per_min: number | null;
   eta_seconds: number | null;
   holds: SyncStatusHold[];
-  /** #6729: renames whose page identity was not kept and whose pair has no disposition yet (old page soft-deleted with its facts and links, held from the purge; `gbrain restore` keeps one). */
-  identity_downgrades: import('../sync-identity-downgrades.ts').IdentityDowngrade[];
+  /**
+   * #6729: renames whose page identity was not kept and whose pair has no disposition yet (old page soft-deleted with its
+   * facts and links, held from the purge), each with its remedy: `gbrain repair rename-identity` preview and apply argv,
+   * consent and when the purge hold releases.
+   */
+  identity_downgrades: import('../sync-identity-downgrades.ts').IdentityDowngradeEntry[];
   last_error: SyncStatusError | null;
   /** Whether anything (a hold or the last error) waits on a person; the first such reason. */
   needs_human: boolean;
@@ -132,6 +136,13 @@ export interface SyncStatus {
   checkpoint_blockers_read: SyncStatusRead;
   cursors_read: SyncStatusRead;
   terminal_failures_read: SyncStatusRead;
+  /**
+   * #6712 PR 4a: the read-only shadow of the level-triggered pass (sync-convergence.ts), \`dry_run: true\`; a heavy read, so
+   * only \`--detail\` runs it (\`convergence_read\`). Null when not read, on a brain that is not managed, or for a company-brain
+   * source; \`status: 'unavailable'\` names why a read could not run. No other field's meaning depends on it.
+   */
+  convergence: import('./sync-convergence.ts').ConvergenceReceipt | { dry_run: true; status: 'unavailable'; code: string; message: string } | null;
+  convergence_read: SyncStatusRead;
 }
 export type SyncStatusState = 'synced' | 'resumable' | 'blocked';
 /** Why the source is in its state; one closed list. */
@@ -300,7 +311,7 @@ export async function readSyncStatus(engine: BrainEngine, sourceId: string, opts
   const [state, stateReason] = statusState({ human: !!human, oldest, recovery, liveJob: liveJob !== null, unfinished, lastError: !!lastError, actionable: actionable.length > 0, holds: holds.length > 0 });
   return { source_id: sourceId, run_id: header?.runId ?? null,
     cursor: header ? { index: Number(header.index), total: Number(header.total), pinned_target: header.target ?? null, last_advance_at: p ? new Date(p.lastAt).toISOString() : null, done: !!header.done } : null,
-    committed_last_10m: Number(committed?.n ?? 0), ...estimate, live_job_id: liveJob, holds, identity_downgrades: await listIdentityDowngrades(engine, [sourceId]), last_error: lastError, needs_human: !!human, ...(human ? { human_reason: human.human_reason } : {}),
+    committed_last_10m: Number(committed?.n ?? 0), ...estimate, live_job_id: liveJob, holds, identity_downgrades: await withIdentityRemedies(engine, await listIdentityDowngrades(engine, [sourceId])), last_error: lastError, needs_human: !!human, ...(human ? { human_reason: human.human_reason } : {}),
     resume_argv: resume, ...blockers, cursors: detail ? await liveCursors(engine, sourceId, source.incarnation, selected?.key ?? null, failures) : [],
     terminal_failures: terminal, connector_last_error: connectorLastError, next: next ?? recovery_next ?? (stateReason === 'request_pending' && oldest.status === 'ok' && oldest.request ? { argv: ['gbrain', 'sync', ...resume], consent: [], actor: 'agent', requires_exclusive: false, verify,
       why: `Write request ${oldest.request.request_id} of this source is still ${oldest.request.state}${oldest.request.step ? ` (step ${oldest.request.step})` : ''}; a running owner finishes it on its own, and the next sync of this source drains it.` } satisfies Action
@@ -308,7 +319,8 @@ export async function readSyncStatus(engine: BrainEngine, sourceId: string, opts
       why: `The oldest-blocker or recovery probe did not answer within ${SYNC_STATUS_PROBE_MS / 1000} s, so this status does not know the state (it is not reported synced). Rerun it after a short wait; gbrain doctor --json checks the database if it keeps timing out.` } satisfies Action : null),
     state, reason: stateReason,
     oldest_blocker: oldest, recovery, checkpoint_blockers_read: detail ? { status: 'read' } : notRead('checkpoint blocker list'),
-    cursors_read: detail ? { status: 'read' } : notRead('live cursor'), terminal_failures_read: detail ? { status: 'read' } : notRead('terminal-failure summary') };
+    cursors_read: detail ? { status: 'read' } : notRead('live cursor'), terminal_failures_read: detail ? { status: 'read' } : notRead('terminal-failure summary'),
+    convergence: detail ? await (await import('./sync-pass.ts')).statusConvergence(engine, sourceId) : null, convergence_read: detail ? { status: 'read' } : notRead('convergence shadow') };
 }
 
 /** #6712 PR 2: the state and its reason, from what this read saw; a probe that did not answer never yields `synced`. */
