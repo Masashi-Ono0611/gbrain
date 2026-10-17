@@ -80,7 +80,9 @@ Every hold and error has three fields, from one table
   reruns the same sync; `retry_when_clean` re-screens a held file once its edit
   is committed; `repair` previews and applies a hash-bound file repair;
   `reconcile` previews two diverged versions; `upgrade` installs a newer gbrain;
-  `none` waits for a person.
+  `migrate` applies the pending schema migrations (`gbrain apply-migrations
+  --yes`, as the database role that owns the gbrain tables) before the write is
+  resubmitted; `none` waits for a person.
 - `needs_human`: a person has to choose or act before it clears;
   `human_reason` says what. A page whose safe action failed three times with
   the same code (`attempts`: a re-hold, or a failed `unblock --apply` or

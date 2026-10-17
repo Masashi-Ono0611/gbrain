@@ -26,7 +26,8 @@
  * model prose; the table row stays the lane's default for every other state.
  */
 export type SyncFaultClass = 'page' | 'connection' | 'systemic';
-export type SyncSafeAction = 'retry' | 'retry_when_clean' | 'repair' | 'reconcile' | 'upgrade' | 'none';
+/** #6904: `migrate` applies the pending schema migrations (as the schema owner) before the write is resubmitted. */
+export type SyncSafeAction = 'retry' | 'retry_when_clean' | 'repair' | 'reconcile' | 'upgrade' | 'migrate' | 'none';
 
 export interface SyncFaultRule {
   code: string;

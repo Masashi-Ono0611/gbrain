@@ -2234,9 +2234,9 @@ Reasons: `orchestrator_failed`, `orchestrator_threw`, `ledger_write_failed`, `pr
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| Schema migrations are behind (or could not be confirmed at head), or an orchestrator migration is wedged, so the command did not report success. | apply-migrations reasons: not_applied: the run had no --yes (or --non-interactive), so it did not apply the schema migrations; the fix applies them with --yes. still_behind: an authorized run tried them and they did not apply; another --yes repeats the failure, so run `gbrain doctor --json` and report. schema_unreadable: the schema version could not be read back after the orchestrators ran, so the run cannot confirm it reached head; report it. wedged: an orchestrator migration ended partial three or more times in a row, so runs skip it until a person fixes the cause and clears it with --force-retry. Each failure names the migrations still pending. | not_applied: apply them with `gbrain apply-migrations --yes`. still_behind or schema_unreadable: run `gbrain doctor --json` and report it to the user; another --yes repeats the failure. wedged: ask the user, read the migration's partial rows in the brain home's migrations/completed.jsonl (phases[].detail, if present; apply-migrations prints the resolved path), fix the cause, then `gbrain apply-migrations --force-retry <version>` and `gbrain apply-migrations --yes`. | agent | `repeat the read that failed` | 1 | no |
+| Schema migrations are behind (or could not be confirmed at head), or an orchestrator migration is wedged, so the command did not report success. | apply-migrations reasons: not_applied: the run had no --yes (or --non-interactive), so it did not apply the schema migrations; the fix applies them with --yes. still_behind: an authorized run tried them and they did not apply; another --yes repeats the failure, so run `gbrain doctor --json` and report. schema_unreadable: the schema version could not be read back after the orchestrators ran, so the run cannot confirm it reached head; report it. wedged: an orchestrator migration ended partial three or more times in a row, so runs skip it until a person fixes the cause and clears it with --force-retry. Each failure names the migrations still pending. schema_behind (#6904): a managed write was refused at admission because the brain schema is below the version this build needs. Not retryable as is (class caller): the same write refuses until the migrations are applied; nothing was admitted, so the request_id was not consumed and the same request_id commits once the schema is migrated (a replay of an already accepted id still reconciles). | schema_behind: apply them with `gbrain apply-migrations --yes` as the database role that owns the gbrain tables (the brain host operator when this connection does not own them), then resubmit the write with the same request_id. not_applied: apply them with `gbrain apply-migrations --yes`. still_behind or schema_unreadable: run `gbrain doctor --json` and report it to the user; another --yes repeats the failure. wedged: ask the user, read the migration's partial rows in the brain home's migrations/completed.jsonl (phases[].detail, if present; apply-migrations prints the resolved path), fix the cause, then `gbrain apply-migrations --force-retry <version>` and `gbrain apply-migrations --yes`. | agent | `repeat the read that failed` | 1 | no |
 
-Reasons: `not_applied`, `still_behind`, `schema_unreadable`, `wedged`.
+Reasons: `not_applied`, `still_behind`, `schema_unreadable`, `wedged`, `schema_behind`.
 
 ### migrations_running
 
@@ -2400,13 +2400,23 @@ Reasons: `host_mismatch`, `transfer_in_progress`, `clone_in_progress`, `binding_
 
 More: [docs/guides/troubleshooting.md#owner-unavailable](../../docs/guides/troubleshooting.md#owner-unavailable)
 
+### page_body_rows_unreadable
+
+<a id="page_body_rows_unreadable"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| This large page's segment rows readable on this connection do not cover its body, so the read returned nothing rather than a short or empty body. | A segmented page keeps its body in manifest rows that must tile the stored body from its first byte to body_bytes; a role that sees the page row but not its manifest rows (a row-level security policy or grant that covers pages only), or rows missing from the database, would otherwise read as an empty or truncated page with nothing to say so. | Give the role that reads the brain the same access to page_body_manifest and page_segment_texts it has to pages (the brain host's operator), then read again; run gbrain doctor --json to check the segment tables. | host_admin | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/windowed-reads.md#page_body_rows_unreadable](../../docs/guides/windowed-reads.md#page_body_rows_unreadable)
+
 ### page_body_segmented
 
 <a id="page_body_segmented"></a>
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| This page's body is stored in segments, and the path that hit it reads or writes the whole body as one string, so it stopped before reading or changing anything. | With pages.segmented_storage on, a page over 1 MiB keeps its body in segments instead of the page row; a whole-body path would otherwise see an empty body and could overwrite the page or drop the unread rest. Windowed reads and segment-aware writers replace these paths. | Read the page's revision and stored size with get_page body: 'none' (size.body_bytes); windowed reads of a segmented body arrive with the segment reader. Run: gbrain get --source '{source_id}' --body none -- '{slug}' | agent | `repeat the read that failed` | 1 | no |
+| This page's body is stored in segments, and the path that hit it reads or writes the whole body as one string, so it stopped before reading or changing anything. | With pages.segmented_storage on, a page over 1 MiB keeps its body in segments instead of the page row; a whole-body path would otherwise see an empty body and could overwrite the page or drop the unread rest. Windowed reads and segment-aware writers replace these paths. | Retrying refuses the same way. Read the page in pieces: get_page body: 'auto' returns its outline and first window, and body: 'window' reads any lines or bytes. Run: gbrain get --source '{source_id}' --body auto -- '{slug}' | agent | `repeat the read that failed` | 1 | no |
 
 More: [docs/guides/windowed-reads.md#page_body_segmented](../../docs/guides/windowed-reads.md#page_body_segmented)
 
@@ -2435,6 +2445,16 @@ More: [docs/guides/windowed-reads.md#page_body_segmented](../../docs/guides/wind
 | Another worker installed a newer search projection of the page while this command prepared its own. | The projection guard keeps the newer installation instead of overwriting it; the canonical page revision did not change. | Re-run the same command; it re-reads the current projection. If it conflicts again, wait for the other worker to finish. | agent | `repeat the read that failed` | 1 | yes |
 
 More: [docs/guides/repair.md#page-projection-conflict](../../docs/guides/repair.md#page-projection-conflict)
+
+### page_projection_stale
+
+<a id="page_projection_stale"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A segment of this large page has projection metadata gbrain cannot use, so the read returned nothing for it rather than unsanitized text. | Windows of a segmented page are cut from each segment's stored protected regions; when they are stale (another segmenter version, a text that does not match its hash) gbrain recomputes them from the segment's carried parser state, and refuses when that state is missing or of another version, or when a facts fence block crosses a forced cut while the source has withdrawals. | Rewrite the page body (import or sync its file again), which segments it with this gbrain version, then read it again; other windows and the outline still work. | host_admin | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/windowed-reads.md#page_projection_stale](../../docs/guides/windowed-reads.md#page_projection_stale)
 
 ### page_shrink_refused
 
@@ -3105,6 +3125,16 @@ More: [docs/guides/windowed-reads.md#revision_changed](../../docs/guides/windowe
 | A schema step (the schema.sql replay in init/upgrade, or one migration) waited its lock_timeout for a table lock another session holds and stopped instead of hanging. | Every ALTER TABLE in the replay takes an ACCESS EXCLUSIVE lock even as a no-op, so one open transaction in another client (idle in transaction, a stuck job) blocked gbrain init and upgrade forever with no output. The wait is now bounded (GBRAIN_SCHEMA_LOCK_TIMEOUT_SECONDS, default 60) and the refusal names the blocking sessions by pid, application and state, sampled while the wait was active; query text is never shown. The cancelled step changed nothing. | Let the named session finish or, with the user's agreement, end it on the database host with SELECT pg_terminate_backend(<pid>), then rerun the same gbrain command; init retries a few times on its own with a short backoff. Run: gbrain doctor --json | agent | `gbrain doctor --json` | 1 | yes |
 
 More: [docs/ENGINES.md#schema-lock-blocked](../../docs/ENGINES.md#schema-lock-blocked)
+
+### schema_owner_required
+
+<a id="schema_owner_required"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The database role this command connects as may not create schema objects (Postgres 42501), so the schema repair created nothing. | On a brain whose tables belong to a separate owner role, the application role cannot run DDL; only the owner can recreate a missing table. | Run the same apply connected as the role that owns the brain tables (the one apply-migrations uses). | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/repair.md#missing-tables](../../docs/guides/repair.md#missing-tables)
 
 ### schema_pack_emit_mismatch
 

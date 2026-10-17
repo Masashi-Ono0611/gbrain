@@ -315,6 +315,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'vector_plan',
   'keyword_plan',
   'writer_version',
+  'segmented_storage',
   'pgbouncer_prepare',
   'pglite_data_dir',
   // #6573: a local IPC socket path over the platform's AF_UNIX budget (doctor/checks/local-ipc.ts).
@@ -390,6 +391,8 @@ export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
   // #5216: the resumable pages.knowledge_revision backfill (resumed by apply-migrations --force-schema).
   'revision_backfill',
   'schema_columns',
+  // #6911: tables the applied migrations created that are missing (repair missing-tables recreates rebuildable caches).
+  'schema_missing_tables',
   'schema_pack_active',
   'schema_pack_consistency',
   'schema_pack_source_drift',
