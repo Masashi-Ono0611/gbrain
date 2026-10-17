@@ -16,6 +16,23 @@ identifiers and attribution are available in the pre-removal Git revision
 
 - Declare built-in extraction receipts as non-extractable annotations in the standard gbrain-base-v2 pack, keeping normal receipt records out of undeclared-type warnings and catch-all retyping.
 
+## [0.60.289.0] - 2026-10-17
+
+**The unit test matrix runs 10 shards instead of 8, so one slow CI runner no longer turns master red.** Master run 39030803745 lost `test (2)` to the 22-minute job timeout. The tests were fine: CPU steal on that runner was 2–3x the usual and every file ran about 1.5x slower. At 8 shards each shard carried about 908s of measured test time, so a normal job took about 16.5 minutes and a 1.5x slower runner overran the timeout. At 10 shards each carries about 727s.
+
+### What changed
+
+| Area | Before | Now |
+|---|---|---|
+| `test` matrix in `test.yml` | 8 shards, 22-minute timeout | 10 shards, same timeout |
+| `scripts/test-weights.json` | one run from an older master | re-mined from the last fully green master run (3,591 files) |
+| `coverage-report` manifest | `shard-1`..`shard-8` | `shard-1`..`shard-10` |
+| Drift guard | none | `test/scripts/ci-gates.test.ts` fails if the matrix, the shard step and the coverage manifest disagree on the shard count |
+
+### What you need to do
+
+Nothing. This only changes CI.
+
 ## [0.60.288.0] - 2026-10-17
 
 **`gbrain sync --dry-run --json` now shows what the coming level-triggered reconcile would do, without doing any of it.** This is the read-only shadow of #6712 PR 4. It compares every path in Git with its record and page, puts each one in exactly one class, and reports the counts. It writes nothing, and sync behaves exactly as before.
