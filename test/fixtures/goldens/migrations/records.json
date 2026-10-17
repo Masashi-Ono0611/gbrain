@@ -1,6 +1,6 @@
 {
   "golden": {
-    "count": 245,
+    "count": 246,
     "gaps": [
       17,
       18,
@@ -62,7 +62,7 @@
       "tableRows": "906d2413b13d76a06d5910885e47ed5c544be4ff3a2266e83146715721b24270",
       "verifyProjectionStatistics": "0d231b04ecfbc5a4109d6fca9567bf4e8c9e9db6c3fbbb35212e026579ed6f67"
     },
-    "latest": 250,
+    "latest": 251,
     "records": [
       {
         "handler": {
@@ -3884,6 +3884,19 @@
         "transaction": false,
         "verify": "absent",
         "version": 250
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "take_horizons",
+        "sql": {
+          "length": 414,
+          "sha256": "43fb123a615e4eb3a77b021b2e8766e85093bfb80e8ef4f1dbc86dcc01658137"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 251
       }
     ],
     "versions": [
@@ -4131,7 +4144,8 @@
       247,
       248,
       249,
-      250
+      250,
+      251
     ]
   },
   "normalizer": "migrations-record-v1"
