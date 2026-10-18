@@ -110,7 +110,7 @@ runs every file in `test/postgres-unit-arms.txt` the way persistence-validation'
 `unit-postgres-arms` step does (`bun --no-env-file test --timeout=120000`,
 `GBRAIN_TEST_ALLOW_DATABASE_URL=1`, no timeout multiplier) against the slot's
 own empty `gbrain_arms_test` database. The summary sums its measured durations over
-that job's `ARM_SHARDS` partition (12 shards), and a shard over the step's 20-minute timeout
+that job's `ARM_SHARDS` partition (14 shards), and a shard over the step's 20-minute timeout
 fails the run, since GitHub would cut that shard off mid-list. The committed
 weights must also fit each shard twice over with a minute to spare
 (`ARM_SHARD_BUDGET_MS`, 570 s), because a slow runner ran the files 1.3-2x

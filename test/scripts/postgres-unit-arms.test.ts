@@ -36,6 +36,8 @@ describe('postgres-unit-arms list', () => {
     expect(job).toContain(`shard: [${shards.join(', ')}]`);
     expect(job).toContain(`Unit-lane PostgreSQL arms \${{ matrix.shard }}/${ARM_SHARDS}`);
     expect(job).toContain(`postgres-unit-arms.ts shard "$SHARD" ${ARM_SHARDS})`);
+    expect(job).toContain(`shard $SHARD/${ARM_SHARDS} selected no files`);
+    expect(job).toContain(`postgres-unit-arms.ts shard $SHARD ${ARM_SHARDS}' locally`);
     expect(job).toMatch(new RegExp(`- name: Require PostgreSQL arms of unit-lane suites\\n\\s+timeout-minutes: ${ARM_STEP_TIMEOUT_MS / 60_000}\\n`));
   });
 
