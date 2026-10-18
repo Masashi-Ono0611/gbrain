@@ -101,8 +101,11 @@ function run(args: string[], extraEnv: Record<string, string> = {}) {
 }
 
 /** Async launch for the in-flight / signal pins. */
-function start(args: string[], extraEnv: Record<string, string> = {}) {
-  const child = spawn('bash', [SCRIPT, ...args], { cwd: ROOT, env: guardEnv(extraEnv), stdio: ['ignore', 'pipe', 'pipe'] });
+function start(args: string[], extraEnv: Record<string, string> = {}, keepStdinOpen = false) {
+  const options = { cwd: ROOT, env: guardEnv(extraEnv) };
+  const child = keepStdinOpen
+    ? spawn('bash', [SCRIPT, ...args], { ...options, stdio: ['pipe', 'pipe', 'pipe'] })
+    : spawn('bash', [SCRIPT, ...args], { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = '';
   child.stderr.on('data', (d: Buffer) => {
     stderr += d.toString();
@@ -274,28 +277,38 @@ describe('eval-spend-guard.sh', () => {
   });
 
   test('a SIGTERMed guard stops the command and reconciles at the estimate (exit 143)', async () => {
-    const g = start(['10', '4', '--', 'sleep', '30']);
-    // Deterministic: the `reserved $` line is printed AFTER the reservation
-    // row lands and the traps are armed, so the signal can never race the
-    // guard's own setup (the pre-fix flake: traps were installed after the
-    // append, and a TERM in that window left the reservation unreconciled).
-    await waitFor(() => g.stderr().includes('reserved $4.000000'), "the 'reserved $' line");
-    expect(runningRows().length).toBe(1);
-    const t0 = Date.now();
-    g.child.kill('SIGTERM');
-    const { code } = await g.exit;
-    expect(code).toBe(143);
-    expect(Date.now() - t0).toBeLessThan(10_000); // the child was killed, not waited out
-    expect(g.stderr()).toContain('interrupted (signal 15)');
-    const rows = ledgerRows();
-    expect(rows.length).toBe(2);
-    expect(rows[1].status).toBe('done');
-    expect(rows[1].run_id).toBe(rows[0].run_id);
-    expect(rows[1].cost_usd).toBe(4); // the estimate
-    expect(rows[1].exit_code).toBe(143);
-    // …and that spend drives the next decision: 4 + 7 > 10.
-    expect(run(['10', '7', '--', 'true']).status).toBe(3);
-    expect(run(['10', '6', '--', 'true']).status).toBe(0);
+    const g = start(['10', '4', '--', 'cat'], {}, true);
+    let releaseInput: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // Keep stdin open so cat cannot finish while the test is descheduled.
+      // Deterministic: the `reserved $` line is printed AFTER the reservation
+      // row lands and the traps are armed, so the signal can never race the
+      // guard's own setup (the pre-fix flake: traps were installed after the
+      // append, and a TERM in that window left the reservation unreconciled).
+      await waitFor(() => g.stderr().includes('reserved $4.000000'), "the 'reserved $' line");
+      expect(runningRows().length).toBe(1);
+      const t0 = Date.now();
+      // Safety EOF retains the original 10s termination budget if TERM is lost.
+      releaseInput = setTimeout(() => g.child.stdin?.end(), 10_000);
+      g.child.kill('SIGTERM');
+      const { code } = await g.exit;
+      expect(code).toBe(143);
+      expect(Date.now() - t0).toBeLessThan(10_000); // the child was killed, not waited out
+      expect(g.stderr()).toContain('interrupted (signal 15)');
+      const rows = ledgerRows();
+      expect(rows.length).toBe(2);
+      expect(rows[1].status).toBe('done');
+      expect(rows[1].run_id).toBe(rows[0].run_id);
+      expect(rows[1].cost_usd).toBe(4); // the estimate
+      expect(rows[1].exit_code).toBe(143);
+      // …and that spend drives the next decision: 4 + 7 > 10.
+      expect(run(['10', '7', '--', 'true']).status).toBe(3);
+      expect(run(['10', '6', '--', 'true']).status).toBe(0);
+    } finally {
+      if (releaseInput !== undefined) clearTimeout(releaseInput);
+      g.child.stdin?.end();
+      await g.exit;
+    }
   });
 
   test('a SIGKILLed guard leaves its reservation counted at the estimate for the next guard', async () => {
