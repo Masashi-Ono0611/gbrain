@@ -214,12 +214,14 @@ for (const kind of testBackends()) {
           await engine.stageSegmentTexts(sourceId, Array.from({ length: 1000 }, (_, i) => segmentText(`text ${filler + i} of ${sourceId}\n`)));
         }
         await engine.executeRaw("UPDATE page_segment_texts SET created_at = now() + interval '1 hour' WHERE source_id = $1", [sourceId]);
-        await engine.executeRaw('ANALYZE page_segment_texts');
+        await engine.executeRaw('ANALYZE page_segment_texts, page_body_manifest, page_body_stagings, page_body_staging_texts, pages, persistence_requests, content_chunks, page_versions');
       };
-      /** Rows each plan node produced or filtered out; a bitmap index scan's TIDs are counted by its heap scan instead (they include dead entries). */
+      /** Rows each table scan returned or filtered out. Joins, aggregates, sorts and locks pass the same rows on, and how many of
+       *  them a plan stacks depends on the strategy the planner picks, not on the source's size. A bitmap index scan names no
+       *  table: its heap scan counts the rows. */
       const examined = (node: Record<string, unknown>): number => {
         const loops = Number(node['Actual Loops'] ?? 1);
-        const own = node['Node Type'] === 'Bitmap Index Scan' ? 0 : ['Actual Rows', 'Rows Removed by Filter', 'Rows Removed by Join Filter', 'Rows Removed by Index Recheck']
+        const own = !node['Relation Name'] || node['Node Type'] === 'ModifyTable' ? 0 : ['Actual Rows', 'Rows Removed by Filter', 'Rows Removed by Index Recheck']
           .reduce((n, key) => n + Number(node[key] ?? 0) * loops, 0);
         return own + ((node.Plans as Record<string, unknown>[] | undefined) ?? []).reduce((n, child) => n + examined(child), 0);
       };

@@ -16,6 +16,34 @@ identifiers and attribution are available in the pre-removal Git revision
 
 - Declare built-in extraction receipts as non-extractable annotations in the standard gbrain-base-v2 pack, keeping normal receipt records out of undeclared-type warnings and catch-all retyping.
 
+## [0.60.294.0] - 2026-10-17
+
+**Graph walks are breadth-first: each page and edge comes back once, at its shortest depth, and dense clusters walk in milliseconds.** First step of the graph-traversal plan (HydraDB evaluation, autoplan run-20261017033903).
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A graph walk (`traverse_graph`, `gbrain graph`, `think` graph context) | enumerated every simple path, capped at 20,000 paths; a page came back once per depth some path reached it, and an edge once per depth | visits each page once, at its shortest distance, and returns each edge once (one hop past its shallower walked endpoint); the pages and edges reached are the same |
+| A walk over a densely linked cluster (12-page clique, depth 5) | 44 to 91 ms on Postgres under the path cap (22 s before the cap) | 4 to 9 ms |
+| A walk that reaches a large share of the brain | the 20,000-path cap could stop before deeper pages were reached | stops at 20,000 visited pages, shallowest first; the truncation warning names both caps |
+| `frontierCap` on `traverseGraph` | an approximate per-iteration cap applied before deduplication | an exact per-layer cap on new pages, in (slug, id) order |
+
+Every per-hop filter is unchanged and still applies at every step: soft delete, `excludePrivate` (page and link-origin privacy), source scope, link type and temporal policy.
+
+### What you need to do
+
+Nothing. Callers that relied on a page appearing at several depths now see it once, at its shortest depth.
+
+### For contributors
+
+- `src/core/engine-sql/links.ts`: one breadth-first CTE (`bfsWalkCtes`) serves `traverseGraph` and `traversePathsDetailed` on both engines.
+- `test/traverse-bfs.test.ts` checks the walks against a TypeScript shortest-path reference and the old CTE on seeded random graphs, and checks that a private, out-of-scope, private-origin or soft-deleted page in the middle of a chain stops the walk.
+- The dense-hub fixture (`test/helpers/dense-hub.ts`) now has 12 ring links per spoke, so the row-cap tests still overflow 5,000 edges now that each edge is returned once.
+- `scripts/bench-graph-walk.ts` times the walks on PGLite and, with `GBRAIN_BENCH_DATABASE_URL`, on Postgres.
+- `relationalFanout` still enumerates paths (3 hops at most); moving it to breadth-first changes search ranking and is a follow-up.
+- `test/large-pages/segmented-storage-visibility.test.ts`: the sweep-cost test counts rows at table scans only and analyzes every table the sweep reads, so a planner switching aggregate or join strategy between rounds no longer moves the count by one. A full scan of the source still fails it (12 rows against 20,014).
+
 ## [0.60.293.0] - 2026-10-17
 
 **CI only: the unit-lane PostgreSQL arms run in 14 shards, sized from fresh measured timings.** Nothing changes for gbrain users.
