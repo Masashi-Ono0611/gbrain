@@ -13,7 +13,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -22,6 +22,7 @@ import { opError } from '../src/core/ops/contract.ts';
 import { serializePageToMarkdown } from '../src/core/markdown.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { installFaultHook } from '../src/core/persistence/fault-points.ts';
 import { activateSharedSkillPersistence } from '../src/core/persistence/skill-activation.ts';
 import { adoptSharedSkillpack } from '../src/core/shared-skills/publication.ts';
@@ -52,14 +53,15 @@ interface Fixture { engine: BrainEngine; root: string }
  * directory, three ordinary pages and one kept page, all file-backed; then the shared skillpack is adopted on the source
  * (pack root = source root) and every file but the kept one and the pack's SKILL.md is removed.
  */
-async function fixture(run: (f: Fixture) => Promise<void>): Promise<void> {
+async function fixture(run: (f: Fixture) => Promise<void>, seed?: (engine: BrainEngine) => Promise<void>): Promise<void> {
   const scratch = mkdtempSync(join(tmpdir(), 'gbrain-ghost-skills-'));
   try {
     await withEnv({ GBRAIN_HOME: join(scratch, 'home'), DATABASE_URL: undefined }, async () => {
       const isolated = await isolatedSharedSkillsEngine();
       const engine = isolated.engine;
       try {
-        const root = join(scratch, 'brain'); mkdirSync(root);
+        const rootPath = join(scratch, 'brain'); mkdirSync(rootPath);
+        const root = realpathSync(rootPath);
         execFileSync('git', ['init', '-q'], { cwd: root });
         writeFileSync(join(root, 'skillpack.json'), JSON.stringify({ api_version: 'gbrain-skillpack-v1', name: 'example-pack', version: '1.0.0',
           description: 'Synthetic fixture', author: 'Example Maintainer', license: 'MIT', homepage: 'https://example.com/skills',
@@ -72,6 +74,7 @@ async function fixture(run: (f: Fixture) => Promise<void>): Promise<void> {
           mkdirSync(dirname(join(root, `${slug}.md`)), { recursive: true });
           writeFileSync(join(root, `${slug}.md`), serializePageToMarkdown(snapshot.page, snapshot.tags));
         }
+        await seed?.(engine);
         await claimWorktree(engine, SOURCE, root);
         await activateSharedSkillPersistence(engine, { confirmQuiesced: true });
         const ctx: OperationContext = { engine, config: { engine: engine.kind }, remote: false, sourceId: SOURCE, dryRun: false, logger };
@@ -138,6 +141,21 @@ describe('#6910 ghost pages under the shared skillpack', () => {
       .rejects.toMatchObject({ code: 'skill_bundle_required' });
     await expect(assertKnowledgePublicationAllowed(f.engine, row(MEMBER))).rejects.toMatchObject({ code: 'skill_bundle_required' });
     await expect(assertKnowledgePublicationAllowed(f.engine, { ...row(SKILL), intent: { kind: 'put_page' } })).rejects.toMatchObject({ code: 'skill_bundle_required' });
+  }), 120_000);
+
+  test('retention purge removes a soft-deleted non-member skills page but still refuses a pack member', () => fixture(async f => {
+    const ctx: OperationContext = { engine: f.engine, config: { engine: f.engine.kind }, remote: false, sourceId: SOURCE, dryRun: false, logger };
+    const purgeRetention = async (slug: string) => {
+      const snapshot = await f.engine.readPageSnapshot(slug, { sourceId: SOURCE, includeDeleted: true });
+      return submitPageMutation(ctx, { operation: 'delete_page', params: { slug, source_id: SOURCE, purge: true, retention: true,
+        expected_revision: snapshot!.revision, request_id: randomUUID() } });
+    };
+
+    const nonMember = await purgeRetention(SKILL).then(result => result, error => ({ code: (error as { code?: string }).code }));
+    expect(nonMember).toMatchObject({ status: 'purged', retention: true });
+    await expect(purgeRetention(MEMBER)).rejects.toMatchObject({ code: 'skill_bundle_required' });
+  }, async engine => {
+    await engine.executeRaw('UPDATE pages SET deleted_at=now() - interval \'100 hours\' WHERE source_id=$1 AND slug=ANY($2::text[])', [SOURCE, [SKILL, MEMBER]]);
   }), 120_000);
 
   test('doctor ghost_pages and pages ghosts count the skill-path ghost apart, not as a knowledge ghost awaiting the repair', () => fixture(async f => {
