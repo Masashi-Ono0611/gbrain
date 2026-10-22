@@ -539,7 +539,7 @@ async function buildRetrievalResponseMeta(
     // cached result set originally produced with relational recall still
     // reports no `relational` here).
     ...(opts.relationalMeta ? { relational: opts.relationalMeta } : {}),
-    ...(hint || readiness.hint ? { hint: [hint, readiness.hint].filter(Boolean).join(' ') } : {}),
+    ...(hint || readinessHint ? { hint: [hint, readinessHint].filter(Boolean).join(' ') } : {}),
     ...(opts.feedbackOp ? await searchAnswerFeedback(ctx, opts.feedbackOp, results as SearchResult[]) : {}),
   };
 }
