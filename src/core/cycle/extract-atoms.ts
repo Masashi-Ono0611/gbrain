@@ -4,7 +4,8 @@
 //   1. Discover transcripts via discoverTranscripts() AND brain pages
 //      via a single raw SQL query (NOT EXISTS subquery filters out
 //      pages already extracted by content hash — see "Idempotency" below).
-//   2. Dedup by content_hash; transcripts win on collision.
+//   2. Drop physical-file twins owned by live source pages, then dedup
+//      by content_hash; remaining transcripts win on hash collision.
 //   3. Per work-item, ask the configured extract_atoms model (key-aware
 //      utility-tier default, see resolveExtractAtomsModel below) for 1-3 atoms.
 //   4. Write each atom via importFromContent(slug, markdown, {sourceId})
@@ -68,9 +69,13 @@ import { chat as gatewayChat, withBudgetTracker, isAvailable } from '../ai/gatew
 import { createGlobalLlmHaltTracker, haltedClassOf, providerContentBlockReason, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { importFromContent } from '../import-file.ts';
 import { derivedWriteThrough, reportFileHolds } from './derived-write-through.ts';
-import { serializeMarkdown } from '../markdown.ts';
 import { DEFAULT_EXTRACT_MAX_INPUT_CHARS, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone, type ExtractAtomsInput, type ExtractAtomsItem } from './extract-atoms-input.ts';
 import { commitExtractionPlan, readPageWatermark } from '../extraction-watermark.ts';
+import { realpath } from 'node:fs/promises';
+import { isAbsolute, relative, sep } from 'node:path';
+import { resolveSourceLocalFilePath, serializeMarkdown } from '../markdown.ts';
+import { truncateUtf8 } from '../text-safe.ts';
+import { corpusTextForExtraction } from '../context/corpus-segments.ts';
 import { claudeCliSelfSessionIds } from '../ai/providers/claude-cli-scratch.ts';
 import { BudgetExhausted, BudgetTracker, loadPricingOverrides } from '../budget/budget-tracker.ts';
 import type { MaintenanceWriteWait } from '../persistence/maintenance-wait.ts';
@@ -101,6 +106,7 @@ import { derivedGateInput } from '../trust/derived-gate.ts';
 import { ATOM_TYPES, ATOMS_RESPONSE_SCHEMA } from './extract-atoms-schema.ts';
 import { parseAtomsOutcome } from './extract-atoms-parse.ts';
 export { parseAtomsOutcome, parseAtomsResponse, type AtomsParseOutcome } from './extract-atoms-parse.ts';
+import { countSourceChangedAtoms } from './extract-atoms-source-drift.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 // #4529 + #4540: per-item extractor caps, overridable via
@@ -544,6 +550,55 @@ export async function countExtractAtomsBacklog(
   }
 }
 
+/**
+ * Synced pages own transcripts that resolve to the same file in the source
+ * checkout, but only extractable page types own notes so neither door loses them.
+ * Scan live pages independently of the extraction batch.
+ */
+async function filterTranscriptPageTwins(
+  engine: BrainEngine,
+  sourceId: string,
+  transcripts: NonNullable<ExtractAtomsOpts['_transcripts']>,
+) {
+  if (transcripts.length === 0) return transcripts;
+  try {
+    const sources = await engine.executeRaw<{ local_path: string | null }>(
+      'SELECT local_path FROM sources WHERE id = $1', [sourceId],
+    );
+    const localPath = sources[0]?.local_path;
+    if (!localPath) return transcripts;
+    const root = await realpath(localPath);
+    const transcriptFiles = new Map<typeof transcripts[number], string>();
+    for (const transcript of transcripts) {
+      try {
+        const path = await realpath(transcript.filePath);
+        const withinRoot = relative(root, path);
+        if (withinRoot !== '..' && !withinRoot.startsWith(`..${sep}`)
+          && !isAbsolute(withinRoot)) transcriptFiles.set(transcript, path);
+      } catch { /* keep transcripts whose physical path is unavailable */ }
+    }
+    if (transcriptFiles.size === 0) return transcripts;
+    const pages = await engine.executeRaw<{ source_path: string | null; slug: string }>(
+      `SELECT source_path, slug FROM pages
+       WHERE source_id = $1 AND deleted_at IS NULL AND type = ANY($2::text[])`,
+      [sourceId, await resolveExtractableTypes()],
+    );
+    const pageFiles = new Set<string>();
+    for (const page of pages) {
+      try {
+        const path = resolveSourceLocalFilePath(localPath, page.source_path, page.slug);
+        if (path) pageFiles.add(await realpath(path));
+      } catch { /* unresolved page cannot establish a twin */ }
+    }
+    return transcripts.filter(transcript => {
+      const path = transcriptFiles.get(transcript);
+      return path === undefined || !pageFiles.has(path);
+    });
+  } catch {
+    return transcripts; // fail-soft: extraction still proceeds
+  }
+}
+
 async function resolvePageDiscoveryLimit(engine: BrainEngine): Promise<number> {
   try {
     const configured = await engine.getConfig('cycle.extract_atoms.page_discovery_budget');
@@ -744,6 +799,9 @@ export async function runPhaseExtractAtoms(
   // a raised cap supersedes are released and their items offered in this run.
   const maxInputChars = await resolveExtractAtomsInputCap(engine);
   if (!opts.dryRun) await releasePartialDispositions(engine, sourceId, maxInputChars);
+  const transcriptsBeforeTwins = transcripts.length;
+  transcripts = await filterTranscriptPageTwins(engine, sourceId, transcripts);
+  const transcriptPageTwinsSkipped = transcriptsBeforeTwins - transcripts.length;
 
   // 1b. Get pages (test seam OR production discovery).
   //     _pages === undefined triggers discovery; _pages: [] suppresses it
@@ -871,12 +929,14 @@ export async function runPhaseExtractAtoms(
         reason: 'no_work',
         source_id: sourceId,
         atoms_extracted: 0,
+        atoms_source_changed: 0,
         transcripts_processed: 0,
         transcripts_total: 0,
         transcripts_skipped_budget: 0,
         pages_processed: 0,
         pages_total: 0,
         duplicates_skipped: 0,
+        transcript_page_twins_skipped: transcriptPageTwinsSkipped,
         failures: [],
         estimated_spend_usd: 0,
         budget_usd: DEFAULT_BUDGET_USD,
@@ -887,6 +947,8 @@ export async function runPhaseExtractAtoms(
 
   // 4. Per work-item: extract atoms via the configured extract_atoms model
   let totalAtomsExtracted = 0;
+  // Read-only drift visibility; see ./extract-atoms-source-drift.ts.
+  let atomsSourceChanged = 0;
   let transcriptsProcessed = 0;
   let pagesProcessed = 0;
   let transcriptsSkipped = 0;
@@ -1154,6 +1216,10 @@ export async function runPhaseExtractAtoms(
           else if (!origin && item.kind === 'transcript') await stampTranscriptTombstone(engine, sourceId, item.filePath, item.contentHash);
           await commitAtomsWatermark(item, input, published);
         }
+        // Zero yield ≠ zero atoms: earlier runs can have left stale rows.
+        if (item.kind === 'page') {
+          atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
+        }
         if (item.kind === 'transcript') transcriptsProcessed++;
         else pagesProcessed++;
         continue;
@@ -1301,7 +1367,25 @@ export async function runPhaseExtractAtoms(
         throwIfAborted(opts.signal, 'extract_atoms');
         // #6503: a cut item keeps its atoms provisional (`pending:<hash>`, the upsert path when it runs
         // again), retires nothing and records its partial disposition instead of a completion stamp.
-        const retired = truncated ? [] : await completeUnmanagedItem(engine, sourceId, item, hash16, importedSlugs);
+        const retired = truncated ? [] : await completeUnmanagedItem(
+          engine,
+          sourceId,
+          item,
+          hash16,
+          importedSlugs,
+          item.kind === 'page'
+            ? async () => {
+                // Preserve the pre-cleanup drift population after receipts flip,
+                // before the upstream helper retires stale atoms.
+                atomsSourceChanged += await countSourceChangedAtoms(
+                  engine,
+                  sourceId,
+                  item.slug,
+                  item.contentHash.slice(0, 16),
+                );
+              }
+            : undefined,
+        );
         await atomFiles?.write(importedSlugs, retired);
         if (truncated) await recordPartialDisposition(engine, sourceId, item, maxInputChars);
         else if (item.kind === 'page') await stampAtomsScanHash(item);
@@ -1309,6 +1393,11 @@ export async function runPhaseExtractAtoms(
         }
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting
+      }
+      // Dry-run wrote nothing, so report the pre-run live population. Normal
+      // writes counted after receipt completion and before upstream cleanup.
+      if (opts.dryRun && item.kind === 'page') {
+        atomsSourceChanged += await countSourceChangedAtoms(engine, sourceId, item.slug, item.contentHash.slice(0, 16));
       }
       if (item.kind === 'transcript') transcriptsProcessed++;
       else pagesProcessed++;
@@ -1429,9 +1518,11 @@ export async function runPhaseExtractAtoms(
       (transcriptsSkipped + pagesSkipped > 0
         ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
         : '') +
-      (inputTruncated > 0 ? ` (${inputTruncated} input-truncated: the model did not read the tail)` : ''),
+      (inputTruncated > 0 ? ` (${inputTruncated} input-truncated: the model did not read the tail)` : '') +
+      (atomsSourceChanged > 0 ? ` (${atomsSourceChanged} source-changed atoms)` : ''),
     details: {
       atoms_extracted: totalAtomsExtracted,
+      atoms_source_changed: atomsSourceChanged,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,
       transcripts_skipped_budget: transcriptsSkipped,
@@ -1442,6 +1533,7 @@ export async function runPhaseExtractAtoms(
       write_pending: writesPending,
       held_failed: heldFailed,
       input_truncated: inputTruncated,
+      transcript_page_twins_skipped: transcriptPageTwinsSkipped,
       failures,
       ...(managed ? { write_requests: writeRequests } : {}),
       ...(abortedGlobalError ? { aborted_global_error: abortedGlobalError } : {}),
@@ -1466,8 +1558,10 @@ export async function runPhaseExtractAtoms(
  * produced that this one did not. Returns the retired slugs.
  */
 async function completeUnmanagedItem(engine: BrainEngine, sourceId: string,
-  item: { kind: 'transcript'; filePath: string } | ({ kind: 'page' } & AtomPageInput), hash16: string, importedSlugs: string[]): Promise<string[]> {
+  item: { kind: 'transcript'; filePath: string } | ({ kind: 'page' } & AtomPageInput), hash16: string, importedSlugs: string[],
+  beforeRetire?: () => Promise<void>): Promise<string[]> {
   await completeAtomReceipts(engine, sourceId, importedSlugs, hash16, item.kind === 'page' ? item : undefined);
+  await beforeRetire?.();
   return retireStaleAtoms(engine, sourceId, item.kind === 'page'
     ? { key: 'source_slug', value: item.slug } : { key: 'source_path', value: item.filePath }, hash16, importedSlugs);
 }
