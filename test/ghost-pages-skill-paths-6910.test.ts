@@ -13,7 +13,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -60,8 +60,7 @@ async function fixture(run: (f: Fixture) => Promise<void>, seed?: (engine: Brain
       const isolated = await isolatedSharedSkillsEngine();
       const engine = isolated.engine;
       try {
-        const rootPath = join(scratch, 'brain'); mkdirSync(rootPath);
-        const root = realpathSync(rootPath);
+        const root = join(scratch, 'brain'); mkdirSync(root);
         execFileSync('git', ['init', '-q'], { cwd: root });
         writeFileSync(join(root, 'skillpack.json'), JSON.stringify({ api_version: 'gbrain-skillpack-v1', name: 'example-pack', version: '1.0.0',
           description: 'Synthetic fixture', author: 'Example Maintainer', license: 'MIT', homepage: 'https://example.com/skills',
