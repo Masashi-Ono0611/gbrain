@@ -10,6 +10,12 @@
 # sysctl/nproc/vm_stat/timeout and no package.json).
 
 # ──────────────────────────────────────────────────────────────────────────
+# Bun prints failures only when it detects an AI agent (CLAUDECODE, REPL_ID),
+# which drops the per-file headers the runners count. AGENT is checked first
+# and AGENT=0 turns that detection off.
+export AGENT=0
+
+# ──────────────────────────────────────────────────────────────────────────
 # CPU detection: Apple Silicon perf cores → Mac total physical → nproc → 4.
 # Returns a single positive integer.
 # ──────────────────────────────────────────────────────────────────────────

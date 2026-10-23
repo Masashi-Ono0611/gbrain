@@ -142,7 +142,30 @@ exit "$failed"
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
+/** Run a real passing Bun test under Claude Code's AI-agent environment. */
+function runClaudeCodePassingFixture() {
+  const root = mkdtempSync(join(tmpdir(), 'gbrain-unit-agent-mode-test-'));
+  try {
+    mkdirSync(join(root, 'scripts/lib'), { recursive: true });
+    mkdirSync(join(root, 'test'), { recursive: true });
+    copyFileSync(SHARD_SH, join(root, 'scripts/run-unit-shard.sh'));
+    copyFileSync(join(dirname(SHARD_SH), 'lib/test-env.sh'), join(root, 'scripts/lib/test-env.sh'));
+    writeFileSync(join(root, 'test/passing.test.ts'), `import { expect, test } from 'bun:test';\ntest('passes', () => expect(1 + 1).toBe(2));\n`);
+    return spawnSync('bash', [join(root, 'scripts/run-unit-shard.sh'), 'test/passing.test.ts'], {
+      cwd: root, encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, CLAUDECODE: '1' },
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
 describe('run-unit-shard.sh bounded processes', () => {
+  it('counts a real passing file when launched from Claude Code', () => {
+    const result = runClaudeCodePassingFixture();
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(`${result.stdout ?? ''}${result.stderr ?? ''}`).toContain('complete_groups=1 files=1 pass=1 fail=0 skip=0 rc=0');
+  });
+
   for (const count of [1, 2, 3]) {
     it(`executes the exact ordered ${count}-file inventory with one Bun process per file`, () => {
       const result = runGroupedFixture(count);
