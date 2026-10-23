@@ -88,7 +88,7 @@ export interface ManagedFactsSession {
   batchKey: string; inputDigest: string; origin: ManagedFactOrigin | null; originalRequestId: string | null;
   completionRequestId: string;
   embedding?: FactEmbeddingSignature | null;
-  /** #6048: the batch is keyed by its input alone and the caller asked to re-admit facts the canonical file check refused. */
+  /** Recheck retained file refusals for automatic page-write extraction or an opted-in input-keyed sweep. */
   fileRefusalRetry?: boolean;
   /** #6506: the batch is keyed by its input alone (no request id), so a stored withdrawal refusal would replay on every run. */
   inputKeyed?: boolean;
@@ -305,7 +305,10 @@ export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
   const session: ManagedFactsSession = { authority, binding: writeThrough ? binding : null, config,
     batchKey, inputDigest, origin, originalRequestId: ctx.persistenceRequestId ?? null,
     completionRequestId: ctx.requestId ? requireUuid(ctx.requestId) : managedFactRequestId(batchKey, '__managed_facts_complete__'),
-    fileRefusalRetry: ctx.reAdmitFileRefusals === true && seed === inputDigest,
+    // A facts-absorb retry keeps its original page write's identity. Replaying that batch's
+    // old file refusal would strand it after repair. Explicit request IDs still replay unchanged.
+    fileRefusalRetry: !ctx.requestId && (ctx.persistenceRequestId !== undefined
+      || ctx.reAdmitFileRefusals === true && seed === inputDigest),
     inputKeyed: seed === inputDigest,
     wait: new MaintenanceWriteWait(ctx.deadlineAtMs ?? null), ...(ctx.abortSignal ? { signal: ctx.abortSignal } : {}),
     ...(captureGateLaneForSource(ctx.source) ? { captureSource: ctx.source } : {}),
