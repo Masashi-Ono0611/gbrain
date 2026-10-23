@@ -305,7 +305,9 @@ export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
   const session: ManagedFactsSession = { authority, binding: writeThrough ? binding : null, config,
     batchKey, inputDigest, origin, originalRequestId: ctx.persistenceRequestId ?? null,
     completionRequestId: ctx.requestId ? requireUuid(ctx.requestId) : managedFactRequestId(batchKey, '__managed_facts_complete__'),
-    fileRefusalRetry: ctx.reAdmitFileRefusals === true && seed === inputDigest,
+    // Page-triggered jobs reuse the committed write's identity on retry. Their
+    // retained file refusal must be rechecked too, rather than replayed forever.
+    fileRefusalRetry: !!ctx.persistenceRequestId || ctx.reAdmitFileRefusals === true && seed === inputDigest,
     inputKeyed: seed === inputDigest,
     wait: new MaintenanceWriteWait(ctx.deadlineAtMs ?? null), ...(ctx.abortSignal ? { signal: ctx.abortSignal } : {}),
     ...(captureGateLaneForSource(ctx.source) ? { captureSource: ctx.source } : {}),
@@ -391,8 +393,8 @@ async function storedBatch(engine: BrainEngine, session: ManagedFactsSession): P
 const isEntityRequest = (row: WriteRequest) => (row.intent?.kind ?? row.outcome?.kind) === 'managed_facts_entity';
 
 /**
- * #6048: an input-keyed batch (the sweep has no request id to give a window)
- * would replay a terminal file-check refusal forever. Walk its follow-up
+ * Input-keyed sweeps and page-triggered jobs reuse their batch identity and
+ * would replay a terminal file-check refusal forever. Walk their follow-up
  * batches instead: while every request of the latest one is terminal and each
  * uncommitted entity request is a `source_changed` refusal that kept its facts,
  * look for the next follow-up, or admit it when every refused page now passes
