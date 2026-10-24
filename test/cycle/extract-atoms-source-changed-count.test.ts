@@ -312,21 +312,37 @@ describe('extract_atoms per-page atoms_source_changed', () => {
     expect(await snapshotPages()).toBe(before);
   });
 
-  test('a normal run reports stale siblings before upstream cleanup retires them', async () => {
+  test('a normal run reports stale siblings without changing unproven legacy atoms', async () => {
     await seedSourcePage();
     await seedAtom('atoms/seeded/stale-one', { source_slug: PAGE_SLUG, source_hash: OLD_HASH16 });
     const before = await snapshotPage('atoms/seeded/stale-one');
     expect(before).not.toBe(''); // guard: the row really is there to compare
 
+    // Isolate the diagnostic from publication: it must leave EVERY page
+    // column unchanged, including the source page and the stale atom.
+    const pagesBeforeCount = await snapshotPages();
+    expect(await countSourceChangedAtoms(engine, 'default', PAGE_SLUG, CURRENT_HASH16)).toBe(1);
+    expect(await snapshotPages()).toBe(pagesBeforeCount);
+
     const result = await runPage('Prototypes beat renders');
+    expect(result.details?.atoms_extracted).toBe(1);
     expect(result.details?.atoms_source_changed).toBe(1);
-    // Upstream's successful-extraction lifecycle retires stale atoms after
-    // the diagnostic captures them; the content remains available as history.
-    expect(await snapshotPage('atoms/seeded/stale-one')).not.toBe(before);
-    const retired = await engine.executeRaw<{ is_deleted: boolean }>(
+    // Publication completed, rather than being held/deferred or zero-yield.
+    const generations = await engine.executeRaw<{ state: string }>(
+      `SELECT state FROM derived_generations WHERE source_id = 'default' AND kind = 'atom' AND owner_key = $1`,
+      [`source_slug:${PAGE_SLUG}`],
+    );
+    expect(generations.map((generation) => generation.state)).toEqual(['live']);
+    // src/core/generations/plan.ts:55-60 protects unrecorded atoms unless
+    // reproduced or backed by retained producer evidence. This bare seed has
+    // neither an extractor page version nor a committed managed receipt
+    // (src/core/generations/adapters/atoms.ts:95-97), so a stale source_hash
+    // alone cannot retire it, in this run or a later unchanged run.
+    expect(await snapshotPage('atoms/seeded/stale-one')).toBe(before);
+    const stale = await engine.executeRaw<{ is_deleted: boolean }>(
       `SELECT deleted_at IS NOT NULL AS is_deleted FROM pages WHERE slug='atoms/seeded/stale-one' AND source_id='default'`,
     );
-    expect(retired[0]?.is_deleted).toBe(true);
+    expect(stale[0]?.is_deleted).toBe(false);
   });
 
   test('deliberately NOT doctor: an atom whose hash another live page still carries is counted', async () => {
