@@ -35,6 +35,10 @@ export const PERSISTENCE_REQUEST_SLUG_INTENT_INDEX = { name: 'persistence_reques
 export const PERSISTENCE_REQUEST_ID_INDEX_SQL = `CREATE INDEX IF NOT EXISTS persistence_requests_request_id
   ON persistence_requests(source_id,request_id)`;
 export const PERSISTENCE_REQUEST_ID_INDEX = { name: 'persistence_requests_request_id', table: 'persistence_requests', sql: PERSISTENCE_REQUEST_ID_INDEX_SQL } as const;
+/** Cold claim fairness probes must not scan permanent receipts when syncSeen is empty. */
+export const PERSISTENCE_FOREGROUND_COMMITTED_INDEX_SQL = `CREATE INDEX IF NOT EXISTS persistence_requests_foreground_committed
+  ON persistence_requests(worktree_id,sequence) WHERE state='committed' AND NOT (COALESCE(intent->>'kind','') LIKE 'managed_sync_%')`;
+export const PERSISTENCE_FOREGROUND_COMMITTED_INDEX = { name: 'persistence_requests_foreground_committed', table: 'persistence_requests', sql: PERSISTENCE_FOREGROUND_COMMITTED_INDEX_SQL } as const;
 /** Every request-table index built online (a migration, then `gbrain repair request-indexes` and doctor `persistence_request_indexes`). */
 export const PERSISTENCE_REQUEST_ONLINE_INDEXES = [...PERSISTENCE_SYNC_RUN_INDEXES, PERSISTENCE_REQUEST_SLUG_INTENT_INDEX, PERSISTENCE_REQUEST_ID_INDEX] as const;
 /**
@@ -107,7 +111,7 @@ export const PERSISTENCE_CONSUMERS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS persi
 /** Indexes the Postgres blob omits because a migration builds them CONCURRENTLY. */
 export const POSTGRES_CONCURRENT_PERSISTENCE_INDEXES: ReadonlySet<string> = new Set([
   PERSISTENCE_DATABASE_PENDING_INDEX_SQL, PERSISTENCE_SYNC_RUN_OPEN_INDEX_SQL, PERSISTENCE_SYNC_RUN_COMMITTED_INDEX_SQL, PERSISTENCE_SYNC_WATERMARK_INDEX_SQL, PERSISTENCE_COMPACTABLE_INDEX_SQL,
-  PERSISTENCE_REQUEST_SLUG_INTENT_INDEX_SQL, PERSISTENCE_REQUEST_ID_INDEX_SQL,
+  PERSISTENCE_REQUEST_SLUG_INTENT_INDEX_SQL, PERSISTENCE_REQUEST_ID_INDEX_SQL, PERSISTENCE_FOREGROUND_COMMITTED_INDEX_SQL,
 ]);
 /** Durable infrastructure: never reconstruct or discard these rows during page reindexing. */
 export const PERSISTENCE_SCHEMA_STATEMENTS = [
@@ -203,6 +207,7 @@ export const PERSISTENCE_SCHEMA_STATEMENTS = [
   PERSISTENCE_COMPACTABLE_INDEX_SQL,
   PERSISTENCE_REQUEST_SLUG_INTENT_INDEX_SQL,
   PERSISTENCE_REQUEST_ID_INDEX_SQL,
+  PERSISTENCE_FOREGROUND_COMMITTED_INDEX_SQL,
   `CREATE INDEX IF NOT EXISTS persistence_requests_principal ON persistence_requests(principal_kind,principal_id,sequence DESC)`,
   `CREATE TABLE IF NOT EXISTS persistence_effects (
     id bigserial PRIMARY KEY,
