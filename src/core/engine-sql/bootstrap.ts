@@ -165,6 +165,11 @@ const FORWARD_REFERENCE_PROBES: readonly Probe[] = [
   ['facts_exists', 'facts'],
   ['facts_embedding_model_exists', 'facts', 'embedding_model'],
   ['facts_embedded_text_hash_exists', 'facts', 'embedded_text_hash'],
+  ['derived_generations_exists', 'derived_generations'],
+  ['derived_generations_locator_exists', 'derived_generations', 'locator'],
+  ['derived_generations_activation_id_exists', 'derived_generations', 'activation_id'],
+  ['derived_generation_items_exists', 'derived_generation_items'],
+  ['derived_generation_items_pending_exists', 'derived_generation_items', 'pending'],
 ];
 
 // Probed only where `dreamVerdictsForwardReference` (the Postgres blob).
@@ -307,6 +312,11 @@ export function forwardReferenceGaps(probe: ProbeRow, dialect: ForwardReferenceB
     && probe.dream_verdicts_exists && !probe.dream_verdicts_expires_at_exists;
   const needsFactEmbeddingIdentity = probe.facts_exists
     && (!probe.facts_embedding_model_exists || !probe.facts_embedded_text_hash_exists);
+  // v266: blob replay indexes pending before the migration can add it.
+  const needsDerivedGenerationItemsPending = probe.derived_generation_items_exists
+    && !probe.derived_generation_items_pending_exists;
+  const needsDerivedGenerationActivation = probe.derived_generations_exists
+    && (!probe.derived_generations_locator_exists || !probe.derived_generations_activation_id_exists);
   return {
     needsPagesBootstrap, needsLinksBootstrap, needsChunksBootstrap, needsPagesDeletedAt,
     needsMcpLogBootstrap, needsSubagentProviderId, needsChunksEmbeddingImage, needsPagesRecency,
@@ -316,6 +326,7 @@ export function forwardReferenceGaps(probe: ProbeRow, dialect: ForwardReferenceB
     needsPagesLinksExtractedAt, needsTimelineEventPageId, needsMinionJobsTimeoutAt,
     needsMinionJobsIdempotencyKey, needsMinionJobsPrivateQueue, needsMinionJobsAuthority,
     needsDreamVerdictsExpiresAt, needsFactEmbeddingIdentity,
+    needsDerivedGenerationItemsPending, needsDerivedGenerationActivation,
   };
 }
 
@@ -333,6 +344,7 @@ export async function applyForwardReferenceBootstrap(target: ForwardReferenceBoo
     needsPagesLinksExtractedAt, needsTimelineEventPageId, needsMinionJobsTimeoutAt,
     needsMinionJobsIdempotencyKey, needsMinionJobsPrivateQueue, needsMinionJobsAuthority,
     needsDreamVerdictsExpiresAt, needsFactEmbeddingIdentity,
+    needsDerivedGenerationItemsPending, needsDerivedGenerationActivation,
   } = gaps;
 
   if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
@@ -349,7 +361,8 @@ export async function applyForwardReferenceBootstrap(target: ForwardReferenceBoo
       && !needsTimelineEventPageId
       && !needsMinionJobsTimeoutAt && !needsMinionJobsIdempotencyKey
       && !needsMinionJobsPrivateQueue && !needsMinionJobsAuthority
-      && !needsDreamVerdictsExpiresAt && !needsFactEmbeddingIdentity) return;
+      && !needsDreamVerdictsExpiresAt && !needsFactEmbeddingIdentity
+      && !needsDerivedGenerationItemsPending && !needsDerivedGenerationActivation) return;
 
   process.stderr.write('  Schema forward-reference gap detected, applying bootstrap\n');
 
@@ -582,7 +595,21 @@ async function applyLaterColumnGaps(target: ForwardReferenceBootstrapTarget, gap
     needsPagesGeneration, needsPagesEmbeddingSignature, needsPagesLinksExtractedAt,
     needsTimelineEventPageId, needsMinionJobsTimeoutAt, needsMinionJobsIdempotencyKey,
     needsDreamVerdictsExpiresAt, needsMinionJobsPrivateQueue, needsMinionJobsAuthority,
+    needsDerivedGenerationItemsPending, needsDerivedGenerationActivation,
   } = gaps;
+
+  if (needsDerivedGenerationItemsPending) {
+    await exec(`
+      ALTER TABLE derived_generation_items ADD COLUMN IF NOT EXISTS pending BOOLEAN NOT NULL DEFAULT false;
+    `);
+  }
+  if (needsDerivedGenerationActivation) {
+    // Column-only bootstrap; v266 owns the activation table and indexes.
+    await exec(`
+      ALTER TABLE derived_generations ADD COLUMN IF NOT EXISTS locator TEXT;
+      ALTER TABLE derived_generations ADD COLUMN IF NOT EXISTS activation_id TEXT;
+    `);
+  }
 
   if (needsPagesLastRetrievedAt) {
     // v79 (pages_last_retrieved_at): adds the stale-page signal column +
