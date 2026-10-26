@@ -1,6 +1,6 @@
 /**
- * default-source-path-check — detect a `default` source whose null
- * `local_path` DEMONSTRABLY breaks the write-through / sync plane.
+ * default-source-path-check — detect relative default paths and null paths
+ * that DEMONSTRABLY break the write-through / sync plane.
  *
  * The `default` source is the implicit write-through target for any unscoped
  * `gbrain put` / `gbrain capture` call that doesn't name a `--source`.
@@ -11,7 +11,8 @@
  * write into a path that is another source's own working tree. A fresh
  * `gbrain init` leaves `default.local_path` null on purpose.
  *
- * So this check warns ONLY when the null pointer provably breaks something:
+ * Relative pointers warn because they depend on cwd. Null pointers warn only
+ * when the fallback provably breaks something:
  *
  *   - LEAK-GUARDED FALLBACK: `sync.repo_path` is literally another source's
  *     own `local_path`, so every unscoped write-through for default-source
@@ -30,6 +31,8 @@
  * npm-squat-check.ts / pglite-leftovers-check.ts. The gathering wrapper
  * lives on the doctor surface (doctor/checks/default-source-path.ts).
  */
+import { isAbsolute } from 'path';
+
 export interface DefaultSourcePathInput {
   /** The `default` sources row, or undefined when no such row exists. */
   defaultSource: { local_path: string | null } | undefined;
@@ -63,6 +66,12 @@ export function assessDefaultSourcePath(
     return { status: 'skip', message: '' };
   }
   if (defaultSource.local_path) {
+    if (!isAbsolute(defaultSource.local_path)) {
+      return { status: 'warn', message:
+        `default source local_path is relative: ${defaultSource.local_path}. ` +
+        'It depends on the working directory and cannot establish sync ownership. ' +
+        'Set the intended absolute directory with `gbrain sources set-path default <path>`.' };
+    }
     return {
       status: 'ok',
       message: `default source local_path is set: ${defaultSource.local_path}`,

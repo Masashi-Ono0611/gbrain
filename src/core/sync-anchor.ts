@@ -6,7 +6,7 @@ import { withCompanyBrainSource } from './company-brain/profile.ts';
  */
 import { realpathSync } from 'fs';
 import { syncDispatchRow } from './sync-dispatch-read.ts';
-import { resolve as pathResolve } from 'path';
+import { isAbsolute, resolve as pathResolve } from 'path';
 import type { BrainEngine } from './engine.ts';
 import type { SyncOpts } from '../commands/sync.ts';
 import { ownsGlobalSyncAnchor, sameRepoDir } from './sync.ts';
@@ -87,7 +87,8 @@ export async function isAnchorOwnedSyncPath(
   if (opts.srcSubpath) return false;
   if (opts.sourceId && opts.sourceId !== 'default') return false;
   const anchor = await readSyncAnchor(engine, opts.sourceId, 'repo_path');
-  if (anchor === null) return false;
+  // A relative anchor follows the caller's cwd and proves no ownership.
+  if (anchor === null || !isAbsolute(anchor)) return false;
   try {
     return realpathSync(anchor) === realpathSync(repoPath);
   } catch {

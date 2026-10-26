@@ -340,6 +340,11 @@ function schemaMissingVerdict(input: TerminalInput, code: string, origin: string
 
 function faultAction(code: string, input: TerminalInput): Action {
   const v = classifySyncFault({ code });
+  if (code === 'preparation_stalled' && !input.intent_kind?.startsWith('managed_sync_')) {
+    return inspect(input.source_id,
+      'The write preparation stalled; inspect writer status read-only. Once the database and writer are healthy, ' +
+      'resubmit the original operation with a new request_id. A sync does not replay this write.');
+  }
   if (v.safe_actions[0] === 'retry') return syncRetry(input.source_id, `The sync recorded ${code} (${v.class}); a rerun holds or retries it.`);
   return inspect(input.source_id, `The write ended ${code}; writer status names what holds it, read-only.`, v.human_reason);
 }
@@ -436,6 +441,7 @@ export function dispositionOf(later: { state: string; same_intent: boolean } | n
 export function classifyRecordedFault(input: { source_id: string; code: string; slug?: string | null; request_id?: string | null;
   error_detail?: Record<string, unknown> | null; message?: string | null }): TerminalVerdict {
   return classifyTerminal({ source_id: input.source_id, slug: input.slug ?? '', operation: 'submit_job', state: 'failed', error_code: input.code,
+    intent_kind: 'managed_sync_import',
     error_detail: input.error_detail ?? null, recovery: null, blocked_reason: null, compacted: false, error_message: input.message ?? null,
     ...(input.request_id ? { request_id: input.request_id } : {}) })!;
 }
