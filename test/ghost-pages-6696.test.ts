@@ -179,6 +179,24 @@ for (const backend of testBackends()) describe(`#6696 B5 ghost pages (${backend}
     expect(out.next[0]).toContain(`gbrain repair ghost-pages --source ${f.sourceId}`);
   }));
 
+  test('#7736: a tracked JSON code path is not a slug.md ghost', () => fixture(async f => {
+    const path = 'projects/example/decisions.active.json';
+    const slug = 'projects-example-decisions-active-json';
+    const json = '{"decision":"keep"}\n';
+    mkdirSync(join(f.root, 'projects/example'), { recursive: true });
+    writeFileSync(join(f.root, path), json);
+    execFileSync('git', ['add', path], { cwd: f.root });
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    await engine.executeRaw(`INSERT INTO pages(source_id,slug,type,title,compiled_truth,timeline,frontmatter,source_path)
+      VALUES($1,$2,'code',$2,$3,'','{}'::jsonb,$4)`, [f.sourceId, slug, json, path]);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+
+    const scan = await readGhostPages(engine, { sourceIds: [f.sourceId] });
+    expect(existsSync(join(f.root, `${slug}.md`))).toBe(false);
+    expect(scan).toMatchObject({ status: 'known', count: 0 });
+    expect((await repair(f.sourceId)).affected).toBe(0);
+  }));
+
   test('the exact argv the terminal classifier prints is a read-only preview that prints the apply command with its hash', () => fixture(async f => {
     await seed(f);
     const verdict = classifyTerminal({ source_id: f.sourceId, slug: 'notes/ghost', operation: 'put_page', state: 'conflict', error_code: 'source_changed',

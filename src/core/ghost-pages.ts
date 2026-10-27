@@ -126,8 +126,20 @@ export async function sourceContext(engine: BrainEngine, sourceId: string): Prom
 /** The path `prepareFileTarget` compares, resolved the same way (recorded source path, captured file URI, then the slug path). */
 export function canonicalPath(context: Extract<SourceContext, { ok: true }>, page: Pick<PageRow, 'slug' | 'source_path' | 'source_uri'>): string {
   const captured = recordedPathFromFileUri(page.source_uri, context.root);
+  const recordedCodePath = page.source_path && !/\.mdx?$/i.test(page.source_path.trim())
+    ? safeRecordedCodePath(context.root, page.source_path) : null;
   return resolveSourceLocalFilePath(context.root, page.source_path, page.slug, page.source_path ? context.mode : undefined, context.gitScope)
+    ?? recordedCodePath
     ?? (captured ? join(context.root, captured) : join(context.root, `${page.slug}.md`));
+}
+
+/** Code pages retain their original source extension; only use a confined relative recorded path. */
+function safeRecordedCodePath(root: string, value: string): string | null {
+  const path = value.trim();
+  if (!path || path.includes('\0') || path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)) return null;
+  const segments = path.replaceAll('\\', '/').split('/');
+  if (segments.some(segment => !segment || segment === '.' || segment === '..')) return null;
+  return join(root, ...segments);
 }
 
 /** The existence pre-filter: `present`, `database_only`, a `candidate` at its source-relative path, or `ambiguous`. */
@@ -153,6 +165,14 @@ async function confirm(engine: BrainEngine, context: Extract<SourceContext, { ok
   Promise<{ kind: 'ghost'; ghost: GhostPage } | { kind: 'not_ghost'; reason: string } | { kind: 'unknown'; reason: string }> {
   const snapshot: PageSnapshot | null = await engine.readPageSnapshot(slug, { sourceId });
   if (!snapshot || snapshot.page.deleted_at) return { kind: 'not_ghost', reason: 'page_missing' };
+  // `liveFileDrift` follows the Markdown-only resolver. A recorded code path
+  // may be live even when that resolver rejects its extension.
+  try {
+    statSync(canonicalPath(context, { slug, source_path: snapshot.page.source_path ?? null, source_uri: snapshot.page.source_uri ?? null }));
+    return { kind: 'not_ghost', reason: 'agrees' };
+  } catch (error) {
+    if (!missing(error)) return { kind: 'unknown', reason: 'ambiguous_storage' };
+  }
   const live = await liveFileDrift(engine, sourceId, slug, snapshot);
   if (live.reason === 'canonical_file_missing') {
     return { kind: 'ghost', ghost: { source_id: sourceId, slug, path: relative(context.root, canonicalPath(context, { slug, source_path: snapshot.page.source_path ?? null,
