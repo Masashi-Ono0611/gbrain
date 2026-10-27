@@ -37,6 +37,8 @@ import { __setChatTransportForTests, type ChatResult } from '../src/core/ai/gate
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END } from '../src/core/facts-fence.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { mulberry32 } from './helpers/seeded-random.ts';
+import { PRIVATE, PUBLIC, importSegmented, pageContent, privacyFacts, privacyText, seedLedger } from './helpers/segmented-privacy-fixture.ts';
 
 let engine: PGLiteEngine;
 
@@ -407,6 +409,72 @@ describe('think gather keeps structured evidence', () => {
 
     expect(gather!.pages.some(page => page.slug === 'work-mail/quiet-thread')).toBe(false);
     expect(gather!.warnings).not.toContain('GATHER_WINDOW_FLOOR_PARTIAL_FAILED');
+  }, 120_000);
+});
+
+/**
+ * Pin the local hydration guards together with upstream's segmented leads.
+ * The upstream parity test covers a successful remote gather; it does not
+ * cover trusted-local retractions or a segmented row changing after listing.
+ * Direct body reads fail the success cases; bypassing hydration fails the
+ * revision cases. Uses the real engine and its existing getPage seam only.
+ */
+describe('segmented temporal floor preserves hydration guards', () => {
+  let engine: PGLiteEngine;
+  const slug = 'work-mail/segmented-floor';
+  const opening = 'Segmented invoice receipt for the finance folder.';
+  const window = { startMs: Date.UTC(2026, 6, 17), endMs: Date.UTC(2026, 6, 18) };
+  const gatherOpts = { question: 'qqnomatchsegmentedfloor', window, sourceIds: ['default'], excludePrivate: true };
+
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+    await importSegmented(engine, slug, pageContent(`${opening}\n\n${privacyFacts()}\n${privacyText(mulberry32(908), 1_500_000)}`));
+    await seedLedger(engine, slug);
+    await engine.executeRaw(`UPDATE pages SET effective_date='2026-07-17T12:00:00Z' WHERE source_id='default' AND slug=$1`, [slug]);
+  }, 120_000);
+  afterAll(async () => { await engine.disconnect(); });
+
+  test.each([['local', false], ['remote', true]] as const)('keeps a withdrawal-overlaid segmented lead (%s)', async (_mode, remote) => {
+    const gathered = await runGather(engine, { ...gatherOpts, remote });
+    expect(gathered.warnings).toEqual([]);
+    expect(gathered.pages.map(page => page.slug)).toEqual([slug]);
+    const lead = gathered.pages[0]!.chunk_text;
+    expect(lead).toContain(opening);
+    expect(lead).toContain(PUBLIC.fact);
+    expect(lead).not.toContain(PRIVATE.purged);
+    if (remote) {
+      expect(lead).not.toContain(PRIVATE.withdrawn);
+      expect(lead).not.toContain(PRIVATE.privateFact);
+    } else {
+      // Trusted-local snapshots retain withdrawn rows as inactive tombstones.
+      expect(lead).toContain(`~~${PRIVATE.withdrawn} old employer~~`);
+      expect(lead).not.toContain(`| ${PRIVATE.withdrawn} old employer |`);
+      expect(lead).toContain(PRIVATE.privateFact);
+    }
+  }, 120_000);
+
+  test.each(['knowledge_revision', 'text_projection_revision'] as const)('drops a segmented row whose %s changed after enumeration', async revision => {
+    const originalGetPage = engine.getPage;
+    let hydrated = 0;
+    engine.getPage = async (...args: Parameters<typeof engine.getPage>) => {
+      const page = await originalGetPage.apply(engine, args);
+      if (args[0] === slug && page) {
+        hydrated++;
+        // Do not spread a segmented page: that itself reads its body getters.
+        page[revision] = `${page[revision] ?? 'missing'}-changed`;
+      }
+      return page;
+    };
+    try {
+      const gathered = await runGather(engine, { ...gatherOpts, remote: true });
+      expect(hydrated).toBeGreaterThan(0);
+      expect(gathered.pages).toEqual([]);
+      expect(gathered.warnings).toEqual([]);
+    } finally {
+      engine.getPage = originalGetPage;
+    }
   }, 120_000);
 });
 

@@ -24,6 +24,7 @@ import { INTERNAL_BREADTH_SEARCH_OPTS } from '../search/internal-breadth.ts';
 import { resolveHardExcludes } from '../search/source-boost.ts';
 import { boundedProjectedPrefix } from '../page-window/document.ts';
 import { boundedRawPrefix, overlaidBoundedRows, pageLeadSource } from '../page-window/bounded-lead.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
 import type { Page, SearchResult } from '../types.ts';
 import { DEFAULT_PAGES_BUDGET, PAGES_BLOCK_EXCERPT_FLOOR_CHARS, type PagesBudget } from './pages-budget.ts';
 import { filterPagesToWindow, type TemporalWindow } from './temporal-window.ts';
@@ -233,6 +234,11 @@ export async function runGather(
           if (!current || current.id !== page.id
             || current.knowledge_revision !== page.knowledge_revision
             || current.text_projection_revision !== page.text_projection_revision) return null;
+          // Segmented snapshots have throwing body getters; overlay their stored
+          // lead with the withdrawal ledger after the same hydration checks.
+          if (isSegmentedPage(current)) {
+            return toSearchResult(current, rank, (await visibleLeads([current]))[0]!);
+          }
           return toSearchResult(current, rank, opts.remote === false
             ? boundedRawPrefix(current.compiled_truth)
             : boundedProjectedPrefix(current.compiled_truth));
