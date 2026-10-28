@@ -7,6 +7,7 @@ import { importFromFile } from '../src/core/import-file.ts';
 import { runSources } from '../src/commands/sources.ts';
 import { extractTimelineFromDB } from '../src/commands/extract-timeline-db.ts';
 import { pruneTimelineOrphans } from '../src/core/timeline-extract.ts';
+import { withTrustPromotion } from '../src/core/persistence/context.ts';
 
 let engine: PGLiteEngine;
 beforeAll(async () => {
@@ -36,7 +37,7 @@ test('prunes a linked-source row produced by an older plain-source version', asy
   expect(applied.removed).toBe(1);
 }, 30_000);
 
-async function historyFixture(sourceId: string, previous: string, current: string, options: { nested?: boolean; segmented?: boolean } = {}) {
+async function historyFixture(sourceId: string, previous: string, current: string, options: { nested?: boolean; segmented?: boolean; extractPrevious?: boolean } = {}) {
   await runSources(engine, ['add', sourceId, '--no-federated']);
   await engine.setConfig('pages.segmented_storage', options.segmented ? 'on' : 'off');
   const slug = options.nested ? 'people/deep/example' : 'people/example';
@@ -46,9 +47,10 @@ async function historyFixture(sourceId: string, previous: string, current: strin
   const padding = options.segmented ? 'A neutral retained detail.\n\n'.repeat(50_000) : '';
   const page = (source: string) => `---\ntype: person\ntitle: Example\n---\n\n${padding}<!-- timeline -->\n\n## Timeline\n\n`
     + (source ? `- **2024-01-02** | ${source} — board discussion\n` : '');
-  for (const source of [previous, current]) {
+  for (const [index, source] of [previous, current].entries()) {
     writeFileSync(path, page(source));
     await importFromFile(engine, path, `${slug}.md`, { noEmbed: true, sourceId });
+    if (index === 0 && options.extractPrevious) await extractTimelineFromDB(engine, { dryRun: false, jsonMode: false, quiet: true, sourceIdFilter: sourceId });
   }
   const [snapshot] = await engine.executeRaw<{ body_storage: string }>(
     'SELECT body_storage FROM pages WHERE source_id=$1 AND slug=$2', [sourceId, slug]);
@@ -73,7 +75,7 @@ test('a plain historical slug cannot authorize pruning a different same-label ta
   expect(await fixture.sources()).toEqual([unrelated]);
 }, 30_000);
 
-test('a current plain slug keeps its identity-proven linked row', async () => {
+test('a current plain source does not authorize deleting a linked row without stored history', async () => {
   const sourceId = 'current-plain';
   const fixture = await historyFixture(sourceId, 'meetings/x', 'meetings/x');
   const linked = '[meetings/x](../meetings/x.md)';
@@ -119,4 +121,45 @@ test('the parser markdown sentinel is not provenance for a page named markdown',
   await fixture.add(unrelated);
   expect((await pruneTimelineOrphans(engine, { sourceId, dryRun: false })).removed).toBe(0);
   expect(await fixture.sources()).toEqual([unrelated]);
+}, 30_000);
+
+
+for (const delayed of [false, true]) {
+  test(`source representation changes leave one current tuple, delayed old row=${delayed}`, async () => {
+    for (const segmented of [false, true]) {
+      for (const plainFirst of [true, false]) {
+        const sourceId = `representation-${Number(delayed)}-${Number(segmented)}-${Number(plainFirst)}`;
+        const plain = 'meetings/x', linked = '[meetings/x](../meetings/x.md)';
+        const previous = plainFirst ? plain : linked, current = plainFirst ? linked : plain;
+        const fixture = await historyFixture(sourceId, previous, current, { segmented, extractPrevious: !delayed });
+        if (delayed) await fixture.add(previous);
+        const result = await extractTimelineFromDB(engine, { dryRun: false, jsonMode: false, quiet: true, sourceIdFilter: sourceId });
+        expect(result.refused).toBe(0);
+        expect(result.pending).toBe(0);
+        expect(await fixture.sources()).toEqual([current]);
+      }
+    }
+  }, 60_000);
+}
+
+test('historical aliases cannot delete a more trusted row or an open contested row', async () => {
+  for (const protection of ['trusted', 'contested']) {
+    const sourceId = `protected-${protection}`;
+    const fixture = await historyFixture(sourceId, 'meetings/x', '');
+    const linked = '[meetings/x](../meetings/x.md)';
+    await fixture.add(linked);
+    const [row] = await engine.executeRaw<{ id: number }>(
+      `SELECT t.id FROM timeline_entries t JOIN pages p ON p.id=t.page_id WHERE p.source_id=$1 AND p.slug=$2`, [sourceId, fixture.slug]);
+    if (protection === 'trusted') {
+      await engine.transaction(tx => withTrustPromotion(tx, 'user_confirmed', () => tx.executeRaw(
+        "UPDATE timeline_entries SET trust_tier='user_confirmed' WHERE id=$1", [row!.id])));
+    } else {
+      await engine.executeRaw(`INSERT INTO trust_proposals(action,source_id,target_table,target_id,proposer)
+        VALUES('forget',$1,'timeline_entries',$2,'test')`, [sourceId, row!.id]);
+    }
+    expect((await pruneTimelineOrphans(engine, { sourceId, dryRun: false })).removed).toBe(0);
+    expect(await fixture.sources()).toEqual([linked]);
+    const [held] = await engine.executeRaw<{ trust_tier: string }>('SELECT trust_tier FROM timeline_entries WHERE id=$1', [row!.id]);
+    expect(held!.trust_tier).toBe(protection === 'trusted' ? 'user_confirmed' : 'unknown');
+  }
 }, 30_000);

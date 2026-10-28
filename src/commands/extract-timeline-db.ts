@@ -301,7 +301,7 @@ async function plannedTimeline(engine: BrainEngine, page: Page, slug: string, so
     const recorded = new TimelineKeySet();
     rowCount = 0;
     const take = (row: StoredTimelineRows) => {
-      within.add(storedTimelineKey(row, slug));
+      within.add(storedTimelineKey(row));
       recorded.add(timelineKey({ date: row.date_text, source: row.source, summary: row.summary }));
       rowCount++;
     };
@@ -310,7 +310,7 @@ async function plannedTimeline(engine: BrainEngine, page: Page, slug: string, so
     const collector = segmentedCanonicalCollector(slug, recorded);
     const keys = await segmentedTimelineText(engine, page, { within, entries: false, ...(opts.stop ? { stop: opts.stop } : {}), onBlock: text => collector.add(text) });
     removed = await retractRemovedTimelineEntries(engine, slug, sourceId, keys, { ...retraction,
-      storedRows: stored ? strip(stored) : await unkeptTimelineRows(engine, Number(page.id), keys, slug) });
+      storedRows: stored ? strip(stored) : await unkeptTimelineRows(engine, Number(page.id), keys) });
     entries = [...collector.result().values()];
     parsed = keys.parsed;
   }
