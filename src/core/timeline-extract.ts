@@ -103,7 +103,7 @@ export function extractTimelineFromContent(content: string, slug: string): Extra
 }
 
 type TimelineTuple = Pick<ExtractedTimelineEntry, 'date' | 'source' | 'summary'>;
-const tupleKey = (e: TimelineTuple) => JSON.stringify([e.date, e.source, e.summary]);
+const tupleKey = (e: TimelineTuple) => JSON.stringify([e.date, e.source.replace(/^\[([^\]]+)\]\([^)]*\)$/, '$1'), e.summary]);
 
 /**
  * #6226: the tuples the inline-citation pass of either parser filed for this
