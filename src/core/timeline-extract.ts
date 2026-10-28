@@ -107,8 +107,8 @@ const tupleKey = (e: TimelineTuple) => JSON.stringify([e.date, e.source, e.summa
 const historicalTupleKey = (e: TimelineTuple, slug: string) => {
   // A legacy plain slug aliases only a link proven to name that same local target.
   // Other labels/destinations remain exact identities, including historical rows.
-  const link = /^\[([^\]]+)\]\(([^?#:\s]+\.md)\)$/.exec(e.source);
-  const source = link && link[1] !== 'markdown' && resolveMarkdownLinkSlug(slug, link[2]!) === link[1] ? link[1] : e.source;
+  const link = /^\[([^\[\]\(\)\\\r\n]+)\]\(([^\[\]\(\)\\?#:\s]+\.md)\)$/.exec(e.source);
+  const source = link && link[0] === e.source && link[1] !== 'markdown' && resolveMarkdownLinkSlug(slug, link[2]!) === link[1] ? link[1] : e.source;
   return JSON.stringify([e.date, source, e.summary]);
 };
 

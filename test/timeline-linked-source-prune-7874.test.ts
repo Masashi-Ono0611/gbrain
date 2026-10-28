@@ -163,3 +163,26 @@ test('historical aliases cannot delete a more trusted row or an open contested r
     expect(held!.trust_tier).toBe(protection === 'trusted' ? 'user_confirmed' : 'unknown');
   }
 }, 30_000);
+
+
+test('only a whole simple local link authorizes historical alias pruning', async () => {
+  const sourceId = 'simple-source-grammar';
+  const fixture = await historyFixture(sourceId, 'meetings/x', '');
+  await fixture.add('[meetings/x](../meetings/x.md)');
+  const separate = [
+    '[meetings/x](../meetings/x.md)[z](q.md)',
+    '[meetings/x](../meetings/x.md)\n',
+    '[meetings/[x]](../meetings/x.md)',
+    '[meetings/x()](../meetings/x.md)',
+    '[meetings/x](../meetings/x.md(q.md))',
+    '[meetings/x](../meetings/x.md#part)',
+    '[meetings/x](../meetings/x.md?query)',
+    '[meetings/x](../meetings\\x.md)',
+    '![meetings/x](../meetings/x.md)',
+    '[meetings/x](../meetings/x.md) suffix',
+  ];
+  for (const source of separate) await fixture.add(source);
+  expect((await pruneTimelineOrphans(engine, { sourceId, dryRun: true })).orphans).toBe(1);
+  expect((await pruneTimelineOrphans(engine, { sourceId, dryRun: false })).removed).toBe(1);
+  expect((await fixture.sources()).sort()).toEqual(separate.sort());
+}, 30_000);
