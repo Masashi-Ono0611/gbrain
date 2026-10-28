@@ -1,4 +1,4 @@
-import { afterAll, expect, test } from 'bun:test';
+import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,12 +7,15 @@ import { importFromFile } from '../src/core/import-file.ts';
 import { runSources } from '../src/commands/sources.ts';
 import { pruneTimelineOrphans } from '../src/core/timeline-extract.ts';
 
-const engine = new PGLiteEngine();
+let engine: PGLiteEngine;
+beforeAll(async () => {
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+}, 60_000);
 afterAll(async () => engine.disconnect());
 
 test('prunes a linked-source row produced by an older plain-source version', async () => {
-  await engine.connect({});
-  await engine.initSchema();
   await runSources(engine, ['add', 'notes', '--no-federated']);
   const dir = mkdtempSync(join(tmpdir(), 'timeline-prune-7874-'));
   mkdirSync(join(dir, 'people'));
