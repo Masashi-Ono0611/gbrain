@@ -11,7 +11,7 @@
  * names, so its existing importers are unaffected.
  */
 
-import { parseInlineCitationTimelineEntries, findTimelineSourceDelimiter, parseTimelineEntries } from './link-extraction.ts';
+import { parseInlineCitationTimelineEntries, findTimelineSourceDelimiter, parseTimelineEntries, resolveMarkdownLinkSlug } from './link-extraction.ts';
 import { isDatedTimelineLine, supersededInlineCitationEntries } from './timeline-citations.ts';
 import { createHash } from 'node:crypto';
 import type { BrainEngine } from './engine.ts';
@@ -103,7 +103,13 @@ export function extractTimelineFromContent(content: string, slug: string): Extra
 }
 
 type TimelineTuple = Pick<ExtractedTimelineEntry, 'date' | 'source' | 'summary'>;
-const tupleKey = (e: TimelineTuple) => JSON.stringify([e.date, e.source.replace(/^\[([^\]]+)\]\([^)]*\)$/, '$1'), e.summary]);
+const tupleKey = (e: TimelineTuple, slug: string) => {
+  // A legacy plain slug aliases only a link proven to name that same local target.
+  // Other labels/destinations remain exact identities, including historical rows.
+  const link = /^\[([^\]]+)\]\(([^?#:\s]+\.md)\)$/.exec(e.source);
+  const source = link && link[1] !== 'markdown' && resolveMarkdownLinkSlug(slug, link[2]!) === link[1] ? link[1] : e.source;
+  return JSON.stringify([e.date, source, e.summary]);
+};
 
 /**
  * #6226: the tuples the inline-citation pass of either parser filed for this
@@ -135,8 +141,8 @@ export function hasExtractorDetail(row: { source: string; detail?: string | null
  * extraction paths never undo each other's rows.
  */
 function markdownTimelineKeys(text: string, slug: string): Set<string> {
-  const keys = new Set(extractTimelineFromContent(text, slug).map(tupleKey));
-  for (const entry of parseTimelineEntries(text)) keys.add(tupleKey({ ...entry, source: entry.source ?? '' }));
+  const keys = new Set(extractTimelineFromContent(text, slug).map(entry => tupleKey(entry, slug)));
+  for (const entry of parseTimelineEntries(text)) keys.add(tupleKey({ ...entry, source: entry.source ?? '' }, slug));
   return keys;
 }
 
@@ -227,7 +233,7 @@ function keyDigest(key: string): [number, number] {
 export interface TimelineTextKeys { kept: TimelineKeyLookup; superseded: TimelineKeyLookup; within?: TimelineKeyLookup; runs?: ReadonlySet<string> }
 
 /** The key retraction compares a stored row by (`within` of segmentedTimelineText). */
-export const storedTimelineKey = (row: TimelineTuple): string => tupleKey(row);
+export const storedTimelineKey = (row: TimelineTuple, slug: string): string => tupleKey(row, slug);
 
 export interface SegmentedTimelineOptions {
   /**
@@ -260,7 +266,7 @@ export async function segmentedTimelineText(engine: Pick<BrainEngine, 'executeRa
   for await (const block of bodyBlocks(engine as BrainEngine, page, { runKeys: runs, ...(opts.stop ? { stop: opts.stop } : {}) })) {
     for (const key of markdownTimelineKeys(block.text, page.slug)) if (!within) kept.add(key); else within.mark(key);
     for (const entry of supersededCitationTimeline(block.text)) {
-      const key = tupleKey(entry);
+      const key = tupleKey(entry, page.slug);
       if (!within || within.has(key)) superseded.add(key);
     }
     const read = parseTimelineEntries(block.text);
@@ -303,10 +309,10 @@ export async function eachStoredTimelineRow(engine: Pick<BrainEngine, 'executeRa
  * The stored rows of a page a segmented read of it can retract: those whose key `keys` (segmentedTimelineText with
  * `within`) neither keeps nor leaves out of `within`, streamed (eachStoredTimelineRow).
  */
-export async function unkeptTimelineRows(engine: Pick<BrainEngine, 'executeRaw'>, pageId: number, keys: TimelineTextKeys): Promise<StoredTimelineTuple[]> {
+export async function unkeptTimelineRows(engine: Pick<BrainEngine, 'executeRaw'>, pageId: number, keys: TimelineTextKeys, slug: string): Promise<StoredTimelineTuple[]> {
   const out: StoredTimelineTuple[] = [];
   await eachStoredTimelineRow(engine, pageId, ({ date_text: _text, ...row }) => {
-    const key = tupleKey(row);
+    const key = tupleKey(row, slug);
     if (!keys.kept.has(key) && (!keys.within || keys.within.has(key))) out.push(row);
   });
   return out;
@@ -335,22 +341,23 @@ export async function retractRemovedTimelineEntries(
   current: string | TimelineTextKeys,
   opts: { dryRun?: boolean; storedRows?: ReadonlyArray<StoredTimelineTuple>; stop?: () => boolean; expectedRevision?: string } = {},
 ): Promise<Array<TimelineTuple & { id: number }>> {
+  const keyOf = (row: TimelineTuple) => tupleKey(row, slug);
   const kept = typeof current === 'string' ? markdownTimelineKeys(current, slug) : current.kept;
   const within = typeof current === 'string' ? undefined : current.within;
   const rows = opts.storedRows ?? await storedTimelineRows(engine, sourceId, slug);
-  const extra = rows.filter(row => !kept.has(tupleKey(row)) && (!within || within.has(tupleKey(row))));
+  const extra = rows.filter(row => !kept.has(keyOf(row)) && (!within || within.has(keyOf(row))));
   if (!extra.length) return [];
   const versions = await engine.executeRaw<{ compiled_truth: string | null; timeline: string | null; body_storage: string; page_id: number; generation: number | null }>(
     `SELECT DISTINCT v.compiled_truth, v.timeline, v.body_storage, v.page_id, v.body_generation AS generation FROM page_versions v JOIN pages p ON p.id = v.page_id
       WHERE p.source_id = $1 AND p.slug = $2`, [sourceId, slug]);
-  const wanted = new Set(extra.map(tupleKey));
+  const wanted = new Set(extra.map(keyOf));
   const produced = new Set<string>();
   // #6226: rows the older citation reading filed for this text or a stored version.
-  const superseded = new Set(typeof current === 'string' ? supersededCitationTimeline(current).map(tupleKey)
+  const superseded = new Set(typeof current === 'string' ? supersededCitationTimeline(current).map(keyOf)
     : [...wanted].filter(key => current.superseded.has(key)));
   const addText = (text: string) => {
     for (const key of markdownTimelineKeys(text, slug)) if (wanted.has(key)) produced.add(key);
-    for (const entry of supersededCitationTimeline(text)) if (wanted.has(tupleKey(entry))) superseded.add(tupleKey(entry));
+    for (const entry of supersededCitationTimeline(text)) if (wanted.has(keyOf(entry))) superseded.add(keyOf(entry));
   };
   const seen = new Set(typeof current === 'string' ? [] : current.runs ?? []);
   for (const version of versions) {
@@ -358,7 +365,7 @@ export async function retractRemovedTimelineEntries(
     for await (const block of retainedGenerationBlocks(engine, { id: Number(version.page_id), slug, sourceId }, Number(version.generation),
       { seen, ...(opts.stop ? { stop: opts.stop } : {}) })) addText(block);
   }
-  const found = extra.filter(row => produced.has(tupleKey(row)) || (superseded.has(tupleKey(row)) && hasExtractorDetail(row)))
+  const found = extra.filter(row => produced.has(keyOf(row)) || (superseded.has(keyOf(row)) && hasExtractorDetail(row)))
     .map(({ detail: _detail, ...row }) => row);
   if (!found.length) return [];
   // W1 #6783 §12 (a): a row more trusted than the page's restatement, or held by an open contest, stays; the owner decides.
@@ -397,10 +404,10 @@ async function retractStoredPage(engine: BrainEngine, page: { id: number; slug: 
   opts: { dryRun?: boolean; expectedRevision?: string }) {
   if (page.body_storage !== 'segmented') return retractRemovedTimelineEntries(engine, page.slug, page.source_id, `${page.compiled_truth}\n${page.timeline ?? ''}`, opts);
   const within = new TimelineKeySet();
-  await eachStoredTimelineRow(engine, page.id, row => within.add(tupleKey(row)));
+  await eachStoredTimelineRow(engine, page.id, row => within.add(tupleKey(row, page.slug)));
   if (!within.size) return [];
   const keys = await segmentedTimelineText(engine, page, { within, entries: false });
-  return retractRemovedTimelineEntries(engine, page.slug, page.source_id, keys, { ...opts, storedRows: await unkeptTimelineRows(engine, page.id, keys) });
+  return retractRemovedTimelineEntries(engine, page.slug, page.source_id, keys, { ...opts, storedRows: await unkeptTimelineRows(engine, page.id, keys, page.slug) });
 }
 
 export interface TimelineOrphanPruneResult {
