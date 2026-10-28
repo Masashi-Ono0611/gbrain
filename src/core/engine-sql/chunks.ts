@@ -46,6 +46,9 @@ import type { LegacyUnscopedRead, ScopedRead } from './brands.ts';
 import { joinFragments, renderFragment, sqlFragment, trustedSql, type SqlFragment } from './fragment.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { compileRowNormalizer } from './normalize.ts';
+import { atomRetirementPurgeHold } from '../persistence/atom-retirement-hold.ts';
+import { derivedRetirementPurgeHold } from '../persistence/derived-retirement-hold.ts';
+import { identityDowngradePurgeHold } from '../sync-identity-downgrades.ts';
 
 /** The engine's page-state guards, run on the same (transaction) engine. */
 export interface ChunkPageGuards {
@@ -925,7 +928,10 @@ export async function readEmbeddingStateCounts(exec: ScopedRead, column: string,
   }
   const counts: Partial<Record<EmbeddingState, number>> = {};
   const add = (state: EmbeddingState, n: number) => { counts[state] = (counts[state] ?? 0) + n; };
-  const overdue = sqlFragment`(p.deleted_at < now() - make_interval(hours => ${opts.purgeWindowHours}::int))`;
+  const overdue = sqlFragment`(p.deleted_at < now() - make_interval(hours => ${opts.purgeWindowHours}::int)
+    AND ${trustedSql(identityDowngradePurgeHold('p'))}
+    AND ${trustedSql(atomRetirementPurgeHold('p'))}
+    AND ${trustedSql(derivedRetirementPurgeHold('p'))})`;
   const aggregate = (where: SqlFragment) => exec.run(sqlFragment`
       SELECT s.state, count(*)::bigint AS n, count(*) FILTER (WHERE s.eligible)::bigint AS eligible,
              count(*) FILTER (WHERE s.overdue)::bigint AS overdue,
@@ -1009,7 +1015,7 @@ export async function listEmbeddingStateRows(exec: ScopedRead, column: string,
                COALESCE(sum(octet_length(cc.chunk_text)), 0)::bigint AS bytes,
                p.frontmatter -> 'embed_skip' ->> 'reason' AS embed_skip_reason, ${MARKER_BYTES} AS marker_bytes,
                p.frontmatter -> 'quarantine' ->> 'reason' AS quarantine_reason, p.deleted_at,
-               COALESCE(p.deleted_at < now() - make_interval(hours => ${opts.purgeWindowHours}::int), false) AS overdue
+               COALESCE(${overdue}, false) AS overdue
           FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
          WHERE ${trustedSql(chunkGenerationFilter('p', 'cc'))}${scope}
          GROUP BY p.id, 3
