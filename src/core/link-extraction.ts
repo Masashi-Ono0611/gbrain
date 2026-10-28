@@ -772,7 +772,7 @@ function makeTypeFor(content: string, pageType: PageType, opts: ExtractPageLinks
       return decide('mentions', { rule: 'page.meeting' });
     }
     const suppressPrior = idx !== undefined && idx >= 0 && inSuppressedRange(suppressedRanges, idx);
-    const roleText = opts.roleText ?? content;
+    const roleText = opts.roleText ?? rolePriorPhrases(content).filter((phrase): phrase is string => phrase !== null).join('\n');
     const trace = traceLinkType(pageType, ctx, suppressPrior ? undefined : roleText, targetSlug,
       opts.targetType ? targetType ?? null : undefined, bodyReference && idx !== undefined && idx >= 0 ? excerptAnchor(content, idx, 240) : undefined, roleText, !!explain);
     const { type, ...why } = trace;
@@ -1323,7 +1323,7 @@ const ZH_CITED_RE = /(?:引用|援引|提到|提及|转述|摘录)(?:了|的|自
 // Page-role detection: if the source page describes a partner/investor at
 // page level, that's a strong prior for outbound company refs being
 // invested_in even when per-edge context lacks explicit investment verbs.
-const PARTNER_ROLE_RE = /\b(?:partner at|partner of|venture partner|VC partner|invested early|investor at|investor in|portfolio|venture capital|early-stage investor|seed investor|fund [A-Z]|invests across|backs companies)\b/i;
+const PARTNER_ROLE_RE = /\b(?:partner at|partner of|venture partner|VC partner|invested early|investor at|investor in|venture capital|early-stage investor|seed investor|fund [A-Z]|invests across|backs companies)\b/i;
 
 // Advisor role prior: fires when the page-level description indicates the
 // person IS an advisor (not just mentions advising). Broadened in v0.10.5
@@ -1342,7 +1342,16 @@ const ADVISOR_ROLE_RE = /\b(?:full-time advisor|professional advisor|advises (?:
 // pages mentioning their employees use the page-role layer differently.
 /** The first match of each page-role prior in `text`: joined with newlines, they decide every prior exactly as the whole text does (no prior crosses a line). */
 export function rolePriorPhrases(text: string): Array<string | null> {
-  return [PARTNER_ROLE_RE, ADVISOR_ROLE_RE, EMPLOYEE_ROLE_RE].map(re => re.exec(text)?.[0] ?? null);
+  const cleanText = stripCodeBlocks(text);
+  const suppressed = rolePriorSuppressedRanges(cleanText);
+  let cursor = 0;
+  let prose = '';
+  for (const [start, end] of suppressed) {
+    prose += cleanText.slice(cursor, start) + '\n';
+    cursor = end;
+  }
+  prose += cleanText.slice(cursor);
+  return [PARTNER_ROLE_RE, ADVISOR_ROLE_RE, EMPLOYEE_ROLE_RE].map(re => re.exec(prose)?.[0] ?? null);
 }
 
 const EMPLOYEE_ROLE_RE = /\b(?:is an? (?:senior|staff|principal|lead|backend|frontend|full-?stack|ML|data|security|DevOps|platform)? ?engineer at|is an? (?:senior|staff|principal|lead)? ?(?:developer|designer|product manager|engineering manager|director|VP) (?:at|of)|holds? the (?:CTO|CEO|CFO|COO|CMO|CRO|VP) (?:role|position|seat|title) at|is the (?:CTO|CEO|CFO|COO|CMO|CRO) of|employee at|on the team at|works on .{0,30} at)\b/i;
