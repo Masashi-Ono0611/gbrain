@@ -1,4 +1,4 @@
-import { afterAll, expect, test } from 'bun:test';
+import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,16 +7,19 @@ import { importImageFile } from '../src/core/import-file.ts';
 import { PAGE_PROJECTION_ACTIVATION_SQL } from '../src/core/page-state/projection-schema.ts';
 import { drainProjections, projectionBacklog } from '../src/core/page-state/projections.ts';
 
-const engine = new PGLiteEngine();
+let engine: PGLiteEngine;
 const roots: string[] = [];
+beforeAll(async () => {
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+});
 afterAll(async () => {
   await engine.disconnect();
   for (const root of roots) rmSync(root, { recursive: true, force: true });
 });
 
 test('a fileless pre-fence image with its importer chunk seals without reimport', async () => {
-  await engine.connect({});
-  await engine.initSchema();
   const root = mkdtempSync(join(tmpdir(), 'image-seal-7921-'));
   roots.push(root);
   const file = join(root, 'legacy.png');
