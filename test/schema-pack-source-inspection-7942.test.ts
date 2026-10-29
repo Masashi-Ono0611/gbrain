@@ -8,10 +8,11 @@ import { _resetPackCacheForTests } from '../src/core/schema-pack/registry.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 
-const engine = new PGLiteEngine();
+let engine: PGLiteEngine;
 let home: string;
 
 beforeAll(async () => {
+  engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
 });
