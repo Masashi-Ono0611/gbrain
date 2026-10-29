@@ -242,6 +242,8 @@ const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
   // DigitalOcean personal access (dop_), OAuth (doo_) and refresh (dor_)
   // tokens: v1 + 64 lowercase hex, hard right edge.
   { name: 'digitalocean', source: 'do[opr]_v1_[a-f0-9]{64}(?![A-Za-z0-9])', since: SECURITY_WAVE_SINCE },
+  // OpenRouter API keys: v1 + 64 lowercase hex, hard right edge.
+  { name: 'openrouter', source: 'sk-or-v1-[a-f0-9]{64}(?![A-Za-z0-9])', since: SECURITY_WAVE_SINCE },
   // gbrain's own tokens: generateToken (core/utils.ts) mints 'gbrain_' plus an
   // optional OAuth infix (at_ access / rt_ refresh / cs_ client secret /
   // code_ auth code) plus 32 random bytes hex. Without this entry the scanner
