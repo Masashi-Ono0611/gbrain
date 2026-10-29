@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { withEnv, emptyHome } from './helpers/with-env.ts';
