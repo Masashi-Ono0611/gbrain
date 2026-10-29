@@ -42,7 +42,7 @@ test('fixture ingestion survives but cannot create or update entity evidence', a
   expect(await engine.getPage(created.slug, { sourceId: 'default' })).toEqual(before);
   expect(await engine.getTimeline(created.slug)).toEqual(timeline);
   const add = timelineOperations.find(op => op.name === 'add_timeline_entry')!;
-  await add.handler({ engine, remote: false, sourceId: 'default' } as OperationContext,
+  await add.handler({ engine, remote: false, sourceId: 'default' } as unknown as OperationContext,
     { slug: created.slug, source: fixture.slug, date: '2026-04-20', summary: text });
   expect(await engine.getTimeline(created.slug)).toEqual(timeline);
   expect((await engine.getPage(fixture.slug, { sourceId: 'default' }))?.compiled_truth).toBe(text);
