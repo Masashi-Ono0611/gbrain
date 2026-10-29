@@ -13,7 +13,7 @@ import { assertNoUnreviewedJobs, authorizeJobExecution, withSubmissionAuthority 
  */
 
 import { existsSync } from 'fs';
-import { autopilotOperatorPauseMarkerPath, autopilotPausedMarkerPath } from '../autopilot-paths.ts';
+import { autopilotOperatorPauseMarkerPath, autopilotPaused, autopilotPausedMarkerPath } from '../autopilot-paths.ts';
 import type { BrainEngine } from '../engine.ts';
 import type {
   MinionJob, MinionJobContext, MinionHandler, MinionWorkerOpts,
@@ -709,6 +709,13 @@ export class MinionWorker extends EventEmitter {
           // detector too would double-act (and both emitting 'unhealthy' +
           // supervisor SIGTERM race). Bare `gbrain jobs work` keeps it.
           if (!isSupervisedChild) {
+          if (autopilotPaused()) {
+            // A deliberate hold explains the lack of claims. Keep the DB probe
+            // above active, and restart the no-progress clock while held so
+            // resuming does not inherit time spent paused.
+            lastCompletionTime = Date.now();
+            stallWarningSince = null;
+          } else {
           if (this.jobsCompleted > lastKnownCompleted) {
             lastKnownCompleted = this.jobsCompleted;
             lastCompletionTime = Date.now();
@@ -768,6 +775,7 @@ export class MinionWorker extends EventEmitter {
             }
           } else {
             stallWarningSince = null;
+          }
           }
           } // end stall detection (NON-supervised only)
         } finally {
