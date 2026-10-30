@@ -180,6 +180,8 @@ function isStopword(value: string): boolean {
 /** A meeting link's `?pwd=` passcode is part of a shareable invite URL, not a typed credential. */
 const QUERY_PWD_RE = /[?&]pwd=$/i;
 const LABEL_START_RE = /pass|pwd|log-?in|cred|user|email/i;
+const REDACTION_MARKER_HEAD_RE = /<REDACTED:[A-Za-z0-9_-]*$/i;
+const REDACTION_MARKER_VALUE_RE = /<REDACTED:[A-Za-z0-9_-]+>/i;
 
 /**
  * True when a backtick-"quoted" value is really the close of a code span
@@ -201,6 +203,7 @@ const PAIR_USER_TAIL_RE = /([^\s/:"'`*]+)["'`]?\s*[/:]\s*["'`]?$/;
  * (`login page / step2`).
  */
 export function labeledValueIsCredential(value: string, form: 'single' | 'pair' | 'cli', head = ''): boolean {
+  if (REDACTION_MARKER_HEAD_RE.test(head) || REDACTION_MARKER_VALUE_RE.test(value)) return false;
   if (value.length < 3 || isStopword(value)) return false;
   // A flag's "value" starting with `-` is the next flag; a typed password may start with `-` (W12 S1).
   if (form === 'cli' && value.startsWith('-')) return false;
