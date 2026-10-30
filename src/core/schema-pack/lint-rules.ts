@@ -497,10 +497,9 @@ export const storedTypePathPrefixMismatch: LintRule = async (manifest, opts) => 
     issues.push({
       rule: 'stored_type_path_prefix_mismatch',
       severity: 'warning',
-      message: `${count} page(s) store type '${type}' but their slugs match none of its path_prefixes (${prefixes})`,
+      message: `${count} page(s) store type '${type}' but their slugs match none of its path_prefixes (${prefixes}); move the page(s) under a declared prefix OR add a matching path_prefix`,
       pack: manifest.name,
       type: t.name,
-      hint: `move the page(s) under a declared prefix OR add a path_prefix that matches their slugs`,
     });
   }
   return issues;
