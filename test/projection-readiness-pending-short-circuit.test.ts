@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import type { BrainEngine } from '../src/core/engine.ts';
 import { probeProjectionReadiness } from '../src/core/search/projection-readiness.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -12,7 +13,7 @@ test('pending readiness defers the by-design scan', async () => {
       }
       return [];
     },
-  };
+  } as unknown as Pick<BrainEngine, 'executeRaw'>;
   const result = await withEnv({ GBRAIN_PROJECTION_READINESS_CACHE: '0' }, () =>
     probeProjectionReadiness(engine, {}));
 
