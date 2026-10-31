@@ -18,14 +18,25 @@ export interface SingleFactIntent {
   /** Speaker of the new claim; a fact another known speaker asserted is never its duplicate. */
   attributed_to?: FactAttribution | null;
 }
+/** Leave time for the rest of remember's 30 s foreground preparation after a slow embedding call. */
+const FACT_EMBED_PREPARATION_TIMEOUT_MS = 25_000;
 /** Provider work belongs to preparation, never to a page/source transaction. `disabled`: the brain opted out of embedding. */
-export async function prepareFactEmbedding(fact: string, signal?: AbortSignal, disabled = false): Promise<{ embedding: Float32Array | null; embedding_model: string | null; degraded: boolean }> {
+export async function prepareFactEmbedding(fact: string, signal?: AbortSignal, disabled = false,
+  timeoutMs = FACT_EMBED_PREPARATION_TIMEOUT_MS): Promise<{ embedding: Float32Array | null; embedding_model: string | null; degraded: boolean }> {
   signal?.throwIfAborted();
   if (!disabled && isAvailable('embedding')) {
+    const embedAbort = new AbortController();
+    const embedSignal = signal ? AbortSignal.any([signal, embedAbort.signal]) : embedAbort.signal;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const model = getEmbeddingModel();
-      return { embedding: await embedOne(fact, { abortSignal: signal, embeddingModel: model, inputType: 'document' }), embedding_model: model, degraded: false };
+      const timedOut = new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => { embedAbort.abort(); reject(new Error('fact embedding preparation timed out')); }, timeoutMs);
+      });
+      const embedding = await Promise.race([embedOne(fact, { abortSignal: embedSignal, embeddingModel: model, inputType: 'document' }), timedOut]);
+      return { embedding, embedding_model: model, degraded: false };
     } catch { signal?.throwIfAborted(); }
+    finally { if (timeout) clearTimeout(timeout); }
   }
   return { embedding: null, embedding_model: null, degraded: true };
 }
