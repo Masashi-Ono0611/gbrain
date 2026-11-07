@@ -71,7 +71,6 @@ import { derivedWriteThrough, reportDerivedWriteThrough } from './derived-write-
 import { emptySessionSourceRouting, keepSessionSourceTranscripts, withSessionSourceRouting } from './synthesize-source-routing.ts';
 import { DEFAULT_EXTRACT_MAX_INPUT_CHARS, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone, type ExtractAtomsInput, type ExtractAtomsItem } from './extract-atoms-input.ts';
 import { commitExtractionPlan, readPageWatermark } from '../extraction-watermark.ts';
-import { realpath } from 'node:fs/promises';
 import { isAbsolute, relative, sep } from 'node:path';
 import { resolveSourceLocalFilePath, serializeMarkdown } from '../markdown.ts';
 import { truncateUtf8 } from '../text-safe.ts';
@@ -101,7 +100,7 @@ import { isOpPageSlug } from '../ops/context.ts';
 import type { WriteReceipt } from '../persistence/types.ts';
 import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
 import { AtomPageStateError, MAX_DETERMINISTIC_FAILURES, readAtomPageIdentity, writeAtomPageState, type AtomPageInput } from './extract-atoms-page-state.ts';
-import { atomGenerationOrigin, atomInputPin, heldLine, publishUnmanagedAtoms, resolveTranscriptAtomSlug, resolveTranscriptKeys, transcriptRoot } from './extract-atoms-generation.ts';
+import { atomGenerationOrigin, atomInputPin, heldLine, publishUnmanagedAtoms, resolveTranscriptAtomSlug, resolveTranscriptKeys, transcriptRoot, realpathOf as realpath } from './extract-atoms-generation.ts';
 import { heldForInput } from '../generations/publish.ts';
 import { ATOM_TYPES, ATOMS_RESPONSE_SCHEMA } from './extract-atoms-schema.ts';
 import { parseAtomsOutcome } from './extract-atoms-parse.ts';
