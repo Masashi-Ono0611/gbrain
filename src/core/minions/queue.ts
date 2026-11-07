@@ -24,6 +24,7 @@ import { validateAttachment } from './attachments.ts';
 import type { QueueFamilyStats } from './queue-families.ts';
 import { isProtectedJobName, LEASE_BEACON_QUEUE } from './protected-names.ts';
 import { jsonbSafeJson } from '../text-safe.ts';
+import { terminalProvenance } from './terminal-provenance.ts';
 import { assertEmbedBackfillQueueAdmission } from './embed-backfill-admission.ts';
 import { lockDelegatedSubmission, checkDelegatedCapacity, prepareDelegatedReplay, admitDelegatedRetry } from './delegated-admission.ts';
 import {
@@ -1050,6 +1051,7 @@ export class MinionQueue {
     // own data payload — the recursion follows the owned root, which is the
     // semantic the delegating agent expects (its job tree, not per-row tags).
     const rootStatuses = opts?.rootStatuses ?? null;
+    const cancelProvenanceLiteral = `'${terminalProvenance({ status: 'cancelled' }).replace(/'/g, "''")}'`;
     const ownerClientId = opts?.ownerClientId ?? null;
     return this.engine.transaction(async (tx) => {
       const rows = await tx.executeRaw<Record<string, unknown>>(
@@ -1074,6 +1076,8 @@ export class MinionQueue {
           -- false 'waited > Nh' text AND inflate the LIKE-prefix stats the
           -- alerting surfaces count).
           error_text = CASE WHEN id = ANY($1::int[]) THEN COALESCE($2, error_text) ELSE error_text END,
+          -- patch 208: producing build + disposition in the per-attempt record.
+          stacktrace = COALESCE(stacktrace, '[]'::jsonb) || to_jsonb(${cancelProvenanceLiteral}::text),
           finished_at = now(),
           updated_at = now()
          WHERE id IN (SELECT id FROM descendants)
@@ -1832,6 +1836,7 @@ export class MinionQueue {
     newStatus: 'delayed' | 'failed' | 'dead',
     backoffMs?: number,
     result?: Record<string, unknown>,
+    provenance?: string,
   ): Promise<MinionJob | null> {
     return retryOnStalePlan(() => this.engine.transaction(async (tx) => {
       // Lock the parent row first so concurrent sibling completions/failures
@@ -1859,7 +1864,7 @@ export class MinionQueue {
           lock_token = NULL, lock_until = NULL, updated_at = now()
          WHERE id = $5 AND status = 'active' AND lock_token = $6
          RETURNING *`,
-        [newStatus, errorText, errorText, backoffMs ?? 0, id, lockToken, result ?? null]
+        [newStatus, errorText, provenance ? `${errorText} ${provenance}` : errorText, backoffMs ?? 0, id, lockToken, result ?? null]
       );
       if (rows.length === 0) return null;
 

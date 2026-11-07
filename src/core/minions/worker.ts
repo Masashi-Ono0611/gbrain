@@ -92,6 +92,7 @@ import { IdleWaiter } from './idle-wait.ts';
 import { jobOutcomeResult, jobResultOutcome } from './job-outcome.ts';
 import { DEFAULT_LONG_JOB_NAMES, DEFAULT_SHORT_JOB_RESERVED_SLOTS, claimExclusions } from './lanes.ts';
 import { jobRefusal, refusedJobResult } from './refusal.ts';
+import { errorStopReason, terminalProvenance } from './terminal-provenance.ts';
 import { readFileSync } from 'fs';
 import { parseRssFromProcStatus } from './proc-rss.ts';
 import { withEngineScope } from '../engine-scope.ts';
@@ -1732,9 +1733,13 @@ export class MinionWorker extends EventEmitter {
       // what), then reconnect + retry the recording once. If it still fails,
       // leave the row to the stall detector: the lock has stopped renewing,
       // so handleStalled requeues it cleanly on a live pool (the D8a path).
+      const provenance = terminalProvenance({
+        status: newStatus, attempt: job.attempts_made + 1, abortReason,
+        errorName: err instanceof Error ? err.constructor.name : null, stopReason: errorStopReason(err),
+      });
       let failed: MinionJob | null;
       try {
-        failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs, refusal ? refusedJobResult(refusal) : undefined);
+        failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs, refusal ? refusedJobResult(refusal) : undefined, provenance);
       } catch (recordErr) {
         const recordMsg = recordErr instanceof Error ? recordErr.message : String(recordErr);
         console.error(
@@ -1743,7 +1748,7 @@ export class MinionWorker extends EventEmitter {
         if (!isRetryableConnError(recordErr)) throw recordErr;
         await this.reconnectAfterConnectionError('failJob', recordErr);
         try {
-          failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs, refusal ? refusedJobResult(refusal) : undefined);
+          failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs, refusal ? refusedJobResult(refusal) : undefined, provenance);
         } catch (retryErr) {
           if (isLocalConfigurationError(retryErr)) {
             this.blockForConfiguration(retryErr);
