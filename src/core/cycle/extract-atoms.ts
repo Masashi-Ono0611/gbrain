@@ -105,6 +105,7 @@ import { atomGenerationOrigin, atomInputPin, heldLine, publishUnmanagedAtoms, re
 import { heldForInput } from '../generations/publish.ts';
 import { ATOM_TYPES, ATOMS_RESPONSE_SCHEMA } from './extract-atoms-schema.ts';
 import { parseAtomsOutcome } from './extract-atoms-parse.ts';
+import { VERSION } from '../../version.ts';
 export { parseAtomsOutcome, parseAtomsResponse, type AtomsParseOutcome } from './extract-atoms-parse.ts';
 import { countSourceChangedAtoms } from './extract-atoms-source-drift.ts';
 
@@ -1210,8 +1211,11 @@ export async function runPhaseExtractAtoms(
       const parseOutcome = parseAtomsOutcome(result.text, result.stopReason);
       if (!parseOutcome.ok) {
         if (parseOutcome.stopped) stoppedOutputs++; else malformedOutputs++;
-        if (!opts.dryRun && managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, [], parseOutcome.reason));
-        await recordDeterministicFailure(item, originLabel, parseOutcome.stopped ? parseOutcome.reason : `malformed model output: ${parseOutcome.reason}`);
+        // #8752: reply-free diagnostic so a tombstone's cause can be checked later.
+        const replyText = result.text ?? '';
+        const diag = ` [stop_reason=${result.stopReason ?? 'unknown'} output_tokens=${result.usage?.output_tokens ?? 'unknown'} reply_chars=${replyText.length} has_open_bracket=${replyText.includes('[')} model=${result.model ?? 'unknown'} gbrain=${VERSION}]`;
+        if (!opts.dryRun && managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, [], parseOutcome.reason + diag));
+        await recordDeterministicFailure(item, originLabel, (parseOutcome.stopped ? parseOutcome.reason : `malformed model output: ${parseOutcome.reason}`) + diag);
         continue;
       }
       const atoms = parseOutcome.atoms;
