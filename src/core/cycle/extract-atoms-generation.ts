@@ -3,7 +3,7 @@
  * adapter context, the unmanaged one-transaction publication, and the transcript keys (root label plus root-relative
  * path, with the rename map) and slugs. Peeled out of extract-atoms.ts (module-size ratchet).
  */
-import { existsSync } from 'node:fs';
+import { existsSync, promises as fsp } from 'node:fs';
 import { relative, resolve, sep } from 'node:path';
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
 import { isAvailable } from '../ai/gateway.ts';
@@ -142,4 +142,9 @@ export function heldAtomInputExclusionSql(placeholder: string): string {
         WHERE dg.source_id = p.source_id AND dg.kind = 'atom' AND dg.state = 'held' AND dg.owner_key = 'source_slug:' || p.slug
           AND dg.hold_id = ANY(${placeholder}::text[]) AND COALESCE(dg.held_context->>'partial', 'false') <> 'true'
           AND dg.input_pin IN (p.content_hash, p.content_hash || ':' || p.id::text || ':' || p.knowledge_revision::text))`;
+}
+
+/** Physical path of a file (patch 206): the fs boundary of extract_atoms stays in this module (core-world-reads). */
+export function realpathOf(path: string): Promise<string> {
+  return fsp.realpath(path);
 }
