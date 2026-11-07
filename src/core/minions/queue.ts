@@ -24,6 +24,7 @@ import { validateAttachment } from './attachments.ts';
 import type { QueueFamilyStats } from './queue-families.ts';
 import { isProtectedJobName, LEASE_BEACON_QUEUE } from './protected-names.ts';
 import { jsonbSafeJson } from '../text-safe.ts';
+import { terminalProvenance } from './terminal-provenance.ts';
 import { assertEmbedBackfillQueueAdmission } from './embed-backfill-admission.ts';
 import { lockDelegatedSubmission, checkDelegatedCapacity, prepareDelegatedReplay, admitDelegatedRetry } from './delegated-admission.ts';
 import {
@@ -1055,6 +1056,7 @@ export class MinionQueue {
     const rootStatuses = opts?.rootStatuses ?? null;
     const owner: JobOwner | undefined = opts?.owner ?? (opts?.ownerClientId
       ? { principal: { kind: 'oauth_client', id: opts.ownerClientId }, clientId: opts.ownerClientId, actor: opts.ownerActor ?? NO_JOB_ACTOR } : undefined);
+    const cancelProvenanceLiteral = `'${terminalProvenance({ status: 'cancelled' }).replace(/'/g, "''")}'`;
     return this.engine.transaction(async (tx) => {
       const rows = await tx.executeRaw<Record<string, unknown>>(
         `WITH RECURSIVE descendants AS (
@@ -1078,6 +1080,8 @@ export class MinionQueue {
           -- false 'waited > Nh' text AND inflate the LIKE-prefix stats the
           -- alerting surfaces count).
           error_text = CASE WHEN id = ANY($1::int[]) THEN COALESCE($2, error_text) ELSE error_text END,
+          -- patch 208: producing build + disposition in the per-attempt record.
+          stacktrace = COALESCE(stacktrace, '[]'::jsonb) || to_jsonb(${cancelProvenanceLiteral}::text),
           finished_at = now(),
           updated_at = now()
          WHERE id IN (SELECT id FROM descendants)
@@ -1856,6 +1860,7 @@ export class MinionQueue {
     newStatus: 'delayed' | 'failed' | 'dead',
     backoffMs?: number,
     result?: Record<string, unknown>,
+    provenance?: string,
   ): Promise<MinionJob | null> {
     return retryOnStalePlan(() => this.engine.transaction(async (tx) => {
       // Lock the parent row first so concurrent sibling completions/failures
@@ -1883,7 +1888,7 @@ export class MinionQueue {
           lock_token = NULL, lock_until = NULL, updated_at = now()
          WHERE id = $5 AND status = 'active' AND lock_token = $6
          RETURNING *`,
-        [newStatus, errorText, errorText, backoffMs ?? 0, id, lockToken, result ?? null]
+        [newStatus, errorText, provenance ? `${errorText} ${provenance}` : errorText, backoffMs ?? 0, id, lockToken, result ?? null]
       );
       if (rows.length === 0) return null;
 
