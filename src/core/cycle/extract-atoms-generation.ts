@@ -3,7 +3,7 @@
  * adapter context, the unmanaged one-transaction publication, and the transcript keys (root label plus root-relative
  * path, with the rename map) and slugs. Peeled out of extract-atoms.ts (module-size ratchet).
  */
-import { existsSync } from 'node:fs';
+import { existsSync, promises as fsp } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
 import { isAvailable } from '../ai/gateway.ts';
@@ -105,4 +105,9 @@ export async function resolveTranscriptAtomSlug(engine: BrainEngine, sourceId: s
     `SELECT locator FROM derived_generations WHERE source_id=$1 AND kind=$2 AND owner_key=$3 AND state='live'`,
     [sourceId, ATOM_KIND, atomOwnerKey({ kind: 'transcript', transcriptKey: item.transcriptKey ?? item.filePath })]);
   return mine?.locator === held.source_path ? legacy : atomSlug(title, item.filePath, item.transcriptKey ?? item.filePath, undatedDate);
+}
+
+/** Physical path of a file (patch 206): the fs boundary of extract_atoms stays in this module (core-world-reads). */
+export function realpathOf(path: string): Promise<string> {
+  return fsp.realpath(path);
 }
