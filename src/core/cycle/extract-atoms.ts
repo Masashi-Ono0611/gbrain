@@ -71,7 +71,6 @@ import { derivedWriteThrough, reportDerivedWriteThrough } from './derived-write-
 import { emptySessionSourceRouting, keepSessionSourceTranscripts, withSessionSourceRouting } from './synthesize-source-routing.ts';
 import { DEFAULT_EXTRACT_MAX_INPUT_CHARS, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone, type ExtractAtomsInput, type ExtractAtomsItem } from './extract-atoms-input.ts';
 import { commitExtractionPlan, readPageWatermark } from '../extraction-watermark.ts';
-import { realpath } from 'node:fs/promises';
 import { isAbsolute, relative, sep } from 'node:path';
 import { resolveSourceLocalFilePath, serializeMarkdown } from '../markdown.ts';
 import { truncateUtf8 } from '../text-safe.ts';
@@ -106,6 +105,7 @@ import { AtomPageStateError, canonicalPageInputs, MAX_DETERMINISTIC_FAILURES, PA
 import { heldRowsForCaller } from '../eligibility/fence-overlay.ts';
 import { atomGenerationOrigin, atomInputPin, heldAtomInputExclusionSql, heldLine, publishUnmanagedAtoms, resolveTranscriptAtomSlug, resolveTranscriptKeys, retireRenamedOriginAtoms, transcriptRoot } from './extract-atoms-generation.ts';
 import { currentHoldIds, heldForInput } from '../generations/publish.ts';
+import { realpathOf as realpath } from './extract-atoms-generation.ts';
 import { ATOM_TYPES, ATOMS_RESPONSE_SCHEMA } from './extract-atoms-schema.ts';
 import { parseAtomsOutcome } from './extract-atoms-parse.ts';
 import { VERSION } from '../../version.ts';
