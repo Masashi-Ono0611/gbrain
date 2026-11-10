@@ -21,10 +21,10 @@ import type { PageWriteOptions } from '../page-state/types.ts';
 import { moveSlugBindings, recordRenameAlias } from '../page-state/rename-alias.ts';
 import { segmentedRevertRefusal } from '../page-state/versions.ts';
 import { sanitizeText } from '../batch-rows.ts';
-import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion } from '../search/safe-chunks.ts';
+import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion, currentTextProjectionFilter, safeChunksFilter } from '../search/safe-chunks.ts';
 import { privatePagesFilterFragment, privateSnapshotFilterFragment, privatePagesFilterForCaller, privacyForCaller, callerReadersAllowedSql } from '../search/private-visibility.ts';
 import { validDateSql } from '../valid-time.ts';
-import { quarantineFilterFragment } from '../quarantine.ts';
+import { QUARANTINE_FILTER_FRAGMENT, quarantineFilterFragment } from '../quarantine.ts';
 import { rederiveHiddenSql } from '../eligibility/sql.ts';
 import { buildVisibilityClause } from '../search/sql-ranking.ts';
 import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, isMissingSchemaObject, warnOncePerProcess } from '../utils.ts';
@@ -522,12 +522,13 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       ? trustedSql(`AND ${privatePagesFilterForCaller('p')}`)
       : sqlFragment``;
     // Opt-in search visibility for canonical bodies; administrative listPages calls retain their existing behavior.
+    const visibilityPrivate = filters?.excludePrivate
+      ? sqlFragment` AND ${trustedSql(privatePagesFilterFragment('p'))}` : sqlFragment``;
+    const visibilitySafeChunks = (filters?.requireSafeChunks ?? filters?.excludePrivate)
+      ? sqlFragment` AND ${trustedSql(safeChunksFilter('p'))}` : sqlFragment``;
+    const visibilityCondition = sqlFragment`AND p.deleted_at IS NULL AND ${trustedSql(currentTextProjectionFilter('p'))} AND NOT s.archived AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)} AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'pinned_question')${visibilityPrivate}${visibilitySafeChunks}`;
     const privateAndVisibilityCondition = requireVisibility
-      ? sqlFragment`${privateCondition} ${trustedSql(buildVisibilityClause('p', 's', {
-          excludePrivate: filters?.excludePrivate,
-          requireSafeChunks: filters?.requireSafeChunks === true,
-        }))}`
-      : privateCondition;
+      ? sqlFragment`${privateCondition} ${visibilityCondition}` : privateCondition;
     const effectiveAfterCondition = filters?.effective_after
       ? sqlFragment`AND p.effective_date >= ${filters.effective_after}::timestamptz`
       : sqlFragment``;

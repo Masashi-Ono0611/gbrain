@@ -26,7 +26,7 @@ import { extractCandidates, isCommonCapitalizedWord } from '../context/entity-sa
 import { isFactEntityPage, resolveStrictEntityReference, type StrictResolution } from '../entities/resolve.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import { DEFAULT_ENTITY_MENTION_IGNORE_LIST, isGenericEntityToken } from '../entity-name-quality.ts';
-import { isUndefinedTableError } from '../utils.ts';
+import { isMissingSchemaObject } from '../utils.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 
 export type InferredVia = 'page' | 'mention';
@@ -174,7 +174,7 @@ async function weakAliasEvidence(engine: BrainEngine, sourceId: string, queries:
   try {
     aliases = await engine.resolveAliases([...new Set(queries.map(normalizeAlias))], { sourceId, excludePrivate });
   } catch (error) {
-    if (isUndefinedTableError(error)) return out;
+    if (isMissingSchemaObject(error, 'table', 'page_aliases')) return out;
     throw error;
   }
   const slugs = [...new Set([...aliases.values()].flatMap(hits => hits.map(hit => hit.slug)))];
