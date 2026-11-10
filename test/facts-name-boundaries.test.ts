@@ -152,8 +152,17 @@ describe('curated weak Latin aliases', () => {
   test('missing alias tables abstain while other lookup failures propagate', async () => {
     const aliases = spyOn(engine, 'resolveAliases');
     try {
-      aliases.mockRejectedValueOnce(Object.assign(new Error('relation page_aliases does not exist'), { code: '42P01' }));
+      aliases.mockRejectedValueOnce(Object.assign(new Error('relation "page_aliases" does not exist'), { code: '42P01' }));
       expect((await infer('atlascode ships weekly')).slug).toBeNull();
+      for (const failure of [
+        Object.assign(new Error('relation "pages" does not exist'), { code: '42P01' }),
+        Object.assign(new Error('column "origin" does not exist'), { code: '42703' }),
+        Object.assign(new Error('permission denied for relation page_aliases'), { code: '42501' }),
+        Object.assign(new Error('missing relation not identified'), { code: '42P01' }),
+      ]) {
+        aliases.mockRejectedValueOnce(failure);
+        await expect(infer('atlascode ships weekly')).rejects.toBe(failure);
+      }
       aliases.mockRejectedValueOnce(new Error('alias database offline'));
       await expect(infer('atlascode ships weekly')).rejects.toThrow('alias database offline');
     } finally { aliases.mockRestore(); }
