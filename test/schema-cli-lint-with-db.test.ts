@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runCli } from './helpers/cli-spawn.ts';
@@ -7,7 +7,7 @@ import { runCli } from './helpers/cli-spawn.ts';
 let home: string;
 
 beforeAll(async () => {
-  home = mkdtempSync(join(tmpdir(), 'gbrain-schema-lint-with-db-'));
+  home = mkdtempSync(join(realpathSync(tmpdir()), 'gbrain-schema-lint-with-db-'));
   const init = await runCli(['init', '--pglite', '--no-embedding', '--non-interactive'], { home });
   expect(init.exitCode, init.stderr).toBe(0);
   const config = await runCli(['config', 'set', 'schema_pack', 'gbrain-base'], { home });
