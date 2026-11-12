@@ -26,6 +26,7 @@ import {
   type CredentialEntry,
   type ProviderClientRecord,
 } from '../src/core/creds/vault.ts';
+import { GoogleTokenProvider } from '../src/core/creds/providers/google.ts';
 
 // ── Fixtures (synthetic only) ────────────────────────────────────────────────
 
@@ -194,6 +195,69 @@ describe('FileVaultBackend provider client records', () => {
       clients: ProviderClientRecord[];
     };
     expect(raw.clients.filter((c) => c.provider === 'google')).toHaveLength(1);
+  });
+
+  it('two accounts on two clients each refresh with the client that minted them', async () => {
+    const vault = new FileVaultBackend();
+    const first = makeClient({ client_id: '11111-first.apps.googleusercontent.com', client_secret: 'GOCSPX-first' });
+    const second = makeClient({ client_id: '22222-second.apps.googleusercontent.com', client_secret: 'GOCSPX-second' });
+    const expired = { ...makeEntry().secret, expiry: '2020-01-01T00:00:00.000Z' };
+    await vault.putClient(first);
+    await vault.put(makeEntry({ secret: expired, meta: { ...makeEntry().meta, client_id: first.client_id } }));
+    await vault.putClient(second);
+    await vault.put(
+      makeEntry({ id: 'google:b@example.com', secret: expired, meta: { ...makeEntry().meta, account: 'b@example.com', client_id: second.client_id } }),
+    );
+    // The new client is the default; the first survives because an account names it.
+    expect(await vault.getClient('google')).toEqual(second);
+    expect(await vault.getClient('google', first.client_id)).toEqual(first);
+
+    const sent: URLSearchParams[] = [];
+    const fetchImpl = (async (_url: unknown, init?: { body?: unknown }) => {
+      sent.push(new URLSearchParams(String(init?.body)));
+      return new Response(JSON.stringify({ access_token: 'ya29.refreshed', expires_in: 3600 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await new GoogleTokenProvider(vault, 'google:a@example.com', fetchImpl).getAccessToken();
+    await new GoogleTokenProvider(vault, 'google:b@example.com', fetchImpl).getAccessToken();
+    expect(sent.map((p) => [p.get('client_id'), p.get('client_secret')])).toEqual([
+      [first.client_id, 'GOCSPX-first'],
+      [second.client_id, 'GOCSPX-second'],
+    ]);
+
+    // A scoped delete refuses while an account still refreshes through the client.
+    expect(await vault.deleteClient('google', first.client_id)).toBe(false);
+    await vault.delete('google:a@example.com');
+    expect(await vault.deleteClient('google', first.client_id)).toBe(true);
+    expect(await vault.getClient('google')).toEqual(second);
+  });
+
+  it('a byo account with no recorded client is pinned to the outgoing default', async () => {
+    const vault = new FileVaultBackend();
+    const first = makeClient({ client_id: '11111-first.apps.googleusercontent.com' });
+    await vault.putClient(first);
+    const { client_id: _dropped, ...legacyMeta } = makeEntry().meta;
+    await vault.put(makeEntry({ meta: legacyMeta }));
+    await vault.putClient(makeClient({ client_id: '22222-second.apps.googleusercontent.com' }));
+
+    expect((await vault.get('google:a@example.com'))?.meta.client_id).toBe(first.client_id);
+    expect(await vault.getClient('google', first.client_id)).toEqual(first);
+  });
+
+  it('refresh never falls back to another client when the recorded one is missing', async () => {
+    const vault = new FileVaultBackend();
+    await vault.putClient(makeClient({ client_id: '22222-second.apps.googleusercontent.com' }));
+    await vault.put(
+      makeEntry({
+        secret: { ...makeEntry().secret, expiry: '2020-01-01T00:00:00.000Z' },
+        meta: { ...makeEntry().meta, client_id: '11111-gone.apps.googleusercontent.com' },
+      }),
+    );
+    const fetchImpl = (async () => {
+      throw new Error('no token request expected');
+    }) as unknown as typeof fetch;
+    await expect(new GoogleTokenProvider(vault, 'google:a@example.com', fetchImpl).getAccessToken()).rejects.toThrow(
+      /11111-gone\.a/,
+    );
   });
 });
 

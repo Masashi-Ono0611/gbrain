@@ -295,8 +295,13 @@ async function resolveClientCreds(
   if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
     return validateClientPair(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
   }
-  // 4. Already on file.
-  const existing = await vault.getClient(GOOGLE_PROVIDER);
+  // 4. Already on file — a named account's own client first, so a --reauth
+  //    keeps the client its other tokens were minted by; else the default.
+  const hint = typeof f.reauth === 'string' ? f.reauth : f.account;
+  const hinted = hint ? await vault.get(credentialId(GOOGLE_PROVIDER, hint)) : null;
+  const existing =
+    (hinted?.meta.client_id ? await vault.getClient(GOOGLE_PROVIDER, hinted.meta.client_id) : null) ??
+    (await vault.getClient(GOOGLE_PROVIDER));
   if (existing) return { client_id: existing.client_id, client_secret: existing.client_secret };
   // 5. TTY prompt (readLineSafe returns '' immediately on non-TTY).
   const pastedId = await readLineSafe('Google OAuth client ID (or Enter to see setup steps): ', '', 120_000);
@@ -316,6 +321,7 @@ async function finishConnect(
   fetchImpl: typeof fetch,
   knownEmail?: string,
   scopesOverride?: string[],
+  client?: { client_id: string; client_secret: string },
 ): Promise<CredentialEntry> {
   const email = knownEmail ?? (await fetchUserinfoEmail(tokens.access_token, fetchImpl));
   if (f.account && email !== f.account) {
@@ -359,6 +365,17 @@ async function finishConnect(
     },
   };
   await vault.put(entry);
+  // Consent can take minutes, and a connect started meanwhile with another
+  // client drops clients no account names yet. This account names its client
+  // now, so put the record back if it went missing.
+  if (client && !(await vault.getClient(GOOGLE_PROVIDER, client.client_id))) {
+    await vault.putClient({ provider: GOOGLE_PROVIDER, ...client, created_at: nowIso });
+  }
+  // A re-consent that moved this account to another client leaves the old
+  // one behind; drop it unless some other account still refreshes through it.
+  if (prior?.meta.client_id && prior.meta.client_id !== clientId) {
+    await vault.deleteClient(GOOGLE_PROVIDER, prior.meta.client_id);
+  }
   appendGoogleHeartbeat('consent_ok', 'ok', { account_hash: hashish(email), client_ref: clientRef });
   return entry;
 }
@@ -424,7 +441,8 @@ export async function runGoogleConnect(args: string[]): Promise<void> {
     if (f.code) {
       const pending = readPending();
       if (!pending) throw new CredentialError('consent_timeout');
-      const client = await vault.getClient(GOOGLE_PROVIDER);
+      // Step 1's client, not whatever became the default since.
+      const client = await vault.getClient(GOOGLE_PROVIDER, pending.client_id);
       if (!client) throw new CredentialError('not_connected', ' (no OAuth client on file)');
       const parsed = parsePastedRedirect(f.code, pending.state);
       const tokens = await exchangeCode(
@@ -449,6 +467,7 @@ export async function runGoogleConnect(args: string[]): Promise<void> {
         // token response carries no `scope`; never this invocation's default
         // f.services.
         pending.scopes,
+        client,
       );
       // Only the flow that CONSUMED the pending record clears it — a
       // parallel loopback/relay connect completing must not delete an
@@ -477,27 +496,20 @@ export async function runGoogleConnect(args: string[]): Promise<void> {
       setCliExitVerdict(2);
       return;
     }
-    // Refresh tokens are bound to the client that minted them: silently
-    // replacing the stored client (stale env vars suffice) breaks every
-    // sibling account's refresh with a misleading "revoked" diagnosis.
-    // Warn loudly; proceeding is still legal (BYO users rotate clients).
-    const priorClient = await vault.getClient(GOOGLE_PROVIDER);
-    if (priorClient && priorClient.client_id !== creds.client_id) {
-      const accounts = await vault.list({ provider: GOOGLE_PROVIDER });
-      if (accounts.length > 0) {
-        process.stderr.write(
-          `[google] warning: replacing the stored OAuth client (${priorClient.client_id.slice(0, 12)}…) ` +
-            `with a different one. Refresh tokens are client-bound — if refresh starts failing for the ` +
-            `${accounts.length} already-connected account(s), run \`gbrain google connect --reauth <email>\`.\n`,
-        );
-      }
+    // Refresh tokens are bound to the client that minted them, so a new
+    // client becomes the default without displacing the clients that
+    // already-connected accounts still refresh through (putClient).
+    // A client already on file stays where it is: re-storing it would make it
+    // the default and drop whichever client no account names at the moment.
+    const onFile = await vault.getClient(GOOGLE_PROVIDER, creds.client_id);
+    if (onFile?.client_secret !== creds.client_secret) {
+      await vault.putClient({
+        provider: GOOGLE_PROVIDER,
+        client_id: creds.client_id,
+        client_secret: creds.client_secret,
+        created_at: new Date().toISOString(),
+      });
     }
-    await vault.putClient({
-      provider: GOOGLE_PROVIDER,
-      client_id: creds.client_id,
-      client_secret: creds.client_secret,
-      created_at: new Date().toISOString(),
-    });
     appendGoogleHeartbeat('client_creds_ok', 'ok');
 
     const accountHint =
@@ -540,7 +552,7 @@ export async function runGoogleConnect(args: string[]): Promise<void> {
           },
           fetchImpl,
         );
-        const entry = await finishConnect(vault, f, tokens, creds.client_id, 'byo', fetchImpl);
+        const entry = await finishConnect(vault, f, tokens, creds.client_id, 'byo', fetchImpl, undefined, undefined, creds);
         // The TTY paste consumed the pending record it wrote above; a FAILED
         // paste deliberately leaves it (recoverable via --code, same state).
         clearPending();
@@ -589,7 +601,7 @@ export async function runGoogleConnect(args: string[]): Promise<void> {
         },
         fetchImpl,
       );
-      const entry = await finishConnect(vault, f, tokens, creds.client_id, 'byo', fetchImpl);
+      const entry = await finishConnect(vault, f, tokens, creds.client_id, 'byo', fetchImpl, undefined, undefined, creds);
       printConnected(f.json, entry);
     } finally {
       loop.close();
@@ -797,6 +809,17 @@ export async function runGoogleStatus(args: string[]): Promise<void> {
 
 // ── disconnect ───────────────────────────────────────────────────────────────
 
+/**
+ * --purge-client removes the disconnected account's client (the default when
+ * it recorded none). The vault refuses while a remaining byo account still
+ * refreshes through it.
+ */
+async function purgeClientOf(vault: CredentialVault, clientId: string | undefined): Promise<void> {
+  const target = clientId ?? (await vault.getClient(GOOGLE_PROVIDER))?.client_id;
+  if (target === undefined) return;
+  await vault.deleteClient(GOOGLE_PROVIDER, target);
+}
+
 export async function runGoogleDisconnect(args: string[]): Promise<void> {
   const json = args.includes('--json');
   const purgeClient = args.includes('--purge-client');
@@ -806,8 +829,10 @@ export async function runGoogleDisconnect(args: string[]): Promise<void> {
     process.exit(2);
   }
   const vault = openVault();
-  const deleted = await vault.delete(credentialId(GOOGLE_PROVIDER, email));
-  if (purgeClient) await vault.deleteClient(GOOGLE_PROVIDER);
+  const id = credentialId(GOOGLE_PROVIDER, email);
+  const ownClientId = (await vault.get(id))?.meta.client_id;
+  const deleted = await vault.delete(id);
+  if (purgeClient) await purgeClientOf(vault, ownClientId);
   emit(
     json,
     {

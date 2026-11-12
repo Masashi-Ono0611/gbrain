@@ -85,7 +85,11 @@ export interface CredentialMeta {
   consent_publish_state?: string;
 }
 
-/** A provider's OAuth client credentials (byo). One per provider in v1. */
+/**
+ * A provider's OAuth client credentials (byo). A provider can hold several:
+ * refresh tokens are bound to the client that minted them, so each connected
+ * account keeps the client named by its `meta.client_id`.
+ */
 export interface ProviderClientRecord {
   provider: string;
   client_id: string;
@@ -98,9 +102,21 @@ export interface CredentialVault {
   put(entry: CredentialEntry): Promise<void>;
   list(filter?: { provider?: string }): Promise<CredentialMeta[]>;
   delete(id: string): Promise<boolean>;
-  getClient(provider: string): Promise<ProviderClientRecord | null>;
+  /**
+   * With `clientId`: that exact client, or null. Without: the provider's
+   * most recently stored client (the default for new connections).
+   */
+  getClient(provider: string, clientId?: string): Promise<ProviderClientRecord | null>;
+  /**
+   * Stores `rec` as the provider's default client. Clients a connected
+   * credential still names survive; unreferenced ones are dropped.
+   */
   putClient(rec: ProviderClientRecord): Promise<void>;
-  deleteClient(provider: string): Promise<boolean>;
+  /**
+   * With `clientId`: that client only, and only when no byo credential still
+   * refreshes through it (false otherwise). Without: every client of the provider.
+   */
+  deleteClient(provider: string, clientId?: string): Promise<boolean>;
 }
 
 export function credentialId(provider: string, account: string): string {
@@ -273,24 +289,53 @@ export class FileVaultBackend implements CredentialVault {
     });
   }
 
-  async getClient(provider: string): Promise<ProviderClientRecord | null> {
-    return this.read().clients.find((c) => c.provider === provider) ?? null;
+  async getClient(provider: string, clientId?: string): Promise<ProviderClientRecord | null> {
+    const own = this.read().clients.filter((c) => c.provider === provider);
+    if (clientId !== undefined) return own.find((c) => c.client_id === clientId) ?? null;
+    // The default is the most recently stored record (putClient appends).
+    return own[own.length - 1] ?? null;
   }
 
   async putClient(rec: ProviderClientRecord): Promise<void> {
     withVaultLock(this.path, () => {
       const shape = this.read();
-      shape.clients = shape.clients.filter((c) => c.provider !== rec.provider);
+      const own = shape.clients.filter((c) => c.provider === rec.provider);
+      const priorDefault = own[own.length - 1];
+      const byo = Object.values(shape.credentials).filter(
+        (e) => e.provider === rec.provider && e.client_ref === 'byo',
+      );
+      // A byo credential with no recorded client was minted by the default
+      // client of its day. Pin it before the default moves, or its refresh
+      // token would be sent to a client that never issued it.
+      if (priorDefault && priorDefault.client_id !== rec.client_id) {
+        for (const e of byo) {
+          if (e.meta.client_id === undefined) e.meta.client_id = priorDefault.client_id;
+        }
+      }
+      const inUse = new Set(byo.map((e) => e.meta.client_id));
+      shape.clients = shape.clients.filter(
+        (c) => c.provider !== rec.provider || (c.client_id !== rec.client_id && inUse.has(c.client_id)),
+      );
       shape.clients.push(rec);
       this.write(shape);
     });
   }
 
-  async deleteClient(provider: string): Promise<boolean> {
+  async deleteClient(provider: string, clientId?: string): Promise<boolean> {
     return withVaultLock(this.path, () => {
       const shape = this.read();
       const before = shape.clients.length;
-      shape.clients = shape.clients.filter((c) => c.provider !== provider);
+      if (clientId !== undefined) {
+        // A byo credential with no recorded client refreshes through the default.
+        const defaultId = shape.clients.filter((c) => c.provider === provider).at(-1)?.client_id;
+        const inUse = Object.values(shape.credentials).some(
+          (e) => e.provider === provider && e.client_ref === 'byo' && (e.meta.client_id ?? defaultId) === clientId,
+        );
+        if (inUse) return false;
+      }
+      shape.clients = shape.clients.filter(
+        (c) => c.provider !== provider || (clientId !== undefined && c.client_id !== clientId),
+      );
       if (shape.clients.length === before) return false;
       this.write(shape);
       return true;
