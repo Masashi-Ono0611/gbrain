@@ -368,8 +368,15 @@ export class GoogleTokenProvider {
       if (!base) throw new CredentialError('relay_disabled');
       token = await refreshViaRelay(base, e, this.fetchImpl);
     } else {
-      const client = await this.vault.getClient(GOOGLE_PROVIDER);
-      if (!client) throw new CredentialError('not_connected', ` (no OAuth client on file)`);
+      // The client that minted the tokens. Only an entry that recorded none
+      // uses the default: another client's secret can never refresh this token.
+      const client = await this.vault.getClient(GOOGLE_PROVIDER, e.meta.client_id);
+      if (!client) {
+        throw new CredentialError(
+          'not_connected',
+          e.meta.client_id ? ` (OAuth client ${e.meta.client_id.slice(0, 12)}… not on file)` : ` (no OAuth client on file)`,
+        );
+      }
       token = await refreshAccessToken(e, client, this.fetchImpl);
     }
     const nowIso = new Date().toISOString();
