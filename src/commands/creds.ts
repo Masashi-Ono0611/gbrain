@@ -125,10 +125,23 @@ async function runExport(args: string[]): Promise<void> {
   }
   // Refresh tokens are bound to the client that minted them: byo clients
   // MUST travel with their tokens or the bundle imports dead credentials.
+  // A provider can hold several: each entry's own client, then the default
+  // LAST (import replays this order; the last one stored is the default). The
+  // default travels only when an exported entry refreshes through it.
   const clients: ProviderClientRecord[] = [];
   for (const p of providers) {
-    const c = await vault.getClient(p);
-    if (c) clients.push(c);
+    const def = await vault.getClient(p);
+    for (const e of entries) {
+      if (e.provider !== p || !e.meta.client_id || e.meta.client_id === def?.client_id) continue;
+      if (clients.some((x) => x.provider === p && x.client_id === e.meta.client_id)) continue;
+      const own = await vault.getClient(p, e.meta.client_id);
+      if (own) clients.push(own);
+      else process.stderr.write(`warning: ${e.id} — its OAuth client is not in the vault; the exported refresh token will not work until that account reconnects.\n`);
+    }
+    const usesDefault = entries.some(
+      (e) => e.provider === p && (e.meta.client_id === undefined || e.meta.client_id === def?.client_id),
+    );
+    if (def && usesDefault) clients.push(def);
   }
 
   const passphrase = await passphraseFrom(args);
@@ -195,8 +208,18 @@ async function runImport(args: string[]): Promise<void> {
     return fail(e instanceof Error ? e.message : String(e));
   }
   const vault = openVault();
+  // Credentials first: putClient keeps only the clients a credential names.
+  // A byo entry with no recorded client belongs to its bundle's default (the
+  // provider's last client) — pin it so this vault's own default can't claim it.
+  for (const e of payload.credentials) {
+    const def = payload.clients.filter((c) => c.provider === e.provider).at(-1);
+    const pinned =
+      e.client_ref === 'byo' && e.meta.client_id === undefined && def
+        ? { ...e, meta: { ...e.meta, client_id: def.client_id } }
+        : e;
+    await vault.put(pinned);
+  }
   for (const c of payload.clients) await vault.putClient(c);
-  for (const e of payload.credentials) await vault.put(e);
   if (json) {
     process.stdout.write(
       JSON.stringify({
