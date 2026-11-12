@@ -21,7 +21,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { runGoogleCalendars, runGoogleConnect } from '../src/commands/google.ts';
+import { runCreds } from '../src/commands/creds.ts';
+import { runGoogleCalendars, runGoogleConnect, runGoogleDisconnect } from '../src/commands/google.ts';
 import { CredentialError } from '../src/core/creds/errors.ts';
 import type { CredentialEntry, ProviderClientRecord, VaultFileShape } from '../src/core/creds/vault.ts';
 import {
@@ -662,6 +663,215 @@ describe('runGoogleCalendars', () => {
         'gbrain sources add <id> --kind google --account a@example.com --services calendar --calendar-id "<id>"',
       );
       expect(() => JSON.parse(r.out)).toThrow(); // human mode is not JSON
+    });
+  });
+});
+
+// ── Several OAuth clients under one provider ────────────────────────────────
+
+const OTHER_CLIENT_ID = '654321-fedcba.apps.googleusercontent.com';
+
+function otherClient(): ProviderClientRecord {
+  return { provider: 'google', client_id: OTHER_CLIENT_ID, client_secret: 'GOCSPX-other-secret-0000', created_at: new Date().toISOString() };
+}
+
+function entryOn(email: string, clientId: string): CredentialEntry {
+  const e = googleEntry(email);
+  return { ...e, meta: { ...e.meta, client_id: clientId } };
+}
+
+describe('several OAuth clients under one provider', () => {
+  test('connecting with a second client keeps the client a connected account refreshes through', async () => {
+    const home = freshHome();
+    await withEnv(connectEnv(home), async () => {
+      writeVault(home, [otherClient()], { 'google:a@example.com': entryOn('a@example.com', OTHER_CLIENT_ID) });
+      const r = await captured(() =>
+        runGoogleConnect(['--client-json', writeClientJsonFile(home), '--paste', '--scopes', 'gmail', '--json']),
+      );
+      expect((JSON.parse(r.out) as { status: string }).status).toBe('awaiting_consent');
+
+      const vault = readVault(home);
+      expect(vault.clients.map((c) => c.client_id)).toEqual([OTHER_CLIENT_ID, CLIENT_ID]);
+      expect(vault.credentials['google:a@example.com'].meta.client_id).toBe(OTHER_CLIENT_ID);
+      expect(r.err).not.toContain('replacing the stored OAuth client');
+    });
+  });
+
+  test('disconnect --purge-client removes a client only once no account uses it', async () => {
+    const home = freshHome();
+    await withEnv(connectEnv(home), async () => {
+      writeVault(home, [otherClient(), googleClient()], {
+        'google:a@example.com': entryOn('a@example.com', OTHER_CLIENT_ID),
+        'google:b@example.com': entryOn('b@example.com', CLIENT_ID),
+        'google:c@example.com': entryOn('c@example.com', CLIENT_ID),
+      });
+
+      await captured(() => runGoogleDisconnect(['b@example.com', '--purge-client', '--json']));
+      expect(readVault(home).clients.map((c) => c.client_id)).toEqual([OTHER_CLIENT_ID, CLIENT_ID]);
+
+      await captured(() => runGoogleDisconnect(['c@example.com', '--purge-client', '--json']));
+      const after = readVault(home);
+      expect(after.clients.map((c) => c.client_id)).toEqual([OTHER_CLIENT_ID]);
+      expect(Object.keys(after.credentials)).toEqual(['google:a@example.com']);
+    });
+  });
+
+  test('disconnect --purge-client of an account with no recorded client spares clients still in use', async () => {
+    const home = freshHome();
+    await withEnv(connectEnv(home), async () => {
+      const relay = googleEntry('r@example.com');
+      const { client_id: _none, ...relayMeta } = relay.meta;
+      const legacy = googleEntry('l@example.com');
+      const { client_id: _legacyNone, ...legacyMeta } = legacy.meta;
+      writeVault(home, [otherClient(), googleClient()], {
+        'google:a@example.com': entryOn('a@example.com', OTHER_CLIENT_ID),
+        'google:l@example.com': { ...legacy, meta: legacyMeta },
+        'google:r@example.com': { ...relay, client_ref: 'hosted-relay', meta: relayMeta },
+      });
+
+      // The relay account names no client; the default is still used by the
+      // byo account that recorded none, and the other client by a@.
+      await captured(() => runGoogleDisconnect(['r@example.com', '--purge-client', '--json']));
+      expect(readVault(home).clients.map((c) => c.client_id)).toEqual([OTHER_CLIENT_ID, CLIENT_ID]);
+
+      // Once that byo account is gone, the default has no user left.
+      await captured(() => runGoogleDisconnect(['l@example.com', '--purge-client', '--json']));
+      expect(readVault(home).clients.map((c) => c.client_id)).toEqual([OTHER_CLIENT_ID]);
+    });
+  });
+
+  test('--code exchanges with the client step 1 recorded, not the current default', async () => {
+    const home = freshHome();
+    await withEnv(connectEnv(home), async () => {
+      // The default is CLIENT_ID; the pending flow was started with the other client.
+      writeVault(home, [otherClient(), googleClient()], {
+        'google:z@example.com': entryOn('z@example.com', OTHER_CLIENT_ID),
+      });
+      const pending = writePendingFile(home, { client_id: OTHER_CLIENT_ID });
+      const redirect = `http://127.0.0.1:41999/?code=4%2Fauthcode-test&state=${pending.state}`;
+      const r = await captured(() => runGoogleConnect(['--code', redirect, '--json']));
+      expect((JSON.parse(r.out) as { status: string }).status).toBe('connected');
+
+      const params = new URLSearchParams(fetchCalls.find((c) => c.url.includes('oauth2.googleapis.com'))!.body);
+      expect(params.get('client_id')).toBe(OTHER_CLIENT_ID);
+      expect(params.get('client_secret')).toBe('GOCSPX-other-secret-0000');
+      expect(readVault(home).credentials['google:a@example.com'].meta.client_id).toBe(OTHER_CLIENT_ID);
+    });
+  });
+
+  test('--code whose step-1 client is no longer on file → not_connected, no token exchange', async () => {
+    const home = freshHome();
+    await withEnv(connectEnv(home), async () => {
+      writeVault(home, [googleClient()]);
+      const pending = writePendingFile(home, { client_id: OTHER_CLIENT_ID });
+      const redirect = `http://127.0.0.1:41999/?code=4%2Fauthcode-test&state=${pending.state}`;
+      const r = await captured(() => runGoogleConnect(['--code', redirect, '--json']));
+      expect(parseErrorEnvelope(r.out).error.code).toBe('not_connected');
+      expect(fetchCalls.filter((c) => c.url.includes('oauth2.googleapis.com'))).toHaveLength(0);
+    });
+  });
+
+  test('--reauth with no client flags reuses the account\'s own client, not the default', async () => {
+    const home = freshHome();
+    await withEnv(connectEnv(home), async () => {
+      writeVault(home, [otherClient(), googleClient()], {
+        'google:a@example.com': entryOn('a@example.com', OTHER_CLIENT_ID),
+        'google:b@example.com': entryOn('b@example.com', CLIENT_ID),
+      });
+      await captured(() => runGoogleConnect(['--reauth', 'a@example.com', '--paste', '--json']));
+      const pending = JSON.parse(readFileSync(pendingPath(home), 'utf-8')) as PendingShape;
+      expect(pending.client_id).toBe(OTHER_CLIENT_ID);
+      // Both clients survive: each still has an account refreshing through it.
+      expect(readVault(home).clients.map((c) => c.client_id).sort()).toEqual([CLIENT_ID, OTHER_CLIENT_ID].sort());
+    });
+  });
+
+  test('a re-consent that moves an account to another client drops the client it left', async () => {
+    const home = freshHome();
+    await withEnv(connectEnv(home), async () => {
+      writeVault(home, [otherClient()], { 'google:a@example.com': entryOn('a@example.com', OTHER_CLIENT_ID) });
+      await captured(() =>
+        runGoogleConnect(['--client-json', writeClientJsonFile(home), '--paste', '--scopes', 'gmail', '--json']),
+      );
+      const pending = JSON.parse(readFileSync(pendingPath(home), 'utf-8')) as PendingShape;
+      const redirect = `http://127.0.0.1:41999/?code=4%2Fauthcode-test&state=${pending.state}`;
+      await captured(() => runGoogleConnect(['--code', redirect, '--json']));
+
+      const vault = readVault(home);
+      expect(vault.credentials['google:a@example.com'].meta.client_id).toBe(CLIENT_ID);
+      expect(vault.clients.map((c) => c.client_id)).toEqual([CLIENT_ID]);
+    });
+  });
+
+  test('importing a bundle pins its byo accounts with no recorded client to the bundle\'s client', async () => {
+    const source = freshHome();
+    const target = freshHome();
+    const bundle = join(source, 'bundle.json');
+    const legacy = googleEntry('l@example.com');
+    const { client_id: _none, ...legacyMeta } = legacy.meta;
+    await withEnv(connectEnv(source, { TEST_BUNDLE_PASSPHRASE: 'correct-horse-battery' }), async () => {
+      writeVault(source, [googleClient()], { 'google:l@example.com': { ...legacy, meta: legacyMeta } });
+      await captured(() => runCreds(['export', '--out', bundle, '--passphrase-env', 'TEST_BUNDLE_PASSPHRASE', '--json']));
+    });
+    await withEnv(connectEnv(target, { TEST_BUNDLE_PASSPHRASE: 'correct-horse-battery' }), async () => {
+      // The target already has its own default client and an account on it.
+      writeVault(target, [otherClient()], { 'google:a@example.com': entryOn('a@example.com', OTHER_CLIENT_ID) });
+      await captured(() => runCreds(['import', bundle, '--passphrase-env', 'TEST_BUNDLE_PASSPHRASE', '--json']));
+      const vault = readVault(target);
+      expect(vault.credentials['google:l@example.com'].meta.client_id).toBe(CLIENT_ID);
+      expect(vault.credentials['google:a@example.com'].meta.client_id).toBe(OTHER_CLIENT_ID);
+      expect(vault.clients.map((c) => c.client_id)).toEqual([OTHER_CLIENT_ID, CLIENT_ID]);
+    });
+  });
+
+  test('--reauth of an account on a non-default client leaves the default where it was', async () => {
+    const home = freshHome();
+    await withEnv(connectEnv(home), async () => {
+      writeVault(home, [otherClient(), googleClient()], {
+        'google:a@example.com': entryOn('a@example.com', OTHER_CLIENT_ID),
+      });
+      await captured(() => runGoogleConnect(['--reauth', 'a@example.com', '--paste', '--json']));
+      // CLIENT_ID has no account yet and stays the default; nothing is dropped.
+      expect(readVault(home).clients.map((c) => c.client_id)).toEqual([OTHER_CLIENT_ID, CLIENT_ID]);
+    });
+  });
+
+  test('creds export --ids leaves out a default client no exported account uses', async () => {
+    const source = freshHome();
+    const target = freshHome();
+    const bundle = join(source, 'bundle.json');
+    await withEnv(connectEnv(source, { TEST_BUNDLE_PASSPHRASE: 'correct-horse-battery' }), async () => {
+      writeVault(source, [otherClient(), googleClient()], {
+        'google:a@example.com': entryOn('a@example.com', OTHER_CLIENT_ID),
+        'google:b@example.com': entryOn('b@example.com', CLIENT_ID),
+      });
+      await captured(() =>
+        runCreds(['export', '--out', bundle, '--ids', 'google:a@example.com', '--passphrase-env', 'TEST_BUNDLE_PASSPHRASE', '--json']),
+      );
+    });
+    await withEnv(connectEnv(target, { TEST_BUNDLE_PASSPHRASE: 'correct-horse-battery' }), async () => {
+      await captured(() => runCreds(['import', bundle, '--passphrase-env', 'TEST_BUNDLE_PASSPHRASE', '--json']));
+      expect(readVault(target).clients.map((c) => c.client_id)).toEqual([OTHER_CLIENT_ID]);
+    });
+  });
+
+  test('creds export then import carries every client and keeps the default', async () => {
+    const source = freshHome();
+    const target = freshHome();
+    const bundle = join(source, 'bundle.json');
+    await withEnv(connectEnv(source, { TEST_BUNDLE_PASSPHRASE: 'correct-horse-battery' }), async () => {
+      writeVault(source, [otherClient(), googleClient()], {
+        'google:a@example.com': entryOn('a@example.com', OTHER_CLIENT_ID),
+        'google:b@example.com': entryOn('b@example.com', CLIENT_ID),
+      });
+      await captured(() => runCreds(['export', '--out', bundle, '--passphrase-env', 'TEST_BUNDLE_PASSPHRASE', '--json']));
+    });
+    await withEnv(connectEnv(target, { TEST_BUNDLE_PASSPHRASE: 'correct-horse-battery' }), async () => {
+      await captured(() => runCreds(['import', bundle, '--passphrase-env', 'TEST_BUNDLE_PASSPHRASE', '--json']));
+      const vault = readVault(target);
+      expect(vault.clients.map((c) => c.client_id)).toEqual([OTHER_CLIENT_ID, CLIENT_ID]);
+      expect(vault.credentials['google:a@example.com'].meta.client_id).toBe(OTHER_CLIENT_ID);
+      expect(vault.credentials['google:b@example.com'].meta.client_id).toBe(CLIENT_ID);
     });
   });
 });
