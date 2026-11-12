@@ -99,6 +99,17 @@ Repeat `gbrain google connect --account work@yourco.com` per account; each
 account becomes its own source (`gbrain sources add gmail-work --kind google
 --account work@yourco.com`) with independent sync cursors and locks.
 
+Accounts do not have to share one OAuth client. When a work account can only
+consent to an app in its own Google Cloud project, connect it with that
+project's client: `gbrain google connect --client-json <that-client>.json
+--account work@yourco.com`. The newest client becomes the default for later
+connections, and every already-connected account keeps refreshing through the
+client that issued its tokens. `gbrain google disconnect <email>
+--purge-client` removes a client once no connected account uses it.
+
+**Say to your agent:** *"Connect my work Google account with its own OAuth
+client and keep my personal account connected."*
+
 ## Contacts next to your own person pages
 
 A Google source renders each contact as a near-empty person page under
