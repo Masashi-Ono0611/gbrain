@@ -110,11 +110,9 @@ export interface CredentialMeta {
 }
 
 /**
- * A provider's OAuth client credentials (byo). A record without `account` is
- * the provider-wide client (the only shape a v1 vault holds); a record with
- * `account` belongs to that one account (Personal mode: one client per
- * mailbox). Writing an account record moves the file to version 2, which a v1
- * binary refuses to read instead of clobbering the per-account records.
+ * A provider's OAuth client credentials (byo). Providers can retain several
+ * clients because refresh tokens are bound to the client that minted them;
+ * account-scoped records are used by Personal mode.
  */
 export interface ProviderClientRecord {
   provider: string;
@@ -130,9 +128,21 @@ export interface CredentialVault {
   put(entry: CredentialEntry): Promise<void>;
   list(filter?: { provider?: string }): Promise<CredentialMeta[]>;
   delete(id: string): Promise<boolean>;
-  getClient(provider: string): Promise<ProviderClientRecord | null>;
+  /**
+   * With `clientId`: that exact client, or null. Without: the provider's
+   * most recently stored client (the default for new connections).
+   */
+  getClient(provider: string, clientId?: string): Promise<ProviderClientRecord | null>;
+  /**
+   * Stores `rec` as the provider's default client. Clients a connected
+   * credential still names survive; unreferenced ones are dropped.
+   */
   putClient(rec: ProviderClientRecord): Promise<void>;
-  deleteClient(provider: string): Promise<boolean>;
+  /**
+   * With `clientId`: that client only, and only when no byo credential still
+   * refreshes through it (false otherwise). Without: every client of the provider.
+   */
+  deleteClient(provider: string, clientId?: string): Promise<boolean>;
 }
 
 export function credentialId(provider: string, account: string): string {
@@ -475,9 +485,11 @@ export class FileVaultBackend implements GrantVault {
     });
   }
 
-  /** The provider-wide client (the v1 record); per-account records are read by id or account. */
-  async getClient(provider: string): Promise<ProviderClientRecord | null> {
-    return this.read().clients.find((c) => c.provider === provider && !c.account) ?? null;
+  /** Look up a named client, or the latest provider client for new consents. */
+  async getClient(provider: string, clientId?: string): Promise<ProviderClientRecord | null> {
+    const own = this.read().clients.filter((c) => c.provider === provider);
+    if (clientId !== undefined) return own.find((c) => c.client_id === clientId) ?? null;
+    return own[own.length - 1] ?? null;
   }
 
   async listClients(provider: string): Promise<ProviderClientRecord[]> {
@@ -494,18 +506,31 @@ export class FileVaultBackend implements GrantVault {
   async putClient(rec: ProviderClientRecord): Promise<void> {
     withVaultLock(this.path, () => {
       const shape = this.read();
+      const oldDefault = shape.clients.filter((c) => c.provider === rec.provider).at(-1);
+      const byo = Object.values(shape.credentials).filter((e) => e.provider === rec.provider && e.client_ref === 'byo');
+      if (oldDefault && oldDefault.client_id !== rec.client_id) {
+        for (const e of byo) if (e.meta.client_id === undefined) e.meta.client_id = oldDefault.client_id;
+      }
+      const inUse = new Set(byo.map((e) => e.meta.client_id));
+      shape.clients = shape.clients.filter((c) =>
+        c.provider !== rec.provider || sameClientSlot(c, rec) || (c.client_id !== rec.client_id && inUse.has(c.client_id)),
+      );
       shape.clients = shape.clients.filter((c) => !sameClientSlot(c, rec));
       shape.clients.push(rec);
       this.write(shape);
     });
   }
 
-  /** Deletes the provider-wide client; per-account records go with their account (deleteAccountClient). */
-  async deleteClient(provider: string): Promise<boolean> {
+  async deleteClient(provider: string, clientId?: string): Promise<boolean> {
     return withVaultLock(this.path, () => {
       const shape = this.read();
       const before = shape.clients.length;
-      shape.clients = shape.clients.filter((c) => !(c.provider === provider && !c.account));
+      if (clientId !== undefined) {
+        const defaultId = shape.clients.filter((c) => c.provider === provider).at(-1)?.client_id;
+        const inUse = Object.values(shape.credentials).some((e) => e.provider === provider && e.client_ref === 'byo' && (e.meta.client_id ?? defaultId) === clientId);
+        if (inUse) return false;
+      }
+      shape.clients = shape.clients.filter((c) => c.provider !== provider || (clientId !== undefined && c.client_id !== clientId));
       if (shape.clients.length === before) return false;
       this.write(shape);
       return true;
@@ -535,6 +560,15 @@ export class FileVaultBackend implements GrantVault {
       const next = Math.max(currentGen ?? 0, shape.grant_generations?.[input.entry.id] ?? 0) + 1;
       const entry: CredentialEntry = { ...input.entry, meta: { ...input.entry.meta, grant_generation: next } };
       if (input.client) {
+        const priorDefault = shape.clients.filter((c) => c.provider === input.client!.provider).at(-1);
+        const byo = Object.values(shape.credentials).filter((e) => e.provider === input.client!.provider && e.client_ref === 'byo');
+        if (priorDefault && priorDefault.client_id !== input.client.client_id) {
+          for (const e of byo) if (e.meta.client_id === undefined) e.meta.client_id = priorDefault.client_id;
+        }
+        const inUse = new Set(byo.map((e) => e.meta.client_id));
+        shape.clients = shape.clients.filter((c) =>
+          c.provider !== input.client!.provider || sameClientSlot(c, input.client!) || (c.client_id !== input.client!.client_id && inUse.has(c.client_id)),
+        );
         shape.clients = shape.clients.filter((c) => !sameClientSlot(c, input.client!));
         shape.clients.push(input.client);
       }
