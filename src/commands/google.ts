@@ -1007,6 +1007,22 @@ export async function runGoogleStatus(args: string[]): Promise<void> {
 
 // ── disconnect ───────────────────────────────────────────────────────────────
 
+/**
+ * --purge-client removes the disconnected account's client (the default when
+ * it recorded none). The vault refuses while a remaining byo account still
+ * refreshes through it; say so, since the secret then stays on disk.
+ */
+async function purgeClientOf(vault: CredentialVault, clientId: string | undefined): Promise<void> {
+  const target = clientId ?? (await vault.getClient(GOOGLE_PROVIDER))?.client_id;
+  if (target === undefined) return;
+  const removed = await vault.deleteClient(GOOGLE_PROVIDER, target);
+  if (!removed && (await vault.getClient(GOOGLE_PROVIDER, target))) {
+    process.stderr.write(
+      `[google] kept OAuth client ${target.slice(0, 12)}…: another connected account still refreshes through it.\n`,
+    );
+  }
+}
+
 export async function runGoogleDisconnect(args: string[]): Promise<void> {
   const json = args.includes('--json');
   const purgeClient = args.includes('--purge-client');
