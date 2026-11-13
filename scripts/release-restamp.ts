@@ -297,12 +297,13 @@ function branchNoticeRows(ctx: Ctx, masterRef: string, mergeBase: string): Array
   const close = head.findIndex((l, i) => i >= open && l === '];') + 1;
   const outside = added.filter((l) => l.line <= open || l.line >= close);
   if (removed !== '0' || outside.length > 0) fail(`this branch changes ${BEHAVIOR_NOTICE_FILE} beyond appending BEHAVIOR_CHANGES rows${outside.length ? ` (line ${outside.slice(0, 5).map((l) => l.line).join(', ')})` : ''}`, why, how);
-  const noId = added.filter((l) => /\{ since:/.test(l.text) && !/\bid: '/.test(l.text));
+  const quotedId = /\bid:\s*(['"`])([^'"`]+)\1/g;
+  const noId = added.filter((l) => /\{ since:|\bid\s*:/.test(l.text) && !l.text.match(quotedId));
   if (noId.length > 0) fail(`${noId.length} BEHAVIOR_CHANGES row(s) this branch added have no id (line ${noId.map((l) => l.line).join(', ')})`, 'a moved row is named behavior-changes.d/<id>.md and dated by its id.', 'give each row an id (lowercase letters, digits and _), commit, then rerun: bun run release:unstamp');
   const r = ctx.run(['bun', '-e', ROW_DUMP]);
   const rows = (() => { try { return JSON.parse(r.out.trim().split('\n').at(-1) ?? '') as Array<{ id: string | null; text: string | null }>; } catch { return null; } })();
   if (r.code !== 0 || !rows) fail(`could not read the BEHAVIOR_CHANGES table at HEAD (exit ${r.code}): ${r.out.trim().split('\n').slice(-3).join(' ')}`, 'release:unstamp reads each appended row\'s text from the evaluated table.', 'fix the table so bun can import it, then rerun: bun run release:unstamp');
-  const ids = (text: string) => new Set([...text.matchAll(/\bid: '([^']+)'/g)].map((m) => m[1]!));
+  const ids = (text: string) => new Set([...text.matchAll(quotedId)].map((m) => m[2]!));
   const appended = ids(added.map((l) => l.text).join('\n'));
   const mine = rows.filter((row): row is { id: string; text: string | null } => !!row.id && appended.has(row.id));
   const fn = mine.filter((row) => row.text === null).map((row) => row.id);
