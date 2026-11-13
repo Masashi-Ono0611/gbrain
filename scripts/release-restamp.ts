@@ -209,19 +209,23 @@ interface MigrationAnalysis { masterMax: number; branch: BranchMigration[]; plan
 /**
  * Split `head` migrations into published (on the master ref) and branch-only,
  * with the payload identity rules: a published file must keep master's
- * payload, and a branch file must not be a copy of a published one.
+ * payload unless only master changed it since the merge base, and a branch
+ * file must not be a copy of a published one.
  */
 function analyzeMigrations(ctx: Ctx, masterRef: string, head: Map<string, string>): MigrationAnalysis {
   const masterFiles = migrationPaths(ctx.git('ls-tree', '--name-only', `${masterRef}:${MIGRATIONS_DIR}`).split('\n'));
   const masterText = catFiles(ctx, masterRef, masterFiles.map((m) => m.path));
   const masterMax = Math.max(...masterFiles.map((m) => m.version));
   const masterKeys = new Map(masterFiles.map((m) => [migrationPayloadKey(masterText.get(m.path)!, m.path), m.path]));
+  const mergeBase = ctx.git('merge-base', 'HEAD', masterRef).trim();
+  const baseText = catFiles(ctx, mergeBase, migrationPaths(ctx.git('ls-tree', '--name-only', `${mergeBase}:${MIGRATIONS_DIR}`).split('\n')).map((m) => m.path));
+  const changes = (from: string | undefined, to: string, path: string) => from === undefined || (from !== to && migrationPayloadKey(from, path) !== migrationPayloadKey(to, path));
   const branch: BranchMigration[] = [];
   for (const m of migrationPaths([...head.keys()].map((p) => p.slice(MIGRATIONS_DIR.length + 1)))) {
     const text = head.get(m.path)!;
     const published = masterText.get(m.path);
     if (published !== undefined) {
-      if (published !== text && migrationPayloadKey(published, m.path) !== migrationPayloadKey(text, m.path)) {
+      if (changes(published, text, m.path) && changes(baseText.get(m.path), text, m.path)) {
         fail(`${m.path} is published on ${masterRef} but this branch changes its payload`,
           'brains that already applied it never run it again, so an edit to a published migration silently never lands; restamp never renumbers or edits published migrations.',
           [`put the change in a new migration (bun run new:migration <name>) and restore the file: git checkout ${masterRef} -- ${m.path}`, 'commit, then rerun: bun run release:restamp'], COLLISION_DOCS);
@@ -278,7 +282,7 @@ const ROW_DUMP = `import { BEHAVIOR_CHANGES } from './${BEHAVIOR_NOTICE_FILE}';
 console.log(JSON.stringify(BEHAVIOR_CHANGES.map((r) => ({ id: r.id ?? null, text: typeof r.text === 'string' ? r.text : null }))));`;
 
 /**
- * The BEHAVIOR_CHANGES rows this branch appended (ids its merge base does not hold), read from the evaluated table at
+ * The BEHAVIOR_CHANGES rows this branch appended (the ids on the lines it added since the merge base), read from the evaluated table at
  * HEAD. release:unstamp moves them to behavior-changes.d/, so it refuses a branch whose notice-file diff is anything
  * but appended table lines, a row without an id, and a row whose text is a function (convert that one by hand).
  */
@@ -299,8 +303,8 @@ function branchNoticeRows(ctx: Ctx, masterRef: string, mergeBase: string): Array
   const rows = (() => { try { return JSON.parse(r.out.trim().split('\n').at(-1) ?? '') as Array<{ id: string | null; text: string | null }>; } catch { return null; } })();
   if (r.code !== 0 || !rows) fail(`could not read the BEHAVIOR_CHANGES table at HEAD (exit ${r.code}): ${r.out.trim().split('\n').slice(-3).join(' ')}`, 'release:unstamp reads each appended row\'s text from the evaluated table.', 'fix the table so bun can import it, then rerun: bun run release:unstamp');
   const ids = (text: string) => new Set([...text.matchAll(/\bid: '([^']+)'/g)].map((m) => m[1]!));
-  const baseIds = ids(ctx.git('show', `${mergeBase}:${BEHAVIOR_NOTICE_FILE}`));
-  const mine = rows.filter((row): row is { id: string; text: string | null } => !!row.id && !baseIds.has(row.id));
+  const appended = ids(added.map((l) => l.text).join('\n'));
+  const mine = rows.filter((row): row is { id: string; text: string | null } => !!row.id && appended.has(row.id));
   const fn = mine.filter((row) => row.text === null).map((row) => row.id);
   if (fn.length > 0) fail(`${fn.length} appended row(s) compute their text (${fn.join(', ')})`, 'a function row stays in the table, dated since: releasedIn(\'<id>\'), which release:unstamp does not write for you.', ["change each to { since: releasedIn('<id>'), id: '<id>', ... }, name <!-- behavior-change: <id> --> in changelog.d/<slug>.md, commit,", 'then rerun: bun run release:unstamp']);
   const taken = [...ids(ctx.git('show', `${masterRef}:${BEHAVIOR_NOTICE_FILE}`))].filter((id) => mine.some((row) => row.id === id));
