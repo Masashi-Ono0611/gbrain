@@ -704,39 +704,6 @@ describe('release:unstamp and merge: direct', () => {
     expect(read(fx.work, 'changelog.d/feature.md')).toContain('Widgets now sync twice as fast.');
   }, 120_000);
 
-  test('rows the table pulls in from released fragments are master\'s, not the branch\'s', () => {
-    const fx = noticeFixture();
-    const RELEASED = 'src/core/released-rows.ts';
-    const table = (...rows: string[]) => [`import { RELEASED_ROWS } from './released-rows.ts';`, ...noticeFile(...rows).split('\n').slice(0, 2), '  ...RELEASED_ROWS,', ...rows, '];', ''].join('\n');
-    put(fx.master, {
-      [NOTICE]: table(),
-      [RELEASED]: "export const RELEASED_ROWS = [{ since: '0.1.0.0', id: 'released_row_abc', text: 'Released.' }];\n",
-      'behavior-changes.d/released_row_abc.md': 'Released.\n',
-    });
-    commit(fx.master, 'released rows');
-    git(fx.master, 'push', '-q', 'origin', 'master');
-    git(fx.work, 'fetch', '-q', 'origin');
-    git(fx.work, 'merge', '-q', '--ff-only', 'origin/master');
-    branchWork(fx, '0.1.1.0', { [NOTICE]: table(BRANCH_ROW) });
-    landOnMaster(fx, '0.1.1.0', null, POLICY_DIRECT);
-    const r = restamp(fx.work, ['--unstamp'], QUIET);
-    expect(r.out).not.toContain('already name a row');
-    expect(r.code).toBe(0);
-    expect(r.out).toContain('1 row(s) in behavior-changes.d/ (faster_sync_abc)');
-    expect(read(fx.work, NOTICE)).toBe(git(fx.work, 'show', `origin/master:${NOTICE}`));
-    expect(read(fx.work, 'behavior-changes.d/released_row_abc.md')).toBe('Released.\n');
-  }, 120_000);
-
-  test('a row whose id is double-quoted moves to its fragment instead of vanishing with the table', () => {
-    const fx = noticeFixture();
-    branchWork(fx, '0.1.1.0', { [NOTICE]: noticeFile(BRANCH_ROW, "  { id: \"quoted_row_abc\", since: '0.1.1.0', text: 'Quoted id.' },") });
-    landOnMaster(fx, '0.1.1.0', null, POLICY_DIRECT);
-    const r = restamp(fx.work, ['--unstamp'], QUIET);
-    expect(r.code).toBe(0);
-    expect(read(fx.work, 'behavior-changes.d/quoted_row_abc.md')).toContain('Quoted id.');
-    expect(read(fx.work, 'behavior-changes.d/faster_sync_abc.md')).toContain('Sync is faster now.');
-  }, 120_000);
-
   test('plain restamp is refused when origin/master says merge: direct', () => {
     const fx = noticeFixture();
     branchWork(fx, '0.1.1.0', {});

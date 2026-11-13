@@ -282,7 +282,7 @@ const ROW_DUMP = `import { BEHAVIOR_CHANGES } from './${BEHAVIOR_NOTICE_FILE}';
 console.log(JSON.stringify(BEHAVIOR_CHANGES.map((r) => ({ id: r.id ?? null, text: typeof r.text === 'string' ? r.text : null }))));`;
 
 /**
- * The BEHAVIOR_CHANGES rows this branch appended (the ids on the lines it added since the merge base), read from the evaluated table at
+ * The BEHAVIOR_CHANGES rows this branch appended (ids its merge base does not hold), read from the evaluated table at
  * HEAD. release:unstamp moves them to behavior-changes.d/, so it refuses a branch whose notice-file diff is anything
  * but appended table lines, a row without an id, and a row whose text is a function (convert that one by hand).
  */
@@ -297,15 +297,14 @@ function branchNoticeRows(ctx: Ctx, masterRef: string, mergeBase: string): Array
   const close = head.findIndex((l, i) => i >= open && l === '];') + 1;
   const outside = added.filter((l) => l.line <= open || l.line >= close);
   if (removed !== '0' || outside.length > 0) fail(`this branch changes ${BEHAVIOR_NOTICE_FILE} beyond appending BEHAVIOR_CHANGES rows${outside.length ? ` (line ${outside.slice(0, 5).map((l) => l.line).join(', ')})` : ''}`, why, how);
-  const quotedId = /\bid:\s*(['"`])([^'"`]+)\1/g;
-  const noId = added.filter((l) => /\{ since:|\bid\s*:/.test(l.text) && !l.text.match(quotedId));
+  const noId = added.filter((l) => /\{ since:/.test(l.text) && !/\bid: '/.test(l.text));
   if (noId.length > 0) fail(`${noId.length} BEHAVIOR_CHANGES row(s) this branch added have no id (line ${noId.map((l) => l.line).join(', ')})`, 'a moved row is named behavior-changes.d/<id>.md and dated by its id.', 'give each row an id (lowercase letters, digits and _), commit, then rerun: bun run release:unstamp');
   const r = ctx.run(['bun', '-e', ROW_DUMP]);
   const rows = (() => { try { return JSON.parse(r.out.trim().split('\n').at(-1) ?? '') as Array<{ id: string | null; text: string | null }>; } catch { return null; } })();
   if (r.code !== 0 || !rows) fail(`could not read the BEHAVIOR_CHANGES table at HEAD (exit ${r.code}): ${r.out.trim().split('\n').slice(-3).join(' ')}`, 'release:unstamp reads each appended row\'s text from the evaluated table.', 'fix the table so bun can import it, then rerun: bun run release:unstamp');
-  const ids = (text: string) => new Set([...text.matchAll(quotedId)].map((m) => m[2]!));
-  const appended = ids(added.map((l) => l.text).join('\n'));
-  const mine = rows.filter((row): row is { id: string; text: string | null } => !!row.id && appended.has(row.id));
+  const ids = (text: string) => new Set([...text.matchAll(/\bid: '([^']+)'/g)].map((m) => m[1]!));
+  const baseIds = ids(ctx.git('show', `${mergeBase}:${BEHAVIOR_NOTICE_FILE}`));
+  const mine = rows.filter((row): row is { id: string; text: string | null } => !!row.id && !baseIds.has(row.id));
   const fn = mine.filter((row) => row.text === null).map((row) => row.id);
   if (fn.length > 0) fail(`${fn.length} appended row(s) compute their text (${fn.join(', ')})`, 'a function row stays in the table, dated since: releasedIn(\'<id>\'), which release:unstamp does not write for you.', ["change each to { since: releasedIn('<id>'), id: '<id>', ... }, name <!-- behavior-change: <id> --> in changelog.d/<slug>.md, commit,", 'then rerun: bun run release:unstamp']);
   const taken = [...ids(ctx.git('show', `${masterRef}:${BEHAVIOR_NOTICE_FILE}`))].filter((id) => mine.some((row) => row.id === id));
