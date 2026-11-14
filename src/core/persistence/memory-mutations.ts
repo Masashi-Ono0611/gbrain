@@ -1,4 +1,5 @@
 import { throwIfHeld } from '../trust/gate-outcomes.ts';
+import { assertStorageSourceWriter } from '../storage-manifest/door.ts';
 import { forgetRequiresOwner, guardRemoteForget, remoteForgetRaced, supersessionGuarded } from '../trust/supersede-handlers.ts';
 import { storedTrustTier } from '../trust/tier.ts';
 import { randomUUID } from 'node:crypto';
@@ -26,7 +27,6 @@ import { grantedWriteSource, writeGrantRefusal } from './write-grant.ts';
 import type { WriteRequest } from './model.ts';
 import { prepareMemoryMutation } from './memory-prepare.ts';
 import { ownerReachesFact, readForgetTarget, refuseForgetReachingOtherCopies } from './forget-prepare.ts';
-import { assertStrictGitHome } from './git-declared.ts';
 import { callerIsOwner, currentCallerAccess, privateProvenanceFilterUnderPolicy, resolveExcludePrivatePages, withFolderRestricted } from '../search/private-visibility.ts';
 import { projectionEligibleSql } from '../eligibility/sql.ts';
 import { resolveReadEligibility } from '../eligibility/policy.ts';
@@ -127,11 +127,10 @@ async function planRememberTarget(ctx: OperationContext, sourceId: string, sourc
   // authority above ran on the entity (decision D1); the holding row is gbrain's own companion write, authorized as a write
   // to that entity. A folder's holding page takes the folder's storage class (database-only under storage.db_only or a path
   // Git ignores, as the entity's own page would be); a shared one kept out of Git keeps the fact database-only, as before.
-  const { accessStateUnreadable, holdingHome } = await import('../facts/held-fact-move.ts');
+  const { holdingHome, refuseUnheldFact } = await import('../facts/held-fact-move.ts');
   const home = !inferred && memberPage === null && entitySlug !== null && !snapshot && writeThrough ? await holdingHome(ctx.engine, sourceId, entitySlug) : null;
   // An exact page rule on the entity, or an access state this role cannot read: no holding page carries those readers.
-  if (home && 'refused' in home && home.refused === 'page_rule') await assertStrictGitHome(ctx.engine, { source_id: sourceId, slug: entitySlug! }, ctx.remote !== false);
-  if (home && 'refused' in home) throw accessStateUnreadable(sourceId);
+  if (home && 'refused' in home) await refuseUnheldFact(ctx.engine, sourceId, entitySlug!, home.refused, ctx.remote !== false);
   const holdingSlug = home && 'slug' in home ? home.slug : null;
   const holding = holdingSlug ? await ctx.engine.readPageSnapshot(holdingSlug, { sourceId, includeDeleted: true }) ?? 'absent' : null;
   const held = holding !== null && (holding === 'absent' || !holding.page.deleted_at && (Boolean(holding.page.source_path) || holdingSlug !== UNATTRIBUTED_MEMORY_SLUG));
@@ -233,9 +232,10 @@ export async function submitRememberMutation(ctx: OperationContext, params: Reco
   const sub = await submission(ctx, 'remember', params, opts.visibilityDefaulted ? withoutDefault : params);
   if (sub.prior) { const prior = sub.prior; const settled = await waitForWrite(ctx.engine, prior, ctx.config, waitMs ?? ctx.writeWaitMs); return rememberLanded(ctx, settled, throwIfHeld(withRememberTarget(prior, () => writeResponse(settled)))); }
   const { p, sourceId, principal, callerIntent, requestId, clientRequestId } = sub;
-  const [source] = await ctx.engine.executeRaw<RememberSource>(
-    "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
+  const [source] = await ctx.engine.executeRaw<RememberSource & { role: string | null }>(
+    "SELECT incarnation,archived,local_path,config->>'kind' AS kind,config->>'role' AS role FROM sources WHERE id=$1", [sourceId]);
   if (!source || source.archived) throw sourceInactive(sourceId);
+  assertStorageSourceWriter(ctx, sourceId, source.role, {});
   const { parseTtlParam } = await import('../ops/facts.ts');
   const validUntil = parseTtlParam(p.ttl);
   const entity = typeof p.entity === 'string' && !isNullLikeEntity(p.entity) ? p.entity.trim() : null;
@@ -429,9 +429,10 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
   const hidePrivate = ownerReach || excludePrivate;
   // #5575 I3: a remote caller cannot forget a fact more trusted than its own writes; the owner is asked instead.
   if (remote) await guardRemoteForget(ctx.engine, { sourceId, factId: id, principal, reason, excludePrivate });
-  const [source] = await ctx.engine.executeRaw<RememberSource>(
-    "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
+  const [source] = await ctx.engine.executeRaw<RememberSource & { role: string | null }>(
+    "SELECT incarnation,archived,local_path,config->>'kind' AS kind,config->>'role' AS role FROM sources WHERE id=$1", [sourceId]);
   if (!source || source.archived) throw sourceInactive(sourceId);
+  assertStorageSourceWriter(ctx, sourceId, source.role, {});
   const fact = await readForgetTarget(ctx.engine, id, sourceId, worldOnly, targetHidden, false, ownPage);
   if (!fact) throw missing();
   if (remote && supersessionGuarded('agent_written', fact.trust_tier)) {

@@ -87,9 +87,36 @@ gbrain repair visibility --slug notes/a-example --readers none   # remove readab
 
 Every visibility write is label-only: the page keeps its trust tier, files no
 `lower_page` proposal, and its file changes only on the `visibility` line (a fact
-item: its fence row). A file that cannot take the change without being
-re-rendered (a label with a block value or a duplicate key, no frontmatter
-block) is refused with nothing written; make that edit by hand. `--slug` is the operator's way to make one page private;
+item: its fence row). Stamps gbrain keeps only in the database (a type a schema
+pack renamed, the `validate: false` grandfather stamp, a `legacy_type` retype
+record) do not count as a difference: such a page is labelled and its file
+still gains only the label line (GST-2603). A page whose file cannot take the
+change line by line (a label with a block value or a duplicate key, no
+frontmatter block, or a file that differs from the page in a real key such as a
+date, the tags, the title or the body) is held by the preview: it is listed
+under `details.held` with the key that blocks it and its next step
+(`gbrain sources reconcile <id> <slug> --preview` for a file edited outside
+gbrain, the field to fix for a label line), and it stays out of the hash and
+the approved set. A page that starts refusing after the preview is declined
+with [`label_edit_refused`](write-refusals.md#label_edit_refused) and nothing
+written; it never counts toward `item_failures_systemic`, so the rest of the
+window applies and the receipt names the pages that did.
+
+Labels and folder rules apply per source. When another source holds a live
+page with the same slug, labelling the page in one source leaves that copy as
+it was, and a reader with no source filter still finds it by slug and in
+search. So the preview also lists those copies under `details.open_twins`:
+every same-slug page in another source that is not private already and that a
+caller outside the change could read (by its own `readable_by` and folder
+rules). It gives their count and the command that covers them, such as
+`gbrain repair visibility --source <other> --slug <slug>`. The list is
+read-only, checks at most 1,000 pages and names at most 50 copies; it is not
+part of the preview hash, so applying the window changes only the window. The
+`--readers` preview lists copies a member outside the new readers could read,
+`gbrain repair private-labels --class restore` lists them too, and the preview
+of `gbrain access rule add` or `gbrain access rule import` lists copies a
+narrowed rule leaves open, with the same rule for `--source <other>`. Whether
+a label should follow a copy is your call; nothing changes the copy for you. `--slug` is the operator's way to make one page private;
 a `put_page` that adds the label is an agent edit and lowers the page. On a brain
 without managed persistence, a page whose file sits in its source's checkout gets
 the same edit in that file and in the database together, so the next sync reads
@@ -202,7 +229,7 @@ work behind exits 0, so scripts should also check `results[].complete`.
 | Kind | Doctor check that points here | What it does | Left alone and counted |
 | --- | --- | --- | --- |
 | `timeline` | `timeline_history` | Re-saves each page with its current body through a revision-bound `put_page`. The save writes each database-only timeline entry back into the page as a bullet preceded by `<!-- gbrain:materialized v1 <hash> -->`. | `kept_unrenderable_rows`: entries that would change if written as a bullet (for example an empty source). They stay in the database. |
-| `visibility` | `derived_visibility` | Stamps an explicit `visibility` on extracted atoms and synthesized concepts. An atom takes its origin page's visibility; transcript atoms and atoms whose origin is gone become `private`; a concept takes the strictest visibility of its input atoms. A concept input found only through an atom's `concepts:` list counts as private. Atoms are repaired before concepts. It never loosens an explicit value: `private` stays `private`, and `world` can only become `private`. A missing value is stamped with the origin's value, which is `world` when the origin page is public. | `concepts_without_lineage`: concepts whose inputs cannot be found. One with no visibility is stamped `private` (what remote readers already treat it as), so the doctor warning clears; an explicit value stays as it is. `atoms_origin_gone_to_private` counts atoms made private because their origin page no longer exists. |
+| `visibility` | `derived_visibility` | Stamps an explicit `visibility` on extracted atoms and synthesized concepts. An atom takes its origin page's visibility, and becomes `private` when a rename moved its origin to a private page; transcript atoms and atoms whose origin is gone become `private`; a concept takes the strictest visibility of its input atoms. A concept input found only through an atom's `concepts:` list counts as private. Atoms are repaired before concepts. It never loosens an explicit value: `private` stays `private`, and `world` can only become `private`. A missing value is stamped with the origin's value, which is `world` when the origin page is public. | `concepts_without_lineage`: concepts whose inputs cannot be found. One with no visibility is stamped `private` (what remote readers already treat it as), so the doctor warning clears; an explicit value stays as it is. `atoms_origin_gone_to_private` counts atoms made private because their origin page no longer exists. |
 | `request-indexes` | `persistence_request_indexes` | Creates a missing request-table index (the managed sync checkpoint pair, the purge slug index, the dream postprocess request-id index, the write claims' foreground-commit index, the failed-writes replay and page-sequence indexes), or drops an INVALID one (left by an interrupted concurrent build) and rebuilds it, on a brain whose schema version is already current. Postgres builds each index `CONCURRENTLY`, one at a time, so writes continue; PGLite builds inline. It changes no user data, takes no journal admission and runs brain-wide (`--source` does not narrow it). See [managed sync request indexes](#request-indexes). | `building`: an index another session is still building; it is never dropped. |
 | `connector-fences` | none (a `connector_fence_below_timeline` refusal names it) | Moves a facts or takes fence that sits below the timeline sentinel of a Google or GitHub page into the page body through a revision-bound `put_page`, so the connector's next re-render carries the fence instead of refusing. Then re-attempt the held item with `gbrain sources retry-held <source>`. | `kept_ambiguous_pages`: pages whose fences are duplicated, unbalanced or unparseable. Move the fence by hand: read the page, place the fence above the `<!-- timeline -->` line, and save it with the current `expected_revision`. |
 | `take-supersession` | none | Rebuilds `takes.superseded_by` for supersession chains written before the pointer moved onto the old fence row (#5886). Each struck take is linked to the row that replaced it only from evidence: a committed `takes_supersede` receipt, a stored `superseded_by`, or a row carrying the old `superseded by #<own row>` pointer with exactly one possible predecessor. The pointer is written onto the old row (`<source>; superseded by #N`) and stale self-pointers are dropped through a revision-bound `put_page`; a page whose fence is already right but whose stored pointers differ is reprojected without a page write. See [take supersession](#take-supersession). | `ambiguous_pages` / `ambiguous_rows`: pages where a new row has two or more possible predecessors, or where evidence conflicts. The preview lists each with its candidates and the manual edit; nothing on them changes. `unparsed_pages`: pages whose takes fence does not parse cleanly. |
@@ -2299,7 +2326,10 @@ database, so a page whose file sits in its source's checkout is held with
 outcome `file_backed`. The next sync or re-import would put the label back from
 the file, so edit the file's frontmatter, commit it, and run
 `gbrain sync --source <id>`. Repo-less pages clear as usual. A clear or restore
-changes only the label lines of the page's file and keeps its trust tier; a
+changes only the label lines of the page's file and keeps its trust tier, and
+gbrain's own database-only stamps never block it; a file that cannot take the
+edit line by line is declined with `label_edit_refused`, as in
+`repair visibility`; a
 restore whose label value isn't a plain word is held as `label_not_plain`, so
 add that label to the file by hand.
 
@@ -2318,8 +2348,10 @@ writer's outstanding-request cap is low), and the owner
 publishes them in groups of up to 8, instead of one page and one wait at a time.
 Each page still has its own fate: a page whose write is declined fails alone and
 the rest of its group lands. A decline is the page's own state refusing the
-write: its file differs from the database or is gone (`source_changed`), or its
-body is stored in segments. The page is left unchanged, the result counts it
+write: its file differs from the database or is gone (`source_changed`), its
+body is stored in segments, or its file cannot take the label edit line by line
+([`label_edit_refused`](write-refusals.md#label_edit_refused), which never
+counts toward the systemic-failure stop, even on its first try). The page is left unchanged, the result counts it
 under `declined` by reason, and when every failure of a complete run is a
 decline the command exits 0, so a script working through windows carries on.
 Any other failure, or a stop, still exits 1. The next preview lists pages an
@@ -2701,7 +2733,10 @@ page's takes fence when the page holds it, otherwise made inactive in the
 database. The preview lists those as `take_to_retire`. A fact or take that
 changed since the preview reports `changed_since_preview` and is kept; a fact
 that already reads as the agent's with its speaker note (a resumed apply whose
-accepted request committed meanwhile) reports `reattributed`.
+accepted request committed meanwhile) reports `reattributed`. A page stored in
+segments is read back whole, up to 24 MiB, and written back bound to that
+revision; a larger page reports `page_body_segmented` and its facts and takes
+are kept.
 
 <a id="redacted-facts"></a>
 ### Redacted facts
