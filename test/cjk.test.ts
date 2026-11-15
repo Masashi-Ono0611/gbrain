@@ -203,4 +203,17 @@ describe('cjkMatchTerms (#6666)', () => {
     expect(cjkMatchTerms('혈당 혈당에서 수치')).toEqual(['혈당', '수치']);
     expect(cjkMatchTerms('席位 升级')).toEqual(['席位', '升级']);
   });
+
+  test('splits a Japanese sentence into its content words', () => {
+    expect(cjkMatchTerms('バックアップはどうすればいい？')).toEqual(['バックアップ']);
+    expect(cjkMatchTerms('先週の会議で決めた予算の上限はいくら')).toEqual(['先週', '会議', '決め', '予算', '上限']);
+    expect(cjkMatchTerms('東京オフィスの移転スケジュール')).toEqual(['東京', 'オフィス', '移転', 'スケジュール']);
+  });
+
+  test('keeps compounds, Chinese text and space-separated keywords as they were', () => {
+    expect(cjkMatchTerms('請求書')).toEqual(['請求書']);
+    expect(cjkMatchTerms('予算 上限')).toEqual(['予算', '上限']);
+    expect(cjkMatchTerms('席位升级')).toEqual(['席位升级']);
+    expect(cjkMatchTerms('それはどうする')).toEqual(['それはどうする']);
+  });
 });
