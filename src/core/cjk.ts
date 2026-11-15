@@ -247,5 +247,34 @@ export function stripKoreanParticle(term: string): string {
  * the chunk search all read this, so a count never disagrees with the rows.
  */
 export function cjkMatchTerms(query: string): string[] {
-  return Array.from(new Set(splitCJKQueryTerms(query).map(stripKoreanParticle)));
+  return Array.from(new Set(splitCJKQueryTerms(query).flatMap(t => segmentJapaneseTerm(t).map(stripKoreanParticle))));
+}
+
+const HIRAGANA = /\p{Script=Hiragana}/u;
+const PURE_HIRAGANA = /^[\p{Script=Hiragana}ー]+$/u;
+const JA_MIN_SEGMENT_LENGTH = 2;
+let jaSegmenter: Intl.Segmenter | null | undefined;
+
+/**
+ * The content words of a Japanese term written as a sentence
+ * ("バックアップはどうすればいい？" → ["バックアップ"]), or the term unchanged.
+ * Japanese prose has no spaces, so a whole question would otherwise be one
+ * substring that no chunk contains. Only terms holding hiragana are split —
+ * a kanji/katakana compound ("請求書") and Chinese text keep their current
+ * match. Pure-hiragana segments (particles, auxiliaries) and one-character
+ * segments are dropped; a term with no content word left stays as it was.
+ */
+export function segmentJapaneseTerm(term: string): string[] {
+  if (!HIRAGANA.test(term)) return [term];
+  if (jaSegmenter === undefined) {
+    jaSegmenter = typeof Intl.Segmenter === 'function' ? new Intl.Segmenter('ja', { granularity: 'word' }) : null;
+  }
+  if (!jaSegmenter) return [term];
+  const words: string[] = [];
+  for (const s of jaSegmenter.segment(term)) {
+    if (!s.isWordLike) continue;
+    if (s.segment.length < JA_MIN_SEGMENT_LENGTH || PURE_HIRAGANA.test(s.segment)) continue;
+    words.push(s.segment);
+  }
+  return words.length > 0 ? words : [term];
 }
