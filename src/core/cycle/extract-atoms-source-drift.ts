@@ -39,8 +39,8 @@ import type { BrainEngine } from '../engine.ts';
  * later runs report whatever is still stale once they have extracted, which may
  * legitimately be nothing.
  *
- * Fail-soft: any query error returns 0. A reporting counter must never fail a
- * phase.
+ * Query failures propagate so a failed read cannot look like a zero-drift
+ * result.
  */
 export async function countSourceChangedAtoms(
   engine: BrainEngine,
@@ -48,9 +48,8 @@ export async function countSourceChangedAtoms(
   pageSlug: string,
   currentHash16: string,
 ): Promise<number> {
-  try {
-    const rows = await engine.executeRaw<{ cnt: number | string }>(
-      `SELECT COUNT(*)::int AS cnt
+  const rows = await engine.executeRaw<{ cnt: number | string }>(
+    `SELECT COUNT(*)::int AS cnt
          FROM pages
         WHERE type = 'atom'
           AND deleted_at IS NULL
@@ -59,11 +58,8 @@ export async function countSourceChangedAtoms(
           AND frontmatter->>'source_hash' IS NOT NULL
           AND frontmatter->>'source_hash' NOT LIKE 'pending:%'
           AND frontmatter->>'source_hash' <> $3`,
-      [sourceId, pageSlug, currentHash16],
-    );
-    const cnt = rows[0]?.cnt;
-    return cnt == null ? 0 : Number(cnt);
-  } catch {
-    return 0;
-  }
+    [sourceId, pageSlug, currentHash16],
+  );
+  const cnt = rows[0]?.cnt;
+  return cnt == null ? 0 : Number(cnt);
 }

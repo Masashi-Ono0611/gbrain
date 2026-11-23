@@ -576,42 +576,38 @@ async function filterTranscriptPageTwins(
   transcripts: NonNullable<ExtractAtomsOpts['_transcripts']>,
 ) {
   if (transcripts.length === 0) return transcripts;
-  try {
-    const sources = await engine.executeRaw<{ local_path: string | null }>(
-      'SELECT local_path FROM sources WHERE id = $1', [sourceId],
-    );
-    const localPath = sources[0]?.local_path;
-    if (!localPath) return transcripts;
-    const root = await realpath(localPath);
-    const transcriptFiles = new Map<typeof transcripts[number], string>();
-    for (const transcript of transcripts) {
-      try {
-        const path = await realpath(transcript.filePath);
-        const withinRoot = relative(root, path);
-        if (withinRoot !== '..' && !withinRoot.startsWith(`..${sep}`)
-          && !isAbsolute(withinRoot)) transcriptFiles.set(transcript, path);
-      } catch { /* keep transcripts whose physical path is unavailable */ }
-    }
-    if (transcriptFiles.size === 0) return transcripts;
-    const pages = await engine.executeRaw<{ source_path: string | null; slug: string }>(
-      `SELECT source_path, slug FROM pages
-       WHERE source_id = $1 AND deleted_at IS NULL AND type = ANY($2::text[])`,
-      [sourceId, await resolveExtractableTypes()],
-    );
-    const pageFiles = new Set<string>();
-    for (const page of pages) {
-      try {
-        const path = resolveSourceLocalFilePath(localPath, page.source_path, page.slug);
-        if (path) pageFiles.add(await realpath(path));
-      } catch { /* unresolved page cannot establish a twin */ }
-    }
-    return transcripts.filter(transcript => {
-      const path = transcriptFiles.get(transcript);
-      return path === undefined || !pageFiles.has(path);
-    });
-  } catch {
-    return transcripts; // fail-soft: extraction still proceeds
+  const sources = await engine.executeRaw<{ local_path: string | null }>(
+    'SELECT local_path FROM sources WHERE id = $1', [sourceId],
+  );
+  const localPath = sources[0]?.local_path;
+  if (!localPath) return transcripts;
+  const root = await realpath(localPath);
+  const transcriptFiles = new Map<typeof transcripts[number], string>();
+  for (const transcript of transcripts) {
+    try {
+      const path = await realpath(transcript.filePath);
+      const withinRoot = relative(root, path);
+      if (withinRoot !== '..' && !withinRoot.startsWith(`..${sep}`)
+        && !isAbsolute(withinRoot)) transcriptFiles.set(transcript, path);
+    } catch { /* keep transcripts whose physical path is unavailable */ }
   }
+  if (transcriptFiles.size === 0) return transcripts;
+  const pages = await engine.executeRaw<{ source_path: string | null; slug: string }>(
+    `SELECT source_path, slug FROM pages
+       WHERE source_id = $1 AND deleted_at IS NULL AND type = ANY($2::text[])`,
+    [sourceId, await resolveExtractableTypes()],
+  );
+  const pageFiles = new Set<string>();
+  for (const page of pages) {
+    try {
+      const path = resolveSourceLocalFilePath(localPath, page.source_path, page.slug);
+      if (path) pageFiles.add(await realpath(path));
+    } catch { /* unresolved page cannot establish a twin */ }
+  }
+  return transcripts.filter(transcript => {
+    const path = transcriptFiles.get(transcript);
+    return path === undefined || !pageFiles.has(path);
+  });
 }
 
 async function resolvePageDiscoveryLimit(engine: BrainEngine): Promise<number> {
