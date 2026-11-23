@@ -11,7 +11,6 @@ import type { Check } from '../../doctor.ts';
 import type { Action } from '../../../core/agent-output.ts';
 import { agentFix, checkError, infoCheck } from '../check-fix.ts';
 import { isAvailable } from '../../../core/ai/gateway.ts';
-import { isSyncDisabledConfig } from '../../../core/sync-policy.ts';
 
 /** Local alias; the shared warn-once memo lives in core so it can't fork per module. */
 const _resolveSyncFreshnessHours = resolveHoursEnv;
