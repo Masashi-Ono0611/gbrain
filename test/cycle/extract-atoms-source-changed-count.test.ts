@@ -348,11 +348,12 @@ describe('extract_atoms per-page atoms_source_changed', () => {
     expect(await countSourceChangedAtoms(engine, 'default', PAGE_SLUG, CURRENT_HASH16)).toBe(1);
   });
 
-  test('fails soft to 0 when the query throws', async () => {
+  test('propagates query failures instead of reporting zero drift', async () => {
     const brokenEngine = {
       executeRaw: async () => { throw new Error('connection refused'); },
     } as unknown as typeof engine;
-    expect(await countSourceChangedAtoms(brokenEngine, 'default', PAGE_SLUG, CURRENT_HASH16)).toBe(0);
+    await expect(countSourceChangedAtoms(brokenEngine, 'default', PAGE_SLUG, CURRENT_HASH16))
+      .rejects.toThrow('connection refused');
   });
 });
 

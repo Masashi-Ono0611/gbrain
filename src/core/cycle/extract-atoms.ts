@@ -589,7 +589,12 @@ async function filterTranscriptPageTwins(
       const withinRoot = relative(root, path);
       if (withinRoot !== '..' && !withinRoot.startsWith(`..${sep}`)
         && !isAbsolute(withinRoot)) transcriptFiles.set(transcript, path);
-    } catch { /* keep transcripts whose physical path is unavailable */ }
+    } catch (err) {
+      // A missing transcript file cannot establish a page twin. Other I/O
+      // failures must surface rather than silently bypassing deduplication.
+      if (isMissingPathError(err)) continue;
+      throw err;
+    }
   }
   if (transcriptFiles.size === 0) return transcripts;
   const pages = await engine.executeRaw<{ source_path: string | null; slug: string }>(
@@ -602,12 +607,22 @@ async function filterTranscriptPageTwins(
     try {
       const path = resolveSourceLocalFilePath(localPath, page.source_path, page.slug);
       if (path) pageFiles.add(await realpath(path));
-    } catch { /* unresolved page cannot establish a twin */ }
+    } catch (err) {
+      // A missing page file cannot establish a page twin; permission and other
+      // filesystem failures leave the filter's result unknown and must surface.
+      if (isMissingPathError(err)) continue;
+      throw err;
+    }
   }
   return transcripts.filter(transcript => {
     const path = transcriptFiles.get(transcript);
     return path === undefined || !pageFiles.has(path);
   });
+}
+
+function isMissingPathError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
 }
 
 async function resolvePageDiscoveryLimit(engine: BrainEngine): Promise<number> {
