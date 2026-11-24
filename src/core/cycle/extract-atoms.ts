@@ -108,6 +108,7 @@ import { parseAtomsOutcome } from './extract-atoms-parse.ts';
 import { VERSION } from '../../version.ts';
 export { parseAtomsOutcome, parseAtomsResponse, type AtomsParseOutcome } from './extract-atoms-parse.ts';
 import { countSourceChangedAtoms } from './extract-atoms-source-drift.ts';
+import { rethrowCapabilityRefusal } from '../engine-capability-refusal.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 // #4529 + #4540: per-item extractor caps, overridable via
@@ -590,7 +591,7 @@ async function filterTranscriptPageTwins(
         const withinRoot = relative(root, path);
         if (withinRoot !== '..' && !withinRoot.startsWith(`..${sep}`)
           && !isAbsolute(withinRoot)) transcriptFiles.set(transcript, path);
-      } catch { /* keep transcripts whose physical path is unavailable */ }
+      } catch { /* keep transcripts whose physical path is unavailable */ } // silent-read-ok: unavailable optional file metadata must not drop a transcript.
     }
     if (transcriptFiles.size === 0) return transcripts;
     const pages = await engine.executeRaw<{ source_path: string | null; slug: string }>(
@@ -603,14 +604,16 @@ async function filterTranscriptPageTwins(
       try {
         const path = resolveSourceLocalFilePath(localPath, page.source_path, page.slug);
         if (path) pageFiles.add(await realpath(path));
-      } catch { /* unresolved page cannot establish a twin */ }
+      } catch { /* unresolved page cannot establish a twin */ } // silent-read-ok: an unresolved page cannot establish a transcript twin.
     }
     return transcripts.filter(transcript => {
       const path = transcriptFiles.get(transcript);
       return path === undefined || !pageFiles.has(path);
     });
   // silent-read-ok: preserve extraction when the optional transcript twin scan is unavailable.
-  } catch { // capability-refusal-ok: the transcript twin scan is an optional fail-soft filter.
+  } catch (err) { // capability-refusal-ok: standard read failures keep the optional fail-soft filter.
+    rethrowCapabilityRefusal(err);
+    console.error(`[extract_atoms] transcript twin scan failed: ${err instanceof Error ? err.message : String(err)}`);
     return transcripts; // fail-soft: extraction still proceeds
   }
 }

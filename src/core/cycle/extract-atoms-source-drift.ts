@@ -14,6 +14,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { rethrowCapabilityRefusal } from '../engine-capability-refusal.ts';
 
 /**
  * Count live atoms bound to `pageSlug` in `sourceId` whose stored `source_hash`
@@ -64,7 +65,9 @@ export async function countSourceChangedAtoms(
     const cnt = rows[0]?.cnt;
     return cnt == null ? 0 : Number(cnt);
   // silent-read-ok: this diagnostic counter must not fail its extraction phase.
-  } catch { // capability-refusal-ok: this diagnostic counter preserves fail-soft phase behavior.
+  } catch (err) { // capability-refusal-ok: standard read failures preserve diagnostic fail-soft behavior.
+    rethrowCapabilityRefusal(err);
+    console.error(`[extract_atoms] source-drift count failed: ${err instanceof Error ? err.message : String(err)}`);
     return 0;
   }
 }
