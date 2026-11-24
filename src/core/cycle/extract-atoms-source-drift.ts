@@ -63,7 +63,8 @@ export async function countSourceChangedAtoms(
     );
     const cnt = rows[0]?.cnt;
     return cnt == null ? 0 : Number(cnt);
-  } catch {
+  // silent-read-ok: this diagnostic counter must not fail its extraction phase.
+  } catch { // capability-refusal-ok: this diagnostic counter preserves fail-soft phase behavior.
     return 0;
   }
 }

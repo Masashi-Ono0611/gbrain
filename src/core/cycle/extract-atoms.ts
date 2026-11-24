@@ -609,7 +609,8 @@ async function filterTranscriptPageTwins(
       const path = transcriptFiles.get(transcript);
       return path === undefined || !pageFiles.has(path);
     });
-  } catch {
+  // silent-read-ok: preserve extraction when the optional transcript twin scan is unavailable.
+  } catch { // capability-refusal-ok: the transcript twin scan is an optional fail-soft filter.
     return transcripts; // fail-soft: extraction still proceeds
   }
 }
