@@ -609,7 +609,8 @@ async function filterTranscriptPageTwins(
       const path = transcriptFiles.get(transcript);
       return path === undefined || !pageFiles.has(path);
     });
-  } catch { // silent-read-ok: twin lookup preserves the pre-filter transcript list; // capability-refusal-ok: filtering remains best-effort on every engine
+  // silent-read-ok: twin lookup preserves the pre-filter transcript list
+  } catch { // capability-refusal-ok: filtering remains best-effort on every engine
     return transcripts; // fail-soft: extraction still proceeds
   }
 }
