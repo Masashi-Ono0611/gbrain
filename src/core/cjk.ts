@@ -289,7 +289,7 @@ export function cjkMatchAlternatives(query: string): Array<{ terms: string[]; ph
 
 /** Every substring cjkMatchGroups names (one alternative is the old strict AND), deduplicated in order: ranking and the any-term fallback read it. */
 export function cjkMatchTerms(query: string): string[] {
-  return Array.from(new Set(cjkMatchGroups(query).flatMap(t => segmentJapaneseTerm(t).map(stripKoreanParticle))));
+  return Array.from(new Set(cjkMatchGroups(query).flatMap(group => group.flatMap(term => segmentJapaneseTerm(term).map(stripKoreanParticle)) )));
 }
 
 const HIRAGANA = /\p{Script=Hiragana}/u;
