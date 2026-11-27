@@ -578,7 +578,8 @@ async function filterTranscriptPageTwins(
         const withinRoot = relative(root, path);
         if (withinRoot !== '..' && !withinRoot.startsWith(`..${sep}`)
           && !isAbsolute(withinRoot)) transcriptFiles.set(transcript, path);
-      } catch { /* keep transcripts whose physical path is unavailable */ }
+      // capability-refusal-ok: a path probe cannot establish a twin on any engine.
+      } catch { /* keep transcripts whose physical path is unavailable */ } // silent-read-ok: an unavailable transcript path cannot establish a twin; retain the transcript.
     }
     if (transcriptFiles.size === 0) return transcripts;
     const pages = await engine.executeRaw<{ source_path: string | null; slug: string }>(
@@ -591,13 +592,15 @@ async function filterTranscriptPageTwins(
       try {
         const path = resolveSourceLocalFilePath(localPath, page.source_path, page.slug);
         if (path) pageFiles.add(await realpath(path));
-      } catch { /* unresolved page cannot establish a twin */ }
+      // capability-refusal-ok: an unresolved path cannot establish a twin on any engine.
+      } catch { /* unresolved page cannot establish a twin */ } // silent-read-ok: an unresolved page path cannot establish a twin.
     }
     return transcripts.filter(transcript => {
       const path = transcriptFiles.get(transcript);
       return path === undefined || !pageFiles.has(path);
     });
-  } catch {
+  // capability-refusal-ok: twin filtering remains best-effort across engine capability states.
+  } catch { // silent-read-ok: twin filtering is optional; preserve transcripts if its lookup fails.
     return transcripts; // fail-soft: extraction still proceeds
   }
 }

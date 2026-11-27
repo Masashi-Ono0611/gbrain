@@ -63,7 +63,8 @@ export async function countSourceChangedAtoms(
     );
     const cnt = rows[0]?.cnt;
     return cnt == null ? 0 : Number(cnt);
-  } catch {
+  // capability-refusal-ok: this diagnostic counter remains best-effort for all engine capability states.
+  } catch { // silent-read-ok: this counter is diagnostic and must not fail extraction; 0 preserves the prior behavior.
     return 0;
   }
 }
