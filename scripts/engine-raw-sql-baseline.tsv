@@ -265,7 +265,7 @@ src/commands/storage.ts	execute_raw	1
 src/commands/sweep.ts	execute_raw	2
 src/commands/sync/full.ts	execute_raw	2
 src/commands/sync/holds.ts	execute_raw	5
-src/commands/sync/perform.ts	execute_raw	1
+src/commands/sync/perform.ts	execute_raw	3	local patch-stack: sync diagnostics need three raw reads before typed engine methods exist
 src/commands/sync/plain-directory.ts	execute_raw	2
 src/commands/sync/preflight.ts	execute_raw	3
 src/commands/sync/rename-collision.ts	execute_raw	2
@@ -400,7 +400,7 @@ src/core/cycle/extract-atoms-generation.ts	execute_raw	4
 src/core/cycle/extract-atoms-input.ts	execute_raw	6
 src/core/cycle/extract-atoms-page-state.ts	execute_raw	10	GST-4020: latest-scan read, atom inventory, reused-atom hash move, the locked origin re-read, the discovery read clock and renamed-origin read sit with the module's scan-state SQL until extract_atoms state moves behind engine methods
 src/core/cycle/extract-atoms-stamp.ts	execute_raw	1
-src/core/cycle/extract-atoms.ts	execute_raw	6
+src/core/cycle/extract-atoms.ts	execute_raw	8	local patch-stack: transcript twin lookup and extraction reads before typed engine methods exist
 src/core/cycle/extract-facts.ts	execute_raw	13
 src/core/cycle/extract-takes.ts	execute_raw	10
 src/core/cycle/filing-rules.ts	execute_raw	1
@@ -506,7 +506,7 @@ src/core/facts/retire.ts	execute_raw	1
 src/core/facts/similar-active.ts	execute_raw	2
 src/core/facts/single-prepare.ts	execute_raw	6
 src/core/facts/slot-tagging.ts	execute_raw	1	GBRA-574 #9668: the live person-page read that picks slot-tagging candidates, written before this ratchet landed; moves behind a typed facts engine method with its area
-src/core/facts/subject-infer.ts	execute_raw	1
+src/core/facts/subject-infer.ts	execute_raw	2	local patch-stack: subject inference read before a typed engine method exists
 src/core/facts/unfenced-facts.ts	execute_raw	9	GST-3490 #10005: the sweep's unfenced read counts unfenceable rows on the server before reading only fenceable ones; moves behind a typed facts engine method with its area
 src/core/facts/withdrawal-discovery.ts	execute_raw	4
 src/core/facts/withdrawal.ts	execute_raw	16
@@ -1273,3 +1273,4 @@ src/shadow/writer-hooks.ts	execute_raw	21	the maintainer-approved writer hooks o
 src/shadow/writer-observations.ts	execute_raw	4	swap eligibility's writer observations live in the primary only while a Rust shadow follows it (Rust never holds them): one upsert per writing process after commit under a SET LOCAL lock timeout and statement timeout (two statements), and the eligibility read; the primary's own table by design
 src/commands/policy.ts	execute_raw	1	GST-3824 L1: gbrain policy status reads the last policy_check/agent_policy fetch per client from mcp_request_log
 src/core/policy/store.ts	execute_raw	1	GST-3824 L1: the policy page revision author (pages.revision_principal_kind/id), which no engine read returns
+src/core/cycle/extract-atoms-source-drift.ts	execute_raw	1	local patch-stack: diagnostic source-drift count before a typed engine method exists

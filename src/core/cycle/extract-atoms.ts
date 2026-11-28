@@ -578,7 +578,7 @@ async function filterTranscriptPageTwins(
         const withinRoot = relative(root, path);
         if (withinRoot !== '..' && !withinRoot.startsWith(`..${sep}`)
           && !isAbsolute(withinRoot)) transcriptFiles.set(transcript, path);
-      } catch { /* keep transcripts whose physical path is unavailable */ }
+      } catch { /* keep transcripts whose physical path is unavailable */ } // silent-read-ok: unavailable filesystem probes keep the transcript
     }
     if (transcriptFiles.size === 0) return transcripts;
     const pages = await engine.executeRaw<{ source_path: string | null; slug: string }>(
@@ -591,13 +591,13 @@ async function filterTranscriptPageTwins(
       try {
         const path = resolveSourceLocalFilePath(localPath, page.source_path, page.slug);
         if (path) pageFiles.add(await realpath(path));
-      } catch { /* unresolved page cannot establish a twin */ }
+      } catch { /* unresolved page cannot establish a twin */ } // silent-read-ok: unavailable filesystem probes cannot establish a page twin
     }
     return transcripts.filter(transcript => {
       const path = transcriptFiles.get(transcript);
       return path === undefined || !pageFiles.has(path);
     });
-  } catch {
+  } catch { // capability-refusal-ok: extraction keeps its fail-soft transcript set when twin lookup is unavailable
     return transcripts; // fail-soft: extraction still proceeds
   }
 }
