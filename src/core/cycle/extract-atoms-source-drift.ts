@@ -63,6 +63,7 @@ export async function countSourceChangedAtoms(
     );
     const cnt = rows[0]?.cnt;
     return cnt == null ? 0 : Number(cnt);
+  // capability-refusal-ok: diagnostic counter must not fail its extraction phase
   } catch { // silent-read-ok: diagnostic counter must not fail its extraction phase
     return 0;
   }
